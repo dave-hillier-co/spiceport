@@ -12,14 +12,19 @@ namespace Spiceport.Schema;
 internal sealed class Parser
 {
     private readonly List<Token> _tokens;
+    private readonly string _source;
     private int _pos;
 
-    private Parser(List<Token> tokens) => _tokens = tokens;
+    private Parser(List<Token> tokens, string source)
+    {
+        _tokens = tokens;
+        _source = source;
+    }
 
     public static SchemaFileNode Parse(string input)
     {
         var tokens = new Lexer(input).Tokenize();
-        return new Parser(tokens).ParseFile();
+        return new Parser(tokens, input).ParseFile();
     }
 
     private Token Current => _tokens[_pos];
@@ -57,7 +62,14 @@ internal sealed class Parser
                 continue;
             }
 
-            if (IsKeyword("definition"))
+            if (IsKeyword("use"))
+            {
+                // Feature-flag import, e.g. `use expiration`. Parsed and ignored: the features
+                // it gates (expiration, etc.) are always available in this engine.
+                Advance();
+                ParseTypePath();
+            }
+            else if (IsKeyword("definition"))
             {
                 definitions.Add(ParseDefinition());
             }
@@ -288,36 +300,62 @@ internal sealed class Parser
         Advance(); // 'caveat'
         string name = ParseTypePath();
 
-        // Parameter list: ( name type, ... ) — consumed without modelling.
+        // Parameter list: ( name type, name type, ... )
         Expect(TokenType.LeftParen, "'('");
-        SkipBalancedParens();
-
-        // Body: { CEL ... } — consumed without modelling.
-        Expect(TokenType.LeftBrace, "'{'");
-        SkipBalancedBraces();
-
-        return new CaveatNode(name);
-    }
-
-    private void SkipBalancedParens()
-    {
-        int depth = 1;
-        while (depth > 0 && !Is(TokenType.Eof))
+        var parameters = ImmutableList.CreateBuilder<CaveatParameterNode>();
+        if (!Is(TokenType.RightParen))
         {
-            if (Is(TokenType.LeftParen))
+            parameters.Add(ParseCaveatParameter());
+            while (Is(TokenType.Comma))
             {
-                depth++;
+                Advance();
+                parameters.Add(ParseCaveatParameter());
             }
-            else if (Is(TokenType.RightParen))
-            {
-                depth--;
-            }
-
-            Advance();
         }
+
+        Expect(TokenType.RightParen, "')'");
+
+        // Body: { CEL ... } — captured verbatim from source, not parsed here.
+        Token open = Expect(TokenType.LeftBrace, "'{'");
+        SkipBalancedBraces(out Token close);
+
+        // Slice raw CEL text between the braces, trimming surrounding whitespace.
+        int bodyStart = open.Offset + 1;
+        int bodyEnd = close.Offset;
+        string expression = _source[bodyStart..bodyEnd].Trim();
+
+        return new CaveatNode(name, parameters.ToImmutable(), expression);
     }
 
-    private void SkipBalancedBraces()
+    private CaveatParameterNode ParseCaveatParameter()
+    {
+        string paramName = Expect(TokenType.Identifier, "caveat parameter name").Text;
+        CaveatTypeRefNode type = ParseCaveatTypeRef();
+        return new CaveatParameterNode(paramName, type);
+    }
+
+    private CaveatTypeRefNode ParseCaveatTypeRef()
+    {
+        string typeName = Expect(TokenType.Identifier, "caveat parameter type").Text;
+        var children = ImmutableList.CreateBuilder<CaveatTypeRefNode>();
+
+        if (Is(TokenType.LessThan))
+        {
+            Advance();
+            children.Add(ParseCaveatTypeRef());
+            while (Is(TokenType.Comma))
+            {
+                Advance();
+                children.Add(ParseCaveatTypeRef());
+            }
+
+            Expect(TokenType.GreaterThan, "'>'");
+        }
+
+        return new CaveatTypeRefNode(typeName, children.ToImmutable());
+    }
+
+    private void SkipBalancedBraces(out Token closing)
     {
         int depth = 1;
         while (depth > 0 && !Is(TokenType.Eof))
@@ -329,10 +367,17 @@ internal sealed class Parser
             else if (Is(TokenType.RightBrace))
             {
                 depth--;
+                if (depth == 0)
+                {
+                    closing = Advance();
+                    return;
+                }
             }
 
             Advance();
         }
+
+        throw Error("unterminated caveat body");
     }
 
     /// <summary>Parses a slash-separated namespace path such as <c>org/user</c>.</summary>

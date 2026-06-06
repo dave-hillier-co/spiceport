@@ -1,7 +1,18 @@
 using System.Collections.Immutable;
+using System.Text;
 using Spiceport.Core;
 
 namespace Spiceport.Schema;
+
+/// <summary>
+/// The full result of compiling a schema: both object-type namespace definitions
+/// and caveat definitions, each in source order.
+/// </summary>
+/// <param name="Namespaces">Compiled object-type definitions, in source order.</param>
+/// <param name="Caveats">Compiled caveat definitions, in source order.</param>
+public sealed record CompiledSchema(
+    ImmutableList<NamespaceDefinition> Namespaces,
+    ImmutableList<CaveatDefinition> Caveats);
 
 /// <summary>
 /// Compiles SpiceDB schema DSL text into <see cref="NamespaceDefinition"/> objects
@@ -31,6 +42,51 @@ public static class SchemaCompiler
 
         SchemaFileNode file = Parser.Parse(schemaText);
         return [.. file.Definitions.Select(CompileDefinition)];
+    }
+
+    /// <summary>
+    /// Compiles the given schema DSL text into a <see cref="CompiledSchema"/> exposing
+    /// both namespace definitions and caveat definitions, each in source order.
+    /// </summary>
+    /// <remarks>
+    /// Caveat bodies are captured verbatim as CEL text and stored UTF-8 encoded in
+    /// <see cref="CaveatDefinition.SerializedExpression"/>; they are not type-checked
+    /// or evaluated here. Parameter types are modelled, including generic
+    /// <c>list&lt;T&gt;</c> / <c>map&lt;K,V&gt;</c> forms.
+    /// </remarks>
+    /// <exception cref="SchemaCompileException">If the schema cannot be parsed or compiled.</exception>
+    public static CompiledSchema CompileSchema(string schemaText)
+    {
+        if (schemaText is null)
+        {
+            throw new ArgumentNullException(nameof(schemaText));
+        }
+
+        SchemaFileNode file = Parser.Parse(schemaText);
+        return new CompiledSchema(
+            [.. file.Definitions.Select(CompileDefinition)],
+            [.. file.Caveats.Select(CompileCaveat)]);
+    }
+
+    private static CaveatDefinition CompileCaveat(CaveatNode caveat)
+    {
+        var parameterTypes = caveat.Parameters.ToImmutableDictionary(
+            p => p.Name,
+            p => CompileCaveatType(p.Type));
+
+        // The CEL expression is stored verbatim (UTF-8) rather than evaluated here.
+        byte[] serialized = Encoding.UTF8.GetBytes(caveat.Expression);
+
+        return new CaveatDefinition(caveat.Name, serialized, parameterTypes);
+    }
+
+    private static CaveatTypeReference CompileCaveatType(CaveatTypeRefNode type)
+    {
+        ImmutableList<CaveatTypeReference>? children = type.ChildTypes.IsEmpty
+            ? null
+            : [.. type.ChildTypes.Select(CompileCaveatType)];
+
+        return new CaveatTypeReference(type.Name, children);
     }
 
     private static NamespaceDefinition CompileDefinition(DefinitionNode def)

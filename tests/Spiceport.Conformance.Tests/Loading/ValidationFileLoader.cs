@@ -66,18 +66,23 @@ public static class ValidationFileLoader
 
         foreach (var s in raw.AssertTrue ?? [])
         {
-            builder.Add(ParseAssertion(s, expected: true));
+            builder.Add(ParseAssertion(s, AssertionExpectation.True));
+        }
+
+        foreach (var s in raw.AssertCaveated ?? [])
+        {
+            builder.Add(ParseAssertion(s, AssertionExpectation.Caveated));
         }
 
         foreach (var s in raw.AssertFalse ?? [])
         {
-            builder.Add(ParseAssertion(s, expected: false));
+            builder.Add(ParseAssertion(s, AssertionExpectation.False));
         }
 
         return builder.ToImmutable();
     }
 
-    private static ParsedAssertion ParseAssertion(string source, bool expected)
+    private static ParsedAssertion ParseAssertion(string source, AssertionExpectation expectation)
     {
         var (tupleString, context) = SplitWithContext(source);
 
@@ -86,10 +91,14 @@ public static class ValidationFileLoader
         // ellipsis normalisation for the subject relation.
         var relationship = TupleStrings.ParseRelationship(tupleString);
 
+        // If the assertion did not carry a `with {json}` context, fall back to any
+        // caveat context embedded directly in the relationship tuple.
+        context ??= relationship.OptionalCaveat?.Context;
+
         return new ParsedAssertion(
             relationship.Resource,
             relationship.Subject,
-            expected,
+            expectation,
             context,
             source);
     }

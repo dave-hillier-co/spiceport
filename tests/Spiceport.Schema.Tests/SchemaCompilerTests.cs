@@ -1,4 +1,5 @@
 using System.Collections.Immutable;
+using System.Text;
 using Spiceport.Core;
 using Spiceport.Schema;
 
@@ -168,6 +169,81 @@ public class SchemaCompilerTests
         var viewer = defs.Single().Relations.Single(r => r.Name == "viewer");
         var allowed = Assert.Single(viewer.TypeInformation!.AllowedDirectRelations);
         Assert.Equal("ip_allowlist", allowed.RequiredCaveat!.CaveatName);
+    }
+
+    [Fact]
+    public void CompilesCaveatBlockIntoCaveatDefinition()
+    {
+        const string schema = """
+            caveat ip_allowlist(user_ip ipaddress, allowed_ips list<string>) {
+              user_ip in allowed_ips
+            }
+
+            definition resource {
+              relation viewer: user with ip_allowlist
+            }
+            """;
+
+        var compiled = SchemaCompiler.CompileSchema(schema);
+
+        Assert.Single(compiled.Namespaces);
+        var caveat = Assert.Single(compiled.Caveats);
+
+        Assert.Equal("ip_allowlist", caveat.Name);
+
+        // The raw CEL expression is captured verbatim (UTF-8), not evaluated.
+        Assert.Equal("user_ip in allowed_ips", Encoding.UTF8.GetString(caveat.SerializedExpression));
+
+        Assert.Equal(2, caveat.ParameterTypes.Count);
+        Assert.Equal("ipaddress", caveat.ParameterTypes["user_ip"].TypeName);
+        Assert.Null(caveat.ParameterTypes["user_ip"].ChildTypes);
+
+        var listType = caveat.ParameterTypes["allowed_ips"];
+        Assert.Equal("list", listType.TypeName);
+        var child = Assert.Single(listType.ChildTypes!);
+        Assert.Equal("string", child.TypeName);
+
+        // The caveat name is also attached to the referencing relation.
+        var viewer = compiled.Namespaces.Single().Relations.Single(r => r.Name == "viewer");
+        var allowed = Assert.Single(viewer.TypeInformation!.AllowedDirectRelations);
+        Assert.Equal("ip_allowlist", allowed.RequiredCaveat!.CaveatName);
+    }
+
+    [Fact]
+    public void CompilesWithExpirationRelation()
+    {
+        const string schema = """
+            definition document {
+              relation viewer: user with expiration
+              relation editor: user with some_caveat and expiration
+            }
+            """;
+
+        var compiled = SchemaCompiler.CompileSchema(schema);
+        var doc = Assert.Single(compiled.Namespaces);
+        Assert.Empty(compiled.Caveats);
+
+        var viewer = doc.Relations.Single(r => r.Name == "viewer");
+        var viewerAllowed = Assert.Single(viewer.TypeInformation!.AllowedDirectRelations);
+        Assert.True(viewerAllowed.RequiresExpiration);
+        Assert.Null(viewerAllowed.RequiredCaveat);
+
+        var editor = doc.Relations.Single(r => r.Name == "editor");
+        var editorAllowed = Assert.Single(editor.TypeInformation!.AllowedDirectRelations);
+        Assert.True(editorAllowed.RequiresExpiration);
+        Assert.Equal("some_caveat", editorAllowed.RequiredCaveat!.CaveatName);
+    }
+
+    [Fact]
+    public void CompileStillReturnsNamespacesOnly()
+    {
+        const string schema = """
+            caveat c(x int) { x > 0 }
+            definition user {}
+            """;
+
+        var namespaces = SchemaCompiler.Compile(schema);
+        Assert.Equal("user", Assert.Single(namespaces).Name);
     }
 
     [Fact]

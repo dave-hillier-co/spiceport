@@ -12,8 +12,8 @@ public enum Membership
     Member = 1,
 
     /// <summary>
-    /// Membership is conditional on a caveat. Reserved for future caveat evaluation;
-    /// the current engine never returns this value.
+    /// Membership is conditional on a caveat whose context could not be fully determined.
+    /// The unresolved parameter names are reported in <see cref="CheckResult.MissingExprFields"/>.
     /// </summary>
     Caveated = 2,
 }
@@ -24,8 +24,18 @@ public enum Membership
 /// </summary>
 /// <param name="Verdict">The membership verdict.</param>
 /// <param name="DispatchCount">The number of recursive check steps performed.</param>
-public sealed record CheckResult(Membership Verdict, int DispatchCount = 0)
+/// <param name="MissingExprFields">
+/// When <paramref name="Verdict"/> is <see cref="Membership.Caveated"/>, the caveat parameter
+/// names that were unavailable in the supplied context. Empty otherwise.
+/// </param>
+public sealed record CheckResult(
+    Membership Verdict,
+    int DispatchCount = 0,
+    IReadOnlyList<string>? MissingExprFields = null)
 {
     /// <summary>True if the subject is a member.</summary>
     public bool IsMember => Verdict == Membership.Member;
+
+    /// <summary>The caveat parameter names that were unavailable, or an empty list.</summary>
+    public IReadOnlyList<string> MissingExprFields { get; init; } = MissingExprFields ?? [];
 }

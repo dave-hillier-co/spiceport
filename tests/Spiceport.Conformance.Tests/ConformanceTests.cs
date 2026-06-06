@@ -8,20 +8,24 @@ using Spiceport.Schema;
 namespace Spiceport.Conformance.Tests;
 
 /// <summary>
-/// SpiceDB consistency/validation conformance harness. For every non-skipped YAML
-/// test config it compiles the schema, loads the relationships into an in-memory
-/// datastore, and runs every assertion through the <see cref="CheckEngine"/>,
-/// asserting the expected boolean outcome.
+/// SpiceDB consistency/validation conformance harness. For every YAML test config it
+/// compiles the schema (yielding namespace AND caveat definitions), loads the
+/// relationships (with caveat context + expiration) into an in-memory datastore, and
+/// runs every assertion through the <see cref="CheckEngine"/>, comparing the engine's
+/// membership verdict against the file's expected outcome
+/// (assertTrue → Member, assertFalse → NotMember, assertCaveated → Caveated).
 /// </summary>
 public class ConformanceTests
 {
     /// <summary>
-    /// Files that require caveat or expiration semantics, which the current engine
-    /// treats opaquely (a caveated tuple counts as an unconditional member) and the
-    /// schema compiler does not fully model. Running these would produce misleading
-    /// pass/fail signal, so they are reported as skipped with a reason.
+    /// Files that cannot be run faithfully and the precise reason. A file is only listed
+    /// here when its expected outcome depends on a specific evaluation "now" that we
+    /// cannot derive from the file. The expiration files in this suite all use far-past
+    /// (≤2024) versus far-future (≥2200) timestamps, so the real wall clock falls
+    /// unambiguously between them and is a faithful "now"; they are therefore NOT skipped.
     /// </summary>
-    private static readonly IReadOnlyDictionary<string, string> SkipReasons = BuildSkipReasons();
+    private static readonly IReadOnlyDictionary<string, string> SkipReasons =
+        new Dictionary<string, string>(StringComparer.Ordinal);
 
     public static IEnumerable<object[]> AllYamlFiles()
     {
@@ -43,8 +47,8 @@ public class ConformanceTests
         var path = Path.Combine(AppContext.BaseDirectory, "TestData", fileName);
         var file = ValidationFileLoader.LoadFromFile(path);
 
-        var namespaces = SchemaCompiler.Compile(file.SchemaText);
-        var engine = new CheckEngine(namespaces);
+        var compiled = SchemaCompiler.CompileSchema(file.SchemaText);
+        var engine = new CheckEngine(compiled.Namespaces, compiled.Caveats);
 
         var datastore = new InMemoryDatastore();
         var revision = await LoadRelationships(datastore, file.Relationships);
@@ -53,18 +57,22 @@ public class ConformanceTests
         var failures = new List<string>();
         foreach (var assertion in file.Assertions)
         {
-            var subject = assertion.Subject;
             var result = await engine.Check(
                 reader,
                 assertion.Resource.ObjectType,
                 assertion.Resource.ObjectId,
                 assertion.Resource.Relation,
-                subject);
+                assertion.Subject,
+                caveatContext: assertion.CaveatContext);
 
-            if (result.IsMember != assertion.Expected)
+            var expected = assertion.ExpectedMembership;
+            if (result.Verdict != expected)
             {
+                var missing = result.MissingExprFields.Count > 0
+                    ? $" [missing: {string.Join(", ", result.MissingExprFields)}]"
+                    : string.Empty;
                 failures.Add(
-                    $"  {assertion.SourceText} => expected {assertion.Expected}, got {result.IsMember} (verdict {result.Verdict})");
+                    $"  {assertion.SourceText} => expected {expected}, got {result.Verdict}{missing}");
             }
         }
 
@@ -89,75 +97,4 @@ public class ConformanceTests
 
         return await datastore.ReadWriteTx(tx => tx.WriteRelationships(updates));
     }
-
-    private static Dictionary<string, string> BuildSkipReasons()
-    {
-        var map = new Dictionary<string, string>(StringComparer.Ordinal);
-        var dir = Path.Combine(AppContext.BaseDirectory, "TestData");
-        if (!Directory.Exists(dir))
-        {
-            return map;
-        }
-
-        foreach (var path in Directory.EnumerateFiles(dir, "*.yaml"))
-        {
-            var name = Path.GetFileName(path);
-            var lowerName = name.ToLowerInvariant();
-            string? reason = null;
-
-            if (lowerName.Contains("caveat"))
-            {
-                reason = "requires caveat (CEL) evaluation, not yet modelled";
-            }
-            else if (lowerName.Contains("expiration"))
-            {
-                reason = "requires relationship-expiration semantics, not yet modelled";
-            }
-            else
-            {
-                // Catch files that use caveat syntax without a caveat/expiration name.
-                var text = File.ReadAllText(path);
-                if (UsesCaveatSyntax(text))
-                {
-                    reason = "uses caveat syntax (caveat definition / `with` annotation), not yet modelled";
-                }
-                else if (UsesExpirationSyntax(text))
-                {
-                    reason = "uses expiration syntax, not yet modelled";
-                }
-            }
-
-            if (reason is not null)
-            {
-                map[name] = reason;
-            }
-        }
-
-        return map;
-    }
-
-    private static bool UsesCaveatSyntax(string text)
-    {
-        foreach (var rawLine in text.Split('\n'))
-        {
-            var line = rawLine.Trim();
-            if (line.StartsWith("//", StringComparison.Ordinal))
-            {
-                continue;
-            }
-
-            // A standalone caveat definition, or a `with <caveat>` type annotation,
-            // or a caveat-context assertion (`@subject... with {json}`).
-            if (line.StartsWith("caveat ", StringComparison.Ordinal) ||
-                line.Contains(" with ", StringComparison.Ordinal))
-            {
-                return true;
-            }
-        }
-
-        return false;
-    }
-
-    private static bool UsesExpirationSyntax(string text) =>
-        text.Contains("expiration", StringComparison.OrdinalIgnoreCase);
 }

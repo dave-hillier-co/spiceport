@@ -94,4 +94,63 @@ public class ValidationFileLoaderTests
         Assert.Equal("doc", assertion.Resource.ObjectType);
         Assert.Equal("view", assertion.Resource.Relation);
     }
+
+    [Fact]
+    public void Parses_caveat_relationship_and_caveated_assertion()
+    {
+        const string yaml = """
+            schema: |+
+              use expiration
+              caveat somecaveat(somecondition int) {
+                somecondition == 42
+              }
+              definition user {}
+              definition document {
+                relation viewer: user with somecaveat and expiration
+                permission view = viewer
+              }
+            relationships: |
+              document:firstdoc#viewer@user:sarah[somecaveat:{"somecondition":42}][expiration:2300-12-01T00:00:00Z]
+              document:firstdoc#viewer@user:fred[somecaveat][expiration:2300-12-01T00:00:00Z]
+            assertions:
+              assertTrue:
+                - 'document:firstdoc#view@user:fred with {"somecondition": 42}'
+              assertCaveated:
+                - "document:firstdoc#view@user:fred"
+              assertFalse:
+                - "document:firstdoc#view@user:tom"
+            """;
+
+        var file = ValidationFileLoader.Parse(yaml);
+
+        // Relationship: caveat name + JSON context + expiration all populated.
+        var sarah = file.Relationships.First(r => r.Subject.ObjectId == "sarah");
+        Assert.NotNull(sarah.OptionalCaveat);
+        Assert.Equal("somecaveat", sarah.OptionalCaveat!.CaveatName);
+        Assert.NotNull(sarah.OptionalCaveat.Context);
+        // Relationship caveat context is deserialised lazily as JsonElement by the core parser.
+        Assert.Equal("42", sarah.OptionalCaveat.Context!["somecondition"]!.ToString());
+        Assert.NotNull(sarah.OptionalExpiration);
+        Assert.Equal(2300, sarah.OptionalExpiration!.Value.Year);
+
+        // Relationship: caveat name, no context (context provided at check time).
+        var fred = file.Relationships.First(r => r.Subject.ObjectId == "fred");
+        Assert.NotNull(fred.OptionalCaveat);
+        Assert.Equal("somecaveat", fred.OptionalCaveat!.CaveatName);
+        Assert.Null(fred.OptionalCaveat.Context);
+
+        // assertTrue with " with {json}" context.
+        var trueAssertion = file.Assertions.First(a => a.Expectation == AssertionExpectation.True);
+        Assert.NotNull(trueAssertion.CaveatContext);
+        Assert.Equal(42L, Convert.ToInt64(trueAssertion.CaveatContext!["somecondition"]));
+
+        // assertCaveated maps to the Caveated outcome / Membership.Caveated.
+        var caveated = file.Assertions.First(a => a.Expectation == AssertionExpectation.Caveated);
+        Assert.Equal(Spiceport.Engine.Membership.Caveated, caveated.ExpectedMembership);
+        Assert.Equal("fred", caveated.Subject.ObjectId);
+
+        // assertFalse maps to NotMember.
+        var falseAssertion = file.Assertions.First(a => a.Expectation == AssertionExpectation.False);
+        Assert.Equal(Spiceport.Engine.Membership.NotMember, falseAssertion.ExpectedMembership);
+    }
 }

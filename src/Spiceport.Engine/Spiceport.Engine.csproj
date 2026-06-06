@@ -6,6 +6,10 @@
     <ProjectReference Include="..\Spiceport.Datastore\Spiceport.Datastore.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <PackageReference Include="Cel" Version="0.3.2" />
+  </ItemGroup>
+
   <PropertyGroup>
     <TargetFramework>net10.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>

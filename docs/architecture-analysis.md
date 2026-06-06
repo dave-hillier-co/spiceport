@@ -156,9 +156,16 @@ These are pure CPU and must be ported faithfully; they carry the real porting ri
 - **Graph evaluation semantics** — union/intersection/exclusion, arrows
   (tupleset-to-userset), wildcards (`user:*`), aliasing, expiration, and **caveat** short-
   circuiting. This is where subtle correctness bugs hide.
-- **Caveats (CEL)** — SpiceDB embeds `cel-go`. .NET has **no first-class CEL**; options are a
-  third-party CEL-for-.NET (maturity risk) or porting the needed subset. **Flag as the single
-  biggest dependency risk.**
+- **Caveats (CEL)** — SpiceDB embeds `cel-go`. **Decision (made via spike): adopt the
+  `Cel` NuGet package (`rayokota/cel.net`, a CEL-Java port) as the evaluator rather than port
+  a CEL parser.** Verified it supports full eval, the `.all()` macro, `in`, ternary,
+  short-circuit (`false && missing` → `false` without error), and custom-function registration
+  (so `in_cidr`/`isSubtreeOf` and IP/map types can be wired in). Its one gap vs `cel-go` is
+  **partial evaluation** (a genuinely-needed missing var throws instead of yielding a residual
+  AST). We bridge that with a thin shim: try full eval; if a needed var is missing, return a
+  `Caveated` verdict listing the missing fields (short-circuit handled natively by the library).
+  Residual-AST fidelity (re-evaluating a partial later) is deferred. This was the flagged
+  dependency risk; it is now retired.
 - **Datastore + revision model** — start with an in-memory MVCC store and Postgres (`xid8`
   transaction-id revisions, ZedToken encode/decode). Npgsql for Postgres; defer crdb/mysql/
   spanner.

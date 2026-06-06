@@ -27,8 +27,17 @@ internal sealed record TypeRefNode(
 /// <summary>A <c>permission</c> declaration with its compute expression.</summary>
 internal sealed record PermissionNode(string Name, ExprNode Expression);
 
-/// <summary>A <c>caveat</c> block (parsed; compiled to a placeholder definition).</summary>
-internal sealed record CaveatNode(string Name);
+/// <summary>A <c>caveat</c> block: a name, typed parameters (in source order), and the raw CEL body text.</summary>
+internal sealed record CaveatNode(
+    string Name,
+    ImmutableList<CaveatParameterNode> Parameters,
+    string Expression);
+
+/// <summary>One <c>name type</c> parameter inside a caveat parameter list.</summary>
+internal sealed record CaveatParameterNode(string Name, CaveatTypeRefNode Type);
+
+/// <summary>A caveat parameter type reference, possibly with generic child types (e.g. <c>list&lt;int&gt;</c>).</summary>
+internal sealed record CaveatTypeRefNode(string Name, ImmutableList<CaveatTypeRefNode> ChildTypes);
 
 /// <summary>Base type for permission compute expressions.</summary>
 internal abstract record ExprNode;
