@@ -1,0 +1,43 @@
+syntax = "proto3";
+
+option csharp_namespace = "Spiceport.Protos";
+
+package spiceport.v0;
+
+import "google/protobuf/struct.proto";
+
+// Minimal, NOT authzed v1 byte-compatible yet. Full authzed.api.v1 compatibility is a later step.
+service PermissionsService {
+  rpc CheckPermission(CheckPermissionRequest) returns (CheckPermissionResponse);
+}
+
+message ObjectReference {
+  string object_type = 1;
+  string object_id = 2;
+}
+
+message SubjectReference {
+  ObjectReference object = 1;
+  // Optional subrelation; empty means the ellipsis "..." (direct subject).
+  string optional_relation = 2;
+}
+
+message CheckPermissionRequest {
+  ObjectReference resource = 1;
+  string permission = 2;
+  SubjectReference subject = 3;
+  // Request-time caveat context (overrides relationship context).
+  google.protobuf.Struct context = 4;
+}
+
+message CheckPermissionResponse {
+  enum Permissionship {
+    PERMISSIONSHIP_UNSPECIFIED = 0;
+    PERMISSIONSHIP_NO_PERMISSION = 1;
+    PERMISSIONSHIP_HAS_PERMISSION = 2;
+    PERMISSIONSHIP_CONDITIONAL_PERMISSION = 3; // caveated / undetermined
+  }
+  Permissionship permissionship = 1;
+  // Caveat parameter names missing from context when permissionship is CONDITIONAL.
+  repeated string partial_caveat_missing_fields = 2;
+}

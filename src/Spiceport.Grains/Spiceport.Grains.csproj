@@ -4,6 +4,7 @@
     <ProjectReference Include="..\Spiceport.Grains.Abstractions\Spiceport.Grains.Abstractions.csproj" />
     <ProjectReference Include="..\Spiceport.Engine\Spiceport.Engine.csproj" />
     <ProjectReference Include="..\Spiceport.Datastore\Spiceport.Datastore.csproj" />
+    <ProjectReference Include="..\Spiceport.Schema\Spiceport.Schema.csproj" />
   </ItemGroup>
 
   <ItemGroup>

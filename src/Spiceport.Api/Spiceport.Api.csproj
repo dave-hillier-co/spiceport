@@ -3,11 +3,17 @@
   <ItemGroup>
     <ProjectReference Include="..\Spiceport.Grains.Abstractions\Spiceport.Grains.Abstractions.csproj" />
     <ProjectReference Include="..\Spiceport.Protos\Spiceport.Protos.csproj" />
+    <ProjectReference Include="..\Spiceport.Grains\Spiceport.Grains.csproj" />
+    <ProjectReference Include="..\Spiceport.Engine\Spiceport.Engine.csproj" />
+    <ProjectReference Include="..\Spiceport.Datastore\Spiceport.Datastore.csproj" />
+    <ProjectReference Include="..\Spiceport.Datastore.Memory\Spiceport.Datastore.Memory.csproj" />
+    <ProjectReference Include="..\Spiceport.Schema\Spiceport.Schema.csproj" />
   </ItemGroup>
 
   <ItemGroup>
     <PackageReference Include="Grpc.AspNetCore" Version="2.80.0" />
     <PackageReference Include="Microsoft.Orleans.Client" Version="10.1.0" />
+    <PackageReference Include="Microsoft.Orleans.Server" Version="10.1.0" />
   </ItemGroup>
 
   <PropertyGroup>
