@@ -1,0 +1,15 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <ItemGroup>
+    <ProjectReference Include="..\Spiceport.Core\Spiceport.Core.csproj" />
+    <ProjectReference Include="..\Spiceport.Schema\Spiceport.Schema.csproj" />
+    <ProjectReference Include="..\Spiceport.Datastore\Spiceport.Datastore.csproj" />
+  </ItemGroup>
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+</Project>
