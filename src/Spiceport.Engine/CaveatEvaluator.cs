@@ -52,13 +52,24 @@ public sealed record CaveatResult(CaveatOutcome Outcome, IReadOnlyList<string> M
 /// <c>duration</c> are provided by the underlying CEL implementation.
 /// </para>
 /// <para>
-/// Because the library has no unknowns/residual-AST support, partial evaluation uses a
-/// shim: the set of declared parameters referenced by the expression but absent from the
-/// supplied context is the candidate "missing" set. The expression is still executed against
-/// the supplied context — short-circuiting (e.g. <c>false &amp;&amp; missing</c>) can yield a
-/// definite result even when some candidates are absent. If execution throws
-/// <see cref="CelUndeclaredReferenceException"/>, a missing parameter was genuinely needed and
-/// the result is <see cref="CaveatOutcome.Caveated"/> with the candidate missing names.
+/// Partial evaluation: the underlying CEL engine short-circuits <c>||</c>/<c>&amp;&amp;</c> at the
+/// operator level, so a missing variable on the non-determining branch still yields a definite
+/// verdict (e.g. <c>allowed || tier &gt; 5</c> with <c>{allowed:true}</c> is definitely-true even
+/// though <c>tier</c> is absent). The expression is executed directly against the supplied context;
+/// only when the engine genuinely needs an absent variable (raising
+/// <see cref="CelUndeclaredReferenceException"/>, or an overload/macro failure caused by the
+/// resulting null operand) is the result <see cref="CaveatOutcome.Caveated"/>, carrying the declared
+/// parameters that are referenced by the expression yet absent from the merged context. This mirrors
+/// SpiceDB's <c>cel.OptPartialEval</c> + <c>PartialVars</c> behaviour for boolean short-circuits.
+/// </para>
+/// <para>
+/// Context values are validated and coerced against the caveat's declared parameter types before
+/// evaluation (mirroring SpiceDB's <c>ConvertContextToParameters</c>): a value whose type cannot be
+/// converted to the declared type raises <see cref="CaveatEvaluationException"/> with
+/// <see cref="CaveatEvaluationErrorKind.ParameterTypeMismatch"/> (gRPC <c>InvalidArgument</c>), and a
+/// <c>uint</c> parameter is preserved as an unsigned <see cref="ulong"/> rather than narrowed to a
+/// signed <see cref="long"/>. An unknown caveat name raises
+/// <see cref="CaveatEvaluationErrorKind.UnknownCaveat"/>.
 /// </para>
 /// </remarks>
 public sealed class CaveatEvaluator
@@ -77,8 +88,13 @@ public sealed class CaveatEvaluator
     /// <summary>
     /// Evaluates the named caveat against the relationship context merged with the request context
     /// (request context overrides). Returns <see cref="CaveatOutcome.Caveated"/> when a referenced
-    /// declared parameter is absent. An unknown caveat name evaluates to definitely-false.
+    /// declared parameter is absent and the CEL engine cannot short-circuit around it.
     /// </summary>
+    /// <exception cref="CaveatEvaluationException">
+    /// The caveat name is unknown (<see cref="CaveatEvaluationErrorKind.UnknownCaveat"/>), or a
+    /// supplied context value is type-incompatible with the declared parameter
+    /// (<see cref="CaveatEvaluationErrorKind.ParameterTypeMismatch"/>).
+    /// </exception>
     public CaveatResult Evaluate(
         string caveatName,
         IReadOnlyDictionary<string, object?>? relationshipContext,
@@ -86,25 +102,28 @@ public sealed class CaveatEvaluator
     {
         ArgumentNullException.ThrowIfNull(caveatName);
 
+        // An unknown caveat name is a schema-skew/stale-cache condition. SpiceDB's CaveatRunner.get
+        // returns CaveatNameNotFoundErr; surface it loudly rather than silently denying.
         if (!_caveats.TryGetValue(caveatName, out var def))
-            return CaveatResult.False;
+            throw new CaveatEvaluationException(
+                CaveatEvaluationErrorKind.UnknownCaveat,
+                $"caveat with name `{caveatName}` not found");
 
         var expression = System.Text.Encoding.UTF8.GetString(def.SerializedExpression);
 
+        // Merge request then relationship context (relationship/stored context overrides request),
+        // validating + coercing each value against the declared parameter type. A mismatch becomes
+        // a ParameterTypeError (gRPC InvalidArgument), as in SpiceDB's ConvertContextToParameters.
         var vars = new Dictionary<string, object?>();
-        AddContext(vars, requestContext);
-        AddContext(vars, relationshipContext); // written/stored context overrides request context
+        AddContext(vars, requestContext, def.ParameterTypes);
+        AddContext(vars, relationshipContext, def.ParameterTypes);
 
-        // Partial-eval shim: a declared parameter that the expression actually references but
-        // that is absent from the merged context makes the caveat undeterminable -> Caveated.
-        // We decide this up front (rather than relying on the CEL engine to throw) because a
-        // missing variable can silently arrive as null at a custom function and yield a bogus
-        // definite result. Short-circuiting over a missing variable (residual AST) is deferred.
+        // Candidate missing set: declared parameters referenced by the expression yet absent from the
+        // merged context. Only reported when the CEL engine actually needs one of them (i.e. could
+        // not short-circuit the surrounding ||/&&); the engine handles boolean short-circuiting.
         var missing = def.ParameterTypes.Keys
             .Where(p => !vars.ContainsKey(p) && ReferencesIdentifier(expression, p))
             .ToList();
-        if (missing.Count > 0)
-            return CaveatResult.Missing(missing);
 
         object? result;
         try
@@ -113,9 +132,9 @@ public sealed class CaveatEvaluator
         }
         catch (Exception ex) when (IsMissingReferenceError(ex))
         {
-            // A genuinely-needed parameter was absent (short-circuit did not save us). The
-            // missing reference can surface directly (CelUndeclaredReferenceException) or wrapped
-            // by an operator/macro overload failure (e.g. `somelist.all(...)` on a null var).
+            // A genuinely-needed parameter was absent (short-circuit did not save us). The missing
+            // reference can surface directly (CelUndeclaredReferenceException) or wrapped by an
+            // operator/macro overload failure (e.g. `somelist.all(...)` on a null var).
             if (missing.Count > 0)
                 return CaveatResult.Missing(missing);
 
@@ -224,34 +243,47 @@ public sealed class CaveatEvaluator
         return false;
     }
 
-    private static void AddContext(Dictionary<string, object?> vars, IReadOnlyDictionary<string, object?>? ctx)
+    /// <summary>
+    /// Merges <paramref name="ctx"/> into <paramref name="vars"/>, validating and coercing each value
+    /// against its declared parameter type. A value whose type cannot be converted to the declared
+    /// type raises <see cref="CaveatEvaluationException"/>. Unknown parameters (not declared by the
+    /// caveat) are skipped, mirroring SpiceDB's <c>SkipUnknownParameters</c>; a null value clears the
+    /// parameter (treated as absent).
+    /// </summary>
+    private static void AddContext(
+        Dictionary<string, object?> vars,
+        IReadOnlyDictionary<string, object?>? ctx,
+        IReadOnlyDictionary<string, CaveatTypeReference> parameterTypes)
     {
         if (ctx is null)
             return;
         foreach (var (k, v) in ctx)
         {
-            if (v is not null)
-                vars[k] = Normalize(v);
-            else
+            if (v is null)
+            {
                 vars.Remove(k);
+                continue;
+            }
+
+            // SkipUnknownParameters: a context value with no declared parameter is ignored, not an
+            // error (matches SpiceDB; the value cannot be referenced by the typed expression anyway).
+            if (!parameterTypes.TryGetValue(k, out var declared))
+                continue;
+
+            vars[k] = ConvertValue(k, declared, Normalize(v));
         }
     }
 
     /// <summary>
-    /// Normalizes a context value into a CEL-friendly representation. JSON numbers and integral
-    /// values are widened to <see cref="long"/>/<see cref="double"/>; nested maps/lists recurse.
+    /// Normalizes a context value into a CEL-friendly representation: a lazily-deserialized
+    /// <see cref="System.Text.Json.JsonElement"/> becomes plain CLR values; nested maps/lists recurse.
+    /// Integral/floating CLR values are passed through with their natural width preserved so that
+    /// <see cref="ConvertValue"/> can validate against the declared type (uint64 is not narrowed here).
     /// </summary>
     private static object Normalize(object value) => value switch
     {
         System.Text.Json.JsonElement je => NormalizeJson(je),
-        bool or string or long or double => value,
-        int i => (long)i,
-        short s => (long)s,
-        byte by => (long)by,
-        uint ui => (long)ui,
-        ulong ul => (long)ul,
-        float f => (double)f,
-        decimal dec => (double)dec,
+        bool or string or long or double or int or short or byte or sbyte or ushort or uint or ulong or float or decimal => value,
         IReadOnlyDictionary<string, object?> map =>
             map.Where(kv => kv.Value is not null)
                .ToDictionary(kv => kv.Key, kv => Normalize(kv.Value!)),
@@ -259,6 +291,117 @@ public sealed class CaveatEvaluator
             e.Cast<object?>().Where(x => x is not null).Select(x => Normalize(x!)).ToList(),
         _ => value,
     };
+
+    /// <summary>
+    /// Validates and coerces a normalized value against the declared caveat parameter type, mirroring
+    /// SpiceDB's <c>VariableType.ConvertValue</c>. Numeric types accept the target type, a JSON number,
+    /// or a numeric string; <c>int</c> requires an integral value, <c>uint</c> requires a non-negative
+    /// integral value preserved as <see cref="ulong"/>, <c>double</c> accepts any number. <c>string</c>
+    /// and <c>bool</c> require an exact match. <c>list</c>/<c>map</c> recurse into their child types.
+    /// </summary>
+    private static object ConvertValue(string param, CaveatTypeReference type, object value)
+    {
+        switch (type.TypeName)
+        {
+            case "bool":
+                return value is bool ? value : throw TypeError(param, "bool", value);
+
+            case "string":
+                return value is string ? value : throw TypeError(param, "string", value);
+
+            case "bytes":
+            case "duration":
+            case "timestamp":
+            case "ipaddress":
+                // These flow through as strings (parsed by the registered functions / engine).
+                return value is string ? value : throw TypeError(param, type.TypeName, value);
+
+            case "int":
+                return ToInt64(param, value);
+
+            case "uint":
+                return ToUInt64(param, value);
+
+            case "double":
+                return ToDouble(param, value);
+
+            case "any":
+                return value;
+
+            case "list":
+            {
+                if (value is not List<object> items)
+                    throw TypeError(param, "list", value);
+                var child = type.ChildTypes?.FirstOrDefault();
+                return child is null
+                    ? items
+                    : items.Select(item => ConvertValue(param, child, item)).ToList();
+            }
+
+            case "map":
+            {
+                if (value is not Dictionary<string, object> entries)
+                    throw TypeError(param, "map", value);
+                var valueType = type.ChildTypes is { Count: >= 1 } ct ? ct[^1] : null;
+                return valueType is null
+                    ? entries
+                    : entries.ToDictionary(kv => kv.Key, kv => ConvertValue(param, valueType, kv.Value));
+            }
+
+            default:
+                // Unknown declared type keyword: pass the value through unchanged.
+                return value;
+        }
+    }
+
+    private static long ToInt64(string param, object value)
+    {
+        switch (value)
+        {
+            case long l: return l;
+            case int or short or sbyte or byte or ushort or uint: return Convert.ToInt64(value);
+            case ulong ul when ul <= long.MaxValue: return (long)ul;
+            case double d when d == Math.Floor(d) && !double.IsInfinity(d): return (long)d;
+            case float f when f == Math.Floor(f) && !float.IsInfinity(f): return (long)f;
+            case decimal m when m == Math.Floor(m): return (long)m;
+            case string s when long.TryParse(s, System.Globalization.NumberStyles.Integer,
+                System.Globalization.CultureInfo.InvariantCulture, out var parsed): return parsed;
+            default: throw TypeError(param, "int", value);
+        }
+    }
+
+    private static ulong ToUInt64(string param, object value)
+    {
+        switch (value)
+        {
+            case ulong ul: return ul;
+            case long l when l >= 0: return (ulong)l;
+            case int or short or sbyte when Convert.ToInt64(value) >= 0: return (ulong)Convert.ToInt64(value);
+            case byte or ushort or uint: return Convert.ToUInt64(value);
+            case double d when d >= 0 && d == Math.Floor(d) && !double.IsInfinity(d): return (ulong)d;
+            case float f when f >= 0 && f == Math.Floor(f) && !float.IsInfinity(f): return (ulong)f;
+            case decimal m when m >= 0 && m == Math.Floor(m): return (ulong)m;
+            case string s when ulong.TryParse(s, System.Globalization.NumberStyles.Integer,
+                System.Globalization.CultureInfo.InvariantCulture, out var parsed): return parsed;
+            default: throw TypeError(param, "uint", value);
+        }
+    }
+
+    private static double ToDouble(string param, object value) => value switch
+    {
+        double d => d,
+        float f => f,
+        decimal m => (double)m,
+        long or int or short or sbyte or byte or ushort or uint or ulong => Convert.ToDouble(value),
+        string s when double.TryParse(s, System.Globalization.NumberStyles.Float,
+            System.Globalization.CultureInfo.InvariantCulture, out var parsed) => parsed,
+        _ => throw TypeError(param, "double", value),
+    };
+
+    private static CaveatEvaluationException TypeError(string param, string expected, object value) =>
+        new(CaveatEvaluationErrorKind.ParameterTypeMismatch,
+            $"could not convert context parameter `{param}`: a {expected} value is required, but found " +
+            $"{value.GetType().Name} `{value}`");
 
     /// <summary>
     /// Converts a lazily-deserialized <see cref="System.Text.Json.JsonElement"/> (how relationship
@@ -310,17 +453,41 @@ public sealed class CaveatEvaluator
         env.RegisterFunction("ipaddress", new[] { typeof(string) }, args => args[0]);
 
         // <ipaddress|string>.in_cidr(cidr_string) -> bool. The receiver is declared `ipaddress`
-        // but flows through context as a boxed string, so accept `object` and coerce.
+        // but flows through context as a boxed string, so accept `object` and coerce. A null
+        // receiver/argument means a referenced variable was absent (the CEL engine passes null for
+        // a missing var into a custom overload rather than throwing); signal it as a missing
+        // reference so the caller can return Caveated rather than silently evaluating to false.
         env.RegisterFunction("in_cidr", new[] { typeof(object), typeof(string) }, args =>
-            InCidr(AsString(args[0]), AsString(args[1])));
+        {
+            RequireBound(args[0]);
+            RequireBound(args[1]);
+            return InCidr(AsString(args[0]), AsString(args[1]));
+        });
 
         // <map>.isSubtreeOf(other_map) -> bool
         env.RegisterFunction(
             "isSubtreeOf",
             new[] { typeof(object), typeof(object) },
-            args => IsSubtreeOf(args[0]!, args[1]!));
+            args =>
+            {
+                RequireBound(args[0]);
+                RequireBound(args[1]);
+                return IsSubtreeOf(args[0]!, args[1]!);
+            });
 
         return env;
+    }
+
+    /// <summary>
+    /// Throws <see cref="CelUndeclaredReferenceException"/> when a custom-function argument is null,
+    /// which (given present-but-null context values are stripped before evaluation) can only mean a
+    /// referenced variable was absent. This routes through <see cref="IsMissingReferenceError"/> so
+    /// the result becomes <see cref="CaveatOutcome.Caveated"/> rather than a bogus definite verdict.
+    /// </summary>
+    private static void RequireBound(object? arg)
+    {
+        if (arg is null)
+            throw new CelUndeclaredReferenceException("a referenced caveat parameter was not supplied");
     }
 
     private static string AsString(object? o) => o as string ?? o?.ToString() ?? string.Empty;

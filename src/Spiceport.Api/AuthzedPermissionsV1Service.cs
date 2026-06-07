@@ -25,6 +25,19 @@ public sealed class AuthzedPermissionsV1Service(
     private IReverseOpsGrain ReverseOps => grains.GetGrain<IReverseOpsGrain>(IReverseOpsGrain.Key);
     private IRelationshipsGrain Relationships => grains.GetGrain<IRelationshipsGrain>(IRelationshipsGrain.Key);
 
+    /// <summary>
+    /// Maps a caveat-evaluation failure onto a gRPC status: a context value that does not match a
+    /// declared parameter type is <c>InvalidArgument</c> (SpiceDB <c>ParameterTypeError</c>); a
+    /// reference to a caveat absent from the schema is <c>FailedPrecondition</c> (SpiceDB
+    /// <c>CaveatNameNotFoundErr</c>, a schema-skew condition).
+    /// </summary>
+    private static RpcException ToRpc(CaveatEvaluationException ex) =>
+        new(new Status(
+            ex.Kind == CaveatEvaluationErrorKind.ParameterTypeMismatch
+                ? StatusCode.InvalidArgument
+                : StatusCode.FailedPrecondition,
+            ex.Message));
+
     public override async Task<V1::CheckPermissionResponse> CheckPermission(
         V1::CheckPermissionRequest request, ServerCallContext context)
     {
@@ -67,6 +80,10 @@ public sealed class AuthzedPermissionsV1Service(
             // this as FailedPrecondition, NOT a NoPermission verdict, so the client can tell "the server
             // gave up" apart from "not authorized".
             throw new RpcException(new Status(StatusCode.FailedPrecondition, ex.Message));
+        }
+        catch (CaveatEvaluationException ex)
+        {
+            throw ToRpc(ex);
         }
 
         var ship = result.Verdict switch
@@ -248,6 +265,10 @@ public sealed class AuthzedPermissionsV1Service(
             {
                 throw new RpcException(new Status(StatusCode.InvalidArgument, ex.Message));
             }
+            catch (CaveatEvaluationException ex)
+            {
+                throw ToRpc(ex);
+            }
 
             foreach (var r in reply.Resources)
             {
@@ -312,6 +333,10 @@ public sealed class AuthzedPermissionsV1Service(
             catch (InvalidConsistencyTokenException ex)
             {
                 throw new RpcException(new Status(StatusCode.InvalidArgument, ex.Message));
+            }
+            catch (CaveatEvaluationException ex)
+            {
+                throw ToRpc(ex);
             }
 
             foreach (var s in reply.Subjects)
@@ -381,6 +406,10 @@ public sealed class AuthzedPermissionsV1Service(
         catch (InvalidConsistencyTokenException ex)
         {
             throw new RpcException(new Status(StatusCode.InvalidArgument, ex.Message));
+        }
+        catch (CaveatEvaluationException ex)
+        {
+            throw ToRpc(ex);
         }
 
         // One token for the whole batch (the single pinned revision every item was evaluated at).
