@@ -174,4 +174,198 @@ public class DataPlaneMeshTests
 
         Assert.Equal(hashBefore, cluster.SchemaProvider.Current.SchemaHash);
     }
+
+    // ---- WriteSchema change validation, exercised directly over the grain mesh ----
+    //
+    // These complement WriteSafetyGrpcServiceTests (which drive the same paths through the gRPC
+    // service) by asserting, at the grain boundary, that a rejected schema change surfaces the
+    // serializable SchemaWriteValidationException AND leaves the LIVE schema snapshot intact (the
+    // datastore-persist and the in-memory swap are both abandoned).
+
+    private const string SubjectRefSchema = """
+        definition user {}
+
+        definition group {
+            relation member: user
+        }
+
+        definition document {
+            relation viewer: user | group#member
+            relation editor: user
+            permission view = viewer + editor
+        }
+        """;
+
+    private static RelationshipUpdateWire Member(string group, string user) =>
+        new(RelationshipUpdateOpWire.Touch,
+            new RelationshipWire("group", group, "member", "user", user, CoreConstants.Ellipsis, null, null, null));
+
+    private static RelationshipUpdateWire ViewerGroup(string doc, string group) =>
+        new(RelationshipUpdateOpWire.Touch,
+            new RelationshipWire("document", doc, "viewer", "group", group, "member", null, null, null));
+
+    [Fact]
+    public async Task WriteSchema_removing_referenced_definition_is_rejected_and_live_schema_unchanged()
+    {
+        await using var cluster = await MeshTestCluster.CreateAsync(ViewerOrEditorSchema);
+        await cluster.Relationships.WriteRelationships(
+            new WriteRelationshipsArgs(new List<RelationshipUpdateWire> { Touch("readme", "viewer", "alice") }));
+
+        var hashBefore = cluster.SchemaProvider.Current.SchemaHash;
+
+        // Drop `document` entirely while a relationship is written under it.
+        var ex = await Assert.ThrowsAsync<SchemaWriteValidationException>(
+            () => cluster.WriteSchema(EmptySchema));
+        Assert.Contains("document", ex.Message);
+
+        // Live schema snapshot untouched, and the check still resolves against the old schema.
+        Assert.Equal(hashBefore, cluster.SchemaProvider.Current.SchemaHash);
+        var check = await cluster.Checker.Check("document", "readme", "view", User("alice"), null);
+        Assert.Equal(Membership.Member, check.Verdict);
+    }
+
+    [Fact]
+    public async Task WriteSchema_removing_referenced_relation_is_rejected_and_live_schema_unchanged()
+    {
+        await using var cluster = await MeshTestCluster.CreateAsync(ViewerOrEditorSchema);
+        await cluster.Relationships.WriteRelationships(
+            new WriteRelationshipsArgs(new List<RelationshipUpdateWire> { Touch("readme", "viewer", "alice") }));
+
+        var hashBefore = cluster.SchemaProvider.Current.SchemaHash;
+
+        // Drop the `viewer` relation while it is still written.
+        const string withoutViewer = """
+            definition user {}
+
+            definition document {
+                relation editor: user
+                permission view = editor
+            }
+            """;
+
+        var ex = await Assert.ThrowsAsync<SchemaWriteValidationException>(
+            () => cluster.WriteSchema(withoutViewer));
+        Assert.Contains("viewer", ex.Message);
+
+        Assert.Equal(hashBefore, cluster.SchemaProvider.Current.SchemaHash);
+    }
+
+    [Fact]
+    public async Task WriteSchema_removing_relation_referenced_as_subject_is_rejected_and_live_schema_unchanged()
+    {
+        await using var cluster = await MeshTestCluster.CreateAsync(SubjectRefSchema);
+        await cluster.Relationships.WriteRelationships(new WriteRelationshipsArgs(
+            new List<RelationshipUpdateWire> { ViewerGroup("readme", "eng") }));
+
+        var hashBefore = cluster.SchemaProvider.Current.SchemaHash;
+
+        // Remove group#member: it is referenced on the SUBJECT side of document#viewer.
+        const string withoutGroupMember = """
+            definition user {}
+
+            definition group {}
+
+            definition document {
+                relation viewer: user | group#member
+                relation editor: user
+                permission view = viewer + editor
+            }
+            """;
+
+        var ex = await Assert.ThrowsAsync<SchemaWriteValidationException>(
+            () => cluster.WriteSchema(withoutGroupMember));
+        Assert.Contains("member", ex.Message);
+
+        Assert.Equal(hashBefore, cluster.SchemaProvider.Current.SchemaHash);
+    }
+
+    [Fact]
+    public async Task WriteSchema_removing_referenced_allowed_subject_type_is_rejected_and_live_schema_unchanged()
+    {
+        await using var cluster = await MeshTestCluster.CreateAsync(SubjectRefSchema);
+        await cluster.Relationships.WriteRelationships(
+            new WriteRelationshipsArgs(new List<RelationshipUpdateWire> { Touch("readme", "viewer", "alice") }));
+
+        var hashBefore = cluster.SchemaProvider.Current.SchemaHash;
+
+        // Keep `viewer` but drop `user` from its allowed subject types while a user subject is written.
+        const string viewerWithoutUser = """
+            definition user {}
+
+            definition group {
+                relation member: user
+            }
+
+            definition document {
+                relation viewer: group#member
+                relation editor: user
+                permission view = viewer + editor
+            }
+            """;
+
+        await Assert.ThrowsAsync<SchemaWriteValidationException>(
+            () => cluster.WriteSchema(viewerWithoutUser));
+
+        Assert.Equal(hashBefore, cluster.SchemaProvider.Current.SchemaHash);
+    }
+
+    [Fact]
+    public async Task WriteSchema_removing_unreferenced_definition_is_allowed()
+    {
+        await using var cluster = await MeshTestCluster.CreateAsync(SubjectRefSchema);
+
+        // Only document relationships exist; `group` carries none, so dropping it is safe.
+        await cluster.Relationships.WriteRelationships(
+            new WriteRelationshipsArgs(new List<RelationshipUpdateWire> { Touch("readme", "viewer", "alice") }));
+
+        const string withoutGroup = """
+            definition user {}
+
+            definition document {
+                relation viewer: user
+                relation editor: user
+                permission view = viewer + editor
+            }
+            """;
+
+        var reply = await cluster.WriteSchema(withoutGroup);
+        Assert.False(string.IsNullOrEmpty(reply.WrittenAtToken));
+        Assert.Equal(withoutGroup, cluster.SchemaProvider.Current.SourceText);
+    }
+
+    [Fact]
+    public async Task WriteSchema_removing_unreferenced_relation_is_allowed()
+    {
+        await using var cluster = await MeshTestCluster.CreateAsync(ViewerOrEditorSchema);
+
+        // Only viewer is written; editor carries no relationships, so dropping editor is safe.
+        await cluster.Relationships.WriteRelationships(
+            new WriteRelationshipsArgs(new List<RelationshipUpdateWire> { Touch("readme", "viewer", "alice") }));
+
+        const string withoutEditor = """
+            definition user {}
+
+            definition document {
+                relation viewer: user
+                permission view = viewer
+            }
+            """;
+
+        var reply = await cluster.WriteSchema(withoutEditor);
+        Assert.False(string.IsNullOrEmpty(reply.WrittenAtToken));
+        Assert.Equal(withoutEditor, cluster.SchemaProvider.Current.SourceText);
+    }
+
+    [Fact]
+    public async Task WriteSchema_permission_only_change_is_always_allowed()
+    {
+        await using var cluster = await MeshTestCluster.CreateAsync(ViewerOnlySchema);
+        await cluster.Relationships.WriteRelationships(
+            new WriteRelationshipsArgs(new List<RelationshipUpdateWire> { Touch("readme", "viewer", "alice") }));
+
+        // Relations untouched; only the permission expression changes -> always safe.
+        var reply = await cluster.WriteSchema(ViewerOrEditorSchema);
+        Assert.False(string.IsNullOrEmpty(reply.WrittenAtToken));
+        Assert.Equal(ViewerOrEditorSchema, cluster.SchemaProvider.Current.SourceText);
+    }
 }

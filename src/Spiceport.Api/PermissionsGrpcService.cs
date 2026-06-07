@@ -146,6 +146,11 @@ public sealed class PermissionsGrpcService(IPermissionChecker checker, IGrainFac
             // boundary; in-process calls may still see SchemaCompileException directly.
             throw new RpcException(new Status(StatusCode.InvalidArgument, ex.Message));
         }
+        catch (SchemaWriteValidationException ex)
+        {
+            // The change would orphan existing relationships: reject and commit nothing.
+            throw new RpcException(new Status(StatusCode.FailedPrecondition, ex.Message));
+        }
     }
 
     public override async Task<ReadSchemaResponse> ReadSchema(
@@ -163,8 +168,16 @@ public sealed class PermissionsGrpcService(IPermissionChecker checker, IGrainFac
         WriteRelationshipsRequest request, ServerCallContext context)
     {
         var updates = request.Updates.Select(ToWire).ToList();
-        var reply = await Relationships.WriteRelationships(new WriteRelationshipsArgs(updates));
-        return new WriteRelationshipsResponse { WrittenAt = new ZedToken { Token = reply.WrittenAtToken } };
+        var preconditions = ToWire(request.OptionalPreconditions);
+        try
+        {
+            var reply = await Relationships.WriteRelationships(new WriteRelationshipsArgs(updates, preconditions));
+            return new WriteRelationshipsResponse { WrittenAt = new ZedToken { Token = reply.WrittenAtToken } };
+        }
+        catch (PreconditionFailedException ex)
+        {
+            throw new RpcException(new Status(StatusCode.FailedPrecondition, ex.Message));
+        }
     }
 
     public override async Task<ReadRelationshipsResponse> ReadRelationships(
@@ -188,16 +201,37 @@ public sealed class PermissionsGrpcService(IPermissionChecker checker, IGrainFac
     public override async Task<DeleteRelationshipsResponse> DeleteRelationships(
         DeleteRelationshipsRequest request, ServerCallContext context)
     {
-        var reply = await Relationships.DeleteRelationships(new DeleteRelationshipsArgs(
-            ToWire(request.Filter),
-            request.OptionalLimit == 0 ? null : request.OptionalLimit));
-
-        return new DeleteRelationshipsResponse
+        try
         {
-            DeletedCount = reply.DeletedCount,
-            ReachedLimit = reply.ReachedLimit,
-            DeletedAt = new ZedToken { Token = reply.DeletedAtToken },
-        };
+            var reply = await Relationships.DeleteRelationships(new DeleteRelationshipsArgs(
+                ToWire(request.Filter),
+                request.OptionalLimit == 0 ? null : request.OptionalLimit,
+                ToWire(request.OptionalPreconditions)));
+
+            return new DeleteRelationshipsResponse
+            {
+                DeletedCount = reply.DeletedCount,
+                ReachedLimit = reply.ReachedLimit,
+                DeletedAt = new ZedToken { Token = reply.DeletedAtToken },
+            };
+        }
+        catch (PreconditionFailedException ex)
+        {
+            throw new RpcException(new Status(StatusCode.FailedPrecondition, ex.Message));
+        }
+    }
+
+    private static IReadOnlyList<PreconditionWire>? ToWire(
+        Google.Protobuf.Collections.RepeatedField<Spiceport.Protos.Precondition> preconditions)
+    {
+        if (preconditions.Count == 0)
+            return null;
+
+        return preconditions.Select(p => new PreconditionWire(
+            p.Operation == Spiceport.Protos.Precondition.Types.Operation.MustNotMatch
+                ? PreconditionOpWire.MustNotMatch
+                : PreconditionOpWire.MustMatch,
+            ToWire(p.Filter))).ToList();
     }
 
     private static RelationshipUpdateWire ToWire(RelationshipUpdate u)

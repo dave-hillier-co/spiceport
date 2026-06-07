@@ -350,8 +350,25 @@ message RelationshipUpdate {
   Relationship relationship = 2;
 }
 
+// A condition checked atomically, inside the write transaction, against the same snapshot the writes
+// commit at. If any precondition fails the whole write is rejected (FailedPrecondition) and nothing
+// commits. Mirrors authzed.api.v1.Precondition.
+message Precondition {
+  enum Operation {
+    OPERATION_UNSPECIFIED = 0;
+    // The filter MUST match at least one relationship.
+    OPERATION_MUST_MATCH = 1;
+    // The filter MUST NOT match any relationship.
+    OPERATION_MUST_NOT_MATCH = 2;
+  }
+  Operation operation = 1;
+  RelationshipFilter filter = 2;
+}
+
 message WriteRelationshipsRequest {
   repeated RelationshipUpdate updates = 1;
+  // Checked atomically before the updates apply; any failure rejects the whole write.
+  repeated Precondition optional_preconditions = 2;
 }
 
 message WriteRelationshipsResponse {
@@ -387,6 +404,8 @@ message ReadRelationshipsResponse {
 message DeleteRelationshipsRequest {
   RelationshipFilter filter = 1;
   uint32 optional_limit = 2;
+  // Checked atomically before the deletes apply; any failure rejects the whole delete.
+  repeated Precondition optional_preconditions = 3;
 }
 
 message DeleteRelationshipsResponse {

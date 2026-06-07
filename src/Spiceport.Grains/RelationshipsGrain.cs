@@ -31,24 +31,39 @@ public sealed class RelationshipsGrain(
     {
         ArgumentNullException.ThrowIfNull(args);
 
-        // Compile-and-swap the live schema first (before any persist, so the datastore and the live
-        // snapshot never diverge). A compile failure is surfaced as a serializable ArgumentException
-        // (the underlying SchemaCompileException is not an Orleans-serializable type across the grain
-        // boundary) carrying the original message so the gRPC layer can map it to InvalidArgument.
-        SchemaSnapshot snapshot;
+        // Compile the proposed schema FIRST, but do NOT swap yet. A compile failure is surfaced as a
+        // serializable ArgumentException (the underlying SchemaCompileException is not an Orleans-
+        // serializable type across the grain boundary) carrying the original message so the gRPC layer
+        // can map it to InvalidArgument.
+        Spiceport.Schema.CompiledSchema nextCompiled;
         try
         {
-            snapshot = schemaProvider.Update(args.SchemaText);
+            nextCompiled = Spiceport.Schema.SchemaCompiler.CompileSchema(args.SchemaText);
         }
         catch (Spiceport.Schema.SchemaCompileException ex)
         {
             throw new ArgumentException(ex.Message, nameof(args));
         }
 
-        // Persist so the committed revision advances and the token reflects the new schema hash.
-        var committed = await datastore
-            .ReadWriteTx(tx => tx.WriteStoredSchema(Encoding.UTF8.GetBytes(args.SchemaText)))
-            .ConfigureAwait(ContinueOnCapturedContext);
+        var current = schemaProvider.Current.Schema;
+
+        // Validate the diff against existing data and persist in ONE transaction: the change-validation
+        // reads run against the transaction reader (the snapshot the swap commits at), so a concurrent
+        // write either is seen here or fails the serialization check on commit. A removal that would
+        // orphan an existing relationship throws SchemaWriteValidationException, abandoning the tx — the
+        // datastore is unchanged and (because the swap happens only AFTER commit) the live schema too.
+        var committed = await datastore.ReadWriteTx(async tx =>
+        {
+            await SchemaChangeValidator
+                .ValidateAsync(current, nextCompiled, tx, CancellationToken.None)
+                .ConfigureAwait(ContinueOnCapturedContext);
+            await tx.WriteStoredSchema(Encoding.UTF8.GetBytes(args.SchemaText))
+                .ConfigureAwait(ContinueOnCapturedContext);
+        }).ConfigureAwait(ContinueOnCapturedContext);
+
+        // The persist committed: only now swap the live snapshot so the datastore and the live snapshot
+        // never diverge and a rejected change leaves the live schema intact.
+        var snapshot = schemaProvider.Update(args.SchemaText);
 
         var token = await MintToken(committed, snapshot.SchemaHash).ConfigureAwait(ContinueOnCapturedContext);
         return new WriteSchemaReply(token);
@@ -70,9 +85,14 @@ public sealed class RelationshipsGrain(
         ArgumentNullException.ThrowIfNull(args);
 
         var updates = args.Updates.Select(ToUpdate).ToList();
-        var committed = await datastore
-            .ReadWriteTx(tx => tx.WriteRelationships(updates))
-            .ConfigureAwait(ContinueOnCapturedContext);
+        var committed = await datastore.ReadWriteTx(async tx =>
+        {
+            // Preconditions are evaluated INSIDE the write transaction, against the same snapshot the
+            // writes commit at: the tx reader sees prior committed state and any staged mutations. If a
+            // precondition fails we throw, which abandons the transaction so nothing commits.
+            await CheckPreconditions(tx, args.Preconditions).ConfigureAwait(ContinueOnCapturedContext);
+            await tx.WriteRelationships(updates).ConfigureAwait(ContinueOnCapturedContext);
+        }).ConfigureAwait(ContinueOnCapturedContext);
 
         var token = await MintToken(committed, schemaProvider.Current.SchemaHash)
             .ConfigureAwait(ContinueOnCapturedContext);
@@ -89,6 +109,7 @@ public sealed class RelationshipsGrain(
         var reachedLimit = false;
         var committed = await datastore.ReadWriteTx(async tx =>
         {
+            await CheckPreconditions(tx, args.Preconditions).ConfigureAwait(ContinueOnCapturedContext);
             (count, reachedLimit) = await tx.DeleteRelationships(filter, args.OptionalLimit)
                 .ConfigureAwait(ContinueOnCapturedContext);
         }).ConfigureAwait(ContinueOnCapturedContext);
@@ -144,6 +165,62 @@ public sealed class RelationshipsGrain(
         var token = await MintToken(resolved.Revision, resolved.SchemaHash ?? schemaProvider.Current.SchemaHash)
             .ConfigureAwait(ContinueOnCapturedContext);
         return new ReadRelationshipsReply(page, cursor, token);
+    }
+
+    /// <summary>
+    /// Evaluates each precondition against the transaction reader (the snapshot the writes will commit
+    /// at). A MUST_MATCH that finds nothing, or a MUST_NOT_MATCH that finds something, throws
+    /// <see cref="PreconditionFailedException"/>, which abandons the transaction so nothing commits.
+    /// </summary>
+    private static async Task CheckPreconditions(
+        IReadWriteTransaction tx,
+        IReadOnlyList<PreconditionWire>? preconditions)
+    {
+        if (preconditions is not { Count: > 0 })
+            return;
+
+        for (var i = 0; i < preconditions.Count; i++)
+        {
+            var precond = preconditions[i];
+            var filter = ToFilter(precond.Filter);
+
+            var matched = false;
+            await foreach (var _ in tx.QueryRelationships(filter))
+            {
+                matched = true;
+                break; // existence check only; one row is enough.
+            }
+
+            switch (precond.Operation)
+            {
+                case PreconditionOpWire.MustMatch when !matched:
+                    throw new PreconditionFailedException(
+                        PreconditionFailureKind.MustMatchFoundNone, i,
+                        $"precondition {i} failed: MUST_MATCH filter [{DescribeFilter(filter)}] matched no relationships");
+                case PreconditionOpWire.MustNotMatch when matched:
+                    throw new PreconditionFailedException(
+                        PreconditionFailureKind.MustNotMatchFoundOne, i,
+                        $"precondition {i} failed: MUST_NOT_MATCH filter [{DescribeFilter(filter)}] matched at least one relationship");
+            }
+        }
+    }
+
+    private static string DescribeFilter(RelationshipsFilter f)
+    {
+        var sb = new StringBuilder();
+        if (f.OptionalResourceType is { } rt) sb.Append("resource_type=").Append(rt).Append(' ');
+        if (f.OptionalResourceIds is { Count: > 0 } ids) sb.Append("resource_ids=").Append(string.Join(",", ids)).Append(' ');
+        if (f.OptionalResourceIdPrefix is { Length: > 0 } p) sb.Append("resource_id_prefix=").Append(p).Append(' ');
+        if (f.OptionalResourceRelation is { } rr) sb.Append("relation=").Append(rr).Append(' ');
+        if (f.OptionalSubjectsSelectors is { Count: > 0 } sels)
+        {
+            foreach (var s in sels)
+            {
+                if (s.OptionalSubjectType is { } st) sb.Append("subject_type=").Append(st).Append(' ');
+                if (s.OptionalSubjectIds is { Count: > 0 } sids) sb.Append("subject_ids=").Append(string.Join(",", sids)).Append(' ');
+            }
+        }
+        return sb.ToString().TrimEnd();
     }
 
     private async Task<string> MintToken(IRevision revision, string schemaHash)

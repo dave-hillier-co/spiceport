@@ -32,10 +32,30 @@ public sealed record RelationshipUpdateWire(
     [property: Id(0)] RelationshipUpdateOpWire Operation,
     [property: Id(1)] RelationshipWire Relationship);
 
+/// <summary>The operation a <see cref="PreconditionWire"/> asserts about its filter.</summary>
+public enum PreconditionOpWire
+{
+    /// <summary>The filter must match at least one relationship.</summary>
+    MustMatch = 0,
+
+    /// <summary>The filter must not match any relationship.</summary>
+    MustNotMatch = 1,
+}
+
+/// <summary>
+/// A precondition checked atomically, inside the write transaction, against the same snapshot the writes
+/// commit at. If it fails the whole write is rejected and nothing commits.
+/// </summary>
+[GenerateSerializer]
+public sealed record PreconditionWire(
+    [property: Id(0)] PreconditionOpWire Operation,
+    [property: Id(1)] RelationshipsFilterWire Filter);
+
 /// <summary>Arguments for <see cref="IRelationshipsGrain.WriteRelationships"/>.</summary>
 [GenerateSerializer]
 public sealed record WriteRelationshipsArgs(
-    [property: Id(0)] IReadOnlyList<RelationshipUpdateWire> Updates);
+    [property: Id(0)] IReadOnlyList<RelationshipUpdateWire> Updates,
+    [property: Id(1)] IReadOnlyList<PreconditionWire>? Preconditions = null);
 
 /// <summary>Reply for <see cref="IRelationshipsGrain.WriteRelationships"/>.</summary>
 [GenerateSerializer]
@@ -60,7 +80,8 @@ public sealed record RelationshipsFilterWire(
 [GenerateSerializer]
 public sealed record DeleteRelationshipsArgs(
     [property: Id(0)] RelationshipsFilterWire Filter,
-    [property: Id(1)] ulong? OptionalLimit);
+    [property: Id(1)] ulong? OptionalLimit,
+    [property: Id(2)] IReadOnlyList<PreconditionWire>? Preconditions = null);
 
 /// <summary>Reply for <see cref="IRelationshipsGrain.DeleteRelationships"/>.</summary>
 [GenerateSerializer]
