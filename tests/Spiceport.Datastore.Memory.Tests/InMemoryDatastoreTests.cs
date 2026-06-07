@@ -130,15 +130,17 @@ public class InMemoryDatastoreTests
     }
 
     [Fact]
-    public async Task CreateExisting_ThrowsSerializationException()
+    public async Task CreateExisting_ThrowsCreateRelationshipExists()
     {
+        // A CREATE on an already-existing relationship is a permanent conflict (AlreadyExists at the
+        // gRPC boundary), NOT a transient write-write serialization failure (Aborted).
         var ds = new InMemoryDatastore();
         var rel = Rel("document", "doc1", "viewer", "user", "alice");
 
         await ds.ReadWriteTx(async tx =>
             await tx.WriteRelationships([new RelationshipUpdate(rel, UpdateOperation.Create)]));
 
-        await Assert.ThrowsAsync<SerializationException>(async () =>
+        await Assert.ThrowsAsync<CreateRelationshipExistsException>(async () =>
             await ds.ReadWriteTx(async tx =>
                 await tx.WriteRelationships([new RelationshipUpdate(rel, UpdateOperation.Create)])));
     }

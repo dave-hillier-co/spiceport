@@ -52,7 +52,7 @@ internal sealed class InMemoryReadWriteTransaction : IReadWriteTransaction
             {
                 case UpdateOperation.Create:
                     if (_live.ContainsKey(key))
-                        throw new SerializationException($"relationship already exists: {rel}");
+                        throw new CreateRelationshipExistsException(rel.ToString());
                     Apply(key, rel);
                     break;
                 case UpdateOperation.Touch:

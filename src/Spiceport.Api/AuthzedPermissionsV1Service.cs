@@ -18,7 +18,8 @@ namespace Spiceport.Api;
 /// <see cref="IRelationshipsGrain"/>; the read + lookup RPCs are server-streaming and page the grain's
 /// opaque cursor internally over a single pinned snapshot (mirroring <see cref="BulkGrpcService"/>).
 /// </summary>
-public sealed class AuthzedPermissionsV1Service(IPermissionChecker checker, IGrainFactory grains)
+public sealed class AuthzedPermissionsV1Service(
+    IPermissionChecker checker, IGrainFactory grains, ISchemaProvider schema)
     : V1::PermissionsService.PermissionsServiceBase
 {
     private IReverseOpsGrain ReverseOps => grains.GetGrain<IReverseOpsGrain>(IReverseOpsGrain.Key);
@@ -35,6 +36,14 @@ public sealed class AuthzedPermissionsV1Service(IPermissionChecker checker, IGra
             request.Subject.Object.ObjectType,
             request.Subject.Object.ObjectId,
             subjectRelation);
+
+        // Validate the resource definition+permission and the subject definition+relation up front, as
+        // SpiceDB does (namespace.CheckNamespaceAndRelations). An unknown definition/relation is a client
+        // schema/typo bug surfaced as FailedPrecondition, NOT silently masked as a NO_PERMISSION verdict.
+        SchemaValidation.CheckNamespaceAndRelations(
+            schema.Current,
+            new SchemaValidation.TypeAndRelation(request.Resource.ObjectType, request.Permission, AllowEllipsis: false),
+            new SchemaValidation.TypeAndRelation(request.Subject.Object.ObjectType, subjectRelation, AllowEllipsis: true));
 
         PermissionCheckResult result;
         try
@@ -99,13 +108,20 @@ public sealed class AuthzedPermissionsV1Service(IPermissionChecker checker, IGra
         {
             throw new RpcException(new Status(StatusCode.FailedPrecondition, ex.Message));
         }
-        catch (Spiceport.Datastore.SerializationException ex)
+        catch (WriteConflictException ex)
         {
-            // A CREATE op on an already-existing relationship. SpiceDB returns AlreadyExists here;
-            // mapping it to the proper gRPC code (not Unknown) stops zed from retrying the conflict.
-            throw new RpcException(new Status(StatusCode.AlreadyExists, ex.Message));
+            // CreateExisting -> AlreadyExists (SpiceDB CreateRelationshipExistsError): a permanent
+            // duplicate-create the client must NOT retry as transient. Serialization -> Aborted (SpiceDB
+            // SerializationError): a genuine write-write conflict the client retries as a whole tx.
+            throw new RpcException(new Status(ToStatusCode(ex.Kind), ex.Message));
         }
     }
+
+    private static StatusCode ToStatusCode(WriteConflictKind kind) => kind switch
+    {
+        WriteConflictKind.CreateExisting => StatusCode.AlreadyExists,
+        _ => StatusCode.Aborted,
+    };
 
     public override async Task ReadRelationships(
         V1::ReadRelationshipsRequest request,
@@ -172,6 +188,11 @@ public sealed class AuthzedPermissionsV1Service(IPermissionChecker checker, IGra
     public override async Task<V1::ExpandPermissionTreeResponse> ExpandPermissionTree(
         V1::ExpandPermissionTreeRequest request, ServerCallContext context)
     {
+        // Validate the resource definition+permission up front (SpiceDB: CheckNamespaceAndRelation).
+        SchemaValidation.CheckNamespaceAndRelations(
+            schema.Current,
+            new SchemaValidation.TypeAndRelation(request.Resource.ObjectType, request.Permission, AllowEllipsis: false));
+
         // v1 ExpandPermissionTreeRequest has no mode field; authzed's expand is the recursive walk.
         var reply = await ReverseOps.ExpandPermissionTree(new ExpandTreeArgs(
             request.Resource.ObjectType,
@@ -199,6 +220,13 @@ public sealed class AuthzedPermissionsV1Service(IPermissionChecker checker, IGra
         var context5 = StructToDict(request.Context);
         var consistency = ToWire(request.Consistency);
         string? cursor = null;
+
+        // Validate the resource definition+permission and subject definition+relation up front
+        // (SpiceDB: CheckNamespaceAndRelations) before streaming any results.
+        SchemaValidation.CheckNamespaceAndRelations(
+            schema.Current,
+            new SchemaValidation.TypeAndRelation(request.ResourceObjectType, request.Permission, AllowEllipsis: false),
+            new SchemaValidation.TypeAndRelation(request.Subject.Object.ObjectType, subjectRelation, AllowEllipsis: true));
 
         while (!context.CancellationToken.IsCancellationRequested)
         {
@@ -257,6 +285,13 @@ public sealed class AuthzedPermissionsV1Service(IPermissionChecker checker, IGra
         var context6 = StructToDict(request.Context);
         var consistency = ToWire(request.Consistency);
         string? cursor = null;
+
+        // Validate the resource definition+permission and subject definition+relation up front
+        // (SpiceDB: CheckNamespaceAndRelations) before streaming any results.
+        SchemaValidation.CheckNamespaceAndRelations(
+            schema.Current,
+            new SchemaValidation.TypeAndRelation(request.Resource.ObjectType, request.Permission, AllowEllipsis: false),
+            new SchemaValidation.TypeAndRelation(request.SubjectObjectType, subjectRelation, AllowEllipsis: true));
 
         while (!context.CancellationToken.IsCancellationRequested)
         {
@@ -396,7 +431,8 @@ public sealed class AuthzedPermissionsV1Service(IPermissionChecker checker, IGra
         // Consume the client stream batch by batch. Each batch is one all-or-nothing write transaction in
         // the grain; the load is additive across the whole stream. Empty batches are skipped so they do not
         // commit empty transactions. A CREATE-style conflict (relationship already exists) maps to
-        // AlreadyExists so the client does not retry the doomed import.
+        // AlreadyExists so the client does not retry the doomed import; a genuine write-write
+        // serialization conflict maps to Aborted so the client retries the transaction.
         try
         {
             while (await requestStream.MoveNext(context.CancellationToken))
@@ -411,9 +447,9 @@ public sealed class AuthzedPermissionsV1Service(IPermissionChecker checker, IGra
                 total += reply.NumLoaded;
             }
         }
-        catch (Spiceport.Datastore.SerializationException ex)
+        catch (WriteConflictException ex)
         {
-            throw new RpcException(new Status(StatusCode.AlreadyExists, ex.Message));
+            throw new RpcException(new Status(ToStatusCode(ex.Kind), ex.Message));
         }
 
         // v1 ImportBulkRelationshipsResponse carries only num_loaded (no token).

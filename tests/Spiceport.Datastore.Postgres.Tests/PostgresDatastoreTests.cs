@@ -84,15 +84,17 @@ public class PostgresDatastoreTests
     }
 
     [Fact]
-    public async Task CreateExisting_ThrowsSerializationException()
+    public async Task CreateExisting_ThrowsCreateRelationshipExists()
     {
+        // A CREATE on an already-existing relationship is a permanent conflict (AlreadyExists at the
+        // gRPC boundary), NOT a transient write-write serialization failure (Aborted).
         var ds = await _fixture.NewDatastore();
         var rel = Rel("document", "doc1", "viewer", "user", "alice");
 
         await ds.ReadWriteTx(async tx =>
             await tx.WriteRelationships([new RelationshipUpdate(rel, UpdateOperation.Create)]));
 
-        await Assert.ThrowsAsync<SerializationException>(async () =>
+        await Assert.ThrowsAsync<CreateRelationshipExistsException>(async () =>
             await ds.ReadWriteTx(async tx =>
                 await tx.WriteRelationships([new RelationshipUpdate(rel, UpdateOperation.Create)])));
     }
@@ -427,11 +429,12 @@ public class PostgresDatastoreTests
     }
 
     [Fact]
-    public async Task ConcurrentCreate_SameKey_OneFailsSerialization()
+    public async Task ConcurrentCreate_SameKey_OneFailsCreateConflict()
     {
         // Postgres enforces the unique living-row index pessimistically: two concurrent CREATEs of the
-        // same relationship serialize on the index. The first to commit wins; the other surfaces as a
-        // SerializationException (unique/serialization failure), preserving CREATE-conflict semantics.
+        // same relationship serialize on the index. The first to commit wins; the other hits the unique
+        // living-row violation and surfaces as a CreateRelationshipExistsException (AlreadyExists at the
+        // gRPC boundary), a permanent CREATE-conflict rather than a transient serialization failure.
         var ds = await _fixture.NewDatastore();
         var rel = Rel("document", "doc1", "viewer", "user", "alice");
         var firstInserted = new TaskCompletionSource();
@@ -454,7 +457,7 @@ public class PostgresDatastoreTests
         firstMayCommit.SetResult();
 
         await first; // first commits successfully
-        await Assert.ThrowsAsync<SerializationException>(async () => await second);
+        await Assert.ThrowsAsync<CreateRelationshipExistsException>(async () => await second);
 
         // The winning relationship is present exactly once.
         var head = await ds.HeadRevision();

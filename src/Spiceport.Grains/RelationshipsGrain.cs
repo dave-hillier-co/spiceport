@@ -85,14 +85,28 @@ public sealed class RelationshipsGrain(
         ArgumentNullException.ThrowIfNull(args);
 
         var updates = args.Updates.Select(ToUpdate).ToList();
-        var committed = await datastore.ReadWriteTx(async tx =>
+        IRevision committed;
+        try
         {
-            // Preconditions are evaluated INSIDE the write transaction, against the same snapshot the
-            // writes commit at: the tx reader sees prior committed state and any staged mutations. If a
-            // precondition fails we throw, which abandons the transaction so nothing commits.
-            await CheckPreconditions(tx, args.Preconditions).ConfigureAwait(ContinueOnCapturedContext);
-            await tx.WriteRelationships(updates).ConfigureAwait(ContinueOnCapturedContext);
-        }).ConfigureAwait(ContinueOnCapturedContext);
+            committed = await datastore.ReadWriteTx(async tx =>
+            {
+                // Preconditions are evaluated INSIDE the write transaction, against the same snapshot the
+                // writes commit at: the tx reader sees prior committed state and any staged mutations. If a
+                // precondition fails we throw, which abandons the transaction so nothing commits.
+                await CheckPreconditions(tx, args.Preconditions).ConfigureAwait(ContinueOnCapturedContext);
+                await tx.WriteRelationships(updates).ConfigureAwait(ContinueOnCapturedContext);
+            }).ConfigureAwait(ContinueOnCapturedContext);
+        }
+        catch (CreateRelationshipExistsException ex)
+        {
+            // The datastore exceptions are not Orleans-serializable across the grain boundary; re-wrap
+            // in a [GenerateSerializer] exception that preserves the conflict kind for the gRPC mapping.
+            throw new WriteConflictException(WriteConflictKind.CreateExisting, ex.Message);
+        }
+        catch (SerializationException ex)
+        {
+            throw new WriteConflictException(WriteConflictKind.Serialization, ex.Message);
+        }
 
         var token = await MintToken(committed, schemaProvider.Current.SchemaHash)
             .ConfigureAwait(ContinueOnCapturedContext);
@@ -178,10 +192,22 @@ public sealed class RelationshipsGrain(
         // itself stays request/response.
         var relationships = args.Relationships.Select(ToRelationship).ToList();
         ulong loaded = 0;
-        var committed = await datastore.ReadWriteTx(async tx =>
+        IRevision committed;
+        try
         {
-            loaded = await tx.BulkLoad(ToAsync(relationships)).ConfigureAwait(ContinueOnCapturedContext);
-        }).ConfigureAwait(ContinueOnCapturedContext);
+            committed = await datastore.ReadWriteTx(async tx =>
+            {
+                loaded = await tx.BulkLoad(ToAsync(relationships)).ConfigureAwait(ContinueOnCapturedContext);
+            }).ConfigureAwait(ContinueOnCapturedContext);
+        }
+        catch (CreateRelationshipExistsException ex)
+        {
+            throw new WriteConflictException(WriteConflictKind.CreateExisting, ex.Message);
+        }
+        catch (SerializationException ex)
+        {
+            throw new WriteConflictException(WriteConflictKind.Serialization, ex.Message);
+        }
 
         var token = await MintToken(committed, schemaProvider.Current.SchemaHash)
             .ConfigureAwait(ContinueOnCapturedContext);

@@ -35,7 +35,8 @@ public class AuthzedPermissionsV1ServiceTests
         """;
 
     private static AuthzedPermissionsV1Service Service(MeshTestCluster cluster) =>
-        new(cluster.Services.GetRequiredService<IPermissionChecker>(), cluster.GrainFactory);
+        new(cluster.Services.GetRequiredService<IPermissionChecker>(), cluster.GrainFactory,
+            cluster.Services.GetRequiredService<ISchemaProvider>());
 
     private static async Task SeedAsync(IDatastore datastore, params (string res, string rel, string subj)[] tuples)
     {
@@ -96,6 +97,80 @@ public class AuthzedPermissionsV1ServiceTests
         }, FakeServerCallContext.Default);
 
         Assert.Equal(V1::CheckPermissionResponse.Types.Permissionship.NoPermission, resp.Permissionship);
+    }
+
+    [Fact]
+    public async Task CheckPermission_unknown_definition_is_failed_precondition()
+    {
+        // An unknown resource definition is a client schema/typo bug. SpiceDB validates up front with
+        // CheckNamespaceAndRelations and returns FailedPrecondition, NOT a NO_PERMISSION verdict.
+        await using var cluster = await MeshTestCluster.CreateAsync(Schema);
+
+        var ex = await Assert.ThrowsAsync<RpcException>(() => Service(cluster).CheckPermission(
+            new V1::CheckPermissionRequest
+            {
+                Resource = new V1::ObjectReference { ObjectType = "nonesuch", ObjectId = "readme" },
+                Permission = "view",
+                Subject = UserSubject("alice"),
+            },
+            FakeServerCallContext.Default));
+
+        Assert.Equal(StatusCode.FailedPrecondition, ex.StatusCode);
+    }
+
+    [Fact]
+    public async Task CheckPermission_unknown_permission_is_failed_precondition()
+    {
+        await using var cluster = await MeshTestCluster.CreateAsync(Schema);
+
+        var ex = await Assert.ThrowsAsync<RpcException>(() => Service(cluster).CheckPermission(
+            new V1::CheckPermissionRequest
+            {
+                Resource = new V1::ObjectReference { ObjectType = "document", ObjectId = "readme" },
+                Permission = "no_such_permission",
+                Subject = UserSubject("alice"),
+            },
+            FakeServerCallContext.Default));
+
+        Assert.Equal(StatusCode.FailedPrecondition, ex.StatusCode);
+    }
+
+    [Fact]
+    public async Task CheckPermission_unknown_subject_definition_is_failed_precondition()
+    {
+        await using var cluster = await MeshTestCluster.CreateAsync(Schema);
+
+        var ex = await Assert.ThrowsAsync<RpcException>(() => Service(cluster).CheckPermission(
+            new V1::CheckPermissionRequest
+            {
+                Resource = new V1::ObjectReference { ObjectType = "document", ObjectId = "readme" },
+                Permission = "view",
+                Subject = new V1::SubjectReference
+                {
+                    Object = new V1::ObjectReference { ObjectType = "ghost", ObjectId = "alice" },
+                },
+            },
+            FakeServerCallContext.Default));
+
+        Assert.Equal(StatusCode.FailedPrecondition, ex.StatusCode);
+    }
+
+    [Fact]
+    public async Task WriteRelationships_create_existing_is_already_exists()
+    {
+        // A CREATE on an already-existing relationship is a permanent duplicate-create: AlreadyExists,
+        // distinct from a transient write-write serialization conflict (which maps to Aborted).
+        await using var cluster = await MeshTestCluster.CreateAsync(Schema);
+
+        await Service(cluster).WriteRelationships(
+            WriteReq(V1::RelationshipUpdate.Types.Operation.Create, "readme", "alice"),
+            FakeServerCallContext.Default);
+
+        var ex = await Assert.ThrowsAsync<RpcException>(() => Service(cluster).WriteRelationships(
+            WriteReq(V1::RelationshipUpdate.Types.Operation.Create, "readme", "alice"),
+            FakeServerCallContext.Default));
+
+        Assert.Equal(StatusCode.AlreadyExists, ex.StatusCode);
     }
 
     [Fact]

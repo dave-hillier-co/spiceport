@@ -13,7 +13,7 @@ using static PostgresSchema;
 /// snapshot it observes). All mutations stamp that xid:
 /// <list type="bullet">
 /// <item><b>Create</b>: INSERT a living row; the unique living index makes a duplicate fail
-/// (surfaced as <see cref="SerializationException"/>), enforcing CREATE-conflict semantics.</item>
+/// (surfaced as <see cref="CreateRelationshipExistsException"/>), enforcing CREATE-conflict semantics.</item>
 /// <item><b>Touch</b>: close the existing living row (set its <c>deleted_xid</c>) then INSERT the new row.</item>
 /// <item><b>Delete</b>: set the living row's <c>deleted_xid</c> to this xid.</item>
 /// </list>
@@ -247,7 +247,7 @@ internal sealed class PostgresReadWriteTransaction : IReadWriteTransaction
         catch (PostgresException ex) when (ex.SqlState == PostgresErrorCodes.UniqueViolation)
         {
             // A living row with this identity already exists: CREATE conflict.
-            throw new SerializationException($"relationship already exists: {rel}");
+            throw new CreateRelationshipExistsException(rel.ToString());
         }
     }
 
