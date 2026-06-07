@@ -120,3 +120,38 @@ public sealed record WriteSchemaReply(
 public sealed record ReadSchemaReply(
     [property: Id(0)] string SchemaText,
     [property: Id(1)] string ReadAtToken);
+
+/// <summary>
+/// Arguments for <see cref="IRelationshipsGrain.BulkImportRelationships"/>: one batch of relationships
+/// to load as an efficient insert (create-or-overwrite) in a single write transaction.
+/// </summary>
+[GenerateSerializer]
+public sealed record BulkImportRelationshipsArgs(
+    [property: Id(0)] IReadOnlyList<RelationshipWire> Relationships);
+
+/// <summary>Reply for <see cref="IRelationshipsGrain.BulkImportRelationships"/>: this batch's load.</summary>
+[GenerateSerializer]
+public sealed record BulkImportRelationshipsReply(
+    [property: Id(0)] ulong NumLoaded,
+    [property: Id(1)] string LoadedAtToken);
+
+/// <summary>
+/// Arguments for <see cref="IRelationshipsGrain.BulkExportRelationships"/>: one page request at a
+/// pinned snapshot. With no cursor the grain resolves and pins a revision from <see cref="Consistency"/>;
+/// with a cursor it reads the exact revision the cursor encodes (the consistency is then ignored).
+/// </summary>
+[GenerateSerializer]
+public sealed record BulkExportRelationshipsArgs(
+    [property: Id(0)] RelationshipsFilterWire Filter,
+    [property: Id(1)] int Limit,
+    [property: Id(2)] string? Cursor,
+    [property: Id(3)] ConsistencyWire? Consistency = null);
+
+/// <summary>
+/// Reply for <see cref="IRelationshipsGrain.BulkExportRelationships"/>: one page plus the cursor for the
+/// next page from the same snapshot. <see cref="Cursor"/> is null when the export is exhausted.
+/// </summary>
+[GenerateSerializer]
+public sealed record BulkExportRelationshipsReply(
+    [property: Id(0)] IReadOnlyList<RelationshipWire> Relationships,
+    [property: Id(1)] string? Cursor);

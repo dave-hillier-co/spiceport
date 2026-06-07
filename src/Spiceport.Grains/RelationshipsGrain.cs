@@ -167,6 +167,97 @@ public sealed class RelationshipsGrain(
         return new ReadRelationshipsReply(page, cursor, token);
     }
 
+    /// <inheritdoc />
+    public async Task<BulkImportRelationshipsReply> BulkImportRelationships(BulkImportRelationshipsArgs args)
+    {
+        ArgumentNullException.ThrowIfNull(args);
+
+        // Efficient-insert semantics (create-or-overwrite, NO per-row already-exists check), matching
+        // SpiceDB ImportBulk. The whole batch loads in ONE write transaction: all-or-nothing per batch.
+        // The gRPC service drives the client stream and calls this once per inbound batch, so the grain
+        // itself stays request/response.
+        var relationships = args.Relationships.Select(ToRelationship).ToList();
+        ulong loaded = 0;
+        var committed = await datastore.ReadWriteTx(async tx =>
+        {
+            loaded = await tx.BulkLoad(ToAsync(relationships)).ConfigureAwait(ContinueOnCapturedContext);
+        }).ConfigureAwait(ContinueOnCapturedContext);
+
+        var token = await MintToken(committed, schemaProvider.Current.SchemaHash)
+            .ConfigureAwait(ContinueOnCapturedContext);
+        return new BulkImportRelationshipsReply(loaded, token);
+
+        static async IAsyncEnumerable<Relationship> ToAsync(IReadOnlyList<Relationship> rels)
+        {
+            foreach (var rel in rels)
+                yield return rel;
+            await Task.CompletedTask;
+        }
+    }
+
+    /// <inheritdoc />
+    public async Task<BulkExportRelationshipsReply> BulkExportRelationships(BulkExportRelationshipsArgs args)
+    {
+        ArgumentNullException.ThrowIfNull(args);
+
+        // Pin the snapshot ONCE: with no cursor resolve from the request consistency; with a cursor read
+        // the exact revision the cursor encodes. The pinned revision is carried in every returned cursor,
+        // so resuming reads the same snapshot and never sees writes committed after the export began.
+        IRevision pinned;
+        string? after;
+        if (BulkExportCursor.TryDecode(args.Cursor, out var decoded))
+        {
+            pinned = decoded.Revision;
+            after = decoded.AfterTuple;
+        }
+        else
+        {
+            var requirement = (args.Consistency ?? ConsistencyWire.MinimizeLatency).ToRequirement();
+            var resolved = await RevisionResolver
+                .Resolve(datastore, requirement, cancellationToken: CancellationToken.None)
+                .ConfigureAwait(ContinueOnCapturedContext);
+            pinned = resolved.Revision;
+            after = null;
+        }
+
+        var reader = datastore.SnapshotReader(pinned);
+        var filter = ToFilter(args.Filter);
+        var limit = args.Limit > 0 ? args.Limit : DefaultExportPageSize;
+
+        // Materialize matching tuples ordered by canonical string (same deterministic paging convention
+        // as ReadRelationships), skip past the cursor, and take one page.
+        var matched = new List<(string Tuple, Relationship Rel)>();
+        await foreach (var rel in reader.QueryRelationships(filter))
+        {
+            var tuple = TupleStrings.FormatRelationship(rel);
+            if (after is { } a && string.CompareOrdinal(tuple, a) <= 0)
+                continue;
+            matched.Add((tuple, rel));
+        }
+
+        matched.Sort((x, y) => string.CompareOrdinal(x.Tuple, y.Tuple));
+
+        var page = new List<RelationshipWire>(Math.Min(limit, matched.Count));
+        string? lastTuple = null;
+        for (var i = 0; i < matched.Count && page.Count < limit; i++)
+        {
+            page.Add(ToWire(matched[i].Rel));
+            lastTuple = matched[i].Tuple;
+        }
+
+        // A full page that exactly drains the remaining rows still emits a cursor; the next call returns
+        // an empty page with a null cursor, signalling exhaustion. This mirrors the export's "keep going
+        // while pages are full" contract.
+        var cursor = page.Count == limit && lastTuple is not null
+            ? BulkExportCursor.Encode(pinned, lastTuple)
+            : null;
+
+        return new BulkExportRelationshipsReply(page, cursor);
+    }
+
+    /// <summary>The default bulk-export page size when the request leaves the limit unset.</summary>
+    private const int DefaultExportPageSize = 1000;
+
     /// <summary>
     /// Evaluates each precondition against the transaction reader (the snapshot the writes will commit
     /// at). A MUST_MATCH that finds nothing, or a MUST_NOT_MATCH that finds something, throws

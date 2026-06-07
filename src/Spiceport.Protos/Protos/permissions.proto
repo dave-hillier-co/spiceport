@@ -53,6 +53,63 @@ service WatchService {
   rpc Watch(WatchRequest) returns (stream WatchResponse);
 }
 
+// ---- Bulk import / export ----
+// Streaming bulk load and bulk dump of relationships. A SEPARATE service from PermissionsService for
+// the same reason WatchService is separate: the two streaming RPCs have a different lifecycle from the
+// unary data-plane calls (a client-streaming load and a long server-streaming dump), so keeping them on
+// their own service keeps the unary request/response surface clean and lets clients depend on only what
+// they use. Mirrors authzed.api.v1's ImportBulkRelationships / ExportBulkRelationships.
+service BulkService {
+  // Client-streaming bulk import. Each inbound message carries a batch of relationships; the server
+  // applies each batch as an efficient insert (create-or-overwrite, NO per-row already-exists check —
+  // matching SpiceDB ImportBulk's create-only/efficient-insert path) in its own datastore write
+  // transaction. Each batch is all-or-nothing; across the whole stream the load is additive. On the
+  // client's half-close the server returns the total number loaded and the ZedToken of the LAST batch
+  // committed.
+  rpc ImportBulkRelationships(stream ImportBulkRelationshipsRequest)
+      returns (ImportBulkRelationshipsResponse);
+
+  // Server-streaming bulk export. Pages through ALL relationships (optionally filtered) at a SINGLE
+  // consistency-resolved revision: the revision is resolved once, pinned, and encoded into every
+  // after_cursor so a resumed call reads the exact same snapshot and never observes writes committed
+  // after the export began. Emits fixed-size pages, each carrying its own after_cursor; resume by
+  // passing the last cursor back in optional_cursor.
+  rpc ExportBulkRelationships(ExportBulkRelationshipsRequest)
+      returns (stream ExportBulkRelationshipsResponse);
+}
+
+message ImportBulkRelationshipsRequest {
+  // One batch of relationships to load. The server applies the whole batch in one write transaction.
+  repeated Relationship relationships = 1;
+}
+
+message ImportBulkRelationshipsResponse {
+  // Total relationships loaded across every batch in the stream.
+  uint64 num_loaded = 1;
+  // The ZedToken of the last batch committed (empty if no relationships were sent).
+  ZedToken loaded_at = 2;
+}
+
+message ExportBulkRelationshipsRequest {
+  // Optional filter; empty fields place no constraint (export everything).
+  RelationshipFilter optional_filter = 1;
+  // Page size: the maximum relationships per emitted response. 0 = the server default page size.
+  uint32 optional_limit = 2;
+  // Resume cursor from a prior page. It encodes the pinned revision, so a resumed export reads the same
+  // snapshot. When set, the request's consistency is ignored (the cursor's revision wins).
+  string optional_cursor = 3;
+  // Optional consistency requirement used only on the FIRST page (no cursor); unset = minimize_latency.
+  Consistency consistency = 4;
+}
+
+message ExportBulkRelationshipsResponse {
+  // One page of relationships, ordered by canonical tuple string.
+  repeated Relationship relationships = 1;
+  // Opaque continuation cursor: pass back in optional_cursor to fetch the next page from the SAME
+  // pinned snapshot. Empty when the export is exhausted.
+  string after_cursor = 2;
+}
+
 message WatchRequest {
   // Which kinds of change to receive. Empty = relationship updates only (the common case).
   repeated WatchKind optional_update_kinds = 1;

@@ -32,4 +32,20 @@ public interface IRelationshipsGrain : IGrainWithIntegerKey
 
     /// <summary>Reads relationships matching the filter, as a bounded page with an optional cursor.</summary>
     Task<ReadRelationshipsReply> ReadRelationships(ReadRelationshipsArgs args);
+
+    /// <summary>
+    /// Loads one batch of relationships as an efficient insert (create-or-overwrite, no per-row
+    /// existence check) in a single, all-or-nothing write transaction. The bulk-import gRPC service
+    /// consumes the client stream and calls this once per inbound batch — the grain stays
+    /// request/response.
+    /// </summary>
+    Task<BulkImportRelationshipsReply> BulkImportRelationships(BulkImportRelationshipsArgs args);
+
+    /// <summary>
+    /// Returns one page of a bulk export over a single pinned snapshot. With no cursor the grain
+    /// resolves and pins a revision from the request consistency and encodes it into the returned
+    /// cursor; with a cursor it reads the exact revision the cursor encodes, so every page (and any
+    /// resume) sees the same snapshot.
+    /// </summary>
+    Task<BulkExportRelationshipsReply> BulkExportRelationships(BulkExportRelationshipsArgs args);
 }
