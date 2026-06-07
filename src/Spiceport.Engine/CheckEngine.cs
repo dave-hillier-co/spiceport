@@ -200,7 +200,7 @@ public sealed class CheckEngine
             dispatcher = cachingDispatcher;
         }
 
-        var meta = new ResolverMeta(InProcessRevision.Instance, _maxDepth, ImmutableHashSet<VisitKey>.Empty);
+        var meta = new ResolverMeta(InProcessRevision.Instance, _maxDepth, TraversalBloom.ForDepth(_maxDepth));
         var request = new DispatchCheckRequest(resource, subject, meta);
         var result = await dispatcher.DispatchCheck(request, cancellationToken).ConfigureAwait(false);
 

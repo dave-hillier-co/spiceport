@@ -25,11 +25,17 @@ namespace Spiceport.Grains;
 /// locality per sub-problem key.
 /// </para>
 /// </remarks>
+[ConsistentHashPlacement]
 public sealed class CheckGrain(
     IDatastore datastore,
     ISchemaProvider schemaProvider,
-    ISiloDispatcher onward) : Grain, ICheckGrain
+    ISiloDispatcher onward,
+    Orleans.Runtime.ILocalSiloDetails localSiloDetails) : Grain, ICheckGrain
 {
+    /// <inheritdoc />
+    public Task<string> GetHostSilo() =>
+        Task.FromResult(localSiloDetails.SiloAddress.ToParsableString());
+
     /// <inheritdoc />
     public async Task<DispatchCheckReply> DispatchCheck(DispatchCheckArgs args)
     {
@@ -55,7 +61,7 @@ public sealed class CheckGrain(
         var meta = new ResolverMeta(
             revision,
             args.DepthRemaining,
-            OrleansDispatcher.ToVisitKeys(args.Visited),
+            TraversalBloom.FromBytes(args.BloomBits, args.BloomK),
             parts.Mode);
         var request = new DispatchCheckRequest(parts.Resource, parts.Subject, meta);
 

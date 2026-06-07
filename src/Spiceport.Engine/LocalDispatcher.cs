@@ -71,11 +71,13 @@ public sealed class LocalDispatcher : IDispatcher
         if (OnrEquals(resource, subject))
             return DispatchCheckResult.DefiniteMember;
 
-        // Cycle guard: a repeated (resource, subject) on this path is a cut.
+        // Cycle guard: a repeated (resource, subject) on this path is a cut. The guard is a bounded
+        // Bloom filter (conservative: a false-positive cuts the branch, never grants), so it survives a
+        // grain hop at a fixed cost. CycleCut results are never cached, so a spurious cut is harmless.
         var key = VisitKey.Of(resource, subject);
-        if (meta.Visited.Contains(key))
+        if (meta.Bloom.Contains(key))
             return DispatchCheckResult.Cut;
-        meta = meta with { Visited = meta.Visited.Add(key) };
+        meta = meta with { Bloom = meta.Bloom.Add(key) };
 
         var relation = LookupRelation(resource.ObjectType, resource.Relation);
         if (relation is null)

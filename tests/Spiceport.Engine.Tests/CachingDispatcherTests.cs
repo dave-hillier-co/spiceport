@@ -66,7 +66,7 @@ public class CachingDispatcherTests
 
     private static DispatchCheckRequest Request(IRevision rev, ObjectAndRelation resource, ObjectAndRelation subject) =>
         new(resource, subject,
-            new ResolverMeta(rev, CheckEngine.DefaultMaxDepth, ImmutableHashSet<VisitKey>.Empty));
+            new ResolverMeta(rev, CheckEngine.DefaultMaxDepth, TraversalBloom.Empty));
 
     private static IRevision Rev(long nanos) => new TimestampRevision(nanos);
 

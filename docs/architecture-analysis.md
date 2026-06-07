@@ -142,16 +142,27 @@ The grain identity being the sub-problem is verified by an Orleans `TestCluster`
 conformance corpus (set-ops, arrow, wildcard, nested-group, recursive, caveats) **through the
 grain mesh**, with results identical to the in-process engine.
 
-**Remaining tuning (not correctness — the seam already makes the domain distributable):**
+**Implemented performance mechanisms (the seam already makes the domain distributable):**
+- **Local-recurse vs grain-hop hybrid** — a custom consistent-hash placement director
+  (`ConsistentHashPlacementDirector`, mirroring `authzed/consistent`) places `CheckGrain` on the
+  silo its canonical sub-problem key hashes to. The dispatcher computes the same owner off the
+  same membership view (`ISiloOwnership`, a pure `HashRing.Owner`) without activating the grain:
+  when a sub-problem hashes to the local silo it recurses in-process through the same silo-wide
+  caching dispatcher (no cache bypass, dedup preserved); only a shard miss grain-hops across
+  silos — exactly how SpiceDB only RPCs across nodes. Grain-per-sub-problem is kept (the
+  activation remains the cache entry for remote keys). Toggleable via
+  `OrleansDispatcherOptions.LocalRecurseEnabled` (on by default).
+- **Traversal bloom** — the visited set crosses grain boundaries as a bounded bloom filter
+  (`TraversalBloom`, ≤1KB, as SpiceDB) rather than an exact set: 1024 bits / 10 hashes by default,
+  FNV-1a with Kirsch–Mitzenmacher double hashing (process-stable). A positive is a conservative
+  cycle cut; cut results are never cached, so a false positive can never poison the cache. The
+  full conformance corpus runs through the grain mesh with the bloom enabled with zero false cuts,
+  including every recursive schema.
+
+**Remaining tuning (not correctness):**
 - **Revision quantization** — every write mints a fresh revision, so an un-quantized cache key
   never hits. A quantizer snaps the revision to a coarse bucket so concurrent requests share
   cache entries; the bucket boundary is the cache-staleness knob.
-- **Local-recurse vs grain-hop hybrid** — currently any sub-problem can become a grain call. The
-  perf target is a placement director (consistent hash, mirroring `authzed/consistent`) so the
-  seam recurses in-process when a sub-problem hashes to the local silo and only grain-hops on a
-  shard miss — exactly how SpiceDB only RPCs across nodes.
-- **Traversal bloom** — the visited set crosses grain boundaries as an exact set today; a
-  bounded bloom filter (≤1KB, as SpiceDB) is the optimization.
 
 ### 3.4 Other components, by actor role
 

@@ -6,7 +6,12 @@ using Spiceport.Silo;
 var builder = Host.CreateApplicationBuilder(args);
 
 // Run an Orleans silo in this host so the keyed check grains activate here.
-builder.UseOrleans(silo => silo.UseLocalhostClustering());
+builder.UseOrleans(silo =>
+{
+    silo.UseLocalhostClustering();
+    // Place CheckGrain activations by consistent hash of the sub-problem key.
+    silo.AddConsistentHashPlacement();
+});
 
 // Schema + dispatch mesh (Caching over Orleans) + check-engine singletons.
 builder.Services.AddSpiceportGrainServices(SiloSchema.SchemaText);

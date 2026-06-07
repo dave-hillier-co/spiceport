@@ -32,17 +32,20 @@ public sealed class CachingDispatcher : IDispatcher
     private readonly IDispatchCache _cache;
     private readonly IRevisionQuantizer _quantizer;
     private readonly ISchemaHashSource _schemaHash;
+    private readonly ICacheMetrics? _metrics;
 
     /// <summary>Creates a caching dispatcher over a delegate dispatcher.</summary>
     /// <param name="inner">The dispatcher that performs the actual expansion on a cache miss.</param>
     /// <param name="cache">The branch cache.</param>
     /// <param name="quantizer">Maps a request revision to a stable cache bucket.</param>
     /// <param name="schemaHash">Supplies the live schema hash, scoping cache entries to the current schema so a schema swap is never reused.</param>
+    /// <param name="metrics">Optional branch-cache hit/miss counters (for benchmarking).</param>
     public CachingDispatcher(
         IDispatcher inner,
         IDispatchCache cache,
         IRevisionQuantizer quantizer,
-        ISchemaHashSource schemaHash)
+        ISchemaHashSource schemaHash,
+        ICacheMetrics? metrics = null)
     {
         ArgumentNullException.ThrowIfNull(inner);
         ArgumentNullException.ThrowIfNull(cache);
@@ -52,6 +55,7 @@ public sealed class CachingDispatcher : IDispatcher
         _cache = cache;
         _quantizer = quantizer;
         _schemaHash = schemaHash;
+        _metrics = metrics;
     }
 
     /// <inheritdoc/>
@@ -61,8 +65,12 @@ public sealed class CachingDispatcher : IDispatcher
 
         var key = BuildKey(request);
         if (_cache.TryGet(key, out var cached))
+        {
+            _metrics?.RecordCacheHit();
             return cached;
+        }
 
+        _metrics?.RecordCacheMiss();
         var result = await _inner.DispatchCheck(request, ct).ConfigureAwait(false);
 
         // Never cache cycle-affected results: they depend on the in-flight visited-set, which is not

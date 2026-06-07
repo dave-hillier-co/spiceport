@@ -9,19 +9,19 @@ namespace Spiceport.Grains.Abstractions;
 /// <remarks>
 /// The grain identity (its string key) already pins the canonical sub-problem coordinates
 /// (resource, subject, quantized revision, schema hash). Two callers asking the same sub-problem on
-/// different recursion paths address the SAME grain but may carry a different depth budget / visited
-/// set, so those cross-cutting fields ride in <see cref="DispatchCheckArgs"/> rather than the key.
+/// different recursion paths address the SAME grain but may carry a different depth budget / cycle
+/// guard, so those cross-cutting fields ride in <see cref="DispatchCheckArgs"/> rather than the key.
 /// <para>
-/// <see cref="Visited"/> is sent as an explicit serializable set for correctness in this slice.
-/// FUTURE OPTIMIZATION: SpiceDB carries a bounded-size traversal bloom filter instead of an exact
-/// set, trading a small false-positive rate for a fixed wire/CPU cost. That is the intended
-/// replacement once the mesh is load-bearing.
+/// The cycle guard is a bounded traversal Bloom filter (SpiceDB-style): <see cref="BloomBits"/> is the
+/// fixed-width bit array (≤1KB) and <see cref="BloomK"/> the number of hash functions, so the wire/CPU
+/// cost is constant regardless of recursion depth. It replaces the prior exact visited set. The guard
+/// is conservative — a Bloom false-positive can only cut a branch (never grant) and cut results are
+/// never cached, so it is sound.
 /// </para>
 /// </remarks>
 /// <param name="DepthRemaining">The remaining recursion depth budget for this sub-problem.</param>
-/// <param name="Visited">
-/// The set of (resource, subject) visit keys currently in-flight on this path.
-/// </param>
+/// <param name="BloomBits">The serialized traversal-Bloom bit array (the cycle guard for this path).</param>
+/// <param name="BloomK">The number of hash functions the Bloom was built with.</param>
 /// <param name="Mode">
 /// Whether the revision pinned in the grain key is an optimized (quantizable) bucket revision or an
 /// exact revision that must be keyed exactly in the branch cache (never quantized). Defaults to
@@ -30,21 +30,9 @@ namespace Spiceport.Grains.Abstractions;
 [GenerateSerializer]
 public sealed record DispatchCheckArgs(
     [property: Id(0)] int DepthRemaining,
-    [property: Id(1)] IReadOnlySet<VisitKeyParts> Visited,
-    [property: Id(2)] RevisionMode Mode = RevisionMode.Optimized);
-
-/// <summary>
-/// The six coordinates of a cycle-guard visit key (resource type/id/relation and subject
-/// type/id/relation), made serializable so the in-flight visited set can cross the grain boundary.
-/// </summary>
-[GenerateSerializer]
-public sealed record VisitKeyParts(
-    [property: Id(0)] string ResourceType,
-    [property: Id(1)] string ResourceId,
-    [property: Id(2)] string ResourceRelation,
-    [property: Id(3)] string SubjectType,
-    [property: Id(4)] string SubjectId,
-    [property: Id(5)] string SubjectRelation);
+    [property: Id(1)] byte[] BloomBits,
+    [property: Id(2)] int BloomK,
+    [property: Id(3)] RevisionMode Mode = RevisionMode.Optimized);
 
 /// <summary>
 /// The serializable reply from a dispatched sub-problem: the engine's pre-context branch
@@ -80,4 +68,11 @@ public interface ICheckGrain : IGrainWithStringKey
 {
     /// <summary>Evaluates the one sub-problem this grain is keyed to, dispatching children onward.</summary>
     Task<DispatchCheckReply> DispatchCheck(DispatchCheckArgs args);
+
+    /// <summary>
+    /// Returns the <c>ToParsableString()</c> of the silo this activation is hosted on. Used to prove
+    /// that consistent-hash placement put the grain on the silo the hash ring predicts; it activates
+    /// the grain (an empty step) and reports where it landed.
+    /// </summary>
+    Task<string> GetHostSilo();
 }

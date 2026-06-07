@@ -28,17 +28,12 @@
     <Compile Include="..\Spiceport.Conformance.Tests\Loading\ValidationModel.cs" Link="Loading\ValidationModel.cs" />
   </ItemGroup>
 
-  <!-- Reuse a representative subset of the conformance corpus as linked content (copied to output),
-       so the grain-mesh tests run real SpiceDB consistency fixtures. -->
+  <!-- Link the FULL conformance corpus as content (copied to output), so the grain-mesh tests can run
+       both the representative subset (ConformanceMeshTests) AND the entire corpus through the mesh with
+       the traversal bloom (FullCorpusMeshBloomTests, the mandatory bloom-correctness gate). -->
   <ItemGroup>
-    <None Include="..\Spiceport.Conformance.Tests\TestData\multipleops.yaml" Link="TestData\multipleops.yaml" CopyToOutputDirectory="PreserveNewest" />
-    <None Include="..\Spiceport.Conformance.Tests\TestData\teamwitharrow.yaml" Link="TestData\teamwitharrow.yaml" CopyToOutputDirectory="PreserveNewest" />
-    <None Include="..\Spiceport.Conformance.Tests\TestData\simplewildcard.yaml" Link="TestData\simplewildcard.yaml" CopyToOutputDirectory="PreserveNewest" />
-    <None Include="..\Spiceport.Conformance.Tests\TestData\indirectnestedgroups.yaml" Link="TestData\indirectnestedgroups.yaml" CopyToOutputDirectory="PreserveNewest" />
-    <None Include="..\Spiceport.Conformance.Tests\TestData\simplerecursive.yaml" Link="TestData\simplerecursive.yaml" CopyToOutputDirectory="PreserveNewest" />
-    <None Include="..\Spiceport.Conformance.Tests\TestData\basiccaveat.yaml" Link="TestData\basiccaveat.yaml" CopyToOutputDirectory="PreserveNewest" />
-    <None Include="..\Spiceport.Conformance.Tests\TestData\caveatlr.yaml" Link="TestData\caveatlr.yaml" CopyToOutputDirectory="PreserveNewest" />
-    <None Include="..\Spiceport.Conformance.Tests\TestData\caveatip.yaml" Link="TestData\caveatip.yaml" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="..\Spiceport.Conformance.Tests\TestData\*.yaml"
+          Link="TestData\%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
   <ItemGroup>

@@ -84,7 +84,7 @@ public class DispatcherSeamTests
         var meta = new ResolverMeta(
             InProcessRevisionForTest(),
             CheckEngine.DefaultMaxDepth,
-            ImmutableHashSet<VisitKey>.Empty);
+            TraversalBloom.Empty);
         var request = new DispatchCheckRequest(
             Onr("document", "readme", "view"),
             Onr("user", "alice"),

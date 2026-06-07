@@ -1,4 +1,3 @@
-using System.Collections.Immutable;
 using Spiceport.Core;
 
 namespace Spiceport.Engine;
@@ -34,12 +33,15 @@ public readonly record struct VisitKey(
 /// <remarks>
 /// Deliberately carries the revision <em>identity</em> (an <see cref="IRevision"/>), not an
 /// <c>IDatastoreReader</c>, so the request is serializable: a dispatcher resolves a reader for the
-/// revision itself. <see cref="Visited"/> is an immutable set so each sub-problem can extend it
-/// without mutating its parent's.
+/// revision itself. <see cref="Bloom"/> is an immutable (copy-on-add) bounded Bloom filter so each
+/// sub-problem can extend the cycle guard without mutating its parent's — replacing the exact
+/// <c>ImmutableHashSet&lt;VisitKey&gt;</c> with a fixed-size structure that survives a grain hop at a
+/// bounded wire/CPU cost (SpiceDB's traversal-bloom design). The guard is conservative: a Bloom
+/// false-positive can only cut a branch (CycleCut), never grant.
 /// </remarks>
 /// <param name="Revision">The pinned revision identity to evaluate against.</param>
 /// <param name="DepthRemaining">The remaining recursion depth budget.</param>
-/// <param name="Visited">The set of (resource, subject) pairs currently in-flight on this path.</param>
+/// <param name="Bloom">The bounded cycle-guard of (resource, subject) pairs in-flight on this path.</param>
 /// <param name="Mode">
 /// Whether <paramref name="Revision"/> is the optimized (quantizable) bucket revision or an exact
 /// revision that must NEVER be folded into the optimized cache bucket. Defaults to
@@ -49,7 +51,7 @@ public readonly record struct VisitKey(
 public sealed record ResolverMeta(
     IRevision Revision,
     int DepthRemaining,
-    ImmutableHashSet<VisitKey> Visited,
+    TraversalBloom Bloom,
     RevisionMode Mode = RevisionMode.Optimized);
 
 /// <summary>
