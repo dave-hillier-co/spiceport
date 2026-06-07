@@ -33,7 +33,7 @@ public sealed class ReverseOpsGrain(
     public async Task<ExpandTreeReply> ExpandPermissionTree(ExpandTreeArgs args)
     {
         ArgumentNullException.ThrowIfNull(args);
-        var (reader, now) = await PinReader().ConfigureAwait(ContinueOnCapturedContext);
+        var (reader, now, token) = await PinReader(args.Consistency).ConfigureAwait(ContinueOnCapturedContext);
 
         var engine = new ExpandEngine(Namespaces);
         var mode = args.Mode == ExpandModeWire.Recursive ? ExpandMode.Recursive : ExpandMode.Shallow;
@@ -46,14 +46,14 @@ public sealed class ReverseOpsGrain(
         // Expand carries verbatim caveat expressions; with no request context we collapse each against
         // an empty context so caveated nodes/subjects surface their missing parameter names.
         var evaluator = new CaveatEvaluator(Caveats);
-        return new ExpandTreeReply(ToWire(tree, evaluator));
+        return new ExpandTreeReply(ToWire(tree, evaluator), token);
     }
 
     /// <inheritdoc />
     public async Task<LookupSubjectsReply> LookupSubjects(LookupSubjectsArgs args)
     {
         ArgumentNullException.ThrowIfNull(args);
-        var (reader, now) = await PinReader().ConfigureAwait(ContinueOnCapturedContext);
+        var (reader, now, token) = await PinReader(args.Consistency).ConfigureAwait(ContinueOnCapturedContext);
 
         var engine = new LookupSubjectsEngine(Namespaces);
         var evaluator = new CaveatEvaluator(Caveats);
@@ -89,14 +89,14 @@ public sealed class ReverseOpsGrain(
         var cursor = moreRemain && lastId is not null
             ? ReverseOpsCursorCodec.EncodeSubjectId(lastId)
             : null;
-        return new LookupSubjectsReply(page, cursor);
+        return new LookupSubjectsReply(page, cursor, token);
     }
 
     /// <inheritdoc />
     public async Task<LookupResourcesReply> LookupResources(LookupResourcesArgs args)
     {
         ArgumentNullException.ThrowIfNull(args);
-        var (reader, now) = await PinReader().ConfigureAwait(ContinueOnCapturedContext);
+        var (reader, now, token) = await PinReader(args.Consistency).ConfigureAwait(ContinueOnCapturedContext);
 
         var engine = new LookupResourcesEngine(Namespaces, Caveats);
         var startCursor = ReverseOpsCursorCodec.DecodeResources(args.Cursor);
@@ -129,17 +129,27 @@ public sealed class ReverseOpsGrain(
         }
 
         var cursor = moreRemain ? ReverseOpsCursorCodec.Encode(afterCursor) : null;
-        return new LookupResourcesReply(page, cursor);
+        return new LookupResourcesReply(page, cursor, token);
     }
 
     // Orleans grain code must not ConfigureAwait(false); keep the captured context.
     private const ConfigureAwaitOptions ContinueOnCapturedContext = ConfigureAwaitOptions.ContinueOnCapturedContext;
 
-    private async Task<(IDatastoreReader Reader, DateTimeOffset Now)> PinReader()
+    private async Task<(IDatastoreReader Reader, DateTimeOffset Now, string Token)> PinReader(
+        ConsistencyWire? consistency)
     {
-        var optimized = await datastore.OptimizedRevision(CancellationToken.None)
+        // Resolve the consistency requirement to the revision actually evaluated. Null (the default)
+        // is MinimizeLatency → the optimized revision, identical to the prior behaviour.
+        var requirement = (consistency ?? ConsistencyWire.MinimizeLatency).ToRequirement();
+        var resolved = await RevisionResolver
+            .Resolve(datastore, requirement, cancellationToken: CancellationToken.None)
             .ConfigureAwait(ContinueOnCapturedContext);
-        return (datastore.SnapshotReader(optimized.Revision), DateTimeOffset.UtcNow);
+
+        var reader = datastore.SnapshotReader(resolved.Revision);
+        var datastoreId = await datastore.GetUniqueId(CancellationToken.None)
+            .ConfigureAwait(ContinueOnCapturedContext);
+        var token = ZedTokens.FromRevision(resolved.Revision, resolved.SchemaHash, datastoreId).Token;
+        return (reader, DateTimeOffset.UtcNow, token);
     }
 
     /// <summary>

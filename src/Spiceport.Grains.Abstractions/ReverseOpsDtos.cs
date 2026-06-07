@@ -51,16 +51,22 @@ public enum SetOpWire
 /// <param name="ResourceId">The resource object id.</param>
 /// <param name="Permission">The relation or permission to expand.</param>
 /// <param name="Mode">Shallow or recursive expansion.</param>
+/// <param name="Consistency">The consistency requirement; null means minimize-latency (default).</param>
 [GenerateSerializer]
 public sealed record ExpandTreeArgs(
     [property: Id(0)] string ResourceType,
     [property: Id(1)] string ResourceId,
     [property: Id(2)] string Permission,
-    [property: Id(3)] ExpandModeWire Mode);
+    [property: Id(3)] ExpandModeWire Mode,
+    [property: Id(4)] ConsistencyWire? Consistency = null);
 
 /// <summary>The reply from <see cref="IReverseOpsGrain.ExpandPermissionTree"/>: the whole tree root.</summary>
+/// <param name="Root">The expanded tree root.</param>
+/// <param name="ExpandedAtToken">The ZedToken for the revision actually evaluated.</param>
 [GenerateSerializer]
-public sealed record ExpandTreeReply([property: Id(0)] ExpandTreeNodeWire Root);
+public sealed record ExpandTreeReply(
+    [property: Id(0)] ExpandTreeNodeWire Root,
+    [property: Id(1)] string ExpandedAtToken = "");
 
 /// <summary>
 /// A serializable node of an expanded permission tree, structurally mirroring the engine's
@@ -111,6 +117,7 @@ public sealed record ExpandSubjectWire(
 /// <param name="Context">Optional request-time caveat context for collapsing caveated subjects.</param>
 /// <param name="Limit">Soft page size; null or 0 for the engine default / unbounded in this slice.</param>
 /// <param name="Cursor">Opaque continuation token from a prior page; null to start.</param>
+/// <param name="Consistency">The consistency requirement; null means minimize-latency (default).</param>
 [GenerateSerializer]
 public sealed record LookupSubjectsArgs(
     [property: Id(0)] string ResourceType,
@@ -120,15 +127,18 @@ public sealed record LookupSubjectsArgs(
     [property: Id(4)] string SubjectRelation,
     [property: Id(5)] IReadOnlyDictionary<string, object?>? Context,
     [property: Id(6)] int? Limit,
-    [property: Id(7)] string? Cursor);
+    [property: Id(7)] string? Cursor,
+    [property: Id(8)] ConsistencyWire? Consistency = null);
 
 /// <summary>A bounded page of found subjects with an optional continuation cursor.</summary>
 /// <param name="Subjects">The subjects found in this page.</param>
 /// <param name="Cursor">A continuation token, or null/empty when the enumeration is exhausted.</param>
+/// <param name="LookedUpAtToken">The ZedToken for the revision actually evaluated.</param>
 [GenerateSerializer]
 public sealed record LookupSubjectsReply(
     [property: Id(0)] IReadOnlyList<FoundSubjectWire> Subjects,
-    [property: Id(1)] string? Cursor);
+    [property: Id(1)] string? Cursor,
+    [property: Id(2)] string LookedUpAtToken = "");
 
 /// <summary>A subject found by a lookup, with its collapsed permissionship.</summary>
 /// <param name="SubjectId">The subject object id ("*" for a wildcard).</param>
@@ -151,6 +161,7 @@ public sealed record FoundSubjectWire(
 /// <param name="Context">Optional request-time caveat context.</param>
 /// <param name="Limit">Soft page size; null or 0 for the engine default / unbounded in this slice.</param>
 /// <param name="Cursor">Opaque continuation token from a prior page; null to start.</param>
+/// <param name="Consistency">The consistency requirement; null means minimize-latency (default).</param>
 [GenerateSerializer]
 public sealed record LookupResourcesArgs(
     [property: Id(0)] string ResourceType,
@@ -160,15 +171,18 @@ public sealed record LookupResourcesArgs(
     [property: Id(4)] string SubjectRelation,
     [property: Id(5)] IReadOnlyDictionary<string, object?>? Context,
     [property: Id(6)] int? Limit,
-    [property: Id(7)] string? Cursor);
+    [property: Id(7)] string? Cursor,
+    [property: Id(8)] ConsistencyWire? Consistency = null);
 
 /// <summary>A bounded page of found resources with an optional continuation cursor.</summary>
 /// <param name="Resources">The resources found in this page.</param>
 /// <param name="Cursor">A continuation token, or null/empty when the enumeration is exhausted.</param>
+/// <param name="LookedUpAtToken">The ZedToken for the revision actually evaluated.</param>
 [GenerateSerializer]
 public sealed record LookupResourcesReply(
     [property: Id(0)] IReadOnlyList<FoundResourceWire> Resources,
-    [property: Id(1)] string? Cursor);
+    [property: Id(1)] string? Cursor,
+    [property: Id(2)] string LookedUpAtToken = "");
 
 /// <summary>A resource found by a lookup, with its collapsed permissionship.</summary>
 /// <param name="ResourceId">The reachable resource object id.</param>

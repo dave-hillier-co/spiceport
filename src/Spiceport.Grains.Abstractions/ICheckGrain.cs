@@ -1,3 +1,5 @@
+using Spiceport.Core;
+
 namespace Spiceport.Grains.Abstractions;
 
 /// <summary>
@@ -20,10 +22,16 @@ namespace Spiceport.Grains.Abstractions;
 /// <param name="Visited">
 /// The set of (resource, subject) visit keys currently in-flight on this path.
 /// </param>
+/// <param name="Mode">
+/// Whether the revision pinned in the grain key is an optimized (quantizable) bucket revision or an
+/// exact revision that must be keyed exactly in the branch cache (never quantized). Defaults to
+/// <see cref="RevisionMode.Optimized"/> so existing callers are unchanged.
+/// </param>
 [GenerateSerializer]
 public sealed record DispatchCheckArgs(
     [property: Id(0)] int DepthRemaining,
-    [property: Id(1)] IReadOnlySet<VisitKeyParts> Visited);
+    [property: Id(1)] IReadOnlySet<VisitKeyParts> Visited,
+    [property: Id(2)] RevisionMode Mode = RevisionMode.Optimized);
 
 /// <summary>
 /// The six coordinates of a cycle-guard visit key (resource type/id/relation and subject

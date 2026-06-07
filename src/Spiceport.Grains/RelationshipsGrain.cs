@@ -103,9 +103,14 @@ public sealed class RelationshipsGrain(
     {
         ArgumentNullException.ThrowIfNull(args);
 
-        var optimized = await datastore.OptimizedRevision(CancellationToken.None)
+        // Honour the request consistency; null (the default) is MinimizeLatency → the optimized
+        // revision, identical to the prior behaviour. The read-at token is minted from the revision
+        // actually evaluated, not unconditionally the optimized one.
+        var requirement = (args.Consistency ?? ConsistencyWire.MinimizeLatency).ToRequirement();
+        var resolved = await RevisionResolver
+            .Resolve(datastore, requirement, cancellationToken: CancellationToken.None)
             .ConfigureAwait(ContinueOnCapturedContext);
-        var reader = datastore.SnapshotReader(optimized.Revision);
+        var reader = datastore.SnapshotReader(resolved.Revision);
         var filter = ToFilter(args.Filter);
         var after = args.Cursor;
         var limit = args.Limit is { } l && l > 0 ? l : (int?)null;
@@ -136,7 +141,7 @@ public sealed class RelationshipsGrain(
             page.Add(ToWire(matched[i].Rel));
         }
 
-        var token = await MintToken(optimized.Revision, schemaProvider.Current.SchemaHash)
+        var token = await MintToken(resolved.Revision, resolved.SchemaHash ?? schemaProvider.Current.SchemaHash)
             .ConfigureAwait(ContinueOnCapturedContext);
         return new ReadRelationshipsReply(page, cursor, token);
     }

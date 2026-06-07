@@ -77,7 +77,16 @@ public sealed class CachingDispatcher : IDispatcher
     {
         var r = request.Resource;
         var s = request.Subject;
-        var rev = _quantizer.Quantize(request.Meta.Revision);
+
+        // CORRECTNESS SEAM (Zanzibar consistency): only the OPTIMIZED (head-pinned) revision may be
+        // folded into the quantized 5s bucket. An EXACT revision (FullyConsistent, AtExactSnapshot, or
+        // AtLeastAsFresh when the supplied token is fresher than the optimized bucket) must be keyed by
+        // its exact revision string, so it can NEVER read an entry that was quantized down to an older
+        // bucket boundary — which would serve stale data. Keying exactly still lets identical exact-
+        // revision checks share work, at a lower (intended) hit rate.
+        var rev = request.Meta.Mode == RevisionMode.Optimized
+            ? _quantizer.Quantize(request.Meta.Revision)
+            : "x:" + request.Meta.Revision.ToString();
 
         // The key excludes visited-set, depth budget and caveat context by construction.
         return new StringBuilder(128)

@@ -42,7 +42,8 @@ public sealed class OrleansDispatcher : IDispatcher
             request.Resource,
             request.Subject,
             request.Meta.Revision.ToString(),
-            _schemaHash.CurrentSchemaHash);
+            _schemaHash.CurrentSchemaHash,
+            request.Meta.Mode);
 
         var grain = _grains.GetGrain<ICheckGrain>(key);
 
@@ -52,7 +53,8 @@ public sealed class OrleansDispatcher : IDispatcher
                 .Select(v => new VisitKeyParts(
                     v.ResourceType, v.ResourceId, v.ResourceRelation,
                     v.SubjectType, v.SubjectId, v.SubjectRelation))
-                .ToImmutableHashSet());
+                .ToImmutableHashSet(),
+            request.Meta.Mode);
 
         var reply = await grain.DispatchCheck(args).ConfigureAwait(false);
 

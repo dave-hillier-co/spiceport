@@ -19,6 +19,9 @@ using RelationshipFilter = Spiceport.Protos.RelationshipFilter;
 using ObjectReference = Spiceport.Protos.ObjectReference;
 using SubjectReference = Spiceport.Protos.SubjectReference;
 using ZedToken = Spiceport.Protos.ZedToken;
+using ProtoConsistency = Spiceport.Protos.Consistency;
+using WireConsistency = Spiceport.Grains.Abstractions.ConsistencyWire;
+using WireConsistencyMode = Spiceport.Grains.Abstractions.ConsistencyModeWire;
 
 namespace Spiceport.Api;
 
@@ -46,13 +49,22 @@ public sealed class PermissionsGrpcService(IPermissionChecker checker, IGrainFac
             request.Subject.Object.ObjectId,
             subjectRelation);
 
-        var result = await checker.Check(
-            request.Resource.ObjectType,
-            request.Resource.ObjectId,
-            request.Permission,
-            subject,
-            StructToDict(request.Context),
-            context.CancellationToken);
+        PermissionCheckResult result;
+        try
+        {
+            result = await checker.Check(
+                request.Resource.ObjectType,
+                request.Resource.ObjectId,
+                request.Permission,
+                subject,
+                StructToDict(request.Context),
+                ToWire(request.Consistency).ToRequirement(),
+                context.CancellationToken);
+        }
+        catch (InvalidConsistencyTokenException ex)
+        {
+            throw new RpcException(new Status(StatusCode.InvalidArgument, ex.Message));
+        }
 
         var ship = result.Verdict switch
         {
@@ -61,7 +73,11 @@ public sealed class PermissionsGrpcService(IPermissionChecker checker, IGrainFac
             _ => CheckPermissionResponse.Types.Permissionship.NoPermission,
         };
 
-        var resp = new CheckPermissionResponse { Permissionship = ship };
+        var resp = new CheckPermissionResponse
+        {
+            Permissionship = ship,
+            CheckedAt = new ZedToken { Token = result.EvaluatedToken },
+        };
         resp.PartialCaveatMissingFields.AddRange(result.MissingFields);
         return resp;
     }
@@ -107,7 +123,8 @@ public sealed class PermissionsGrpcService(IPermissionChecker checker, IGrainFac
         var reply = await Relationships.ReadRelationships(new ReadRelationshipsArgs(
             ToWire(request.Filter),
             request.OptionalLimit == 0 ? null : (int)request.OptionalLimit,
-            NullIfEmpty(request.OptionalCursor)));
+            NullIfEmpty(request.OptionalCursor),
+            ToWire(request.Consistency)));
 
         var resp = new ReadRelationshipsResponse
         {
@@ -205,9 +222,14 @@ public sealed class PermissionsGrpcService(IPermissionChecker checker, IGrainFac
             request.Resource.ObjectType,
             request.Resource.ObjectId,
             request.Permission,
-            mode));
+            mode,
+            ToWire(request.Consistency)));
 
-        return new ExpandPermissionTreeResponse { TreeRoot = ToProto(reply.Root) };
+        return new ExpandPermissionTreeResponse
+        {
+            TreeRoot = ToProto(reply.Root),
+            ExpandedAt = new ZedToken { Token = reply.ExpandedAtToken },
+        };
     }
 
     public override async Task<LookupSubjectsResponse> LookupSubjects(
@@ -225,9 +247,14 @@ public sealed class PermissionsGrpcService(IPermissionChecker checker, IGrainFac
             subjectRelation,
             StructToDict(request.Context),
             (int)request.OptionalLimit,
-            NullIfEmpty(request.OptionalCursor)));
+            NullIfEmpty(request.OptionalCursor),
+            ToWire(request.Consistency)));
 
-        var resp = new LookupSubjectsResponse { AfterResultCursor = reply.Cursor ?? string.Empty };
+        var resp = new LookupSubjectsResponse
+        {
+            AfterResultCursor = reply.Cursor ?? string.Empty,
+            LookedUpAt = new ZedToken { Token = reply.LookedUpAtToken },
+        };
         resp.Subjects.AddRange(reply.Subjects.Select(ToProto));
         return resp;
     }
@@ -247,9 +274,14 @@ public sealed class PermissionsGrpcService(IPermissionChecker checker, IGrainFac
             subjectRelation,
             StructToDict(request.Context),
             (int)request.OptionalLimit,
-            NullIfEmpty(request.OptionalCursor)));
+            NullIfEmpty(request.OptionalCursor),
+            ToWire(request.Consistency)));
 
-        var resp = new LookupResourcesResponse { AfterResultCursor = reply.Cursor ?? string.Empty };
+        var resp = new LookupResourcesResponse
+        {
+            AfterResultCursor = reply.Cursor ?? string.Empty,
+            LookedUpAt = new ZedToken { Token = reply.LookedUpAtToken },
+        };
         resp.Resources.AddRange(reply.Resources.Select(ToProto));
         return resp;
     }
@@ -329,6 +361,23 @@ public sealed class PermissionsGrpcService(IPermissionChecker checker, IGrainFac
         SetOpWire.Intersection => ProtoTreeNode.Types.SetOpNode.Types.Operation.Intersection,
         SetOpWire.Exclusion => ProtoTreeNode.Types.SetOpNode.Types.Operation.Exclusion,
         _ => ProtoTreeNode.Types.SetOpNode.Types.Operation.Unspecified,
+    };
+
+    /// <summary>
+    /// Maps the proto <see cref="ProtoConsistency"/> oneof to the cross-grain
+    /// <see cref="WireConsistency"/>. An absent message (null) or an unset oneof is treated as
+    /// minimize-latency — the server default — so existing clients are unchanged.
+    /// </summary>
+    private static WireConsistency ToWire(ProtoConsistency? consistency) => consistency?.RequirementCase switch
+    {
+        ProtoConsistency.RequirementOneofCase.AtLeastAsFresh =>
+            new WireConsistency(WireConsistencyMode.AtLeastAsFresh, consistency.AtLeastAsFresh.Token),
+        ProtoConsistency.RequirementOneofCase.FullyConsistent =>
+            new WireConsistency(WireConsistencyMode.FullyConsistent),
+        ProtoConsistency.RequirementOneofCase.AtExactSnapshot =>
+            new WireConsistency(WireConsistencyMode.AtExactSnapshot, consistency.AtExactSnapshot.Token),
+        // minimize_latency, or unset / absent.
+        _ => WireConsistency.MinimizeLatency,
     };
 
     private static string? NullIfEmpty(string s) => string.IsNullOrEmpty(s) ? null : s;

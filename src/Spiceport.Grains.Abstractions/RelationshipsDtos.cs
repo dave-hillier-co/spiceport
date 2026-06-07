@@ -74,7 +74,8 @@ public sealed record DeleteRelationshipsReply(
 public sealed record ReadRelationshipsArgs(
     [property: Id(0)] RelationshipsFilterWire Filter,
     [property: Id(1)] int? Limit,
-    [property: Id(2)] string? Cursor);
+    [property: Id(2)] string? Cursor,
+    [property: Id(3)] ConsistencyWire? Consistency = null);
 
 /// <summary>Reply for <see cref="IRelationshipsGrain.ReadRelationships"/>.</summary>
 [GenerateSerializer]

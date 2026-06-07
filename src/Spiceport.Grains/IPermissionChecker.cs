@@ -11,7 +11,18 @@ namespace Spiceport.Grains;
 /// When <see cref="Verdict"/> is <see cref="Membership.Caveated"/>, the caveat parameter names that
 /// were missing from the supplied context; otherwise empty.
 /// </param>
-public sealed record PermissionCheckResult(Membership Verdict, IReadOnlyList<string> MissingFields);
+/// <param name="EvaluatedRevision">The revision the check actually evaluated against.</param>
+/// <param name="SchemaHash">The schema hash at the evaluated revision, if any.</param>
+/// <param name="EvaluatedToken">
+/// The ZedToken minted from <see cref="EvaluatedRevision"/> (with <see cref="SchemaHash"/> and the
+/// datastore id), which a client can chain into a subsequent <c>at_least_as_fresh</c> check.
+/// </param>
+public sealed record PermissionCheckResult(
+    Membership Verdict,
+    IReadOnlyList<string> MissingFields,
+    IRevision EvaluatedRevision,
+    string? SchemaHash,
+    string EvaluatedToken);
 
 /// <summary>
 /// The top-level entry point used by the API: pins an optimized (quantized) revision, dispatches the
@@ -21,12 +32,17 @@ public sealed record PermissionCheckResult(Membership Verdict, IReadOnlyList<str
 public interface IPermissionChecker
 {
     /// <summary>Checks whether the subject has the given permission on the resource.</summary>
+    /// <param name="consistency">
+    /// The consistency the read demands; null means <see cref="ConsistencyRequirement.MinimizeLatency"/>
+    /// (the server default), so existing callers behave exactly as before.
+    /// </param>
     Task<PermissionCheckResult> Check(
         string resourceType,
         string resourceId,
         string permission,
         ObjectAndRelation subject,
         IReadOnlyDictionary<string, object?>? caveatContext,
+        ConsistencyRequirement? consistency = null,
         CancellationToken ct = default);
 }
 
@@ -52,11 +68,17 @@ public sealed class PermissionChecker(
         string permission,
         ObjectAndRelation subject,
         IReadOnlyDictionary<string, object?>? caveatContext,
+        ConsistencyRequirement? consistency = null,
         CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(subject);
 
-        var optimized = await datastore.OptimizedRevision(ct).ConfigureAwait(false);
+        // Resolve the consistency requirement to a concrete revision + cache mode. Default (null) is
+        // MinimizeLatency → the optimized (quantized, head-pinned) revision, identical to the prior
+        // behaviour, so existing tests are unchanged.
+        var resolved = await RevisionResolver
+            .Resolve(datastore, consistency ?? ConsistencyRequirement.MinimizeLatency, cancellationToken: ct)
+            .ConfigureAwait(false);
 
         // Capture a single consistent schema snapshot for this check, so the collapse uses the same
         // caveats the dispatch ran under. Collapse is cheap and stateless, so building a per-call
@@ -65,12 +87,16 @@ public sealed class PermissionChecker(
         var engine = new CheckEngine(schema.Namespaces, schema.Caveats, maxDepth);
 
         var resource = new ObjectAndRelation(resourceType, resourceId, permission);
-        var meta = new ResolverMeta(optimized.Revision, maxDepth, ImmutableHashSet<VisitKey>.Empty);
+        var meta = new ResolverMeta(
+            resolved.Revision, maxDepth, ImmutableHashSet<VisitKey>.Empty, resolved.Mode);
         var request = new DispatchCheckRequest(resource, subject, meta);
 
         var branch = await root.Dispatcher.DispatchCheck(request, ct).ConfigureAwait(false);
 
         var collapsed = engine.Collapse(branch, caveatContext);
-        return new PermissionCheckResult(collapsed.Verdict, collapsed.MissingExprFields);
+        var datastoreId = await datastore.GetUniqueId(ct).ConfigureAwait(false);
+        var token = ZedTokens.FromRevision(resolved.Revision, resolved.SchemaHash, datastoreId).Token;
+        return new PermissionCheckResult(
+            collapsed.Verdict, collapsed.MissingExprFields, resolved.Revision, resolved.SchemaHash, token);
     }
 }

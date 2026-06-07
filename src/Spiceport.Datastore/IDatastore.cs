@@ -75,6 +75,13 @@ public interface IDatastore
     /// <summary>Returns a stable unique id for this datastore instance.</summary>
     Task<string> GetUniqueId(CancellationToken cancellationToken = default);
 
+    /// <summary>
+    /// Returns a parser that decodes minted token revision strings back into <see cref="IRevision"/>
+    /// for this datastore. The parser's <see cref="IRevisionParser.DatastoreUniqueId"/> matches
+    /// <see cref="GetUniqueId"/>, so a token minted by this datastore decodes as <see cref="ZedTokenStatus.Valid"/>.
+    /// </summary>
+    Task<IRevisionParser> GetRevisionParser(CancellationToken cancellationToken = default);
+
     /// <summary>Releases resources held by the datastore.</summary>
     Task Close();
 }

@@ -21,7 +21,8 @@ internal static class GrainKey
         ObjectAndRelation resource,
         ObjectAndRelation subject,
         string revision,
-        string schemaHash) =>
+        string schemaHash,
+        RevisionMode mode) =>
         string.Join(Separator, [
             Escape(resource.ObjectType),
             Escape(resource.ObjectId),
@@ -31,19 +32,23 @@ internal static class GrainKey
             Escape(subject.Relation),
             Escape(revision),
             Escape(schemaHash),
+            // The cache mode is part of the identity: an exact-revision sub-problem must never share a
+            // grain (and hence a branch cache entry) with an optimized one even at the same revision.
+            ((int)mode).ToString(System.Globalization.CultureInfo.InvariantCulture),
         ]);
 
     public static GrainKeyParts Parse(string key)
     {
         var parts = key.Split(Separator);
-        if (parts.Length != 8)
-            throw new FormatException($"Malformed check-grain key (expected 8 segments): '{key}'.");
+        if (parts.Length != 9)
+            throw new FormatException($"Malformed check-grain key (expected 9 segments): '{key}'.");
 
         return new GrainKeyParts(
             new ObjectAndRelation(Unescape(parts[0]), Unescape(parts[1]), Unescape(parts[2])),
             new ObjectAndRelation(Unescape(parts[3]), Unescape(parts[4]), Unescape(parts[5])),
             Unescape(parts[6]),
-            Unescape(parts[7]));
+            Unescape(parts[7]),
+            (RevisionMode)int.Parse(parts[8], System.Globalization.CultureInfo.InvariantCulture));
     }
 
     private static string Escape(string s) => Uri.EscapeDataString(s);
@@ -56,4 +61,5 @@ internal sealed record GrainKeyParts(
     ObjectAndRelation Resource,
     ObjectAndRelation Subject,
     string Revision,
-    string SchemaHash);
+    string SchemaHash,
+    RevisionMode Mode);

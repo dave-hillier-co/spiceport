@@ -58,10 +58,14 @@ message ExpandPermissionTreeRequest {
     EXPAND_MODE_RECURSIVE = 2;
   }
   ExpandMode mode = 3;
+  // Optional consistency requirement; unset = minimize_latency.
+  Consistency consistency = 4;
 }
 
 message ExpandPermissionTreeResponse {
   PermissionTreeNode tree_root = 1;
+  // The ZedToken for the revision actually evaluated.
+  ZedToken expanded_at = 2;
 }
 
 // A node in the expanded permission tree. A leaf carries directly-written subjects; an intermediate
@@ -116,12 +120,16 @@ message LookupSubjectsRequest {
   uint32 optional_limit = 6;
   // Opaque continuation token from a prior page; empty to start.
   string optional_cursor = 7;
+  // Optional consistency requirement; unset = minimize_latency.
+  Consistency consistency = 8;
 }
 
 message LookupSubjectsResponse {
   repeated FoundSubject subjects = 1;
   // Opaque continuation token; empty when the enumeration is exhausted.
   string after_result_cursor = 2;
+  // The ZedToken for the revision actually evaluated.
+  ZedToken looked_up_at = 3;
 }
 
 message FoundSubject {
@@ -141,12 +149,16 @@ message LookupResourcesRequest {
   uint32 optional_limit = 5;
   // Opaque continuation token from a prior page; empty to start.
   string optional_cursor = 6;
+  // Optional consistency requirement; unset = minimize_latency.
+  Consistency consistency = 7;
 }
 
 message LookupResourcesResponse {
   repeated FoundResource resources = 1;
   // Opaque continuation token; empty when the enumeration is exhausted.
   string after_result_cursor = 2;
+  // The ZedToken for the revision actually evaluated.
+  ZedToken looked_up_at = 3;
 }
 
 message FoundResource {
@@ -165,12 +177,29 @@ message SubjectReference {
   string optional_relation = 2;
 }
 
+// The consistency a read request demands, mirroring authzed.api.v1.Consistency. An unset Consistency
+// (the whole message absent) is treated as minimize_latency, the server default.
+message Consistency {
+  oneof requirement {
+    // Read at the optimized (quantized, head-pinned) revision for best latency/cache hit rate.
+    bool minimize_latency = 1;
+    // Read at least as fresh as this token (read-your-writes); picks max(token, optimized).
+    ZedToken at_least_as_fresh = 2;
+    // Read at the freshest committed (head) revision.
+    bool fully_consistent = 3;
+    // Read exactly at the snapshot encoded by this token.
+    ZedToken at_exact_snapshot = 4;
+  }
+}
+
 message CheckPermissionRequest {
   ObjectReference resource = 1;
   string permission = 2;
   SubjectReference subject = 3;
   // Request-time caveat context (overrides relationship context).
   google.protobuf.Struct context = 4;
+  // Optional consistency requirement; unset = minimize_latency.
+  Consistency consistency = 5;
 }
 
 message CheckPermissionResponse {
@@ -183,6 +212,8 @@ message CheckPermissionResponse {
   Permissionship permissionship = 1;
   // Caveat parameter names missing from context when permissionship is CONDITIONAL.
   repeated string partial_caveat_missing_fields = 2;
+  // The ZedToken for the revision the check actually evaluated against (chain into at_least_as_fresh).
+  ZedToken checked_at = 3;
 }
 
 // ---- Data plane: schema ----
@@ -257,6 +288,8 @@ message ReadRelationshipsRequest {
   RelationshipFilter filter = 1;
   uint32 optional_limit = 2;
   string optional_cursor = 3;
+  // Optional consistency requirement; unset = minimize_latency.
+  Consistency consistency = 4;
 }
 
 message ReadRelationshipsResponse {

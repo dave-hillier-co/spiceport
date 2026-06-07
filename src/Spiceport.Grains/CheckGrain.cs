@@ -55,7 +55,8 @@ public sealed class CheckGrain(
         var meta = new ResolverMeta(
             revision,
             args.DepthRemaining,
-            OrleansDispatcher.ToVisitKeys(args.Visited));
+            OrleansDispatcher.ToVisitKeys(args.Visited),
+            parts.Mode);
         var request = new DispatchCheckRequest(parts.Resource, parts.Subject, meta);
 
         var result = await local.DispatchCheck(request, CancellationToken.None).ConfigureAwait(false);

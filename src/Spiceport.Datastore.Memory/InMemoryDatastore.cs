@@ -104,6 +104,9 @@ public sealed class InMemoryDatastore : IDatastore
 
     public Task<string> GetUniqueId(CancellationToken cancellationToken = default) => Task.FromResult(_uniqueId);
 
+    public Task<IRevisionParser> GetRevisionParser(CancellationToken cancellationToken = default) =>
+        Task.FromResult<IRevisionParser>(new InMemoryRevisionParser(_uniqueId));
+
     public Task Close() => Task.CompletedTask;
 
     // --- internals ---
