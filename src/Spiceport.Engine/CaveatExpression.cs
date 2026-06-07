@@ -61,6 +61,25 @@ public abstract record CaveatExpression
     public static CaveatExpression? Subtract(CaveatExpression? baseExpr, CaveatExpression excluded) =>
         CombineAnd(baseExpr, new Not(excluded));
 
+    /// <summary>
+    /// Combines two optional expressions with OR where a null operand is treated as "unconditional"
+    /// and the OTHER operand is returned (mirrors SpiceDB's <c>caveats.Or</c>, used by the subject-set
+    /// wildcard algebra). This differs from <see cref="CombineOr"/> (the short-circuited OR, where a
+    /// null operand collapses the whole OR to null).
+    /// </summary>
+    public static CaveatExpression? OrKeepOther(CaveatExpression? a, CaveatExpression? b)
+    {
+        if (a is null)
+            return b;
+        if (b is null)
+            return a;
+        return Flatten<Or>(a, b, children => new Or(children));
+    }
+
+    /// <summary>Negates an optional expression; inverting a null (unconditional) yields null.</summary>
+    public static CaveatExpression? Invert(CaveatExpression? expr) =>
+        expr is null ? null : new Not(expr);
+
     private static CaveatExpression Flatten<TOp>(
         CaveatExpression a,
         CaveatExpression b,

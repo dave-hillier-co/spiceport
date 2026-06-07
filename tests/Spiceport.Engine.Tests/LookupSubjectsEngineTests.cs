@@ -36,6 +36,21 @@ public class LookupSubjectsEngineTests
         }
         """;
 
+    // A schema whose intersection / exclusion permissions mix a wildcard operand with concrete
+    // operands, exercising the wildcard subject-set algebra (BaseSubjectSet port).
+    private const string WildcardAlgebraSchema = """
+        definition user {}
+
+        definition document {
+            relation any: user | user:*
+            relation special: user
+            relation blocked: user | user:*
+
+            permission special_and_any = special & any
+            permission special_minus_blocked = special - blocked
+        }
+        """;
+
     private const string CaveatSchema = """
         caveat over_age(age int, min_age int) {
           age >= min_age
@@ -213,6 +228,59 @@ public class LookupSubjectsEngineTests
         Assert.True(single.IsWildcard);
         Assert.Equal(CoreConstants.PublicWildcard, single.SubjectId);
         Assert.Null(single.Caveat);
+    }
+
+    [Fact]
+    public async Task WildcardIntersectConcrete_YieldsConcrete()
+    {
+        // special = {tom}; any = {*}. special & any must yield {tom} (a concrete matches a wildcard),
+        // not empty. The old keyed-by-id set produced empty because "*" != "user:tom".
+        var (store, rev) = await Seed(
+            Tuple("document", "doc1", "special", Onr("user", "tom")),
+            Tuple("document", "doc1", "any", Onr("user", CoreConstants.PublicWildcard)));
+        var engine = BuildEngine(WildcardAlgebraSchema);
+        var reader = store.SnapshotReader(rev);
+
+        var found = await Collect(engine.LookupSubjects(reader, Onr("document", "doc1", "special_and_any"), "user"));
+
+        var single = Assert.Single(found);
+        Assert.Equal("tom", single.SubjectId);
+        Assert.False(single.IsWildcard);
+        Assert.Null(single.Caveat);
+    }
+
+    [Fact]
+    public async Task BaseMinusWildcard_RemovesConcretesModuloExclusions()
+    {
+        // special = {tom, amy}; blocked = {*}. special - blocked removes everything.
+        var (store, rev) = await Seed(
+            Tuple("document", "doc1", "special", Onr("user", "tom")),
+            Tuple("document", "doc1", "special", Onr("user", "amy")),
+            Tuple("document", "doc1", "blocked", Onr("user", CoreConstants.PublicWildcard)));
+        var engine = BuildEngine(WildcardAlgebraSchema);
+        var reader = store.SnapshotReader(rev);
+
+        var found = await Collect(engine.LookupSubjects(reader, Onr("document", "doc1", "special_minus_blocked"), "user"));
+
+        Assert.Empty(found);
+    }
+
+    [Fact]
+    public async Task WildcardIntersectWildcard_YieldsWildcard()
+    {
+        // special would need a wildcard too; use any & blocked which are both wildcard-capable.
+        var (store, rev) = await Seed(
+            Tuple("document", "doc1", "any", Onr("user", CoreConstants.PublicWildcard)),
+            Tuple("document", "doc1", "special", Onr("user", "tom")),
+            Tuple("document", "doc1", "special", Onr("user", "amy")));
+        var engine = BuildEngine(WildcardAlgebraSchema);
+        var reader = store.SnapshotReader(rev);
+
+        // special & any : both tom and amy are concretes that match the wildcard => {tom, amy}.
+        var found = await Collect(engine.LookupSubjects(reader, Onr("document", "doc1", "special_and_any"), "user"));
+
+        Assert.Equal(["amy", "tom"], found.Select(f => f.SubjectId).OrderBy(x => x).ToArray());
+        Assert.All(found, f => Assert.False(f.IsWildcard));
     }
 
     [Fact]

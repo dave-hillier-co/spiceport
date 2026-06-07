@@ -187,7 +187,12 @@ public sealed record LookupResourcesReply(
 /// <summary>A resource found by a lookup, with its collapsed permissionship.</summary>
 /// <param name="ResourceId">The reachable resource object id.</param>
 /// <param name="Permissionship">Member or caveated (with missing context params).</param>
+/// <param name="AfterResultCursor">
+/// The opaque resume cursor positioned immediately after this resource, so a client can resume the
+/// stream right after it (mirrors v1 <c>after_result_cursor</c>). Null when no cursor is available.
+/// </param>
 [GenerateSerializer]
 public sealed record FoundResourceWire(
     [property: Id(0)] string ResourceId,
-    [property: Id(1)] Permissionship Permissionship);
+    [property: Id(1)] Permissionship Permissionship,
+    [property: Id(2)] string? AfterResultCursor = null);

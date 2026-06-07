@@ -146,12 +146,33 @@ public sealed class LookupResourcesEngine
         // subject of further resources up the chain, so the reverse walk must continue. For the
         // common terminal case there is no such self-referential entrypoint, so Portion #2 yields
         // nothing and the behaviour is unchanged. Duplicate resource ids are deduped by the caller.
-        if (subjectRel.Namespace == target.Namespace && subjectRel.Relation == target.Relation)
+        // The section (if any) for this nesting level positions the resume. A sentinel entrypoint
+        // index of -1 marks a resume *within* Portion #1 (the self-match results); a non-negative
+        // index marks a resume in Portion #2, meaning Portion #1 was already fully drained on a prior
+        // page and must be skipped entirely here.
+        var thisSection = cursorSections.Count > 0 ? cursorSections[0] : null;
+        var deeperSections = cursorSections.Count > 0 ? cursorSections.RemoveAt(0) : [];
+
+        const int Portion1Section = -1;
+        var resumingPortion2 = thisSection is { } topSec && topSec.EntrypointIndex >= 0;
+        if (subjectRel.Namespace == target.Namespace && subjectRel.Relation == target.Relation && !resumingPortion2)
         {
+            var portion1SkipUpTo = thisSection is { } p1 && p1.EntrypointIndex == Portion1Section
+                ? p1.LastResourceId
+                : null;
+
             foreach (var id in subjects.Keys.OrderBy(x => x, StringComparer.Ordinal))
             {
+                if (portion1SkipUpTo is { } skip1 && string.CompareOrdinal(id, skip1) <= 0)
+                    continue;
+
                 var state = subjects[id];
-                yield return new FoundResource(id, state.ForSubjectIds, state.Membership, state.Missing);
+                // Decorate every self-match with a resume cursor so a limited page resumes correctly
+                // instead of silently dropping the remaining self-matches.
+                var cursorOut = new LookupResourcesCursor(
+                    ImmutableList.Create(new LookupResourcesCursorSection(Portion1Section, id)));
+                yield return new FoundResource(id, state.ForSubjectIds, state.Membership, state.Missing)
+                    with { AfterCursor = cursorOut };
             }
         }
 
@@ -169,18 +190,19 @@ public sealed class LookupResourcesEngine
         if (entrypoints.Count == 0)
             yield break;
 
-        // Cursor: the section (if any) for this nesting level positions the resumed entrypoint.
-        var thisSection = cursorSections.Count > 0 ? cursorSections[0] : null;
-        var deeperSections = cursorSections.Count > 0 ? cursorSections.RemoveAt(0) : [];
+        // Portion #2 resume positioning: only honour the section's entrypoint index when it is a
+        // Portion #2 section (>= 0). A Portion #1 section (-1) means "resume mid self-match"; Portion
+        // #2 then starts from its first entrypoint with no skip.
+        var p2Section = thisSection is { } ts && ts.EntrypointIndex >= 0 ? thisSection : null;
 
         for (var epIndex = 0; epIndex < entrypoints.Count; epIndex++)
         {
             ct.ThrowIfCancellationRequested();
 
-            if (thisSection is { } sec && epIndex < sec.EntrypointIndex)
+            if (p2Section is { } sec && epIndex < sec.EntrypointIndex)
                 continue;
 
-            var skipUpToResourceId = thisSection is { } s && epIndex == s.EntrypointIndex
+            var skipUpToResourceId = p2Section is { } s && epIndex == s.EntrypointIndex
                 ? s.LastResourceId
                 : null;
 
@@ -203,7 +225,7 @@ public sealed class LookupResourcesEngine
             if (candidates.Count == 0)
                 continue;
 
-            var nestedSections = thisSection is { } s2 && epIndex == s2.EntrypointIndex ? deeperSections : [];
+            var nestedSections = p2Section is { } s2 && epIndex == s2.EntrypointIndex ? deeperSections : [];
             await foreach (var found in LookupRec(
                 reader, entrypoint.ContainingRelation, candidates, target, terminalSubject, caveatContext, now,
                 depthRemaining - 1, visited, nestedSections, ct).ConfigureAwait(false))

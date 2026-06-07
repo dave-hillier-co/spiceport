@@ -315,34 +315,70 @@ public sealed class LookupSubjectsEngine
         rel.OptionalCaveat is { } c ? CaveatExpression.FromCaveat(c) : null;
 
     /// <summary>
-    /// A combinable set of found subjects keyed by subject id, tracking each subject's accumulated
-    /// caveat and wildcard flag. Models SpiceDB's per-child <c>(subjectId -&gt; caveat)</c> reducer.
+    /// A combinable set of found subjects with first-class wildcard semantics. Port of SpiceDB's
+    /// <c>internal/datasets/basesubjectset.go</c>: concrete subjects are tracked by id, and the
+    /// public wildcard (<c>"*"</c>) is tracked separately as a single optional entry carrying its own
+    /// caveat and a list of <em>excluded</em> concrete subjects.
     /// </summary>
     /// <remarks>
-    /// A subject whose entry has a null caveat is unconditionally present (a caveat-free member
-    /// dominates an OR). Wildcards are carried verbatim by id (<c>"*"</c>); full wildcard×concrete set
-    /// algebra is deferred per the design — the cross-check oracle validates membership.
+    /// Unlike a plain set, a union between a wildcard and a concrete keeps BOTH present. Intersecting a
+    /// wildcard with a concrete yields the concrete (a concrete matches the wildcard, modulo
+    /// exclusions and caveats); subtracting a wildcard removes all concretes modulo its exclusions.
+    /// A concrete/exclusion whose entry has a null caveat is unconditional.
     /// </remarks>
     private sealed class SubjectSet
     {
-        // id -> (caveat, isWildcard). A present key with a null caveat means unconditional.
-        private readonly Dictionary<string, Entry> _entries = new();
+        // Concrete subjects by id (never the wildcard id).
+        private readonly Dictionary<string, Concrete> _concrete = new();
+        // The single optional public wildcard with its exclusions, or null when absent.
+        private Wildcard? _wildcard;
 
-        private readonly record struct Entry(CaveatExpression? Caveat, bool IsWildcard);
+        private readonly record struct Concrete(string Id, CaveatExpression? Caveat);
 
+        private sealed record Wildcard(CaveatExpression? Caveat, IReadOnlyList<Concrete> Excluded);
+
+        /// <summary>Adds a subject (concrete or wildcard) via union semantics.</summary>
         public void Add(string id, CaveatExpression? caveat, bool isWildcard)
         {
-            // Union semantics for repeated adds of the same id within a set: OR the caveats.
-            if (_entries.TryGetValue(id, out var existing))
-                _entries[id] = new Entry(CaveatExpression.CombineOr(existing.Caveat, caveat), existing.IsWildcard || isWildcard);
+            if (id == CoreConstants.PublicWildcard || isWildcard)
+            {
+                Add(new Wildcard(caveat, []));
+                return;
+            }
+            Add(new Concrete(id, caveat));
+        }
+
+        private void Add(Concrete adding)
+        {
+            // Union the wildcard with this concrete (the wildcard's exclusion of this id, if any, is
+            // weakened) and union the concrete with any existing same-id concrete.
+            if (_concrete.TryGetValue(adding.Id, out var existing))
+                _concrete[adding.Id] = new Concrete(adding.Id, CaveatExpression.OrKeepOther(existing.Caveat, adding.Caveat));
             else
-                _entries[id] = new Entry(caveat, isWildcard);
+                _concrete[adding.Id] = adding;
+
+            if (_wildcard is { } w)
+                _wildcard = UnionWildcardWithConcrete(w, adding);
+        }
+
+        private void Add(Wildcard adding)
+        {
+            _wildcard = UnionWildcardWithWildcard(_wildcard, adding);
+            // Re-union the wildcard with every concrete so its exclusions stay consistent.
+            if (_wildcard is { } w)
+            {
+                foreach (var c in _concrete.Values)
+                    w = UnionWildcardWithConcrete(w, c);
+                _wildcard = w;
+            }
         }
 
         public void UnionWith(SubjectSet other)
         {
-            foreach (var (id, e) in other._entries)
-                Add(id, e.Caveat, e.IsWildcard);
+            foreach (var c in other._concrete.Values)
+                Add(c);
+            if (other._wildcard is { } w)
+                Add(w);
         }
 
         /// <summary>Returns a copy of this set with <paramref name="caveat"/> AND-combined into every entry.</summary>
@@ -351,15 +387,22 @@ public sealed class LookupSubjectsEngine
             if (caveat is null)
                 return this;
             var copy = new SubjectSet();
-            foreach (var (id, e) in _entries)
-                copy._entries[id] = new Entry(CaveatExpression.CombineAnd(caveat, e.Caveat), e.IsWildcard);
+            foreach (var (id, c) in _concrete)
+                copy._concrete[id] = new Concrete(id, CaveatExpression.CombineAnd(caveat, c.Caveat));
+            if (_wildcard is { } w)
+            {
+                // The caveat constrains whether the wildcard applies; exclusions are unchanged.
+                copy._wildcard = new Wildcard(CaveatExpression.CombineAnd(caveat, w.Caveat), w.Excluded);
+            }
             return copy;
         }
 
         public IEnumerable<FoundSubject> ToFoundSubjects()
         {
-            foreach (var (id, e) in _entries)
-                yield return new FoundSubject(id, e.Caveat, e.IsWildcard || id == CoreConstants.PublicWildcard);
+            foreach (var c in _concrete.Values)
+                yield return new FoundSubject(c.Id, c.Caveat, IsWildcard: false);
+            if (_wildcard is { } w)
+                yield return new FoundSubject(CoreConstants.PublicWildcard, w.Caveat, IsWildcard: true);
         }
 
         public static SubjectSet Union(IReadOnlyList<SubjectSet> sets)
@@ -375,25 +418,9 @@ public sealed class LookupSubjectsEngine
             if (sets.Count == 0)
                 return new SubjectSet();
 
-            var result = new SubjectSet();
-            foreach (var (id, e) in sets[0]._entries)
-            {
-                var caveat = e.Caveat;
-                var isWildcard = e.IsWildcard;
-                var inAll = true;
-                for (var i = 1; i < sets.Count; i++)
-                {
-                    if (!sets[i]._entries.TryGetValue(id, out var other))
-                    {
-                        inAll = false;
-                        break;
-                    }
-                    caveat = CaveatExpression.CombineAnd(caveat, other.Caveat);
-                    isWildcard = isWildcard || other.IsWildcard;
-                }
-                if (inAll)
-                    result._entries[id] = new Entry(caveat, isWildcard);
-            }
+            var result = sets[0].Clone();
+            for (var i = 1; i < sets.Count; i++)
+                result.IntersectWith(sets[i]);
             return result;
         }
 
@@ -402,27 +429,307 @@ public sealed class LookupSubjectsEngine
             if (sets.Count == 0)
                 return new SubjectSet();
 
-            var result = new SubjectSet();
-            // base minus the union of the rest.
-            var excluded = Union(sets.Skip(1).ToList());
-            foreach (var (id, baseEntry) in sets[0]._entries)
+            var result = sets[0].Clone();
+            for (var i = 1; i < sets.Count; i++)
+                result.SubtractAll(sets[i]);
+            return result;
+        }
+
+        private SubjectSet Clone()
+        {
+            var copy = new SubjectSet();
+            foreach (var (id, c) in _concrete)
+                copy._concrete[id] = c;
+            copy._wildcard = _wildcard;
+            return copy;
+        }
+
+        // ---- intersection (port of IntersectionDifference) ----
+
+        private void IntersectWith(SubjectSet other)
+        {
+            var existingWildcard = _wildcard;
+            var otherWildcard = other._wildcard;
+
+            var newWildcard = IntersectWildcardWithWildcard(existingWildcard, otherWildcard);
+
+            var updated = new Dictionary<string, Concrete>(_concrete.Count);
+            foreach (var concrete in _concrete.Values)
             {
-                if (!excluded._entries.TryGetValue(id, out var exc))
+                Concrete? otherConcrete =
+                    other._concrete.TryGetValue(concrete.Id, out var oc) ? oc : null;
+
+                var concreteIntersected = IntersectConcreteWithConcrete(concrete, otherConcrete);
+                var otherWildcardIntersected = IntersectConcreteWithWildcard(concrete, otherWildcard);
+
+                var result = UnionConcreteWithConcrete(concreteIntersected, otherWildcardIntersected);
+                if (result is { } r)
+                    updated[concrete.Id] = r;
+            }
+
+            if (existingWildcard is not null)
+            {
+                foreach (var otherSubject in other._concrete.Values)
                 {
-                    // Not excluded at all: survives with its base caveat.
-                    result._entries[id] = baseEntry;
-                    continue;
+                    var existingWildcardIntersect = IntersectConcreteWithWildcard(otherSubject, existingWildcard);
+                    if (updated.TryGetValue(otherSubject.Id, out var existingUpdated))
+                    {
+                        var result = UnionConcreteWithConcrete(existingUpdated, existingWildcardIntersect);
+                        if (result is { } r)
+                            updated[otherSubject.Id] = r;
+                    }
+                    else if (existingWildcardIntersect is { } ewi)
+                    {
+                        updated[otherSubject.Id] = ewi;
+                    }
+                }
+            }
+
+            _concrete.Clear();
+            foreach (var (id, c) in updated)
+                _concrete[id] = c;
+            _wildcard = newWildcard;
+        }
+
+        // ---- subtraction (port of SubtractAll / Subtract) ----
+
+        private void SubtractAll(SubjectSet other)
+        {
+            foreach (var c in other._concrete.Values)
+                Subtract(new Concrete(c.Id, c.Caveat), isWildcard: false, []);
+            if (other._wildcard is { } w)
+                Subtract(new Concrete(CoreConstants.PublicWildcard, w.Caveat), isWildcard: true, w.Excluded);
+        }
+
+        private void Subtract(Concrete toRemove, bool isWildcard, IReadOnlyList<Concrete> wildcardExclusions)
+        {
+            if (isWildcard)
+            {
+                var wildcardToRemove = new Wildcard(toRemove.Caveat, wildcardExclusions);
+                foreach (var id in _concrete.Keys.ToList())
+                {
+                    var updated = SubtractWildcardFromConcrete(_concrete[id], wildcardToRemove);
+                    if (updated is { } u)
+                        _concrete[id] = u;
+                    else
+                        _concrete.Remove(id);
                 }
 
-                // Unconditionally excluded => removed.
-                if (exc.Caveat is null)
-                    continue;
-
-                // Conditionally excluded => survives as base AND NOT excluded.
-                var caveat = CaveatExpression.Subtract(baseEntry.Caveat, exc.Caveat);
-                result._entries[id] = new Entry(caveat, baseEntry.IsWildcard);
+                var (newWildcard, concretesToAdd) = SubtractWildcardFromWildcard(_wildcard, wildcardToRemove);
+                _wildcard = newWildcard;
+                foreach (var c in concretesToAdd)
+                    _concrete[c.Id] = c;
+                return;
             }
-            return result;
+
+            if (_concrete.TryGetValue(toRemove.Id, out var existing))
+            {
+                var updated = SubtractConcreteFromConcrete(existing, toRemove);
+                if (updated is { } u)
+                    _concrete[toRemove.Id] = u;
+                else
+                    _concrete.Remove(toRemove.Id);
+            }
+
+            if (_wildcard is { } w)
+                _wildcard = SubtractConcreteFromWildcard(w, toRemove);
+        }
+
+        // ---- combinators (ports of the basesubjectset.go helpers) ----
+
+        private static Concrete? UnionConcreteWithConcrete(Concrete? existing, Concrete? adding)
+        {
+            if (existing is null)
+                return adding;
+            if (adding is null)
+                return existing;
+            // A null (unconditional) caveat on either side dominates the OR.
+            return new Concrete(existing.Value.Id, CaveatExpression.CombineOr(existing.Value.Caveat, adding.Value.Caveat));
+        }
+
+        private static Wildcard UnionWildcardWithWildcard(Wildcard? existing, Wildcard adding)
+        {
+            if (existing is null)
+                return adding;
+
+            // The union wildcard applies when either applies; its exclusions are those excluded by
+            // BOTH (intersection of exclusion sets), since an exclusion only survives if both exclude it.
+            var caveat = CaveatExpression.OrKeepOther(existing.Caveat, adding.Caveat);
+            var addingExclusions = adding.Excluded.ToDictionary(e => e.Id);
+            var newExclusions = new List<Concrete>();
+            foreach (var ex in existing.Excluded)
+            {
+                if (addingExclusions.TryGetValue(ex.Id, out var other))
+                {
+                    // Excluded by both: survives as an exclusion only when both exclusions hold (AND).
+                    var c = CaveatExpression.CombineAnd(ex.Caveat, other.Caveat);
+                    newExclusions.Add(new Concrete(ex.Id, c));
+                }
+            }
+            return new Wildcard(caveat, newExclusions);
+        }
+
+        private static Wildcard UnionWildcardWithConcrete(Wildcard wildcard, Concrete adding)
+        {
+            // Adding a concrete to a wildcard weakens any matching exclusion: the concrete is now
+            // present, so the exclusion only holds when the concrete's caveat is false AND the prior
+            // exclusion held. A non-caveated concrete removes the exclusion outright.
+            var newExclusions = new List<Concrete>();
+            foreach (var ex in wildcard.Excluded)
+            {
+                if (ex.Id != adding.Id)
+                {
+                    newExclusions.Add(ex);
+                    continue;
+                }
+                if (adding.Caveat is null)
+                    continue; // unconditional concrete: exclusion removed.
+                // exclusion survives as ex.Caveat AND NOT(adding.Caveat).
+                var c = CaveatExpression.CombineAnd(ex.Caveat, CaveatExpression.Invert(adding.Caveat));
+                if (c is not null)
+                    newExclusions.Add(new Concrete(ex.Id, c));
+            }
+            return new Wildcard(wildcard.Caveat, newExclusions);
+        }
+
+        private static Concrete? IntersectConcreteWithConcrete(Concrete first, Concrete? second)
+        {
+            if (second is null)
+                return null;
+            return new Concrete(first.Id, CaveatExpression.CombineAnd(first.Caveat, second.Value.Caveat));
+        }
+
+        private static Wildcard? IntersectWildcardWithWildcard(Wildcard? first, Wildcard? second)
+        {
+            if (first is null || second is null)
+                return null;
+            // Intersection: AND of conditionals, UNION of exclusions.
+            var exclusions = new Dictionary<string, Concrete>();
+            foreach (var e in first.Excluded)
+                exclusions[e.Id] = exclusions.TryGetValue(e.Id, out var x)
+                    ? new Concrete(e.Id, CaveatExpression.OrKeepOther(x.Caveat, e.Caveat))
+                    : e;
+            foreach (var e in second.Excluded)
+                exclusions[e.Id] = exclusions.TryGetValue(e.Id, out var x)
+                    ? new Concrete(e.Id, CaveatExpression.OrKeepOther(x.Caveat, e.Caveat))
+                    : e;
+            return new Wildcard(CaveatExpression.CombineAnd(first.Caveat, second.Caveat), exclusions.Values.ToList());
+        }
+
+        private static Concrete? IntersectConcreteWithWildcard(Concrete concrete, Wildcard? wildcard)
+        {
+            if (wildcard is null)
+                return null;
+
+            var exclusion = wildcard.Excluded.FirstOrDefault(e => e.Id == concrete.Id);
+            var isExcluded = wildcard.Excluded.Any(e => e.Id == concrete.Id);
+
+            if (!isExcluded && wildcard.Caveat is null)
+                return concrete; // {tom} & {*} => {tom}
+            if (!isExcluded && wildcard.Caveat is not null)
+                return new Concrete(concrete.Id, CaveatExpression.CombineAnd(concrete.Caveat, wildcard.Caveat));
+            if (isExcluded && exclusion.Caveat is null)
+                return null; // unconditionally excluded.
+            // excluded conditionally: concrete AND wildcard AND NOT(exclusion).
+            return new Concrete(concrete.Id,
+                CaveatExpression.CombineAnd(concrete.Caveat,
+                    CaveatExpression.CombineAnd(wildcard.Caveat, CaveatExpression.Invert(exclusion.Caveat))));
+        }
+
+        private static Concrete? SubtractConcreteFromConcrete(Concrete existing, Concrete toRemove)
+        {
+            if (toRemove.Caveat is null)
+                return null;
+            // existing AND NOT(toRemove).
+            return new Concrete(existing.Id,
+                CaveatExpression.CombineAnd(existing.Caveat, CaveatExpression.Invert(toRemove.Caveat)));
+        }
+
+        private static Wildcard SubtractConcreteFromWildcard(Wildcard wildcard, Concrete concreteToRemove)
+        {
+            // Subtracting a concrete adds it to the wildcard's exclusions.
+            var newExclusions = new List<Concrete>();
+            var found = false;
+            foreach (var ex in wildcard.Excluded)
+            {
+                if (ex.Id == concreteToRemove.Id)
+                {
+                    // shortcircuited OR: either side non-caveated => exclusion non-caveated.
+                    var c = CaveatExpression.CombineOr(ex.Caveat, concreteToRemove.Caveat);
+                    newExclusions.Add(new Concrete(ex.Id, c));
+                    found = true;
+                }
+                else
+                {
+                    newExclusions.Add(ex);
+                }
+            }
+            if (!found)
+                newExclusions.Add(concreteToRemove);
+            return new Wildcard(wildcard.Caveat, newExclusions);
+        }
+
+        private static Concrete? SubtractWildcardFromConcrete(Concrete existingConcrete, Wildcard wildcardToRemove)
+        {
+            var exclusion = wildcardToRemove.Excluded.FirstOrDefault(e => e.Id == existingConcrete.Id);
+            var isExcluded = wildcardToRemove.Excluded.Any(e => e.Id == existingConcrete.Id);
+
+            if (!isExcluded)
+            {
+                // Not in the exclusions: removed when the wildcard applies. Unconditional wildcard
+                // removes it outright; a caveated wildcard keeps it conditional on NOT(wildcard).
+                if (wildcardToRemove.Caveat is null)
+                    return null;
+                return new Concrete(existingConcrete.Id,
+                    CaveatExpression.CombineAnd(existingConcrete.Caveat, CaveatExpression.Invert(wildcardToRemove.Caveat)));
+            }
+
+            // Excluded from the wildcard: present unless the exclusion itself is conditional.
+            if (exclusion.Caveat is null)
+                return existingConcrete;
+
+            // Present when the exclusion holds OR the wildcard does not apply.
+            var exclusionConditional = CaveatExpression.OrKeepOther(CaveatExpression.Invert(wildcardToRemove.Caveat), exclusion.Caveat);
+            return new Concrete(existingConcrete.Id,
+                CaveatExpression.CombineAnd(existingConcrete.Caveat, exclusionConditional));
+        }
+
+        private static (Wildcard? Wildcard, IReadOnlyList<Concrete> ConcretesToAdd) SubtractWildcardFromWildcard(
+            Wildcard? existing, Wildcard toRemove)
+        {
+            if (existing is null)
+                return (null, []);
+
+            // Unconditional removal with no exclusions: {*} - {*} => {}.
+            if (toRemove.Caveat is null && toRemove.Excluded.Count == 0)
+                return (null, []);
+
+            var existingExclusions = existing.Excluded.ToDictionary(e => e.Id);
+            var concretesToAdd = new List<Concrete>();
+            foreach (var excludedSubject in toRemove.Excluded)
+            {
+                var hasExisting = existingExclusions.TryGetValue(excludedSubject.Id, out var existingExclusion);
+                if (!hasExisting || existingExclusion.Caveat is not null)
+                {
+                    var expr = CaveatExpression.CombineAnd(
+                        CaveatExpression.CombineAnd(existing.Caveat, toRemove.Caveat),
+                        excludedSubject.Caveat);
+                    if (hasExisting && existingExclusion.Caveat is not null)
+                    {
+                        expr = CaveatExpression.CombineAnd(
+                            CaveatExpression.CombineAnd(
+                                CaveatExpression.CombineAnd(existing.Caveat, toRemove.Caveat),
+                                CaveatExpression.Invert(existingExclusion.Caveat)),
+                            excludedSubject.Caveat);
+                    }
+                    concretesToAdd.Add(new Concrete(excludedSubject.Id, expr));
+                }
+            }
+
+            var combined = CaveatExpression.CombineAnd(existing.Caveat, CaveatExpression.Invert(toRemove.Caveat));
+            if (combined is not null)
+                return (new Wildcard(combined, existing.Excluded), concretesToAdd);
+            return (null, concretesToAdd);
         }
     }
 }

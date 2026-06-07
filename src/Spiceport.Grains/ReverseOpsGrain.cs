@@ -123,7 +123,8 @@ public sealed class ReverseOpsGrain(
             var permissionship = found.Membership == Membership.Caveated
                 ? Permissionship.Caveated(found.MissingContextParams)
                 : Permissionship.Member;
-            page.Add(new FoundResourceWire(found.ResourceId, permissionship));
+            var perItemCursor = ReverseOpsCursorCodec.Encode(found.AfterCursor);
+            page.Add(new FoundResourceWire(found.ResourceId, permissionship, perItemCursor));
             afterCursor = found.AfterCursor;
             produced++;
         }

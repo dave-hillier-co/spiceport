@@ -293,6 +293,34 @@ public class LookupResourcesEngineTests
     }
 
     [Fact]
+    public async Task Portion1SelfMatch_CarriesResumeCursor()
+    {
+        // A recursive relation (group.member admits group#member) makes a matched group both a
+        // resource AND a subject of further resources. When the subject IS a group#member, Portion #1
+        // self-matches the group(s) directly; each such result must carry a resume cursor so a limited
+        // page resumes rather than silently truncating.
+        var (store, rev) = await Seed(
+            Tuple("group", "ga", "member", Onr("group", "subgrp", "member")),
+            Tuple("group", "gb", "member", Onr("group", "subgrp", "member")),
+            Tuple("group", "gc", "member", Onr("group", "subgrp", "member")));
+        var engine = BuildEngine(Schema);
+        var reader = store.SnapshotReader(rev);
+
+        // subgrp#member is a member of ga, gb, gc (Portion #2) and also self-matches (Portion #1).
+        var first = await Collect(engine.LookupResources(
+            reader, "group", "subgrp", "member", "group", "member", limit: 1));
+        var firstResource = Assert.Single(first);
+        Assert.NotNull(firstResource.AfterCursor); // the Portion #1 result is decorated.
+
+        var rest = await Collect(engine.LookupResources(
+            reader, "group", "subgrp", "member", "group", "member", cursor: firstResource.AfterCursor));
+
+        Assert.DoesNotContain(rest, r => r.ResourceId == firstResource.ResourceId);
+        var all = first.Concat(rest).Select(r => r.ResourceId).Distinct().OrderBy(x => x).ToArray();
+        Assert.Equal(["ga", "gb", "gc", "subgrp"], all);
+    }
+
+    [Fact]
     public async Task CyclicSchema_Terminates()
     {
         var (store, rev) = await Seed(

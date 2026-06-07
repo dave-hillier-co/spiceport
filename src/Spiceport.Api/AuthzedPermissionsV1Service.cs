@@ -236,7 +236,13 @@ public sealed class AuthzedPermissionsV1Service(
 
         var context5 = StructToDict(request.Context);
         var consistency = ToWire(request.Consistency);
-        string? cursor = null;
+
+        // v1 contract: optional_limit (field 6) caps the resources returned; optional_cursor (field 7)
+        // resumes after a prior page. SpiceDB disables cursors entirely when no limit is set, so we
+        // only attach after_result_cursor when a limit was requested.
+        var limit = request.OptionalLimit == 0 ? (int?)null : (int)request.OptionalLimit;
+        var emitCursors = limit is not null;
+        string? cursor = request.OptionalCursor is { } oc && !string.IsNullOrEmpty(oc.Token) ? oc.Token : null;
 
         // Validate the resource definition+permission and subject definition+relation up front
         // (SpiceDB: CheckNamespaceAndRelations) before streaming any results.
@@ -245,6 +251,7 @@ public sealed class AuthzedPermissionsV1Service(
             new SchemaValidation.TypeAndRelation(request.ResourceObjectType, request.Permission, AllowEllipsis: false),
             new SchemaValidation.TypeAndRelation(request.Subject.Object.ObjectType, subjectRelation, AllowEllipsis: true));
 
+        var remaining = limit;
         while (!context.CancellationToken.IsCancellationRequested)
         {
             LookupResourcesReply reply;
@@ -257,7 +264,7 @@ public sealed class AuthzedPermissionsV1Service(
                     request.Subject.Object.ObjectId,
                     subjectRelation,
                     context5,
-                    null,
+                    remaining,
                     cursor,
                     consistency));
             }
@@ -284,7 +291,17 @@ public sealed class AuthzedPermissionsV1Service(
                     partial.MissingRequiredContext.AddRange(r.Permissionship.MissingContextParams);
                     resp.PartialCaveatInfo = partial;
                 }
+                if (emitCursors && !string.IsNullOrEmpty(r.AfterResultCursor))
+                    resp.AfterResultCursor = new V1::Cursor { Token = r.AfterResultCursor };
                 await responseStream.WriteAsync(resp);
+            }
+
+            if (remaining is { } rem)
+            {
+                remaining = rem - reply.Resources.Count;
+                // A limited request is satisfied by a single page (the grain returns up to `remaining`
+                // results plus a continuation cursor the client uses to fetch the next page itself).
+                break;
             }
 
             if (reply.Resources.Count == 0 || string.IsNullOrEmpty(reply.Cursor))
@@ -307,6 +324,11 @@ public sealed class AuthzedPermissionsV1Service(
         var consistency = ToWire(request.Consistency);
         string? cursor = null;
 
+        // v1 contract: optional_concrete_limit (field 7) caps the *concrete* (non-wildcard) subjects
+        // returned. optional_cursor is not supported for LookupSubjects (the proto documents it as
+        // ignored), so we do not read it.
+        var limit = request.OptionalConcreteLimit == 0 ? (int?)null : (int)request.OptionalConcreteLimit;
+
         // Validate the resource definition+permission and subject definition+relation up front
         // (SpiceDB: CheckNamespaceAndRelations) before streaming any results.
         SchemaValidation.CheckNamespaceAndRelations(
@@ -314,8 +336,14 @@ public sealed class AuthzedPermissionsV1Service(
             new SchemaValidation.TypeAndRelation(request.Resource.ObjectType, request.Permission, AllowEllipsis: false),
             new SchemaValidation.TypeAndRelation(request.SubjectObjectType, subjectRelation, AllowEllipsis: true));
 
+        var emitted = 0;
         while (!context.CancellationToken.IsCancellationRequested)
         {
+            // The grain caps each page; once we have served `limit` subjects we stop entirely.
+            var remaining = limit is { } l ? l - emitted : (int?)null;
+            if (remaining is <= 0)
+                break;
+
             LookupSubjectsReply reply;
             try
             {
@@ -326,7 +354,7 @@ public sealed class AuthzedPermissionsV1Service(
                     request.SubjectObjectType,
                     subjectRelation,
                     context6,
-                    null,
+                    remaining,
                     cursor,
                     consistency));
             }
@@ -368,6 +396,9 @@ public sealed class AuthzedPermissionsV1Service(
                     resp.PartialCaveatInfo = partial.Clone();
                 }
                 await responseStream.WriteAsync(resp);
+                // The cap is a *concrete* limit: wildcards do not count against it.
+                if (!s.IsWildcard)
+                    emitted++;
             }
 
             if (reply.Subjects.Count == 0 || string.IsNullOrEmpty(reply.Cursor))
