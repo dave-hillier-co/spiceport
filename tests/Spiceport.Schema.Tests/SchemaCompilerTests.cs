@@ -213,6 +213,8 @@ public class SchemaCompilerTests
     public void CompilesWithExpirationRelation()
     {
         const string schema = """
+            use expiration
+
             definition document {
               relation viewer: user with expiration
               relation editor: user with some_caveat and expiration
@@ -252,5 +254,105 @@ public class SchemaCompilerTests
         const string schema = "definition document { relation owner }";
         var ex = Assert.Throws<SchemaCompileException>(() => SchemaCompiler.Compile(schema));
         Assert.True(ex.Line > 0);
+    }
+
+    [Fact]
+    public void CompilesSelfOperandUnderUseSelf()
+    {
+        const string schema = """
+            use self
+
+            definition user {}
+
+            definition document {
+              relation viewer: user
+              permission view = self + viewer
+            }
+            """;
+
+        var doc = SchemaCompiler.Compile(schema).Single(d => d.Name == "document");
+        var view = doc.Relations.Single(r => r.Name == "view");
+        var op = view.UsersetRewrite!.Operation;
+        Assert.Equal(SetOperationType.Union, op.Type);
+        Assert.Contains(op.Children, c => c is SetOperationChild.Self);
+    }
+
+    [Fact]
+    public void SelfWithoutFlagIsAnOrdinaryReference()
+    {
+        const string schema = """
+            definition document {
+              permission view = self
+            }
+            """;
+
+        var doc = Assert.Single(SchemaCompiler.Compile(schema));
+        var view = doc.Relations.Single(r => r.Name == "view");
+        var child = Assert.Single(view.UsersetRewrite!.Operation.Children);
+        var computed = Assert.IsType<SetOperationChild.ComputedUsersetChild>(child);
+        Assert.Equal("self", computed.Value.Relation);
+    }
+
+    [Fact]
+    public void RejectsWithExpirationWithoutUseFlag()
+    {
+        const string schema = """
+            definition user {}
+
+            definition document {
+              relation viewer: user with expiration
+            }
+            """;
+
+        // Without `use expiration`, `expiration` stays an identifier and is parsed as a caveat
+        // name, which fails caveat-existence validation rather than silently enabling expiration.
+        var doc = SchemaCompiler.Compile(schema).Single(d => d.Name == "document");
+        var viewer = doc.Relations.Single(r => r.Name == "viewer");
+        var allowed = Assert.Single(viewer.TypeInformation!.AllowedDirectRelations);
+        Assert.False(allowed.RequiresExpiration);
+        Assert.Equal("expiration", allowed.RequiredCaveat!.CaveatName);
+    }
+
+    [Fact]
+    public void RejectsUseFlagAfterDefinition()
+    {
+        const string schema = """
+            definition user {}
+            use expiration
+            """;
+
+        Assert.Throws<SchemaCompileException>(() => SchemaCompiler.Compile(schema));
+    }
+
+    [Fact]
+    public void RejectsRepeatedWith()
+    {
+        const string schema = """
+            definition document {
+              relation viewer: user with cav1 with cav2
+            }
+            """;
+
+        Assert.Throws<SchemaCompileException>(() => SchemaCompiler.Compile(schema));
+    }
+
+    [Fact]
+    public void RejectsNestedArrows()
+    {
+        const string schema = """
+            definition document {
+              permission view = a->b->c
+            }
+            """;
+
+        var ex = Assert.Throws<SchemaCompileException>(() => SchemaCompiler.Compile(schema));
+        Assert.Contains("Nested arrows not yet supported", ex.Message);
+    }
+
+    [Fact]
+    public void RejectsUnknownUseFlag()
+    {
+        const string schema = "use bogus\ndefinition user {}";
+        Assert.Throws<SchemaCompileException>(() => SchemaCompiler.Compile(schema));
     }
 }

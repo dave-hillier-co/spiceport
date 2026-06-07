@@ -48,6 +48,9 @@ internal sealed record ReferenceExpr(string Name) : ExprNode;
 /// <summary>The <c>nil</c> empty-set operand.</summary>
 internal sealed record NilExpr : ExprNode;
 
+/// <summary>The <c>self</c> operand: the resource treated as its own subject.</summary>
+internal sealed record SelfExpr : ExprNode;
+
 /// <summary>An arrow expression <c>tupleset-&gt;computed</c>, optionally functioned.</summary>
 internal sealed record ArrowExpr(string Tupleset, string Computed, string? Function) : ExprNode;
 

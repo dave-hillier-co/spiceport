@@ -48,7 +48,20 @@ internal readonly record struct Token(TokenType Type, string Text, int Line, int
 internal sealed class Lexer
 {
     private static readonly HashSet<string> Keywords =
-        ["definition", "relation", "permission", "caveat", "nil", "use"];
+        ["definition", "relation", "permission", "caveat", "nil", "use", "with"];
+
+    /// <summary>
+    /// Identifiers that are only promoted to keywords when the matching <c>use &lt;flag&gt;</c>
+    /// declaration is present. Mirrors SpiceDB's flaggable lexer (pkg/schemadsl/lexer/flags.go):
+    /// <c>use expiration</c> promotes <c>expiration</c> and <c>and</c>; <c>use self</c> promotes
+    /// <c>self</c>. The flag must be declared before any definition or caveat.
+    /// </summary>
+    private static readonly IReadOnlyDictionary<string, string[]> FlagPromotedKeywords =
+        new Dictionary<string, string[]>
+        {
+            ["expiration"] = ["expiration", "and"],
+            ["self"] = ["self"],
+        };
 
     private readonly string _input;
     private int _pos;
@@ -86,9 +99,74 @@ internal sealed class Lexer
             tokens.Add(token);
             if (token.Type == TokenType.Eof)
             {
-                return tokens;
+                break;
             }
         }
+
+        return ApplyFlags(tokens);
+    }
+
+    /// <summary>
+    /// Applies <c>use &lt;flag&gt;</c> declarations, promoting flag-gated identifiers
+    /// (<c>expiration</c>, <c>and</c>, <c>self</c>) to keywords. Mirrors SpiceDB's
+    /// flaggable lexer: a <c>use</c> flag must appear before any <c>definition</c> or
+    /// <c>caveat</c> (otherwise it is rejected), and only the declared flags take effect.
+    /// </summary>
+    private static List<Token> ApplyFlags(List<Token> tokens)
+    {
+        var promoted = new HashSet<string>();
+        bool seenDefinition = false;
+
+        for (int i = 0; i < tokens.Count; i++)
+        {
+            Token token = tokens[i];
+
+            if (token.Type == TokenType.Keyword && token.Text == "use")
+            {
+                if (seenDefinition)
+                {
+                    throw new SchemaCompileException(
+                        "use flags must appear before any definition or caveat", token.Line, token.Column);
+                }
+
+                if (i + 1 >= tokens.Count || tokens[i + 1].Type is not (TokenType.Identifier or TokenType.Keyword))
+                {
+                    throw new SchemaCompileException(
+                        "expected a feature name after 'use'", token.Line, token.Column);
+                }
+
+                string flag = tokens[i + 1].Text;
+                if (!FlagPromotedKeywords.ContainsKey(flag))
+                {
+                    throw new SchemaCompileException(
+                        $"unknown use flag '{flag}'", tokens[i + 1].Line, tokens[i + 1].Column);
+                }
+
+                promoted.UnionWith(FlagPromotedKeywords[flag]);
+                continue;
+            }
+
+            if (token.Type == TokenType.Keyword && token.Text is "definition" or "caveat")
+            {
+                seenDefinition = true;
+            }
+        }
+
+        if (promoted.Count == 0)
+        {
+            return tokens;
+        }
+
+        for (int i = 0; i < tokens.Count; i++)
+        {
+            Token token = tokens[i];
+            if (token.Type == TokenType.Identifier && promoted.Contains(token.Text))
+            {
+                tokens[i] = token with { Type = TokenType.Keyword };
+            }
+        }
+
+        return tokens;
     }
 
     private Token Next()

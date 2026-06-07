@@ -141,6 +141,7 @@ public static class SchemaCompiler
     private static SetOperationChild CompileExpr(ExprNode expr) => expr switch
     {
         NilExpr => new SetOperationChild.Nil(),
+        SelfExpr => new SetOperationChild.Self(),
         ReferenceExpr r => new SetOperationChild.ComputedUsersetChild(ComputedUserset.OnResource(r.Name)),
         ArrowExpr a => CompileArrow(a),
         BinaryExpr b => CompileBinary(b),

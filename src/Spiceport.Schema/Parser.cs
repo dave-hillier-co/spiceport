@@ -64,10 +64,11 @@ internal sealed class Parser
 
             if (IsKeyword("use"))
             {
-                // Feature-flag import, e.g. `use expiration`. Parsed and ignored: the features
-                // it gates (expiration, etc.) are always available in this engine.
+                // Feature-flag import, e.g. `use expiration`. The flaggable lexer (see
+                // Lexer.ApplyFlags) has already validated the flag and promoted the gated
+                // keywords; here we just consume the `use <feature>` pair.
                 Advance();
-                ParseTypePath();
+                Advance(); // the feature name (identifier or now-promoted keyword)
             }
             else if (IsKeyword("definition"))
             {
@@ -168,18 +169,35 @@ internal sealed class Parser
         string? caveatName = null;
         bool requiresExpiration = false;
 
-        // 'with' is not a reserved keyword; it is parsed as an identifier.
-        while (Current.Type == TokenType.Identifier && Current.Text is "with" or "and")
+        // Trait grammar (mirrors SpiceDB consumeSpecificTypeWithCaveat):
+        //   with <caveat> [and expiration]   |   with expiration
+        // 'with' is a reserved keyword; 'expiration'/'and' are keywords only under
+        // `use expiration` (otherwise they remain identifiers, so `with expiration`
+        // without the flag is rejected as a missing caveat name).
+        if (IsKeyword("with"))
         {
-            Advance(); // 'with' / 'and'
-            if (Current.Type == TokenType.Identifier && Current.Text == "expiration")
+            Advance(); // 'with'
+
+            if (!IsKeyword("expiration"))
             {
-                Advance();
-                requiresExpiration = true;
+                caveatName = ParseTypePath();
+
+                if (IsKeyword("and"))
+                {
+                    Advance(); // 'and'
+                    if (!IsKeyword("expiration"))
+                    {
+                        throw Error($"expected 'expiration' after 'and', found '{TokenText()}'");
+                    }
+
+                    Advance(); // 'expiration'
+                    requiresExpiration = true;
+                }
             }
             else
             {
-                caveatName = ParseTypePath();
+                Advance(); // 'expiration'
+                requiresExpiration = true;
             }
         }
 
@@ -267,6 +285,14 @@ internal sealed class Parser
             return new NilExpr();
         }
 
+        if (IsKeyword("self"))
+        {
+            // The resource itself treated as its own subject. Only a keyword under
+            // `use self`; otherwise `self` is an ordinary computed-userset reference.
+            Advance();
+            return new SelfExpr();
+        }
+
         if (Is(TokenType.Identifier))
         {
             string name = Advance().Text;
@@ -275,6 +301,7 @@ internal sealed class Parser
             {
                 Advance();
                 string computed = Expect(TokenType.Identifier, "arrow target relation").Text;
+                RejectNestedArrow();
                 return new ArrowExpr(name, computed, Function: null);
             }
 
@@ -286,6 +313,7 @@ internal sealed class Parser
                 Expect(TokenType.LeftParen, "'('");
                 string computed = Expect(TokenType.Identifier, "arrow target relation").Text;
                 Expect(TokenType.RightParen, "')'");
+                RejectNestedArrow();
                 return new ArrowExpr(name, computed, fn);
             }
 
@@ -293,6 +321,19 @@ internal sealed class Parser
         }
 
         throw Error($"expected an expression operand, found '{TokenText()}'");
+    }
+
+    /// <summary>
+    /// Rejects chained/nested arrows (<c>a-&gt;b-&gt;c</c>) with the SpiceDB compiler diagnostic.
+    /// SpiceDB parses left-recursive arrows then errors in the translator; the port detects the
+    /// trailing arrow operator here and emits the same message.
+    /// </summary>
+    private void RejectNestedArrow()
+    {
+        if (Is(TokenType.RightArrow) || Is(TokenType.Period))
+        {
+            throw Error("Nested arrows not yet supported");
+        }
     }
 
     private CaveatNode ParseCaveat()

@@ -27,6 +27,8 @@ public class CaveatCheckTests
         """;
 
     private const string ExpirationSchema = """
+        use expiration
+
         definition user {}
 
         definition document {
