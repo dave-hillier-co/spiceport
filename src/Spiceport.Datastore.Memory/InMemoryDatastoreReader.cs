@@ -54,6 +54,30 @@ internal sealed class InMemoryDatastoreReader : IDatastoreReader
     public Task<byte[]?> ReadStoredSchema(CancellationToken cancellationToken = default) =>
         Task.FromResult(_state.SchemaAt(_revision));
 
+    public Task<RelationshipsFilter?> ReadCounterFilter(string name, CancellationToken cancellationToken = default) =>
+        Task.FromResult(_state.CounterFilterAt(name, _revision));
+
+    public async Task<ulong> CountRelationships(string name, CancellationToken cancellationToken = default)
+    {
+        var filter = _state.CounterFilterAt(name, _revision)
+            ?? throw new CounterNotRegisteredException(name);
+        ulong count = 0;
+        await foreach (var _ in QueryRelationships(filter, cancellationToken).ConfigureAwait(false))
+            count++;
+        return count;
+    }
+
+    public async IAsyncEnumerable<RegisteredCounter> LookupCounters(
+        [EnumeratorCancellation] CancellationToken cancellationToken = default)
+    {
+        foreach (var counter in _state.LiveCountersAt(_revision))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            yield return counter;
+        }
+        await Task.CompletedTask;
+    }
+
     private static bool IsExpired(Relationship rel, DateTimeOffset now) =>
         rel.OptionalExpiration is { } exp && exp <= now;
 }

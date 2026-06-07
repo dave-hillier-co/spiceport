@@ -48,4 +48,25 @@ public interface IRelationshipsGrain : IGrainWithIntegerKey
     /// resume) sees the same snapshot.
     /// </summary>
     Task<BulkExportRelationshipsReply> BulkExportRelationships(BulkExportRelationshipsArgs args);
+
+    /// <summary>
+    /// Registers an MVCC relationship counter under <c>args.Name</c> with the given filter. Throws
+    /// <see cref="CounterOperationException"/> (<see cref="CounterErrorKind.AlreadyRegistered"/>) if a
+    /// counter with that name is already live.
+    /// </summary>
+    Task<RegisterCounterReply> RegisterRelationshipCounter(RegisterCounterArgs args);
+
+    /// <summary>
+    /// Tombstones the live counter named <c>args.Name</c>. Throws <see cref="CounterOperationException"/>
+    /// (<see cref="CounterErrorKind.NotRegistered"/>) if no such counter is live.
+    /// </summary>
+    Task<UnregisterCounterReply> UnregisterRelationshipCounter(UnregisterCounterArgs args);
+
+    /// <summary>
+    /// Computes, on demand, the count of relationships matching the registered counter's filter at a
+    /// freshly resolved snapshot and returns the count plus a read-at token. Throws
+    /// <see cref="CounterOperationException"/> (<see cref="CounterErrorKind.NotRegistered"/>) if no
+    /// counter named <c>args.Name</c> is live.
+    /// </summary>
+    Task<CountRelationshipsReply> CountRelationships(CountRelationshipsArgs args);
 }

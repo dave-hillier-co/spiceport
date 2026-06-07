@@ -23,6 +23,10 @@ internal sealed class InMemoryReadWriteTransaction : IReadWriteTransaction
 
     private byte[]? _pendingSchema;
 
+    // Staged counter mutations: name -> filter to register; names to tombstone.
+    private readonly Dictionary<string, RelationshipsFilter> _pendingCounterWrites = new();
+    private readonly HashSet<string> _pendingCounterDeletes = new();
+
     public InMemoryReadWriteTransaction(DatastoreState baseState, long newRevision)
     {
         _baseState = baseState;
@@ -144,6 +148,67 @@ internal sealed class InMemoryReadWriteTransaction : IReadWriteTransaction
     public Task<byte[]?> ReadStoredSchema(CancellationToken cancellationToken = default) =>
         Task.FromResult(_pendingSchema ?? _baseState.SchemaAt(_baseState.HeadRevision));
 
+    // --- Counter reads / mutations (snapshot = base committed + staged ops) ---
+
+    public Task<RelationshipsFilter?> ReadCounterFilter(string name, CancellationToken cancellationToken = default) =>
+        Task.FromResult(CounterFilterNow(name));
+
+    public async Task<ulong> CountRelationships(string name, CancellationToken cancellationToken = default)
+    {
+        var filter = CounterFilterNow(name) ?? throw new CounterNotRegisteredException(name);
+        ulong count = 0;
+        await foreach (var _ in QueryRelationships(filter, cancellationToken).ConfigureAwait(false))
+            count++;
+        return count;
+    }
+
+    public async IAsyncEnumerable<RegisteredCounter> LookupCounters(
+        [EnumeratorCancellation] CancellationToken cancellationToken = default)
+    {
+        var names = new HashSet<string>();
+        foreach (var counter in _baseState.LiveCountersAt(_baseState.HeadRevision))
+            names.Add(counter.Name);
+        foreach (var name in _pendingCounterWrites.Keys)
+            names.Add(name);
+
+        foreach (var name in names)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var filter = CounterFilterNow(name);
+            if (filter is not null)
+                yield return new RegisteredCounter(name, filter);
+        }
+        await Task.CompletedTask;
+    }
+
+    public Task WriteCounter(string name, RelationshipsFilter filter, CancellationToken cancellationToken = default)
+    {
+        if (CounterFilterNow(name) is not null)
+            throw new CounterAlreadyRegisteredException(name);
+        _pendingCounterDeletes.Remove(name);
+        _pendingCounterWrites[name] = filter;
+        return Task.CompletedTask;
+    }
+
+    public Task DeleteCounter(string name, CancellationToken cancellationToken = default)
+    {
+        if (CounterFilterNow(name) is null)
+            throw new CounterNotRegisteredException(name);
+        _pendingCounterWrites.Remove(name);
+        _pendingCounterDeletes.Add(name);
+        return Task.CompletedTask;
+    }
+
+    /// <summary>Resolves the counter filter as visible inside this transaction (base committed + staged).</summary>
+    private RelationshipsFilter? CounterFilterNow(string name)
+    {
+        if (_pendingCounterWrites.TryGetValue(name, out var staged))
+            return staged;
+        if (_pendingCounterDeletes.Contains(name))
+            return null;
+        return _baseState.CounterFilterAt(name, _baseState.HeadRevision);
+    }
+
     // --- Commit ---
 
     /// <summary>Produces the committed state by applying staged mutations to the base state.</summary>
@@ -179,7 +244,13 @@ internal sealed class InMemoryReadWriteTransaction : IReadWriteTransaction
         if (_pendingSchema is not null)
             schemas = schemas.Add(new SchemaVersion(_newRevision, _pendingSchema, ComputeHash(_pendingSchema)));
 
-        return new DatastoreState(_newRevision, relationships, schemas);
+        var counters = _baseState.Counters;
+        foreach (var (name, filter) in _pendingCounterWrites)
+            counters = counters.Add(new CounterVersion(_newRevision, name, filter));
+        foreach (var name in _pendingCounterDeletes)
+            counters = counters.Add(new CounterVersion(_newRevision, name, null));
+
+        return new DatastoreState(_newRevision, relationships, schemas, counters);
     }
 
     private void Apply(RelationshipKey key, Relationship rel)

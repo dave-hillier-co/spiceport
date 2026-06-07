@@ -170,6 +170,60 @@ internal sealed class PostgresReadWriteTransaction : IReadWriteTransaction
     public Task<byte[]?> ReadStoredSchema(CancellationToken cancellationToken = default) =>
         PostgresDatastoreReader.ReadSchemaBytes(_conn, _tx, _readSnapshot, cancellationToken);
 
+    // --- Counter reads / mutations (see own staged writes via the folded read snapshot) ---
+
+    public Task<RelationshipsFilter?> ReadCounterFilter(string name, CancellationToken cancellationToken = default) =>
+        PostgresDatastoreReader.ReadCounterFilter(_conn, _tx, _readSnapshot, name, cancellationToken);
+
+    public async Task<ulong> CountRelationships(string name, CancellationToken cancellationToken = default)
+    {
+        var filter = await PostgresDatastoreReader.ReadCounterFilter(_conn, _tx, _readSnapshot, name, cancellationToken).ConfigureAwait(false)
+            ?? throw new CounterNotRegisteredException(name);
+        return await PostgresDatastoreReader.CountForFilter(_conn, _tx, _readSnapshot, filter, cancellationToken).ConfigureAwait(false);
+    }
+
+    public IAsyncEnumerable<RegisteredCounter> LookupCounters(CancellationToken cancellationToken = default) =>
+        PostgresDatastoreReader.LookupCounters(_conn, _tx, _readSnapshot, cancellationToken);
+
+    public async Task WriteCounter(string name, RelationshipsFilter filter, CancellationToken cancellationToken = default)
+    {
+        var existing = await PostgresDatastoreReader.ReadCounterFilter(_conn, _tx, _readSnapshot, name, cancellationToken).ConfigureAwait(false);
+        if (existing is not null)
+            throw new CounterAlreadyRegisteredException(name);
+
+        await using var cmd = _conn.CreateCommand();
+        cmd.Transaction = _tx;
+        cmd.CommandText =
+            $"INSERT INTO {TableRelationshipCounter} ({ColCounterName}, {ColCounterFilter}, {ColCreatedXid}) " +
+            "VALUES (@n, @f, @xid)";
+        cmd.Parameters.AddWithValue("n", name);
+        cmd.Parameters.AddWithValue("f", CounterFilterJson.Serialize(filter));
+        cmd.Parameters.AddWithValue("xid", NpgsqlDbType.Xid8, _newXid);
+        try
+        {
+            await cmd.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (PostgresException ex) when (ex.SqlState == PostgresErrorCodes.UniqueViolation)
+        {
+            // The living unique index guards a concurrent register of the same name.
+            throw new CounterAlreadyRegisteredException(name);
+        }
+    }
+
+    public async Task DeleteCounter(string name, CancellationToken cancellationToken = default)
+    {
+        await using var cmd = _conn.CreateCommand();
+        cmd.Transaction = _tx;
+        cmd.CommandText =
+            $"UPDATE {TableRelationshipCounter} SET {ColDeletedXid} = @xid " +
+            $"WHERE {ColCounterName} = @n AND {ColDeletedXid} = '{PostgresRevision.LiveDeletedXid}'::xid8";
+        cmd.Parameters.AddWithValue("n", name);
+        cmd.Parameters.AddWithValue("xid", NpgsqlDbType.Xid8, _newXid);
+        var rows = await cmd.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
+        if (rows == 0)
+            throw new CounterNotRegisteredException(name);
+    }
+
     // --- mutation helpers ---
 
     private async Task InsertRow(Relationship rel, CancellationToken cancellationToken)

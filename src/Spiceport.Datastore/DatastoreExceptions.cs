@@ -36,3 +36,25 @@ public sealed class InvalidRevisionException : DatastoreException
     /// <summary>Creates an invalid revision exception.</summary>
     public InvalidRevisionException(string message) : base(message) { }
 }
+
+/// <summary>Thrown when registering a relationship counter whose name is already live.</summary>
+public sealed class CounterAlreadyRegisteredException : DatastoreException
+{
+    /// <summary>The counter name that was already registered.</summary>
+    public string CounterName { get; }
+
+    /// <summary>Creates the exception for the given counter name.</summary>
+    public CounterAlreadyRegisteredException(string name)
+        : base($"counter with name `{name}` is already registered") => CounterName = name;
+}
+
+/// <summary>Thrown when reading, counting, or unregistering a counter that is not live.</summary>
+public sealed class CounterNotRegisteredException : DatastoreException
+{
+    /// <summary>The counter name that was not registered.</summary>
+    public string CounterName { get; }
+
+    /// <summary>Creates the exception for the given counter name.</summary>
+    public CounterNotRegisteredException(string name)
+        : base($"counter with name `{name}` not found") => CounterName = name;
+}

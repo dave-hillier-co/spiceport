@@ -32,6 +32,7 @@ app.MapGrpcService<BulkGrpcService>();
 app.MapGrpcService<AuthzedPermissionsV1Service>();
 app.MapGrpcService<AuthzedSchemaV1Service>();
 app.MapGrpcService<AuthzedWatchV1Service>();
+app.MapGrpcService<AuthzedExperimentalV1Service>();
 
 app.MapGet("/", () => "Spiceport API up.");
 

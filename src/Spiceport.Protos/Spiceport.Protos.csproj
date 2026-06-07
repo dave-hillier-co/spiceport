@@ -12,7 +12,7 @@
 
   <ItemGroup>
     <!-- authzed.api.v1 service protos: emit messages + abstract server bases -->
-    <Protobuf Include="Protos\authzed\authzed\api\v1\permission_service.proto;Protos\authzed\authzed\api\v1\schema_service.proto;Protos\authzed\authzed\api\v1\watch_service.proto" ProtoRoot="Protos\authzed" AdditionalImportDirs="Protos\authzed" GrpcServices="Server" />
+    <Protobuf Include="Protos\authzed\authzed\api\v1\permission_service.proto;Protos\authzed\authzed\api\v1\schema_service.proto;Protos\authzed\authzed\api\v1\watch_service.proto;Protos\authzed\authzed\api\v1\experimental_service.proto" ProtoRoot="Protos\authzed" AdditionalImportDirs="Protos\authzed" GrpcServices="Server" />
     <!-- authzed.api.v1 core shared messages (no service) -->
     <Protobuf Include="Protos\authzed\authzed\api\v1\core.proto;Protos\authzed\authzed\api\v1\debug.proto" ProtoRoot="Protos\authzed" AdditionalImportDirs="Protos\authzed" GrpcServices="None" />
     <!-- import-only annotation/validation deps (messages-only, kept out of public surface) -->

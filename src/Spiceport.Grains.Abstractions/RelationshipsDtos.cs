@@ -155,3 +155,60 @@ public sealed record BulkExportRelationshipsArgs(
 public sealed record BulkExportRelationshipsReply(
     [property: Id(0)] IReadOnlyList<RelationshipWire> Relationships,
     [property: Id(1)] string? Cursor);
+
+/// <summary>
+/// Distinguishes the two on-demand counter failures so the gRPC front door can map them to the right
+/// status code. The underlying datastore exceptions are not Orleans-serializable across the grain
+/// boundary, so the grain rethrows a serializable <see cref="CounterOperationException"/> carrying this.
+/// </summary>
+public enum CounterErrorKind
+{
+    /// <summary>A counter with the same name is already registered.</summary>
+    AlreadyRegistered = 0,
+
+    /// <summary>No counter with the given name is registered.</summary>
+    NotRegistered = 1,
+}
+
+/// <summary>
+/// Serializable carrier for a counter failure raised inside the grain. Mirrors how schema-compile
+/// failures are rethrown as a serializable type across the Orleans boundary.
+/// </summary>
+[GenerateSerializer]
+public sealed class CounterOperationException : Exception
+{
+    public CounterOperationException(CounterErrorKind kind, string message) : base(message) => Kind = kind;
+
+    [Id(0)]
+    public CounterErrorKind Kind { get; }
+}
+
+/// <summary>Arguments for <see cref="IRelationshipsGrain.RegisterRelationshipCounter"/>.</summary>
+[GenerateSerializer]
+public sealed record RegisterCounterArgs(
+    [property: Id(0)] string Name,
+    [property: Id(1)] RelationshipsFilterWire Filter);
+
+/// <summary>Reply for <see cref="IRelationshipsGrain.RegisterRelationshipCounter"/> (empty).</summary>
+[GenerateSerializer]
+public sealed record RegisterCounterReply;
+
+/// <summary>Arguments for <see cref="IRelationshipsGrain.UnregisterRelationshipCounter"/>.</summary>
+[GenerateSerializer]
+public sealed record UnregisterCounterArgs(
+    [property: Id(0)] string Name);
+
+/// <summary>Reply for <see cref="IRelationshipsGrain.UnregisterRelationshipCounter"/> (empty).</summary>
+[GenerateSerializer]
+public sealed record UnregisterCounterReply;
+
+/// <summary>Arguments for <see cref="IRelationshipsGrain.CountRelationships"/>.</summary>
+[GenerateSerializer]
+public sealed record CountRelationshipsArgs(
+    [property: Id(0)] string Name);
+
+/// <summary>Reply for <see cref="IRelationshipsGrain.CountRelationships"/>: the on-demand count + read-at token.</summary>
+[GenerateSerializer]
+public sealed record CountRelationshipsReply(
+    [property: Id(0)] ulong Count,
+    [property: Id(1)] string ReadAtToken);

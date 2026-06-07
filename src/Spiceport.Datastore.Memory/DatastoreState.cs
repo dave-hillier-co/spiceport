@@ -21,16 +21,23 @@ internal sealed record StoredRelationship(
 internal sealed record SchemaVersion(long Revision, byte[] Bytes, string Hash);
 
 /// <summary>
+/// An MVCC version of a registered counter, stamped with the revision at which it was written. A null
+/// <paramref name="Filter"/> marks a tombstone (the counter was unregistered at this revision).
+/// </summary>
+internal sealed record CounterVersion(long Revision, string Name, RelationshipsFilter? Filter);
+
+/// <summary>
 /// An immutable point-in-time state of the datastore. Each committed transaction produces a new
 /// instance; snapshot readers capture a reference and remain correct regardless of later writes.
 /// </summary>
 internal sealed record DatastoreState(
     long HeadRevision,
     ImmutableList<StoredRelationship> Relationships,
-    ImmutableList<SchemaVersion> Schemas)
+    ImmutableList<SchemaVersion> Schemas,
+    ImmutableList<CounterVersion> Counters)
 {
     public static DatastoreState Empty(long initialRevision) =>
-        new(initialRevision, ImmutableList<StoredRelationship>.Empty, ImmutableList<SchemaVersion>.Empty);
+        new(initialRevision, ImmutableList<StoredRelationship>.Empty, ImmutableList<SchemaVersion>.Empty, ImmutableList<CounterVersion>.Empty);
 
     /// <summary>Returns the relationships live at the given revision.</summary>
     public IEnumerable<Relationship> LiveAt(long atRevision)
@@ -109,5 +116,40 @@ internal sealed record DatastoreState(
                 break;
         }
         return result;
+    }
+
+    /// <summary>
+    /// Returns the filter registered for the named counter live at the given revision (last-wins fold over
+    /// versions with <c>Revision &lt;= atRevision</c>), or null if the last version is a tombstone / none.
+    /// </summary>
+    public RelationshipsFilter? CounterFilterAt(string name, long atRevision)
+    {
+        RelationshipsFilter? result = null;
+        var found = false;
+        foreach (var version in Counters)
+        {
+            if (version.Name == name && version.Revision <= atRevision)
+            {
+                result = version.Filter;
+                found = true;
+            }
+        }
+        return found ? result : null;
+    }
+
+    /// <summary>Returns the counters live at the given revision.</summary>
+    public IEnumerable<RegisteredCounter> LiveCountersAt(long atRevision)
+    {
+        var latest = new Dictionary<string, RelationshipsFilter?>();
+        foreach (var version in Counters)
+        {
+            if (version.Revision <= atRevision)
+                latest[version.Name] = version.Filter;
+        }
+        foreach (var (name, filter) in latest)
+        {
+            if (filter is not null)
+                yield return new RegisteredCounter(name, filter);
+        }
     }
 }

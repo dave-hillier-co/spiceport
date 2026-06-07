@@ -21,6 +21,10 @@ internal static class PostgresSchema
     public const string TableTuple = "relation_tuple";
     public const string TableStoredSchema = "stored_schema";
     public const string TableMetadata = "datastore_metadata";
+    public const string TableRelationshipCounter = "relationship_counter";
+
+    public const string ColCounterName = "name";
+    public const string ColCounterFilter = "serialized_filter";
 
     public const string ColXid = "xid";
     public const string ColSnapshot = "snapshot";
@@ -100,6 +104,18 @@ CREATE TABLE IF NOT EXISTS {TableStoredSchema} (
     {ColDeletedXid} xid8 NOT NULL DEFAULT '{PostgresRevision.LiveDeletedXid}'::xid8
 );
 CREATE INDEX IF NOT EXISTS ix_stored_schema_by_created_xid ON {TableStoredSchema} ({ColCreatedXid});
+
+-- Relationship counters, versioned MVCC exactly like stored_schema.
+CREATE TABLE IF NOT EXISTS {TableRelationshipCounter} (
+    {ColCounterName}    varchar NOT NULL,
+    {ColCounterFilter}  bytea NOT NULL,
+    {ColCreatedXid}     xid8 NOT NULL,
+    {ColDeletedXid}     xid8 NOT NULL DEFAULT '{PostgresRevision.LiveDeletedXid}'::xid8
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_relationship_counter_living
+    ON {TableRelationshipCounter} ({ColCounterName}, {ColDeletedXid});
+CREATE INDEX IF NOT EXISTS ix_relationship_counter_by_created_xid
+    ON {TableRelationshipCounter} ({ColCreatedXid});
 
 CREATE TABLE IF NOT EXISTS {TableMetadata} (
     key   varchar PRIMARY KEY,

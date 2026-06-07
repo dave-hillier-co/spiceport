@@ -42,10 +42,10 @@ The full design rationale is in [`docs/architecture-analysis.md`](docs/architect
 - **Write safety**: preconditions (must-match / must-not-match) and schema-change validation.
 - **Storage backends**: an in-memory MVCC store and **PostgreSQL** (xid8 / `pg_snapshot` MVCC).
   SpiceDB's own consistency conformance corpus passes against both.
+- **Relationship counters** (ExperimentalService): register/unregister a named counter over a
+  filter and count matching relationships at a revision (computed on demand).
 - **`authzed.api.v1`** gRPC surface — verified end to end with the real `zed` CLI (schema,
   relationships, check, lookups, backup/restore).
-
-Not implemented: the experimental relationship-counter RPCs (`ExperimentalService`).
 
 ## Project layout
 

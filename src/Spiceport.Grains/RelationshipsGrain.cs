@@ -255,6 +255,72 @@ public sealed class RelationshipsGrain(
         return new BulkExportRelationshipsReply(page, cursor);
     }
 
+    /// <inheritdoc />
+    public async Task<RegisterCounterReply> RegisterRelationshipCounter(RegisterCounterArgs args)
+    {
+        ArgumentNullException.ThrowIfNull(args);
+
+        var filter = ToFilter(args.Filter);
+        try
+        {
+            await datastore.ReadWriteTx(tx => tx.WriteCounter(args.Name, filter))
+                .ConfigureAwait(ContinueOnCapturedContext);
+        }
+        catch (CounterAlreadyRegisteredException ex)
+        {
+            // The datastore exception is not Orleans-serializable across the grain boundary; rethrow a
+            // serializable carrier the gRPC front door maps to the right status code.
+            throw new CounterOperationException(CounterErrorKind.AlreadyRegistered, ex.Message);
+        }
+
+        return new RegisterCounterReply();
+    }
+
+    /// <inheritdoc />
+    public async Task<UnregisterCounterReply> UnregisterRelationshipCounter(UnregisterCounterArgs args)
+    {
+        ArgumentNullException.ThrowIfNull(args);
+
+        try
+        {
+            await datastore.ReadWriteTx(tx => tx.DeleteCounter(args.Name))
+                .ConfigureAwait(ContinueOnCapturedContext);
+        }
+        catch (CounterNotRegisteredException ex)
+        {
+            throw new CounterOperationException(CounterErrorKind.NotRegistered, ex.Message);
+        }
+
+        return new UnregisterCounterReply();
+    }
+
+    /// <inheritdoc />
+    public async Task<CountRelationshipsReply> CountRelationships(CountRelationshipsArgs args)
+    {
+        ArgumentNullException.ThrowIfNull(args);
+
+        // The proto request carries no consistency, so (like SpiceDB's on-demand path, which uses
+        // HeadRevision) resolve a fully-consistent revision and count at that pinned snapshot.
+        var resolved = await RevisionResolver
+            .Resolve(datastore, ConsistencyRequirement.FullyConsistent, cancellationToken: CancellationToken.None)
+            .ConfigureAwait(ContinueOnCapturedContext);
+        var reader = datastore.SnapshotReader(resolved.Revision);
+
+        ulong count;
+        try
+        {
+            count = await reader.CountRelationships(args.Name).ConfigureAwait(ContinueOnCapturedContext);
+        }
+        catch (CounterNotRegisteredException ex)
+        {
+            throw new CounterOperationException(CounterErrorKind.NotRegistered, ex.Message);
+        }
+
+        var token = await MintToken(resolved.Revision, resolved.SchemaHash ?? schemaProvider.Current.SchemaHash)
+            .ConfigureAwait(ContinueOnCapturedContext);
+        return new CountRelationshipsReply(count, token);
+    }
+
     /// <summary>The default bulk-export page size when the request leaves the limit unset.</summary>
     private const int DefaultExportPageSize = 1000;
 

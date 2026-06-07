@@ -23,6 +23,22 @@ public interface IDatastoreReader
     /// <summary>Reads the unified stored schema bytes at this revision, or null if none has been written.</summary>
     Task<byte[]?> ReadStoredSchema(CancellationToken cancellationToken = default);
 
+    /// <summary>
+    /// Returns the filter registered for the named counter live at this reader's revision, or null if no
+    /// live counter with that name exists at this snapshot.
+    /// </summary>
+    Task<RelationshipsFilter?> ReadCounterFilter(string name, CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Counts the relationships matching the named counter's registered filter at this reader's snapshot.
+    /// The filter is resolved at the same revision as the count, so the result is consistent.
+    /// </summary>
+    /// <exception cref="CounterNotRegisteredException">If no live counter with this name exists at this snapshot.</exception>
+    Task<ulong> CountRelationships(string name, CancellationToken cancellationToken = default);
+
+    /// <summary>Enumerates the counters live at this reader's revision.</summary>
+    IAsyncEnumerable<RegisteredCounter> LookupCounters(CancellationToken cancellationToken = default);
+
     /// <summary>True if this reader's snapshot is still valid (its revision has not been garbage collected).</summary>
     bool IsValid { get; }
 }
@@ -48,6 +64,17 @@ public interface IReadWriteTransaction : IDatastoreReader
 
     /// <summary>Bulk loads relationships from a source. Returns the number loaded.</summary>
     Task<ulong> BulkLoad(IAsyncEnumerable<Relationship> relationships, CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Registers a relationship counter, writing an MVCC version visible from this transaction's revision
+    /// onward. The count is computed on demand at read time, not precomputed here.
+    /// </summary>
+    /// <exception cref="CounterAlreadyRegisteredException">If a live counter with this name already exists.</exception>
+    Task WriteCounter(string name, RelationshipsFilter filter, CancellationToken cancellationToken = default);
+
+    /// <summary>Unregisters a relationship counter by tombstoning its live version.</summary>
+    /// <exception cref="CounterNotRegisteredException">If no live counter with this name exists.</exception>
+    Task DeleteCounter(string name, CancellationToken cancellationToken = default);
 }
 
 /// <summary>An MVCC datastore: snapshot reads at any valid revision and serialized read-write transactions.</summary>

@@ -43,6 +43,48 @@ internal static class RelationshipQuery
         return cmd;
     }
 
+    /// <summary>
+    /// True if the filter has a component that the structured SQL forward query cannot express on its own
+    /// (so a COUNT(*) would be wrong and we must fall back to streaming + in-memory residual matching).
+    /// The forward SQL pushes only resource type/id/prefix/relation; everything else is residual.
+    /// </summary>
+    public static bool HasResidualForward(RelationshipsFilter filter) =>
+        filter.OptionalSubjectsSelectors is { Count: > 0 }
+        || filter.OptionalCaveatNameFilter is not null
+        || filter.OptionalExpirationOption != ExpirationFilterOption.None;
+
+    /// <summary>
+    /// Builds a <c>SELECT COUNT(*)</c> over <c>relation_tuple</c> applying the SAME visibility predicate and
+    /// structured forward filter columns as <see cref="BuildForward"/>. Only valid when
+    /// <see cref="HasResidualForward"/> is false. Note: expiration is NOT filtered here (no residual), so
+    /// callers must guarantee the filter places no expiration constraint; expired-but-live rows are not
+    /// excluded by this fast path. For registered counters (which never set expiration/caveat/subject
+    /// residuals) this matches SpiceDB's <c>countRels</c> query.
+    /// </summary>
+    public static NpgsqlCommand BuildForwardCount(NpgsqlConnection conn, NpgsqlTransaction? tx, PgSnapshot snapshot, RelationshipsFilter filter)
+    {
+        var sql = new StringBuilder($"SELECT COUNT(*) FROM {TableTuple} WHERE ");
+        var cmd = NewCommand(conn, tx);
+        AppendVisibility(sql, cmd, snapshot);
+
+        if (filter.OptionalResourceType is { } rt)
+            AppendEq(sql, cmd, ColResourceNamespace, rt);
+        if (filter.OptionalResourceRelation is { } rr)
+            AppendEq(sql, cmd, ColResourceRelation, rr);
+        if (filter.OptionalResourceIds is { Count: > 0 } ids)
+            AppendIn(sql, cmd, ColResourceObjectId, ids);
+        if (!string.IsNullOrEmpty(filter.OptionalResourceIdPrefix))
+            AppendPrefix(sql, cmd, ColResourceObjectId, filter.OptionalResourceIdPrefix);
+
+        // Exclude expired-but-not-yet-GC'd rows to match the in-memory reader's now-based skip.
+        var nowParam = $"p{cmd.Parameters.Count}";
+        cmd.Parameters.AddWithValue(nowParam, DateTimeOffset.UtcNow);
+        sql.Append($" AND ({ColExpiration} IS NULL OR {ColExpiration} > @{nowParam})");
+
+        cmd.CommandText = sql.ToString();
+        return cmd;
+    }
+
     /// <summary>Builds the reverse (subject-side) query for a snapshot read.</summary>
     public static NpgsqlCommand BuildReverse(NpgsqlConnection conn, NpgsqlTransaction? tx, PgSnapshot snapshot, SubjectsFilter filter)
     {
