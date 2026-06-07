@@ -19,8 +19,10 @@ namespace Spiceport.Grains;
 /// <item>Adding definitions / relations / allowed subject types.</item>
 /// <item>Permission-only changes (a permission is computed, never written as a relationship).</item>
 /// <item>Removing a permission (permissions hold no stored relationships).</item>
-/// <item>Caveat parameter type changes (deferred; checked by SpiceDB's caveat diff).</item>
 /// </list>
+/// Caveat parameter removal and parameter type changes ARE rejected unconditionally (no datastore
+/// query), mirroring SpiceDB's <c>sanityCheckCaveatChanges</c>, since existing relationships may carry
+/// context typed by the old parameter.
 /// Removing an allowed subject type is checked from the subject side via the reverse query.
 /// </remarks>
 public static class SchemaChangeValidator
@@ -63,6 +65,17 @@ public static class SchemaChangeValidator
                     await EnsureNoRemovedAllowedTypeAsync(reader, defName, rel.Name, allowed, cancellationToken)
                         .ConfigureAwait(false);
                     break;
+
+                case SchemaDelta.CaveatParameterRemoved(var caveatName, var paramName, _):
+                    // SpiceDB's sanityCheckCaveatChanges rejects parameter removal unconditionally (existing
+                    // relationships may carry context typed by the old parameter).
+                    throw new SchemaWriteValidationException(
+                        $"cannot remove parameter `{paramName}` on caveat `{caveatName}`");
+
+                case SchemaDelta.CaveatParameterTypeChanged(var caveatName, var paramName, _, _):
+                    // Likewise, a parameter type change is rejected unconditionally.
+                    throw new SchemaWriteValidationException(
+                        $"cannot change the type of parameter `{paramName}` on caveat `{caveatName}`");
             }
         }
     }
@@ -118,6 +131,17 @@ public static class SchemaChangeValidator
             ? (IReadOnlyList<string>)[CoreConstants.PublicWildcard]
             : null;
 
+        // Mirror SpiceDB's RelationAllowedTypeRemoved orphan check: the removed allowed type's identity
+        // includes its required caveat and expiration trait, so the orphan query must filter on them too.
+        // Removing `user with cav1` only orphans relationships that actually carry cav1 (not cav2/no-caveat);
+        // removing `user with expiration` only orphans relationships that carry an expiration.
+        var caveatFilter = allowed.RequiredCaveat is { CaveatName.Length: > 0 } caveat
+            ? new CaveatNameFilter(CaveatFilterOption.HasMatchingCaveat, caveat.CaveatName)
+            : new CaveatNameFilter(CaveatFilterOption.NoCaveat);
+        var expirationOption = allowed.RequiresExpiration
+            ? ExpirationFilterOption.HasExpiration
+            : ExpirationFilterOption.NoExpiration;
+
         var filter = new RelationshipsFilter
         {
             OptionalResourceType = definition,
@@ -129,13 +153,14 @@ public static class SchemaChangeValidator
                     OptionalSubjectIds: subjectIds,
                     RelationFilter: relationFilter),
             ],
+            OptionalCaveatNameFilter = caveatFilter,
+            OptionalExpirationOption = expirationOption,
         };
 
         await foreach (var rel in reader.QueryRelationships(filter, ct).ConfigureAwait(false))
         {
-            var desc = allowed.IsPublicWildcard ? $"{allowed.ObjectType}:*" : allowed.ObjectType;
             throw new SchemaWriteValidationException(
-                $"cannot remove allowed subject type `{desc}` from `{definition}#{relationName}`: at least one relationship still references it (e.g. {rel})");
+                $"cannot remove allowed subject type `{AllowedRelationIdentity.Source(allowed)}` from `{definition}#{relationName}`: at least one relationship still references it (e.g. {rel})");
         }
     }
 }

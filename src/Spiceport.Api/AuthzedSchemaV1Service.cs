@@ -106,8 +106,11 @@ public sealed class AuthzedSchemaV1Service(IGrainFactory grains, ISchemaProvider
         try
         {
             comparison = Spiceport.Schema.SchemaCompiler.CompileSchema(request.ComparisonSchema);
+            // Reject duplicate/reused names (and other type errors) up front: the diff core keys by name
+            // and would otherwise throw a raw ArgumentException on a duplicate definition/caveat.
+            SchemaTypeValidator.Validate(comparison);
         }
-        catch (Exception ex) when (ex is Spiceport.Schema.SchemaCompileException or ArgumentException)
+        catch (Exception ex) when (ex is Spiceport.Schema.SchemaCompileException or SchemaTypeException or ArgumentException)
         {
             throw new RpcException(new Status(StatusCode.InvalidArgument, ex.Message));
         }

@@ -45,6 +45,20 @@ public sealed class RelationshipsGrain(
             throw new ArgumentException(ex.Message, nameof(args));
         }
 
+        // Run SpiceDB's type-system + caveat-definition validation on the freshly compiled schema BEFORE
+        // touching the datastore. A type error (undefined reference, permission-on-left-of-arrow, wildcard
+        // in arrow, self-reference, missing allowed types, undefined caveat, duplicate/reused name, or an
+        // unparseable/parameterless/unused-parameter caveat) is rejected at write time as a
+        // FailedPrecondition — re-wrapped in the serializable carrier below.
+        try
+        {
+            Spiceport.Engine.SchemaTypeValidator.Validate(nextCompiled);
+        }
+        catch (Spiceport.Engine.SchemaTypeException ex)
+        {
+            throw new SchemaWriteValidationException(ex.Message);
+        }
+
         var current = schemaProvider.Current.Schema;
 
         // Validate the diff against existing data and persist in ONE transaction: the change-validation

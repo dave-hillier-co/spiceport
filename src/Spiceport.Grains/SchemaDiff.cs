@@ -270,11 +270,12 @@ public static class SchemaDiff
     };
 
     /// <summary>
-    /// Structural equality of two allowed subject types: same object type, kind, and subrelation
-    /// (ellipsis-normalized). Mirrors the validator's original <c>SameAllowedType</c>.
+    /// Identity equality of two allowed subject types via their canonical source string, which folds the
+    /// object type, kind, subrelation (ellipsis-normalized), required caveat name, AND the expiration
+    /// trait — matching SpiceDB's <c>SourceForAllowedRelation</c>. Changing a relation's <c>with</c>
+    /// caveat or adding/removing <c>with expiration</c> is therefore a genuine subject-type change (and
+    /// triggers the orphan check), not a no-op.
     /// </summary>
     public static bool SameAllowedType(AllowedRelation a, AllowedRelation b) =>
-        a.ObjectType == b.ObjectType
-        && a.Kind == b.Kind
-        && (a.RelationName ?? CoreConstants.Ellipsis) == (b.RelationName ?? CoreConstants.Ellipsis);
+        AllowedRelationIdentity.Source(a) == AllowedRelationIdentity.Source(b);
 }

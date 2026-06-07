@@ -82,6 +82,53 @@ public class AuthzedSchemaV1ServiceTests
     }
 
     [Fact]
+    public async Task WriteSchema_with_type_error_is_failed_precondition()
+    {
+        await using var cluster = await MeshTestCluster.CreateAsync(EmptySchema);
+        var service = Service(cluster);
+
+        // A permission referencing an undefined relation: rejected at write time as a type error.
+        var bad = """
+            definition user {}
+            definition document {
+                permission view = nonexistent
+            }
+            """;
+
+        var ex = await Assert.ThrowsAsync<RpcException>(() => service.WriteSchema(
+            new V1::WriteSchemaRequest { Schema = bad }, FakeServerCallContext.Default));
+        Assert.Equal(StatusCode.FailedPrecondition, ex.StatusCode);
+    }
+
+    [Fact]
+    public async Task WriteSchema_removing_caveat_parameter_is_failed_precondition()
+    {
+        await using var cluster = await MeshTestCluster.CreateAsync(EmptySchema);
+        var service = Service(cluster);
+
+        var withTwo = """
+            definition user {}
+            definition document {
+                relation viewer: user with c
+            }
+            caveat c(a int, b int) { a > 0 && b > 0 }
+            """;
+        await service.WriteSchema(new V1::WriteSchemaRequest { Schema = withTwo }, FakeServerCallContext.Default);
+
+        // Removing parameter `b` is rejected unconditionally (existing relationships may be typed by it).
+        var withOne = """
+            definition user {}
+            definition document {
+                relation viewer: user with c
+            }
+            caveat c(a int) { a > 0 }
+            """;
+        var ex = await Assert.ThrowsAsync<RpcException>(() => service.WriteSchema(
+            new V1::WriteSchemaRequest { Schema = withOne }, FakeServerCallContext.Default));
+        Assert.Equal(StatusCode.FailedPrecondition, ex.StatusCode);
+    }
+
+    [Fact]
     public async Task ReadSchema_on_fresh_cluster_is_not_found()
     {
         await using var cluster = await MeshTestCluster.CreateAsync(EmptySchema);
