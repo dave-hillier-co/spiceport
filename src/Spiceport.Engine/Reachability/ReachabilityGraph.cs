@@ -49,6 +49,13 @@ public sealed class ReachabilityGraph
     }
 
     /// <summary>
+    /// The set of resource <c>(namespace, relation)</c> targets the graph holds entrypoints for. Used by
+    /// schema-introspection (ComputablePermissions) to enumerate candidate resources to test reachability
+    /// against, instead of re-deriving them from the namespace definitions.
+    /// </summary>
+    public IReadOnlyCollection<RelationReference> Targets => _byTarget.Keys;
+
+    /// <summary>
     /// Returns the productive entrypoints by which a subject of <paramref name="subject"/> can reach
     /// <paramref name="resource"/>. Port of <c>AllEntrypointsForSubjectToResource</c> /
     /// <c>collectEntrypoints</c>: collects direct entrypoints for the subject ref and recurses through

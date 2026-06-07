@@ -39,38 +39,30 @@ public static class SchemaChangeValidator
         ArgumentNullException.ThrowIfNull(next);
         ArgumentNullException.ThrowIfNull(reader);
 
-        var nextByName = next.Namespaces.ToDictionary(n => n.Name);
-
-        foreach (var existingDef in current.Namespaces)
+        // Reuse the shared diff core, then run datastore orphan checks only on the removal deltas. Permission
+        // removals / additions / allowed-type additions are always safe and carry no datastore check.
+        foreach (var delta in SchemaDiff.Compute(current, next))
         {
-            if (!nextByName.TryGetValue(existingDef.Name, out var nextDef))
+            switch (delta)
             {
-                // Whole definition removed: reject if ANY relationship has it as the resource type.
-                await EnsureNoResourceTypeAsync(reader, existingDef.Name, cancellationToken)
-                    .ConfigureAwait(false);
-                continue;
-            }
+                case SchemaDelta.DefinitionRemoved(var def):
+                    // Whole definition removed: reject if ANY relationship has it as the resource type.
+                    await EnsureNoResourceTypeAsync(reader, def.Name, cancellationToken)
+                        .ConfigureAwait(false);
+                    break;
 
-            var nextRelations = nextDef.Relations.ToDictionary(r => r.Name);
-
-            foreach (var existingRel in existingDef.Relations)
-            {
-                // Permissions are computed, never written as relationships: removing one is always safe.
-                if (existingRel.IsPermission)
-                    continue;
-
-                if (!nextRelations.TryGetValue(existingRel.Name, out var nextRel) || nextRel.IsPermission)
-                {
+                case SchemaDelta.RelationRemoved(var defName, var rel):
                     // Base relation removed (or turned into a permission): reject if any relationship is
                     // written under resource-type#relation, or references it as subject-type#relation.
-                    await EnsureNoRelationAsync(reader, existingDef.Name, existingRel.Name, cancellationToken)
+                    await EnsureNoRelationAsync(reader, defName, rel.Name, cancellationToken)
                         .ConfigureAwait(false);
-                    continue;
-                }
+                    break;
 
-                // Relation kept: reject removal of an allowed subject type that is still referenced.
-                await EnsureNoRemovedAllowedTypesAsync(reader, existingDef.Name, existingRel, nextRel, cancellationToken)
-                    .ConfigureAwait(false);
+                case SchemaDelta.RelationSubjectTypeRemoved(var defName, var rel, var allowed):
+                    // Allowed subject type removed: reject if any relationship still references it.
+                    await EnsureNoRemovedAllowedTypeAsync(reader, defName, rel.Name, allowed, cancellationToken)
+                        .ConfigureAwait(false);
+                    break;
             }
         }
     }
@@ -112,55 +104,38 @@ public static class SchemaChangeValidator
         }
     }
 
-    private static async Task EnsureNoRemovedAllowedTypesAsync(
-        IDatastoreReader reader, string definition, Relation existingRel, Relation nextRel, CancellationToken ct)
+    private static async Task EnsureNoRemovedAllowedTypeAsync(
+        IDatastoreReader reader, string definition, string relationName, AllowedRelation allowed, CancellationToken ct)
     {
-        var existingAllowed = existingRel.TypeInformation?.AllowedDirectRelations;
-        if (existingAllowed is null || existingAllowed.Count == 0)
-            return;
+        // This allowed subject type was removed: reject if any relationship under definition#relation has a
+        // subject matching it. A direct subject (ellipsis subrelation) and a subrelation subject (e.g.
+        // group#member) need different relation filters.
+        var subjectRelation = allowed.RelationName ?? CoreConstants.Ellipsis;
+        var relationFilter = subjectRelation == CoreConstants.Ellipsis
+            ? new SubjectRelationFilter(IncludeEllipsisRelation: true)
+            : new SubjectRelationFilter(NonEllipsisRelation: subjectRelation);
+        var subjectIds = allowed.IsPublicWildcard
+            ? (IReadOnlyList<string>)[CoreConstants.PublicWildcard]
+            : null;
 
-        var nextAllowed = nextRel.TypeInformation?.AllowedDirectRelations;
-
-        foreach (var allowed in existingAllowed)
+        var filter = new RelationshipsFilter
         {
-            if (nextAllowed is not null && nextAllowed.Any(a => SameAllowedType(a, allowed)))
-                continue; // still allowed.
+            OptionalResourceType = definition,
+            OptionalResourceRelation = relationName,
+            OptionalSubjectsSelectors =
+            [
+                new SubjectsSelector(
+                    OptionalSubjectType: allowed.ObjectType,
+                    OptionalSubjectIds: subjectIds,
+                    RelationFilter: relationFilter),
+            ],
+        };
 
-            // This allowed subject type was removed: reject if any relationship under
-            // definition#relation has a subject matching it. A direct subject (ellipsis subrelation)
-            // and a subrelation subject (e.g. group#member) need different relation filters.
-            var subjectRelation = allowed.RelationName ?? CoreConstants.Ellipsis;
-            var relationFilter = subjectRelation == CoreConstants.Ellipsis
-                ? new SubjectRelationFilter(IncludeEllipsisRelation: true)
-                : new SubjectRelationFilter(NonEllipsisRelation: subjectRelation);
-            var subjectIds = allowed.IsPublicWildcard
-                ? (IReadOnlyList<string>)[CoreConstants.PublicWildcard]
-                : null;
-
-            var filter = new RelationshipsFilter
-            {
-                OptionalResourceType = definition,
-                OptionalResourceRelation = existingRel.Name,
-                OptionalSubjectsSelectors =
-                [
-                    new SubjectsSelector(
-                        OptionalSubjectType: allowed.ObjectType,
-                        OptionalSubjectIds: subjectIds,
-                        RelationFilter: relationFilter),
-                ],
-            };
-
-            await foreach (var rel in reader.QueryRelationships(filter, ct).ConfigureAwait(false))
-            {
-                var desc = allowed.IsPublicWildcard ? $"{allowed.ObjectType}:*" : allowed.ObjectType;
-                throw new SchemaWriteValidationException(
-                    $"cannot remove allowed subject type `{desc}` from `{definition}#{existingRel.Name}`: at least one relationship still references it (e.g. {rel})");
-            }
+        await foreach (var rel in reader.QueryRelationships(filter, ct).ConfigureAwait(false))
+        {
+            var desc = allowed.IsPublicWildcard ? $"{allowed.ObjectType}:*" : allowed.ObjectType;
+            throw new SchemaWriteValidationException(
+                $"cannot remove allowed subject type `{desc}` from `{definition}#{relationName}`: at least one relationship still references it (e.g. {rel})");
         }
     }
-
-    private static bool SameAllowedType(AllowedRelation a, AllowedRelation b) =>
-        a.ObjectType == b.ObjectType
-        && a.Kind == b.Kind
-        && (a.RelationName ?? CoreConstants.Ellipsis) == (b.RelationName ?? CoreConstants.Ellipsis);
 }
