@@ -111,21 +111,37 @@ The elegant result: **`internal/dispatch/remote`, `cluster`, the consistent-hash
 and the singleflight machinery collapse into the Orleans runtime.** We port the *graph
 engine* (the interesting part) and delete the *distribution plumbing* (the tedious part).
 
-### 3.3 Two viable grain granularities (decision to make in Phase 2)
+### 3.3 The dispatcher seam is the core mechanism (implemented)
 
-- **(A) Grain-per-cache-key** — `CheckGrain` keyed by the canonical
-  `(resource-type, resource-ids, relation, subject, revision, schema-hash)`. The activation
-  *is* the cache entry; it is immutable for that revision, so eviction = deactivation. You get
-  routing + dedup + cache for free. Cost: activation/directory overhead per unique sub-problem,
-  which at Zanzibar request rates (millions/s) is the live risk.
-- **(B) Stateless-worker dispatch grains + custom placement + in-process cache** — keep a
-  Ristretto-equivalent (e.g. a high-perf .NET cache) per silo, and use a *custom placement
-  director* that hashes the request key (mirroring `authzed/consistent`) so locality is
-  preserved without a grain per key. Closer to SpiceDB's actual perf profile.
+The thing that makes the domain *actor-addressable* is not the grain class — it is the
+**dispatcher seam**. The engine must never recurse into itself directly; every sub-problem
+flows through an `IDispatcher.DispatchCheck(request)` interface, mirroring SpiceDB's
+`combined(caching → remote → local)` chain. This is what was built:
 
-Recommendation: prototype with (A) for correctness and simplicity, benchmark, and fall back to
-(B) if directory/activation overhead dominates. The graph-engine code is identical either way;
-only the wrapping changes.
+- `LocalDispatcher` — runs one expansion step; calls back through the dispatcher for sub-problems.
+- `CachingDispatcher` — serves/stores results by sub-problem key. **Caches the pre-context
+  `Branch` (membership + caveat *expression*), not the collapsed verdict** — caveat context is
+  applied per-request outside the cache. Key = `(resourceType, resourceId, relation, subject,
+  quantizedRevision, schemaHash)`, **excluding** the visited-set, depth, and caveat context.
+  Cycle-cut results are not cached. **Revision quantization** is mandatory or the cache never
+  hits (each write mints a fresh revision).
+- `OrleansDispatcher` + `CheckGrain` — the grain is keyed by the canonical sub-problem; the
+  grain's onward sub-dispatch goes *back through Orleans*, so recursion crosses grain
+  boundaries. `ResolverMeta` (revision, depthRemaining, visited) travels in the request so a
+  remote grain reads the same snapshot and continues the same cycle guard.
+
+The grain identity *is* the sub-problem — the domain concept that has identity, is cacheable,
+and is the unit of distribution. Verified by an Orleans `TestCluster` running the conformance
+corpus (set-ops, arrow, wildcard, nested-group, recursive, caveats) **through the grain mesh**
+with results identical to the in-process engine.
+
+**Remaining tuning (not correctness):**
+- **Local-recurse vs grain-hop hybrid** — currently every sub-problem can become a grain call;
+  the perf target is a custom placement director (consistent hash, mirroring
+  `authzed/consistent`) that recurses in-process when a sub-problem hashes to the local silo and
+  only grain-hops on a shard miss — exactly how SpiceDB only RPCs across nodes.
+- **Traversal bloom** — the visited-set currently crosses grain boundaries as an exact set; a
+  bounded bloom filter (≤1KB, as SpiceDB) is the optimization.
 
 ### 3.4 Other components, by actor role
 

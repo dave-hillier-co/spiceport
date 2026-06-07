@@ -1,46 +1,49 @@
 using Google.Protobuf.WellKnownTypes;
 using Grpc.Core;
 using Spiceport.Core;
-using Spiceport.Grains.Abstractions;
+using Spiceport.Engine;
+using Spiceport.Grains;
 using Spiceport.Protos;
 
 namespace Spiceport.Api;
 
 /// <summary>
-/// gRPC front door: translates the proto <see cref="CheckPermissionRequest"/> into the grain
-/// <see cref="CheckRequest"/>, invokes the single stateless-worker check grain, and maps the
-/// verdict back to the proto permissionship.
+/// gRPC front door: translates the proto <see cref="CheckPermissionRequest"/> into a top-level
+/// permission check, dispatches it through the silo-wide Caching-over-Orleans root dispatcher (so the
+/// recursion runs across the grain mesh), and maps the verdict back to the proto permissionship.
 /// </summary>
-public sealed class PermissionsGrpcService(IGrainFactory grains)
+public sealed class PermissionsGrpcService(IPermissionChecker checker)
     : PermissionsService.PermissionsServiceBase
 {
     public override async Task<CheckPermissionResponse> CheckPermission(
         CheckPermissionRequest request, ServerCallContext context)
     {
-        var grain = grains.GetGrain<ICheckGrain>(0);
-
         var subjectRelation = string.IsNullOrEmpty(request.Subject.OptionalRelation)
             ? CoreConstants.Ellipsis
             : request.Subject.OptionalRelation;
 
-        var reply = await grain.Check(new CheckRequest(
+        var subject = new ObjectAndRelation(
+            request.Subject.Object.ObjectType,
+            request.Subject.Object.ObjectId,
+            subjectRelation);
+
+        var result = await checker.Check(
             request.Resource.ObjectType,
             request.Resource.ObjectId,
             request.Permission,
-            request.Subject.Object.ObjectType,
-            request.Subject.Object.ObjectId,
-            subjectRelation,
-            StructToDict(request.Context)));
+            subject,
+            StructToDict(request.Context),
+            context.CancellationToken);
 
-        var ship = reply.Verdict switch
+        var ship = result.Verdict switch
         {
-            CheckVerdict.Member => CheckPermissionResponse.Types.Permissionship.HasPermission,
-            CheckVerdict.Caveated => CheckPermissionResponse.Types.Permissionship.ConditionalPermission,
+            Membership.Member => CheckPermissionResponse.Types.Permissionship.HasPermission,
+            Membership.Caveated => CheckPermissionResponse.Types.Permissionship.ConditionalPermission,
             _ => CheckPermissionResponse.Types.Permissionship.NoPermission,
         };
 
         var resp = new CheckPermissionResponse { Permissionship = ship };
-        resp.PartialCaveatMissingFields.AddRange(reply.MissingFields);
+        resp.PartialCaveatMissingFields.AddRange(result.MissingFields);
         return resp;
     }
 

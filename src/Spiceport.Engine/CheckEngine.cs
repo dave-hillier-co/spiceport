@@ -35,6 +35,26 @@ public sealed class CheckEngine
     private readonly int _maxDepth;
     private readonly CaveatEvaluator _caveatEvaluator;
 
+    // Optional caching layer. Null by default => behaviour is identical to the uncached path.
+    private readonly CachingConfig? _caching;
+
+    /// <summary>
+    /// Optional caching configuration for a <see cref="CheckEngine"/>: the shared branch cache, the
+    /// revision quantizer and the schema hash used to scope cached entries.
+    /// </summary>
+    /// <remarks>
+    /// Caching stores only the pre-context branch (membership + caveat expression). The request-time
+    /// caveat context is still applied per-request in <see cref="Collapse"/>, so enabling caching does
+    /// not change any verdict, including for context-varying caveat checks.
+    /// </remarks>
+    /// <param name="Cache">The shared, thread-safe branch cache.</param>
+    /// <param name="Quantizer">Maps a request revision to a stable cache bucket.</param>
+    /// <param name="SchemaHash">A stable hash of the schema scoping cache entries.</param>
+    public sealed record CachingConfig(
+        IDispatchCache Cache,
+        IRevisionQuantizer Quantizer,
+        string SchemaHash);
+
     /// <summary>
     /// Creates a check engine over the given schema definitions.
     /// </summary>
@@ -60,6 +80,46 @@ public sealed class CheckEngine
         _namespaces = namespaces.ToImmutableDictionary(ns => ns.Name);
         _caveatEvaluator = new CaveatEvaluator(caveats ?? []);
         _maxDepth = maxDepth;
+        _caching = null;
+    }
+
+    private CheckEngine(
+        ImmutableDictionary<string, NamespaceDefinition> namespaces,
+        CaveatEvaluator caveatEvaluator,
+        int maxDepth,
+        CachingConfig? caching)
+    {
+        _namespaces = namespaces;
+        _caveatEvaluator = caveatEvaluator;
+        _maxDepth = maxDepth;
+        _caching = caching;
+    }
+
+    /// <summary>
+    /// Builds a cache-enabled <see cref="CheckEngine"/> over the given schema. Behaviour is identical
+    /// to the uncached engine except that pre-context branches are reused across sub-problems and
+    /// across checks (correctly, because caveat context is applied per-request after dispatch).
+    /// </summary>
+    /// <param name="namespaces">The compiled namespace definitions.</param>
+    /// <param name="caveats">The compiled caveat definitions, or null.</param>
+    /// <param name="cache">The shared branch cache (created if null).</param>
+    /// <param name="quantizer">The revision quantizer (defaults to a 5s timestamp quantizer).</param>
+    /// <param name="maxDepth">The maximum recursion depth before a check fails.</param>
+    public static CheckEngine WithCaching(
+        IEnumerable<NamespaceDefinition> namespaces,
+        IEnumerable<CaveatDefinition>? caveats = null,
+        IDispatchCache? cache = null,
+        IRevisionQuantizer? quantizer = null,
+        int maxDepth = DefaultMaxDepth)
+    {
+        ArgumentNullException.ThrowIfNull(namespaces);
+        var caveatList = caveats?.ToList();
+        var ns = namespaces.ToImmutableDictionary(n => n.Name);
+        var config = new CachingConfig(
+            cache ?? new InMemoryDispatchCache(),
+            quantizer ?? new TimestampRevisionQuantizer(),
+            SchemaHash.Compute(ns, caveatList));
+        return new CheckEngine(ns, new CaveatEvaluator(caveatList ?? []), maxDepth, config);
     }
 
     /// <summary>
@@ -117,378 +177,68 @@ public sealed class CheckEngine
         ArgumentNullException.ThrowIfNull(subject);
 
         var now = evaluationTime ?? SystemClock.Instance.UtcNow;
-        var ctx = new Context(reader, now, cancellationToken);
-        var branch = await CheckOnr(ctx, resource, subject, _maxDepth, []).ConfigureAwait(false);
+        var state = new CheckState();
 
-        return Collapse(branch, caveatContext, ctx.DispatchCount);
+        // In-process drive: build a LocalDispatcher that resolves any revision back to the single
+        // reader we were handed, then dispatch the top-level sub-problem through it. The request
+        // carries a placeholder revision identity (so it is serializable later) while the resolver
+        // closes over the pinned reader.
+        var local = new LocalDispatcher(
+            _namespaces,
+            _ => reader,
+            now,
+            state);
+
+        // Compose Caching over Local when configured: the caching dispatcher becomes the seam every
+        // sub-problem flows through (local.Dispatcher), and is also the top-level entry point.
+        IDispatcher dispatcher = local;
+        if (_caching is { } caching)
+        {
+            var cachingDispatcher = new CachingDispatcher(
+                local, caching.Cache, caching.Quantizer, caching.SchemaHash);
+            local.Dispatcher = cachingDispatcher;
+            dispatcher = cachingDispatcher;
+        }
+
+        var meta = new ResolverMeta(InProcessRevision.Instance, _maxDepth, ImmutableHashSet<VisitKey>.Empty);
+        var request = new DispatchCheckRequest(resource, subject, meta);
+        var result = await dispatcher.DispatchCheck(request, cancellationToken).ConfigureAwait(false);
+
+        // Collapse stays the per-request, post-dispatch step: evaluate the accumulated caveat with
+        // the request-time context. (CycleCut is computed/propagated but does not affect the verdict.)
+        return Collapse(result, caveatContext, state.DispatchCount);
     }
 
-    /// <summary>Collapses an internal branch result into the public, possibly-caveated verdict.</summary>
-    private CheckResult Collapse(
-        Branch branch,
+    /// <summary>
+    /// Collapses a pre-context dispatch result into the public, possibly-caveated verdict by evaluating
+    /// the accumulated caveat expression against the request-time context.
+    /// </summary>
+    /// <remarks>
+    /// This is the per-request, post-dispatch step. It is the same step the in-process <see cref="Check"/>
+    /// applies after dispatch, exposed so callers driving the dispatch seam directly (e.g. the Orleans
+    /// root dispatcher behind the API) collapse a shared, cached pre-context branch with their own
+    /// request context. <c>CycleCut</c> is ignored: it does not affect the verdict.
+    /// </remarks>
+    /// <param name="result">The pre-context dispatch branch (membership + caveat expression).</param>
+    /// <param name="caveatContext">The request-time caveat context, or null.</param>
+    /// <param name="dispatchCount">The dispatch count to report on the result.</param>
+    public CheckResult Collapse(
+        DispatchCheckResult result,
         IReadOnlyDictionary<string, object?>? caveatContext,
-        int dispatchCount)
+        int dispatchCount = 0)
     {
-        if (!branch.Member)
+        if (!result.Member)
             return new CheckResult(Membership.NotMember, dispatchCount);
 
-        if (branch.Caveat is null)
+        if (result.Caveat is null)
             return new CheckResult(Membership.Member, dispatchCount);
 
-        var result = _caveatEvaluator.EvaluateExpression(branch.Caveat, caveatContext);
-        return result.Outcome switch
+        var evaluated = _caveatEvaluator.EvaluateExpression(result.Caveat, caveatContext);
+        return evaluated.Outcome switch
         {
             CaveatOutcome.DefinitelyTrue => new CheckResult(Membership.Member, dispatchCount),
             CaveatOutcome.DefinitelyFalse => new CheckResult(Membership.NotMember, dispatchCount),
-            _ => new CheckResult(Membership.Caveated, dispatchCount, result.MissingFields),
+            _ => new CheckResult(Membership.Caveated, dispatchCount, evaluated.MissingFields),
         };
     }
-
-    /// <summary>Mutable per-check evaluation context.</summary>
-    private sealed class Context(IDatastoreReader reader, DateTimeOffset now, CancellationToken cancellationToken)
-    {
-        public IDatastoreReader Reader { get; } = reader;
-        public DateTimeOffset Now { get; } = now;
-        public CancellationToken CancellationToken { get; } = cancellationToken;
-        public int DispatchCount { get; set; }
-    }
-
-    /// <summary>A visited-set key identifying an in-flight (resource, subject) check.</summary>
-    private readonly record struct VisitKey(
-        string ResourceType, string ResourceId, string ResourceRelation,
-        string SubjectType, string SubjectId, string SubjectRelation);
-
-    private static VisitKey KeyOf(ObjectAndRelation resource, ObjectAndRelation subject) =>
-        new(resource.ObjectType, resource.ObjectId, resource.Relation,
-            subject.ObjectType, subject.ObjectId, subject.Relation);
-
-    /// <summary>The core recursive entry point for a single (resource, subject) pair.</summary>
-    private async Task<Branch> CheckOnr(
-        Context ctx,
-        ObjectAndRelation resource,
-        ObjectAndRelation subject,
-        int depth,
-        ImmutableHashSet<VisitKey> visited)
-    {
-        ctx.CancellationToken.ThrowIfCancellationRequested();
-        ctx.DispatchCount++;
-
-        if (depth <= 0)
-            return Branch.None;
-
-        // Fast path: the resource ONR is literally the subject ONR.
-        if (OnrEquals(resource, subject))
-            return Branch.DefiniteMember;
-
-        // Cycle guard.
-        var key = KeyOf(resource, subject);
-        if (visited.Contains(key))
-            return Branch.None;
-        visited = visited.Add(key);
-
-        var relation = LookupRelation(resource.ObjectType, resource.Relation);
-        if (relation is null)
-            return Branch.None;
-
-        // Permission: evaluate its rewrite. Base relation: match against written tuples.
-        return relation.UsersetRewrite is { } rewrite
-            ? await CheckRewrite(ctx, resource, subject, rewrite.Operation, depth, visited).ConfigureAwait(false)
-            : await CheckDirect(ctx, resource, subject, depth, visited).ConfigureAwait(false);
-    }
-
-    /// <summary>Matches a base relation's directly-written tuples, walking non-terminal subjects.</summary>
-    private async Task<Branch> CheckDirect(
-        Context ctx,
-        ObjectAndRelation resource,
-        ObjectAndRelation subject,
-        int depth,
-        ImmutableHashSet<VisitKey> visited)
-    {
-        var filter = new RelationshipsFilter
-        {
-            OptionalResourceType = resource.ObjectType,
-            OptionalResourceIds = [resource.ObjectId],
-            OptionalResourceRelation = resource.Relation,
-        };
-
-        // Accumulated union over all matching tuples for this (resource, subject).
-        var found = Branch.None;
-
-        // Non-terminal intermediates (with the caveat on the tuple reaching them) to recurse into.
-        List<(ObjectAndRelation Onr, CaveatExpression? Parent)>? intermediates = null;
-
-        await foreach (var rel in ctx.Reader.QueryRelationships(filter, ctx.CancellationToken).ConfigureAwait(false))
-        {
-            if (IsExpired(ctx, rel))
-                continue;
-
-            var s = rel.Subject;
-            var tupleCaveat = CaveatOf(rel);
-
-            // Direct exact match (e.g. tuple subject is user:alice#... and so is the subject).
-            if (OnrEquals(s, subject))
-            {
-                found = found.Or(Branch.CaveatedMember(tupleCaveat));
-                if (found.IsDetermined)
-                    return found;
-                continue;
-            }
-
-            // Public wildcard tuple: e.g. user:* matches any subject of type "user".
-            if (s.IsPublicWildcard && s.ObjectType == subject.ObjectType && s.Relation == subject.Relation)
-            {
-                found = found.Or(Branch.CaveatedMember(tupleCaveat));
-                if (found.IsDetermined)
-                    return found;
-                continue;
-            }
-
-            // Non-terminal subject (a userset like group:eng#member): recurse into it.
-            if (s.Relation != CoreConstants.Ellipsis && !s.IsPublicWildcard)
-            {
-                (intermediates ??= []).Add((s, tupleCaveat));
-            }
-        }
-
-        if (intermediates is null)
-            return found;
-
-        foreach (var (intermediate, parent) in intermediates)
-        {
-            var sub = await CheckOnr(ctx, intermediate, subject, depth - 1, visited).ConfigureAwait(false);
-            if (!sub.Member)
-                continue;
-
-            // The tuple's own caveat ANDs with the computed result of the userset.
-            var combined = Branch.CaveatedMember(CaveatExpression.CombineAnd(parent, sub.Caveat));
-            found = found.Or(combined);
-            if (found.IsDetermined)
-                return found;
-        }
-
-        return found;
-    }
-
-    /// <summary>Evaluates a set operation (union / intersection / exclusion).</summary>
-    private async Task<Branch> CheckRewrite(
-        Context ctx,
-        ObjectAndRelation resource,
-        ObjectAndRelation subject,
-        SetOperation operation,
-        int depth,
-        ImmutableHashSet<VisitKey> visited)
-    {
-        switch (operation.Type)
-        {
-            case SetOperationType.Union:
-            {
-                var acc = Branch.None;
-                foreach (var child in operation.Children)
-                {
-                    var b = await CheckChild(ctx, resource, subject, child, depth, visited).ConfigureAwait(false);
-                    acc = acc.Or(b);
-                    if (acc.IsDetermined)
-                        return acc;
-                }
-                return acc;
-            }
-
-            case SetOperationType.Intersection:
-            {
-                if (operation.Children.Count == 0)
-                    return Branch.None;
-                var acc = Branch.DefiniteMember;
-                foreach (var child in operation.Children)
-                {
-                    var b = await CheckChild(ctx, resource, subject, child, depth, visited).ConfigureAwait(false);
-                    if (!b.Member)
-                        return Branch.None; // short-circuit: empty intersection.
-                    acc = acc.And(b);
-                }
-                return acc;
-            }
-
-            case SetOperationType.Exclusion:
-            {
-                if (operation.Children.Count == 0)
-                    return Branch.None;
-
-                // base AND NOT child1 AND NOT child2 ...
-                var acc = await CheckChild(ctx, resource, subject, operation.Children[0], depth, visited).ConfigureAwait(false);
-                if (!acc.Member)
-                    return Branch.None;
-
-                for (var i = 1; i < operation.Children.Count; i++)
-                {
-                    var excluded = await CheckChild(ctx, resource, subject, operation.Children[i], depth, visited).ConfigureAwait(false);
-                    acc = acc.Subtract(excluded);
-                    if (!acc.Member)
-                        return Branch.None;
-                }
-                return acc;
-            }
-
-            default:
-                return Branch.None;
-        }
-    }
-
-    /// <summary>Evaluates a single set-operation operand.</summary>
-    private async Task<Branch> CheckChild(
-        Context ctx,
-        ObjectAndRelation resource,
-        ObjectAndRelation subject,
-        SetOperationChild child,
-        int depth,
-        ImmutableHashSet<VisitKey> visited)
-    {
-        switch (child)
-        {
-            case SetOperationChild.This:
-                // Legacy "_this": the directly-written tuples on this relation.
-                return await CheckDirect(ctx, resource, subject, depth, visited).ConfigureAwait(false);
-
-            case SetOperationChild.Nil:
-                return Branch.None;
-
-            case SetOperationChild.Self:
-                return resource.ObjectType == subject.ObjectType
-                       && resource.ObjectId == subject.ObjectId
-                       && subject.Relation == CoreConstants.Ellipsis
-                    ? Branch.DefiniteMember
-                    : Branch.None;
-
-            case SetOperationChild.ComputedUsersetChild(var cu):
-                return await CheckComputedUserset(ctx, resource, subject, cu, depth, visited).ConfigureAwait(false);
-
-            case SetOperationChild.TupleToUsersetChild(var ttu):
-                return await CheckTupleToUserset(
-                    ctx, resource, subject, ttu.TuplesetRelation, ttu.ComputedUserset,
-                    TupleToUsersetFunction.Any, depth, visited).ConfigureAwait(false);
-
-            case SetOperationChild.FunctionedTupleToUsersetChild(var fttu):
-                return await CheckTupleToUserset(
-                    ctx, resource, subject, fttu.TuplesetRelation, fttu.ComputedUserset,
-                    fttu.Function, depth, visited).ConfigureAwait(false);
-
-            case SetOperationChild.NestedRewrite(var nested):
-                return await CheckRewrite(ctx, resource, subject, nested.Operation, depth, visited).ConfigureAwait(false);
-
-            default:
-                return Branch.None;
-        }
-    }
-
-    /// <summary>
-    /// Evaluates a computed userset: re-check the subject against a different relation on the
-    /// resource itself.
-    /// </summary>
-    private async Task<Branch> CheckComputedUserset(
-        Context ctx,
-        ObjectAndRelation resource,
-        ObjectAndRelation subject,
-        ComputedUserset cu,
-        int depth,
-        ImmutableHashSet<VisitKey> visited)
-    {
-        var target = resource.WithRelation(cu.Relation);
-        return await CheckOnr(ctx, target, subject, depth - 1, visited).ConfigureAwait(false);
-    }
-
-    /// <summary>
-    /// Evaluates a tuple-to-userset arrow: walk the tupleset relation on the resource, then for each
-    /// reached object compute the userset relation. The tupleset tuple's own caveat ANDs with the
-    /// computed result. <c>Any</c> unions the per-target results; <c>All</c> intersects them.
-    /// </summary>
-    private async Task<Branch> CheckTupleToUserset(
-        Context ctx,
-        ObjectAndRelation resource,
-        ObjectAndRelation subject,
-        string tuplesetRelation,
-        ComputedUserset computed,
-        TupleToUsersetFunction function,
-        int depth,
-        ImmutableHashSet<VisitKey> visited)
-    {
-        var filter = new RelationshipsFilter
-        {
-            OptionalResourceType = resource.ObjectType,
-            OptionalResourceIds = [resource.ObjectId],
-            OptionalResourceRelation = tuplesetRelation,
-        };
-
-        // Each reached target, paired with the caveat on the tupleset tuple that reached it.
-        List<(ObjectAndRelation Onr, CaveatExpression? Parent)>? targets = null;
-
-        await foreach (var rel in ctx.Reader.QueryRelationships(filter, ctx.CancellationToken).ConfigureAwait(false))
-        {
-            if (IsExpired(ctx, rel))
-                continue;
-
-            var reached = rel.Subject;
-
-            // Wildcards cannot have a relation computed on them; skip.
-            if (reached.IsPublicWildcard)
-                continue;
-
-            var target = new ObjectAndRelation(reached.ObjectType, reached.ObjectId, computed.Relation);
-            (targets ??= []).Add((target, CaveatOf(rel)));
-        }
-
-        if (targets is null)
-        {
-            // No intermediates reached via the tupleset relation: neither ALL nor ANY is a
-            // member. SpiceDB's `.all()` is not vacuously true over an empty set — with no
-            // relationships there is nothing to grant access, so the result is not-member.
-            return Branch.None;
-        }
-
-        if (function == TupleToUsersetFunction.All)
-        {
-            var acc = Branch.DefiniteMember;
-            foreach (var (target, parent) in targets)
-            {
-                var sub = await CheckOnr(ctx, target, subject, depth - 1, visited).ConfigureAwait(false);
-                if (!sub.Member)
-                    return Branch.None;
-                acc = acc.And(Branch.CaveatedMember(CaveatExpression.CombineAnd(parent, sub.Caveat)));
-            }
-            return acc;
-        }
-
-        var any = Branch.None;
-        foreach (var (target, parent) in targets)
-        {
-            var sub = await CheckOnr(ctx, target, subject, depth - 1, visited).ConfigureAwait(false);
-            if (!sub.Member)
-                continue;
-            any = any.Or(Branch.CaveatedMember(CaveatExpression.CombineAnd(parent, sub.Caveat)));
-            if (any.IsDetermined)
-                return any;
-        }
-        return any;
-    }
-
-    private Relation? LookupRelation(string objectType, string relationName)
-    {
-        if (!_namespaces.TryGetValue(objectType, out var ns))
-            return null;
-        foreach (var r in ns.Relations)
-        {
-            if (r.Name == relationName)
-                return r;
-        }
-        return null;
-    }
-
-    /// <summary>True if the relationship has expired as of the evaluation "now".</summary>
-    private static bool IsExpired(Context ctx, Relationship rel) =>
-        rel.OptionalExpiration is { } exp && exp <= ctx.Now;
-
-    /// <summary>Wraps a tuple's optional caveat as a leaf expression, or null if uncaveated.</summary>
-    private static CaveatExpression? CaveatOf(Relationship rel) =>
-        rel.OptionalCaveat is { } c ? CaveatExpression.FromCaveat(c) : null;
-
-    private static bool OnrEquals(ObjectAndRelation a, ObjectAndRelation b) =>
-        a.ObjectType == b.ObjectType && a.ObjectId == b.ObjectId && a.Relation == b.Relation;
 }

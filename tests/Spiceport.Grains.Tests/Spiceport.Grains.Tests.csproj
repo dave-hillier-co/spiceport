@@ -1,0 +1,54 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="coverlet.collector" Version="6.0.4" />
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.14.1" />
+    <PackageReference Include="Microsoft.Orleans.Sdk" Version="10.1.0" />
+    <PackageReference Include="Microsoft.Orleans.TestingHost" Version="10.1.0" />
+    <PackageReference Include="xunit" Version="2.9.3" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="3.1.4" />
+    <PackageReference Include="YamlDotNet" Version="18.0.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Using Include="Xunit" />
+  </ItemGroup>
+
+  <!-- Reuse the conformance YAML loader (it lives in the sibling test project and is not
+       referenceable as a package), by linking its source files in here. -->
+  <ItemGroup>
+    <Compile Include="..\Spiceport.Conformance.Tests\Loading\ValidationFileLoader.cs" Link="Loading\ValidationFileLoader.cs" />
+    <Compile Include="..\Spiceport.Conformance.Tests\Loading\ValidationModel.cs" Link="Loading\ValidationModel.cs" />
+  </ItemGroup>
+
+  <!-- Reuse a representative subset of the conformance corpus as linked content (copied to output),
+       so the grain-mesh tests run real SpiceDB consistency fixtures. -->
+  <ItemGroup>
+    <None Include="..\Spiceport.Conformance.Tests\TestData\multipleops.yaml" Link="TestData\multipleops.yaml" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="..\Spiceport.Conformance.Tests\TestData\teamwitharrow.yaml" Link="TestData\teamwitharrow.yaml" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="..\Spiceport.Conformance.Tests\TestData\simplewildcard.yaml" Link="TestData\simplewildcard.yaml" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="..\Spiceport.Conformance.Tests\TestData\indirectnestedgroups.yaml" Link="TestData\indirectnestedgroups.yaml" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="..\Spiceport.Conformance.Tests\TestData\simplerecursive.yaml" Link="TestData\simplerecursive.yaml" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="..\Spiceport.Conformance.Tests\TestData\basiccaveat.yaml" Link="TestData\basiccaveat.yaml" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="..\Spiceport.Conformance.Tests\TestData\caveatlr.yaml" Link="TestData\caveatlr.yaml" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="..\Spiceport.Conformance.Tests\TestData\caveatip.yaml" Link="TestData\caveatip.yaml" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\Spiceport.Grains\Spiceport.Grains.csproj" />
+    <ProjectReference Include="..\..\src\Spiceport.Grains.Abstractions\Spiceport.Grains.Abstractions.csproj" />
+    <ProjectReference Include="..\..\src\Spiceport.Engine\Spiceport.Engine.csproj" />
+    <ProjectReference Include="..\..\src\Spiceport.Schema\Spiceport.Schema.csproj" />
+    <ProjectReference Include="..\..\src\Spiceport.Datastore\Spiceport.Datastore.csproj" />
+    <ProjectReference Include="..\..\src\Spiceport.Datastore.Memory\Spiceport.Datastore.Memory.csproj" />
+    <ProjectReference Include="..\..\src\Spiceport.Core\Spiceport.Core.csproj" />
+  </ItemGroup>
+
+</Project>

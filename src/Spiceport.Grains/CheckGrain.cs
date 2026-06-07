@@ -1,4 +1,4 @@
-using Orleans.Concurrency;
+using System.Collections.Immutable;
 using Spiceport.Core;
 using Spiceport.Datastore;
 using Spiceport.Engine;
@@ -7,46 +7,59 @@ using Spiceport.Grains.Abstractions;
 namespace Spiceport.Grains;
 
 /// <summary>
-/// Stateless-worker grain that answers permission checks by wrapping <see cref="CheckEngine"/>.
+/// A grain keyed by a single canonical sub-problem. It computes exactly ONE expansion step of that
+/// sub-problem and dispatches every deeper sub-problem back out through the (Orleans) dispatcher, so
+/// recursion crosses grain boundaries and the mesh is real.
 /// </summary>
 /// <remarks>
-/// Phase 2 topology: ONE stateless-worker grain (integer key 0) fronting a shared,
-/// immutable <see cref="CheckEngine"/> singleton. Concurrency comes from
-/// <see cref="StatelessWorkerAttribute"/> activating multiple instances on demand.
+/// On <see cref="DispatchCheck"/> the grain decodes its identity from its string key (resource,
+/// subject, revision, schema hash), resolves a snapshot reader at that revision from the injected
+/// <see cref="IDatastore"/> singleton, and runs a <see cref="LocalDispatcher"/> whose onward
+/// <see cref="LocalDispatcher.Dispatcher"/> is the silo-wide onward dispatcher
+/// (<see cref="ISiloDispatcher"/> = Caching over Orleans). The local dispatcher performs the one step;
+/// children flow through Orleans as further grain calls.
 /// <para>
-/// Next optimization (docs/architecture-analysis.md §3.3 option A): grain-per-cache-key,
-/// keyed by (resource-type, resource-id, relation, subject, revision, schema-hash), so the
-/// grain identity itself caches a verdict. Only the grain wrapping changes; the engine,
-/// schema provider and datastore wiring stay the same.
+/// CACHING: there is no per-activation result cache here. Caching lives in the silo-wide
+/// <see cref="CachingDispatcher"/> (the shared branch cache), through which both the API entry and the
+/// grain's onward sub-dispatch flow; the grain identity itself additionally provides activation-level
+/// locality per sub-problem key.
 /// </para>
 /// </remarks>
-[StatelessWorker]
-public sealed class CheckGrain(CheckEngine engine, IDatastore datastore) : Grain, ICheckGrain
+public sealed class CheckGrain(
+    IDatastore datastore,
+    ISchemaProvider schemaProvider,
+    ISiloDispatcher onward) : Grain, ICheckGrain
 {
     /// <inheritdoc />
-    public async Task<CheckReply> Check(CheckRequest request)
+    public async Task<DispatchCheckReply> DispatchCheck(DispatchCheckArgs args)
     {
-        ArgumentNullException.ThrowIfNull(request);
+        ArgumentNullException.ThrowIfNull(args);
 
-        // Evaluate against the freshest committed state. Consistency tokens / quantized
-        // revisions are a later phase; HeadRevision is correct (if not yet cacheable) here.
-        var head = await datastore.HeadRevision();
-        var reader = datastore.SnapshotReader(head.Revision);
+        var parts = GrainKey.Parse(this.GetPrimaryKeyString());
+        var revision = RevisionCodec.Parse(parts.Revision);
+        var now = DateTimeOffset.UtcNow;
 
-        var subject = new ObjectAndRelation(
-            request.SubjectType,
-            request.SubjectId,
-            request.SubjectRelation);
+        // A LocalDispatcher does ONE expansion step; its onward Dispatcher (the silo-wide
+        // Caching-over-Orleans dispatcher) turns each child sub-problem into a further grain call.
+        var namespaces = schemaProvider.Schema.Namespaces.ToImmutableDictionary(ns => ns.Name);
+        var state = new CheckState();
+        var local = new LocalDispatcher(
+            namespaces,
+            datastore.SnapshotReader,
+            now,
+            state)
+        {
+            Dispatcher = onward.Dispatcher,
+        };
 
-        var result = await engine.Check(
-            reader,
-            request.ResourceType,
-            request.ResourceId,
-            request.Permission,
-            subject,
-            request.Context);
+        var meta = new ResolverMeta(
+            revision,
+            args.DepthRemaining,
+            OrleansDispatcher.ToVisitKeys(args.Visited));
+        var request = new DispatchCheckRequest(parts.Resource, parts.Subject, meta);
 
-        // CheckVerdict mirrors the Engine's Membership integer values (0/1/2).
-        return new CheckReply((CheckVerdict)(int)result.Verdict, result.MissingExprFields);
+        var result = await local.DispatchCheck(request, CancellationToken.None).ConfigureAwait(false);
+
+        return new DispatchCheckReply(result.Member, CaveatWire.ToWire(result.Caveat), result.CycleCut);
     }
 }

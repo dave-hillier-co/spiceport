@@ -17,6 +17,7 @@
     <Project Path="tests/Spiceport.Core.Tests/Spiceport.Core.Tests.csproj" />
     <Project Path="tests/Spiceport.Datastore.Memory.Tests/Spiceport.Datastore.Memory.Tests.csproj" />
     <Project Path="tests/Spiceport.Engine.Tests/Spiceport.Engine.Tests.csproj" />
+    <Project Path="tests/Spiceport.Grains.Tests/Spiceport.Grains.Tests.csproj" />
     <Project Path="tests/Spiceport.Schema.Tests/Spiceport.Schema.Tests.csproj" />
   </Folder>
 </Solution>

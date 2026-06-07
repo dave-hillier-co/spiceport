@@ -56,9 +56,14 @@ public sealed class InMemoryDatastore : IDatastore
         lock (_writeLock)
         {
             var head = _current.HeadRevision;
+            // Quantize the clock DOWN to a bucket so near-in-time checks share a revision, but never
+            // below the latest committed revision: a snapshot at an older bucket would silently drop
+            // already-committed writes. When the bucket floor falls before head's commit (the common
+            // case immediately after a write), pin to head — which is still snapshot-able and reflects
+            // all committed data. Cache bucketing across the mesh is handled separately by the
+            // IRevisionQuantizer over this revision, so correctness here costs no cache locality.
             var quantized = _quantizationNanos > 0 ? head - (head % _quantizationNanos) : head;
-            // Never return a revision older than the GC window, or one before any committed state.
-            if (!IsRevisionValid(quantized))
+            if (quantized < head || !IsRevisionValid(quantized))
                 quantized = head;
             return Task.FromResult(new RevisionWithSchemaHash(new TimestampRevision(quantized), _current.SchemaHashAt(quantized)));
         }
