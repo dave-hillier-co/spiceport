@@ -31,18 +31,18 @@ public sealed class CachingDispatcher : IDispatcher
     private readonly IDispatcher _inner;
     private readonly IDispatchCache _cache;
     private readonly IRevisionQuantizer _quantizer;
-    private readonly string _schemaHash;
+    private readonly ISchemaHashSource _schemaHash;
 
     /// <summary>Creates a caching dispatcher over a delegate dispatcher.</summary>
     /// <param name="inner">The dispatcher that performs the actual expansion on a cache miss.</param>
     /// <param name="cache">The branch cache.</param>
     /// <param name="quantizer">Maps a request revision to a stable cache bucket.</param>
-    /// <param name="schemaHash">A stable hash of the schema, scoping cache entries to a schema.</param>
+    /// <param name="schemaHash">Supplies the live schema hash, scoping cache entries to the current schema so a schema swap is never reused.</param>
     public CachingDispatcher(
         IDispatcher inner,
         IDispatchCache cache,
         IRevisionQuantizer quantizer,
-        string schemaHash)
+        ISchemaHashSource schemaHash)
     {
         ArgumentNullException.ThrowIfNull(inner);
         ArgumentNullException.ThrowIfNull(cache);
@@ -81,7 +81,7 @@ public sealed class CachingDispatcher : IDispatcher
 
         // The key excludes visited-set, depth budget and caveat context by construction.
         return new StringBuilder(128)
-            .Append(_schemaHash).Append('|')
+            .Append(_schemaHash.CurrentSchemaHash).Append('|')
             .Append(rev).Append('|')
             .Append(r.ObjectType).Append(':').Append(r.ObjectId).Append('#').Append(r.Relation)
             .Append('@')

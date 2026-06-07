@@ -58,7 +58,7 @@ public class ReverseOpsCorpusMeshTests
     private static async Task<HashSet<string>> EngineLookupSubjects(
         MeshTestCluster cluster, string resourceType, string resourceId, string permission, string subjectType)
     {
-        var schema = cluster.Services.GetRequiredService<ISchemaProvider>().Schema;
+        var schema = cluster.Services.GetRequiredService<ISchemaProvider>().Current;
         var datastore = cluster.Datastore;
         var rev = await datastore.OptimizedRevision();
         var reader = datastore.SnapshotReader(rev.Revision);
@@ -77,7 +77,7 @@ public class ReverseOpsCorpusMeshTests
     private static async Task<HashSet<string>> EngineLookupResources(
         MeshTestCluster cluster, string resourceType, string permission, string subjectType, string subjectId)
     {
-        var schema = cluster.Services.GetRequiredService<ISchemaProvider>().Schema;
+        var schema = cluster.Services.GetRequiredService<ISchemaProvider>().Current;
         var datastore = cluster.Datastore;
         var rev = await datastore.OptimizedRevision();
         var reader = datastore.SnapshotReader(rev.Revision);

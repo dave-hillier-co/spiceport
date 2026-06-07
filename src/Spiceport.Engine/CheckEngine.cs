@@ -195,7 +195,7 @@ public sealed class CheckEngine
         if (_caching is { } caching)
         {
             var cachingDispatcher = new CachingDispatcher(
-                local, caching.Cache, caching.Quantizer, caching.SchemaHash);
+                local, caching.Cache, caching.Quantizer, new FixedSchemaHashSource(caching.SchemaHash));
             local.Dispatcher = cachingDispatcher;
             dispatcher = cachingDispatcher;
         }

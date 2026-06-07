@@ -85,7 +85,7 @@ public class CachingDispatcherTests
             counting,
             new InMemoryDispatchCache(),
             new TimestampRevisionQuantizer(),
-            SchemaHash.Compute(namespaces));
+            new FixedSchemaHashSource(SchemaHash.Compute(namespaces)));
         local.Dispatcher = caching;
 
         var request = Request(rev, Onr("group", "eng", "member"), Onr("user", "alice"));
@@ -157,7 +157,7 @@ public class CachingDispatcherTests
         var cache = new InMemoryDispatchCache();
         var local = new LocalDispatcher(namespaces, _ => reader, DateTimeOffset.UtcNow, state);
         var caching = new CachingDispatcher(
-            local, cache, new TimestampRevisionQuantizer(), SchemaHash.Compute(namespaces));
+            local, cache, new TimestampRevisionQuantizer(), new FixedSchemaHashSource(SchemaHash.Compute(namespaces)));
         local.Dispatcher = caching;
 
         var request = Request(rev, Onr("group", "a", "member"), Onr("user", "ghost"));

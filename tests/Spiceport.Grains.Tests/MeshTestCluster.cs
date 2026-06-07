@@ -38,6 +38,17 @@ public sealed class MeshTestCluster : IAsyncDisposable
     /// <summary>The cluster grain factory, for resolving grains (e.g. the reverse-ops worker) in tests.</summary>
     public IGrainFactory GrainFactory => _cluster.GrainFactory;
 
+    /// <summary>The live, mutable schema provider (for asserting the current snapshot after a swap).</summary>
+    public ISchemaProvider SchemaProvider => Services.GetRequiredService<ISchemaProvider>();
+
+    /// <summary>The data-plane grain (schema + relationship writes), resolved by its constant key.</summary>
+    public Abstractions.IRelationshipsGrain Relationships =>
+        GrainFactory.GetGrain<Abstractions.IRelationshipsGrain>(Abstractions.IRelationshipsGrain.Key);
+
+    /// <summary>Compiles and installs a new schema on the running cluster, exercising the dynamic path.</summary>
+    public Task<Abstractions.WriteSchemaReply> WriteSchema(string schemaText) =>
+        Relationships.WriteSchema(new Abstractions.WriteSchemaArgs(schemaText));
+
     /// <summary>Builds and starts a cluster for the given schema DSL text.</summary>
     public static async Task<MeshTestCluster> CreateAsync(string schemaText)
     {

@@ -12,6 +12,13 @@ using ProtoPermissionship = Spiceport.Protos.Permissionship;
 using ProtoFoundResource = Spiceport.Protos.FoundResource;
 using ProtoFoundSubject = Spiceport.Protos.FoundSubject;
 using ProtoTreeNode = Spiceport.Protos.PermissionTreeNode;
+using Relationship = Spiceport.Protos.Relationship;
+using RelationshipUpdate = Spiceport.Protos.RelationshipUpdate;
+using ContextualizedCaveat = Spiceport.Protos.ContextualizedCaveat;
+using RelationshipFilter = Spiceport.Protos.RelationshipFilter;
+using ObjectReference = Spiceport.Protos.ObjectReference;
+using SubjectReference = Spiceport.Protos.SubjectReference;
+using ZedToken = Spiceport.Protos.ZedToken;
 
 namespace Spiceport.Api;
 
@@ -26,6 +33,7 @@ public sealed class PermissionsGrpcService(IPermissionChecker checker, IGrainFac
     : PermissionsService.PermissionsServiceBase
 {
     private IReverseOpsGrain ReverseOps => grains.GetGrain<IReverseOpsGrain>(IReverseOpsGrain.Key);
+    private IRelationshipsGrain Relationships => grains.GetGrain<IRelationshipsGrain>(IRelationshipsGrain.Key);
     public override async Task<CheckPermissionResponse> CheckPermission(
         CheckPermissionRequest request, ServerCallContext context)
     {
@@ -57,6 +65,134 @@ public sealed class PermissionsGrpcService(IPermissionChecker checker, IGrainFac
         resp.PartialCaveatMissingFields.AddRange(result.MissingFields);
         return resp;
     }
+
+    public override async Task<WriteSchemaResponse> WriteSchema(
+        WriteSchemaRequest request, ServerCallContext context)
+    {
+        try
+        {
+            var reply = await Relationships.WriteSchema(new WriteSchemaArgs(request.Schema));
+            return new WriteSchemaResponse { WrittenAt = new ZedToken { Token = reply.WrittenAtToken } };
+        }
+        catch (Exception ex) when (ex is Spiceport.Schema.SchemaCompileException or ArgumentException)
+        {
+            // The grain surfaces a compile failure as a serializable ArgumentException across the grain
+            // boundary; in-process calls may still see SchemaCompileException directly.
+            throw new RpcException(new Status(StatusCode.InvalidArgument, ex.Message));
+        }
+    }
+
+    public override async Task<ReadSchemaResponse> ReadSchema(
+        ReadSchemaRequest request, ServerCallContext context)
+    {
+        var reply = await Relationships.ReadSchema();
+        return new ReadSchemaResponse
+        {
+            SchemaText = reply.SchemaText,
+            ReadAt = new ZedToken { Token = reply.ReadAtToken },
+        };
+    }
+
+    public override async Task<WriteRelationshipsResponse> WriteRelationships(
+        WriteRelationshipsRequest request, ServerCallContext context)
+    {
+        var updates = request.Updates.Select(ToWire).ToList();
+        var reply = await Relationships.WriteRelationships(new WriteRelationshipsArgs(updates));
+        return new WriteRelationshipsResponse { WrittenAt = new ZedToken { Token = reply.WrittenAtToken } };
+    }
+
+    public override async Task<ReadRelationshipsResponse> ReadRelationships(
+        ReadRelationshipsRequest request, ServerCallContext context)
+    {
+        var reply = await Relationships.ReadRelationships(new ReadRelationshipsArgs(
+            ToWire(request.Filter),
+            request.OptionalLimit == 0 ? null : (int)request.OptionalLimit,
+            NullIfEmpty(request.OptionalCursor)));
+
+        var resp = new ReadRelationshipsResponse
+        {
+            AfterResultCursor = reply.Cursor ?? string.Empty,
+            ReadAt = new ZedToken { Token = reply.ReadAtToken },
+        };
+        resp.Relationships.AddRange(reply.Relationships.Select(ToProto));
+        return resp;
+    }
+
+    public override async Task<DeleteRelationshipsResponse> DeleteRelationships(
+        DeleteRelationshipsRequest request, ServerCallContext context)
+    {
+        var reply = await Relationships.DeleteRelationships(new DeleteRelationshipsArgs(
+            ToWire(request.Filter),
+            request.OptionalLimit == 0 ? null : request.OptionalLimit));
+
+        return new DeleteRelationshipsResponse
+        {
+            DeletedCount = reply.DeletedCount,
+            ReachedLimit = reply.ReachedLimit,
+            DeletedAt = new ZedToken { Token = reply.DeletedAtToken },
+        };
+    }
+
+    private static RelationshipUpdateWire ToWire(RelationshipUpdate u)
+    {
+        var op = u.Operation switch
+        {
+            RelationshipUpdate.Types.Operation.Create => RelationshipUpdateOpWire.Create,
+            RelationshipUpdate.Types.Operation.Delete => RelationshipUpdateOpWire.Delete,
+            _ => RelationshipUpdateOpWire.Touch,
+        };
+        return new RelationshipUpdateWire(op, ToWire(u.Relationship));
+    }
+
+    private static RelationshipWire ToWire(Relationship r)
+    {
+        var subjectRelation = string.IsNullOrEmpty(r.Subject.OptionalRelation)
+            ? CoreConstants.Ellipsis
+            : r.Subject.OptionalRelation;
+        DateTimeOffset? expiration = r.OptionalExpiresAtUnixSeconds == 0
+            ? null
+            : DateTimeOffset.FromUnixTimeSeconds(r.OptionalExpiresAtUnixSeconds);
+        return new RelationshipWire(
+            r.Resource.ObjectType, r.Resource.ObjectId, r.ResourceRelation,
+            r.Subject.Object.ObjectType, r.Subject.Object.ObjectId, subjectRelation,
+            r.OptionalCaveat is { CaveatName.Length: > 0 } c ? c.CaveatName : null,
+            r.OptionalCaveat is { } cc ? StructToDict(cc.Context) : null,
+            expiration);
+    }
+
+    private static Relationship ToProto(RelationshipWire w)
+    {
+        var rel = new Relationship
+        {
+            Resource = new ObjectReference { ObjectType = w.ResourceType, ObjectId = w.ResourceId },
+            ResourceRelation = w.ResourceRelation,
+            Subject = new SubjectReference
+            {
+                Object = new ObjectReference { ObjectType = w.SubjectType, ObjectId = w.SubjectId },
+                OptionalRelation = w.SubjectRelation == CoreConstants.Ellipsis ? string.Empty : w.SubjectRelation,
+            },
+            OptionalExpiresAtUnixSeconds = w.Expiration is { } e ? e.ToUnixTimeSeconds() : 0,
+        };
+        if (w.CaveatName is { Length: > 0 })
+        {
+            rel.OptionalCaveat = new ContextualizedCaveat
+            {
+                CaveatName = w.CaveatName,
+                Context = DictToStruct(w.CaveatContext),
+            };
+        }
+
+        return rel;
+    }
+
+    private static RelationshipsFilterWire ToWire(RelationshipFilter f) => new(
+        NullIfEmpty(f.ResourceType),
+        NullIfEmpty(f.OptionalResourceIdPrefix),
+        f.OptionalResourceIds.Count > 0 ? f.OptionalResourceIds.ToList() : null,
+        NullIfEmpty(f.OptionalResourceRelation),
+        NullIfEmpty(f.OptionalSubjectType),
+        f.OptionalSubjectIds.Count > 0 ? f.OptionalSubjectIds.ToList() : null,
+        NullIfEmpty(f.OptionalSubjectRelation));
 
     public override async Task<ExpandPermissionTreeResponse> ExpandPermissionTree(
         ExpandPermissionTreeRequest request, ServerCallContext context)
@@ -212,6 +348,36 @@ public sealed class PermissionsGrpcService(IPermissionChecker checker, IGrainFac
 
         return d;
     }
+
+    private static Struct? DictToStruct(IReadOnlyDictionary<string, object?>? dict)
+    {
+        if (dict is null || dict.Count == 0)
+        {
+            return null;
+        }
+
+        var s = new Struct();
+        foreach (var (k, v) in dict)
+        {
+            s.Fields[k] = ObjectToValue(v);
+        }
+
+        return s;
+    }
+
+    private static Value ObjectToValue(object? o) => o switch
+    {
+        null => Value.ForNull(),
+        bool b => Value.ForBool(b),
+        string str => Value.ForString(str),
+        double d => Value.ForNumber(d),
+        int i => Value.ForNumber(i),
+        long l => Value.ForNumber(l),
+        IReadOnlyDictionary<string, object?> map => Value.ForStruct(DictToStruct(map) ?? new Struct()),
+        System.Collections.IEnumerable list => Value.ForList(
+            list.Cast<object?>().Select(ObjectToValue).ToArray()),
+        _ => Value.ForString(o.ToString() ?? string.Empty),
+    };
 
     private static object? ValueToObject(Value v) => v.KindCase switch
     {

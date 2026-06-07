@@ -42,7 +42,7 @@ public interface IPermissionChecker
 public sealed class PermissionChecker(
     IDatastore datastore,
     ISiloDispatcher root,
-    CheckEngine engine,
+    ISchemaProvider schemaProvider,
     int maxDepth = CheckEngine.DefaultMaxDepth) : IPermissionChecker
 {
     /// <inheritdoc />
@@ -57,6 +57,12 @@ public sealed class PermissionChecker(
         ArgumentNullException.ThrowIfNull(subject);
 
         var optimized = await datastore.OptimizedRevision(ct).ConfigureAwait(false);
+
+        // Capture a single consistent schema snapshot for this check, so the collapse uses the same
+        // caveats the dispatch ran under. Collapse is cheap and stateless, so building a per-call
+        // engine over the live schema is sufficient (rebuild-on-version-change is a perf follow-up).
+        var schema = schemaProvider.Current;
+        var engine = new CheckEngine(schema.Namespaces, schema.Caveats, maxDepth);
 
         var resource = new ObjectAndRelation(resourceType, resourceId, permission);
         var meta = new ResolverMeta(optimized.Revision, maxDepth, ImmutableHashSet<VisitKey>.Empty);

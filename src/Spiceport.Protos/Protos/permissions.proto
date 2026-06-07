@@ -10,6 +10,15 @@ import "google/protobuf/struct.proto";
 service PermissionsService {
   rpc CheckPermission(CheckPermissionRequest) returns (CheckPermissionResponse);
 
+  // ---- Data plane ----
+  // Schema read/write and relationship read/write/delete. Unary; relationship reads page with an
+  // opaque cursor (same convention as the lookup ops). Tokens are opaque ZedTokens.
+  rpc WriteSchema(WriteSchemaRequest) returns (WriteSchemaResponse);
+  rpc ReadSchema(ReadSchemaRequest) returns (ReadSchemaResponse);
+  rpc WriteRelationships(WriteRelationshipsRequest) returns (WriteRelationshipsResponse);
+  rpc ReadRelationships(ReadRelationshipsRequest) returns (ReadRelationshipsResponse);
+  rpc DeleteRelationships(DeleteRelationshipsRequest) returns (DeleteRelationshipsResponse);
+
   // Whole-resource / whole-subject traversals. Unary-with-cursor for this slice (a bounded
   // materialized page plus an opaque continuation token) rather than server streaming: the engine
   // ops already materialize their working sets, results are small for the fixtures exercised, and a
@@ -174,4 +183,96 @@ message CheckPermissionResponse {
   Permissionship permissionship = 1;
   // Caveat parameter names missing from context when permissionship is CONDITIONAL.
   repeated string partial_caveat_missing_fields = 2;
+}
+
+// ---- Data plane: schema ----
+
+// An opaque consistency token (revision + optional schema hash + datastore id), round-trippable.
+message ZedToken {
+  string token = 1;
+}
+
+message WriteSchemaRequest {
+  string schema = 1;
+}
+
+message WriteSchemaResponse {
+  ZedToken written_at = 1;
+}
+
+message ReadSchemaRequest {}
+
+message ReadSchemaResponse {
+  string schema_text = 1;
+  ZedToken read_at = 2;
+}
+
+// ---- Data plane: relationships ----
+
+message ContextualizedCaveat {
+  string caveat_name = 1;
+  google.protobuf.Struct context = 2;
+}
+
+message Relationship {
+  ObjectReference resource = 1;
+  string resource_relation = 2;
+  SubjectReference subject = 3;
+  ContextualizedCaveat optional_caveat = 4;
+  // Unix seconds; 0 = no expiration.
+  int64 optional_expires_at_unix_seconds = 5;
+}
+
+message RelationshipUpdate {
+  enum Operation {
+    OPERATION_UNSPECIFIED = 0; // treated as TOUCH
+    OPERATION_CREATE = 1;
+    OPERATION_TOUCH = 2;
+    OPERATION_DELETE = 3;
+  }
+  Operation operation = 1;
+  Relationship relationship = 2;
+}
+
+message WriteRelationshipsRequest {
+  repeated RelationshipUpdate updates = 1;
+}
+
+message WriteRelationshipsResponse {
+  ZedToken written_at = 1;
+}
+
+// The subset of the relationships filter the data plane surfaces. Empty fields = no constraint.
+message RelationshipFilter {
+  string resource_type = 1;
+  string optional_resource_id_prefix = 2;
+  repeated string optional_resource_ids = 3;
+  string optional_resource_relation = 4;
+  string optional_subject_type = 5;
+  repeated string optional_subject_ids = 6;
+  string optional_subject_relation = 7;
+}
+
+message ReadRelationshipsRequest {
+  RelationshipFilter filter = 1;
+  uint32 optional_limit = 2;
+  string optional_cursor = 3;
+}
+
+message ReadRelationshipsResponse {
+  repeated Relationship relationships = 1;
+  // Opaque continuation token; empty when exhausted.
+  string after_result_cursor = 2;
+  ZedToken read_at = 3;
+}
+
+message DeleteRelationshipsRequest {
+  RelationshipFilter filter = 1;
+  uint32 optional_limit = 2;
+}
+
+message DeleteRelationshipsResponse {
+  uint64 deleted_count = 1;
+  bool reached_limit = 2;
+  ZedToken deleted_at = 3;
 }

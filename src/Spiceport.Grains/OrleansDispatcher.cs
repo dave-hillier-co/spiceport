@@ -19,12 +19,12 @@ namespace Spiceport.Grains;
 public sealed class OrleansDispatcher : IDispatcher
 {
     private readonly IGrainFactory _grains;
-    private readonly string _schemaHash;
+    private readonly ISchemaHashSource _schemaHash;
 
     /// <summary>Creates an Orleans dispatcher.</summary>
     /// <param name="grains">The grain factory used to resolve keyed check grains.</param>
-    /// <param name="schemaHash">The schema hash embedded in every grain key (scopes identity to a schema).</param>
-    public OrleansDispatcher(IGrainFactory grains, string schemaHash)
+    /// <param name="schemaHash">Supplies the live schema hash embedded in every grain key (scopes identity to the current schema).</param>
+    public OrleansDispatcher(IGrainFactory grains, ISchemaHashSource schemaHash)
     {
         ArgumentNullException.ThrowIfNull(grains);
         ArgumentNullException.ThrowIfNull(schemaHash);
@@ -42,7 +42,7 @@ public sealed class OrleansDispatcher : IDispatcher
             request.Resource,
             request.Subject,
             request.Meta.Revision.ToString(),
-            _schemaHash);
+            _schemaHash.CurrentSchemaHash);
 
         var grain = _grains.GetGrain<ICheckGrain>(key);
 

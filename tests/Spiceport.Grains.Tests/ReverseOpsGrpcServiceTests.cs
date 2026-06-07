@@ -4,6 +4,8 @@ using Spiceport.Api;
 using Spiceport.Core;
 using Spiceport.Datastore;
 using Spiceport.Protos;
+using Relationship = Spiceport.Core.Relationship;
+using RelationshipUpdate = Spiceport.Core.RelationshipUpdate;
 
 namespace Spiceport.Grains.Tests;
 

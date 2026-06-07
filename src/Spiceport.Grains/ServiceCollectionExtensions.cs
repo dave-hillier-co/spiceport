@@ -11,17 +11,19 @@ namespace Spiceport.Grains;
 public static class ServiceCollectionExtensions
 {
     /// <summary>
-    /// Registers the schema, schema hash, revision quantizer, check engine and the silo-wide dispatch
-    /// mesh (Caching over Orleans) that the check grain and the API entry point depend on.
+    /// Registers the dynamic schema provider, revision quantizer, dispatch cache and the silo-wide
+    /// dispatch mesh (Caching over Orleans) that the check grain and the API entry point depend on.
     /// </summary>
     /// <remarks>
     /// The <see cref="IDatastore"/> singleton is owned by the host (it must persist writes), so it is
     /// intentionally NOT registered here — it is only consumed. <see cref="IGrainFactory"/> is provided
-    /// by Orleans. Everything else needed to compute a sub-problem (schema, hash, quantizer, engine,
-    /// dispatchers) is registered here.
+    /// by Orleans. The schema is held by a <see cref="MutableSchemaProvider"/> seeded from
+    /// <paramref name="schemaText"/>; the dispatch mesh reads the provider's CURRENT schema hash per
+    /// request (via <see cref="ISchemaHashSource"/>), so a runtime schema swap is reflected in every new
+    /// cache and grain key and pre-change cache entries are never reused.
     /// </remarks>
     /// <param name="services">The service collection to add to.</param>
-    /// <param name="schemaText">The schema DSL text to compile once at startup.</param>
+    /// <param name="schemaText">The schema DSL text to seed the provider with at startup.</param>
     /// <param name="maxDepth">The check engine's maximum recursion depth.</param>
     public static IServiceCollection AddSpiceportGrainServices(
         this IServiceCollection services,
@@ -31,32 +33,11 @@ public static class ServiceCollectionExtensions
         ArgumentNullException.ThrowIfNull(services);
         ArgumentNullException.ThrowIfNull(schemaText);
 
-        var compiled = SchemaCompiler.CompileSchema(schemaText);
-        return services.AddSpiceportGrainServices(compiled, maxDepth);
-    }
-
-    /// <summary>
-    /// Registers the schema, dispatch mesh and supporting services from an already-compiled schema.
-    /// </summary>
-    /// <param name="services">The service collection to add to.</param>
-    /// <param name="schema">The compiled schema.</param>
-    /// <param name="maxDepth">The check engine's maximum recursion depth.</param>
-    public static IServiceCollection AddSpiceportGrainServices(
-        this IServiceCollection services,
-        CompiledSchema schema,
-        int maxDepth = CheckEngine.DefaultMaxDepth)
-    {
-        ArgumentNullException.ThrowIfNull(services);
-        ArgumentNullException.ThrowIfNull(schema);
-
-        var schemaHash = SchemaHash.Compute(schema.Namespaces, schema.Caveats);
-
-        services.AddSingleton(schema);
-        services.AddSingleton<ISchemaProvider>(new SchemaProvider(schema));
-
-        // The engine is used only for its caveat Collapse step at the top of a check (its recursion
-        // is replaced by the grain mesh); it stays the canonical in-process computation elsewhere.
-        services.AddSingleton(_ => new CheckEngine(schema.Namespaces, schema.Caveats, maxDepth));
+        // The mutable, versioned, thread-safe schema provider. It is the single source of truth for
+        // evaluation and the live schema hash; constructing it validates the seed schema (compile).
+        var provider = new MutableSchemaProvider(schemaText);
+        services.AddSingleton<ISchemaProvider>(provider);
+        services.AddSingleton<ISchemaHashSource>(provider);
 
         // Caching key inputs shared across the mesh.
         services.AddSingleton<IRevisionQuantizer>(_ => new TimestampRevisionQuantizer());
@@ -65,23 +46,25 @@ public static class ServiceCollectionExtensions
         // The Orleans dispatcher turns each sub-problem into a grain call; the caching dispatcher
         // wraps it so the pre-context branch cache is shared across the whole mesh. This single
         // Caching(Orleans) instance is the silo-wide root: the API enters through it AND each grain
-        // routes its child sub-problems back through it (so recursion crosses grain boundaries).
+        // routes its child sub-problems back through it (so recursion crosses grain boundaries). Both
+        // read the live schema hash per request through the provider's ISchemaHashSource.
         services.AddSingleton<ISiloDispatcher>(sp =>
         {
             var grains = sp.GetRequiredService<IGrainFactory>();
             var cache = sp.GetRequiredService<IDispatchCache>();
             var quantizer = sp.GetRequiredService<IRevisionQuantizer>();
-            var orleans = new OrleansDispatcher(grains, schemaHash);
-            var root = new CachingDispatcher(orleans, cache, quantizer, schemaHash);
+            var hashSource = sp.GetRequiredService<ISchemaHashSource>();
+            var orleans = new OrleansDispatcher(grains, hashSource);
+            var root = new CachingDispatcher(orleans, cache, quantizer, hashSource);
             return new SiloDispatcher(root);
         });
 
         // Top-level entry used by the API: pins the optimized revision, dispatches through the root,
-        // collapses with request context.
+        // collapses with request context against the CURRENT schema's caveats (read per call).
         services.AddSingleton<IPermissionChecker>(sp => new PermissionChecker(
             sp.GetRequiredService<IDatastore>(),
             sp.GetRequiredService<ISiloDispatcher>(),
-            sp.GetRequiredService<CheckEngine>(),
+            sp.GetRequiredService<ISchemaProvider>(),
             maxDepth));
 
         return services;

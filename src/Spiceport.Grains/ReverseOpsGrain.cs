@@ -26,8 +26,8 @@ public sealed class ReverseOpsGrain(
     IDatastore datastore,
     ISchemaProvider schemaProvider) : Grain, IReverseOpsGrain
 {
-    private ImmutableList<NamespaceDefinition> Namespaces => schemaProvider.Schema.Namespaces;
-    private ImmutableList<CaveatDefinition> Caveats => schemaProvider.Schema.Caveats;
+    private ImmutableList<NamespaceDefinition> Namespaces => schemaProvider.Current.Namespaces;
+    private ImmutableList<CaveatDefinition> Caveats => schemaProvider.Current.Caveats;
 
     /// <inheritdoc />
     public async Task<ExpandTreeReply> ExpandPermissionTree(ExpandTreeArgs args)
