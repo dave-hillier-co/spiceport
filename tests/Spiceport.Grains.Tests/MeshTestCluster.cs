@@ -26,7 +26,7 @@ public sealed class MeshTestCluster : IAsyncDisposable
     private MeshTestCluster(TestCluster cluster) => _cluster = cluster;
 
     /// <summary>The silo-side service provider (the primary silo's container).</summary>
-    private IServiceProvider Services =>
+    public IServiceProvider Services =>
         ((InProcessSiloHandle)_cluster.Primary!).SiloHost.Services;
 
     /// <summary>The in-memory datastore singleton shared by every grain in the silo.</summary>
@@ -34,6 +34,9 @@ public sealed class MeshTestCluster : IAsyncDisposable
 
     /// <summary>The top-level permission checker (root dispatcher over the grain mesh).</summary>
     public IPermissionChecker Checker => Services.GetRequiredService<IPermissionChecker>();
+
+    /// <summary>The cluster grain factory, for resolving grains (e.g. the reverse-ops worker) in tests.</summary>
+    public IGrainFactory GrainFactory => _cluster.GrainFactory;
 
     /// <summary>Builds and starts a cluster for the given schema DSL text.</summary>
     public static async Task<MeshTestCluster> CreateAsync(string schemaText)

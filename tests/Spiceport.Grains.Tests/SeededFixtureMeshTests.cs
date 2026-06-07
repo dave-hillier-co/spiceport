@@ -11,6 +11,7 @@ namespace Spiceport.Grains.Tests;
 /// non-member (NoPermission). This is the exact behavior the gRPC front door now serves via the root
 /// dispatcher.
 /// </summary>
+[Collection(MeshClusterCollection.Name)]
 public class SeededFixtureMeshTests
 {
     private const string SchemaText = """

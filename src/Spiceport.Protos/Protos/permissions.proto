@@ -9,6 +9,140 @@ import "google/protobuf/struct.proto";
 // Minimal, NOT authzed v1 byte-compatible yet. Full authzed.api.v1 compatibility is a later step.
 service PermissionsService {
   rpc CheckPermission(CheckPermissionRequest) returns (CheckPermissionResponse);
+
+  // Whole-resource / whole-subject traversals. Unary-with-cursor for this slice (a bounded
+  // materialized page plus an opaque continuation token) rather than server streaming: the engine
+  // ops already materialize their working sets, results are small for the fixtures exercised, and a
+  // unary page keeps the gRPC surface, the grain reply DTO and the in-process TestingHost test path
+  // identical. Server streaming can be layered on later without changing the grain seam.
+
+  // Expand the permission tree of a single resource (one unary call; no cursor — a tree is whole).
+  rpc ExpandPermissionTree(ExpandPermissionTreeRequest) returns (ExpandPermissionTreeResponse);
+
+  // Enumerate the subjects (of a requested type/subrelation) that hold a resource's permission.
+  rpc LookupSubjects(LookupSubjectsRequest) returns (LookupSubjectsResponse);
+
+  // Enumerate the resources (of a requested type) on which a subject holds a permission.
+  rpc LookupResources(LookupResourcesRequest) returns (LookupResourcesResponse);
+}
+
+// Shared partial-permission shape: caveated membership plus the unresolved caveat parameter names.
+message Permissionship {
+  enum Kind {
+    KIND_UNSPECIFIED = 0;
+    KIND_HAS_PERMISSION = 1;
+    KIND_CONDITIONAL_PERMISSION = 2; // caveated / undetermined
+  }
+  Kind kind = 1;
+  // Caveat parameter names missing from context when kind is CONDITIONAL.
+  repeated string partial_caveat_missing_fields = 2;
+}
+
+// ---- ExpandPermissionTree ----
+
+message ExpandPermissionTreeRequest {
+  ObjectReference resource = 1;
+  string permission = 2;
+  enum ExpandMode {
+    EXPAND_MODE_UNSPECIFIED = 0; // treated as SHALLOW
+    EXPAND_MODE_SHALLOW = 1;
+    EXPAND_MODE_RECURSIVE = 2;
+  }
+  ExpandMode mode = 3;
+}
+
+message ExpandPermissionTreeResponse {
+  PermissionTreeNode tree_root = 1;
+}
+
+// A node in the expanded permission tree. A leaf carries directly-written subjects; an intermediate
+// node carries a set operation over child nodes. Mirrors the engine's PermissionTreeNode.
+message PermissionTreeNode {
+  // The resource ONR this node expands: type/id from `expanded_object`, relation in `expanded_relation`.
+  ObjectReference expanded_object = 1;
+  string expanded_relation = 2;
+  // Optional caveat parameter names gating this whole node (a non-empty list = the node is caveated).
+  repeated string caveat_missing_fields = 3;
+
+  oneof node {
+    LeafNode leaf = 4;
+    SetOpNode set_op = 5;
+  }
+
+  message LeafNode {
+    repeated DirectSubject subjects = 1;
+  }
+
+  message SetOpNode {
+    enum Operation {
+      OPERATION_UNSPECIFIED = 0;
+      OPERATION_UNION = 1;
+      OPERATION_INTERSECTION = 2;
+      OPERATION_EXCLUSION = 3;
+    }
+    Operation operation = 1;
+    repeated PermissionTreeNode children = 2;
+  }
+
+  // A directly-written subject of a base relation (may be a wildcard or a non-terminal userset).
+  message DirectSubject {
+    SubjectReference subject = 1;
+    // True when the subject is the public wildcard "*".
+    bool is_wildcard = 2;
+    // Caveat parameter names gating this subject (non-empty = the subject is caveated).
+    repeated string caveat_missing_fields = 3;
+  }
+}
+
+// ---- LookupSubjects ----
+
+message LookupSubjectsRequest {
+  ObjectReference resource = 1;
+  string permission = 2;
+  // The requested subject namespace and optional subrelation (empty = ellipsis).
+  string subject_object_type = 3;
+  string optional_subject_relation = 4;
+  google.protobuf.Struct context = 5;
+  // Soft page size; 0 = engine default / unbounded for this slice.
+  uint32 optional_limit = 6;
+  // Opaque continuation token from a prior page; empty to start.
+  string optional_cursor = 7;
+}
+
+message LookupSubjectsResponse {
+  repeated FoundSubject subjects = 1;
+  // Opaque continuation token; empty when the enumeration is exhausted.
+  string after_result_cursor = 2;
+}
+
+message FoundSubject {
+  string subject_object_id = 1; // "*" for a wildcard match
+  bool is_wildcard = 2;
+  Permissionship permissionship = 3;
+}
+
+// ---- LookupResources ----
+
+message LookupResourcesRequest {
+  string resource_object_type = 1;
+  string permission = 2;
+  SubjectReference subject = 3;
+  google.protobuf.Struct context = 4;
+  // Soft page size; 0 = engine default / unbounded for this slice.
+  uint32 optional_limit = 5;
+  // Opaque continuation token from a prior page; empty to start.
+  string optional_cursor = 6;
+}
+
+message LookupResourcesResponse {
+  repeated FoundResource resources = 1;
+  // Opaque continuation token; empty when the enumeration is exhausted.
+  string after_result_cursor = 2;
+}
+
+message FoundResource {
+  string resource_object_id = 1;
+  Permissionship permissionship = 2;
 }
 
 message ObjectReference {

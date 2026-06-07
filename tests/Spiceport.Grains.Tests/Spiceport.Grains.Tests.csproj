@@ -49,6 +49,8 @@
     <ProjectReference Include="..\..\src\Spiceport.Datastore\Spiceport.Datastore.csproj" />
     <ProjectReference Include="..\..\src\Spiceport.Datastore.Memory\Spiceport.Datastore.Memory.csproj" />
     <ProjectReference Include="..\..\src\Spiceport.Core\Spiceport.Core.csproj" />
+    <ProjectReference Include="..\..\src\Spiceport.Protos\Spiceport.Protos.csproj" />
+    <ProjectReference Include="..\..\src\Spiceport.Api\Spiceport.Api.csproj" />
   </ItemGroup>
 
 </Project>

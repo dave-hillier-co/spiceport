@@ -17,6 +17,7 @@ namespace Spiceport.Grains.Tests;
 /// This is the distributed == local proof: the exact same fixtures the in-process conformance suite
 /// asserts are replayed, but each Check recurses across grain boundaries.
 /// </remarks>
+[Collection(MeshClusterCollection.Name)]
 public class ConformanceMeshTests
 {
     /// <summary>
