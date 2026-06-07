@@ -32,7 +32,13 @@ public sealed class AuthzedSchemaV1Service(IGrainFactory grains, ISchemaProvider
             throw new RpcException(new Status(StatusCode.NotFound, "No schema has been defined"));
         }
 
-        return new V1::ReadSchemaResponse { SchemaText = reply.SchemaText };
+        return new V1::ReadSchemaResponse
+        {
+            SchemaText = reply.SchemaText,
+            // read_at must be populated: zed backup reads the schema, then uses this token for the
+            // export's at_exact_snapshot consistency. A null token nil-derefs the zed client.
+            ReadAt = new V1::ZedToken { Token = reply.ReadAtToken },
+        };
     }
 
     public override async Task<V1::WriteSchemaResponse> WriteSchema(
@@ -40,9 +46,8 @@ public sealed class AuthzedSchemaV1Service(IGrainFactory grains, ISchemaProvider
     {
         try
         {
-            // v1 WriteSchemaResponse is empty in this snapshot; the written-at token is discarded.
-            await Relationships.WriteSchema(new WriteSchemaArgs(request.Schema));
-            return new V1::WriteSchemaResponse();
+            var reply = await Relationships.WriteSchema(new WriteSchemaArgs(request.Schema));
+            return new V1::WriteSchemaResponse { WrittenAt = new V1::ZedToken { Token = reply.WrittenAtToken } };
         }
         catch (Exception ex) when (ex is Spiceport.Schema.SchemaCompileException or ArgumentException)
         {
