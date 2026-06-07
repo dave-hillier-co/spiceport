@@ -42,6 +42,43 @@ service PermissionsService {
   rpc LookupResources(LookupResourcesRequest) returns (LookupResourcesResponse);
 }
 
+// ---- Watch ----
+// Relationship + schema changefeed. A SEPARATE service from PermissionsService: a long-lived
+// server-streaming changefeed has a different lifecycle from the unary permission/data-plane RPCs, so
+// keeping it on its own service keeps the request/response surface clean and lets clients depend on
+// only what they use. Mirrors authzed.api.v1.WatchService.
+service WatchService {
+  // Server-streaming changefeed. Emits one WatchResponse per committed revision (strictly AFTER the
+  // start cursor), in increasing revision order, then tails live until the client disconnects.
+  rpc Watch(WatchRequest) returns (stream WatchResponse);
+}
+
+message WatchRequest {
+  // Which kinds of change to receive. Empty = relationship updates only (the common case).
+  repeated WatchKind optional_update_kinds = 1;
+  // Resume cursor. If set, the stream replays every change committed strictly after this token's
+  // revision, then tails. If unset, the stream starts from the current head (future writes only).
+  // A token from a different datastore instance, or older than the retained GC window, is rejected.
+  ZedToken optional_start_cursor = 2;
+}
+
+enum WatchKind {
+  WATCH_KIND_UNSPECIFIED = 0; // treated as INCLUDE_RELATIONSHIP_UPDATES
+  WATCH_KIND_INCLUDE_RELATIONSHIP_UPDATES = 1;
+  WATCH_KIND_INCLUDE_SCHEMA_UPDATES = 2;
+}
+
+message WatchResponse {
+  // The relationship mutations committed at this revision (create/touch surface as TOUCH; removals as
+  // DELETE). Empty when this response carries only a schema-change signal.
+  repeated RelationshipUpdate updates = 1;
+  // The ZedToken for this revision. Pass it back as optional_start_cursor to resume exactly once after
+  // a disconnect (the next stream begins strictly after this revision).
+  ZedToken changes_through = 2;
+  // True if the unified schema was (re)written at this revision (no detailed diff for this slice).
+  bool schema_updated = 3;
+}
+
 // Shared partial-permission shape: caveated membership plus the unresolved caveat parameter names.
 message Permissionship {
   enum Kind {

@@ -1,3 +1,5 @@
+using System.Collections.Immutable;
+using System.Runtime.CompilerServices;
 using Spiceport.Core;
 
 namespace Spiceport.Datastore.Memory;
@@ -17,6 +19,16 @@ public sealed class InMemoryDatastore : IDatastore
 
     private long _lastRevision;
     private DatastoreState _current;
+
+    // Ordered list of revisions that have been committed by a write transaction (the changefeed). The
+    // datastore's initial empty revision is not a write and is not listed. Used by Watch to enumerate
+    // which revisions carry changes after a cursor. Bounded by the GC window in lockstep with reads.
+    private ImmutableList<long> _committedRevisions = ImmutableList<long>.Empty;
+
+    // A signal completed whenever a new revision commits, so live Watch tailers wake without polling.
+    // Swapped under _writeLock on every commit; waiters capture the current instance before re-checking.
+    private TaskCompletionSource _commitSignal =
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
 
     /// <summary>Creates an in-memory datastore.</summary>
     /// <param name="quantization">Quantization window for <see cref="OptimizedRevision"/> (default 5s).</param>
@@ -89,6 +101,11 @@ public sealed class InMemoryDatastore : IDatastore
             if (!ReferenceEquals(_current, baseState))
                 throw new SerializationException();
             _current = tx.Commit();
+            _committedRevisions = _committedRevisions.Add(newRevision);
+            // Wake any live Watch tailers, then arm a fresh signal for the next commit.
+            var signal = _commitSignal;
+            _commitSignal = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            signal.TrySetResult();
         }
 
         return new TimestampRevision(newRevision);
@@ -100,6 +117,81 @@ public sealed class InMemoryDatastore : IDatastore
         {
             return Task.FromResult(IsRevisionValid(ToNanos(revision)));
         }
+    }
+
+    public async IAsyncEnumerable<RevisionChange> Watch(
+        IRevision afterRevision,
+        WatchOptions options,
+        [EnumeratorCancellation] CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(afterRevision);
+        ArgumentNullException.ThrowIfNull(options);
+
+        var cursor = ToNanos(afterRevision);
+        lock (_writeLock)
+        {
+            // Cannot resume from a revision older than the retained GC window.
+            if (!IsRevisionValid(cursor))
+                throw new RevisionNotFoundException(afterRevision);
+        }
+
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            // Snapshot, under the write lock, the state to read changes from, the revisions committed
+            // after the cursor, and the signal to await if there is nothing new. Doing all three under
+            // one lock makes the "check then wait" race-free: any commit after this point either is in
+            // our list, or will complete the signal we captured.
+            DatastoreState state;
+            List<long> pending;
+            TaskCompletionSource signal;
+            lock (_writeLock)
+            {
+                state = _current;
+                signal = _commitSignal;
+                pending = new List<long>();
+                foreach (var rev in _committedRevisions)
+                {
+                    if (rev > cursor)
+                        pending.Add(rev);
+                }
+            }
+
+            // pending is already in ascending order (revisions are appended monotonically).
+            foreach (var rev in pending)
+            {
+                var change = BuildChange(state, rev, options);
+                if (change is not null)
+                    yield return change;
+                cursor = rev;
+            }
+
+            if (pending.Count == 0)
+            {
+                // Nothing new: wait for the next commit or cancellation.
+                var cancelTask = Task.Delay(Timeout.Infinite, cancellationToken);
+                var completed = await Task.WhenAny(signal.Task, cancelTask).ConfigureAwait(false);
+                if (completed == cancelTask)
+                    yield break;
+            }
+        }
+    }
+
+    private static RevisionChange? BuildChange(DatastoreState state, long revision, WatchOptions options)
+    {
+        var rev = new TimestampRevision(revision);
+        var includeRels = (options.Content & WatchContent.Relationships) != 0;
+        var includeSchema = (options.Content & WatchContent.Schema) != 0;
+
+        var relChanges = includeRels
+            ? state.ChangesAt(revision)
+            : Array.Empty<RelationshipUpdate>();
+        var schemaChanged = includeSchema && state.SchemaChangedAt(revision);
+
+        // Suppress empty checkpoints: only emit a revision that actually carries requested content.
+        if (relChanges.Count == 0 && !schemaChanged)
+            return null;
+
+        return new RevisionChange(rev, relChanges, schemaChanged);
     }
 
     public Task<string> GetUniqueId(CancellationToken cancellationToken = default) => Task.FromResult(_uniqueId);

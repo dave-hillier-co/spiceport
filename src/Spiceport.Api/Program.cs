@@ -24,6 +24,7 @@ var app = builder.Build();
 await SeedData.SeedAsync(app.Services.GetRequiredService<IDatastore>());
 
 app.MapGrpcService<PermissionsGrpcService>();
+app.MapGrpcService<WatchGrpcService>();
 app.MapGet("/", () => "Spiceport API up.");
 
 app.Run();

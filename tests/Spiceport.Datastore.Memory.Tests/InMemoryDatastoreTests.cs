@@ -20,6 +20,60 @@ public class InMemoryDatastoreTests
     }
 
     [Fact]
+    public async Task Watch_emits_change_committed_after_cursor()
+    {
+        var ds = new InMemoryDatastore();
+        var head = await ds.HeadRevision();
+        var rel = Rel("document", "doc1", "viewer", "user", "alice");
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        var collected = new List<RevisionChange>();
+        var watchTask = Task.Run(async () =>
+        {
+            await foreach (var change in ds.Watch(head.Revision, new WatchOptions(WatchContent.All), cts.Token))
+            {
+                collected.Add(change);
+                break;
+            }
+        });
+
+        var rev = await ds.ReadWriteTx(async tx =>
+            await tx.WriteRelationships([new RelationshipUpdate(rel, UpdateOperation.Create)]));
+
+        await watchTask.WaitAsync(TimeSpan.FromSeconds(10));
+        cts.Cancel();
+
+        var change = Assert.Single(collected);
+        Assert.Equal(rev, change.Revision);
+        var update = Assert.Single(change.RelationshipChanges);
+        Assert.Equal(UpdateOperation.Touch, update.Operation);
+        Assert.Equal(rel, update.Relationship);
+    }
+
+    [Fact]
+    public async Task Watch_from_old_cursor_replays_committed_write()
+    {
+        var ds = new InMemoryDatastore();
+        var head = await ds.HeadRevision();
+        var rel = Rel("document", "doc2", "viewer", "user", "bob");
+
+        await ds.ReadWriteTx(async tx =>
+            await tx.WriteRelationships([new RelationshipUpdate(rel, UpdateOperation.Create)]));
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        RevisionChange? first = null;
+        await foreach (var change in ds.Watch(head.Revision, new WatchOptions(), cts.Token))
+        {
+            first = change;
+            break;
+        }
+
+        Assert.NotNull(first);
+        var update = Assert.Single(first!.RelationshipChanges);
+        Assert.Equal("doc2", update.Relationship.Resource.ObjectId);
+    }
+
+    [Fact]
     public async Task WriteThenReadBack_ReturnsRelationship()
     {
         var ds = new InMemoryDatastore();

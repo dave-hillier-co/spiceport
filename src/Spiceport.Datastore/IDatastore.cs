@@ -72,6 +72,24 @@ public interface IDatastore
     /// <summary>Returns true if the revision is still available.</summary>
     Task<bool> CheckRevision(IRevision revision, CancellationToken cancellationToken = default);
 
+    /// <summary>
+    /// Streams changes committed strictly AFTER <paramref name="afterRevision"/>, in increasing
+    /// revision order, then tails live as new transactions commit. Each <see cref="RevisionChange"/>
+    /// carries its own revision so a client can mint a resume token and continue exactly once after a
+    /// disconnect. The stream runs until <paramref name="cancellationToken"/> fires.
+    /// </summary>
+    /// <param name="afterRevision">
+    /// Resume cursor: changes made at or before this revision are not emitted. Pass the current head
+    /// to tail only future writes.
+    /// </param>
+    /// <exception cref="RevisionNotFoundException">
+    /// If <paramref name="afterRevision"/> is older than the retained GC window (cannot replay from it).
+    /// </exception>
+    IAsyncEnumerable<RevisionChange> Watch(
+        IRevision afterRevision,
+        WatchOptions options,
+        CancellationToken cancellationToken = default);
+
     /// <summary>Returns a stable unique id for this datastore instance.</summary>
     Task<string> GetUniqueId(CancellationToken cancellationToken = default);
 

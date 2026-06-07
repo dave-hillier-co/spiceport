@@ -42,6 +42,47 @@ internal sealed record DatastoreState(
         }
     }
 
+    /// <summary>
+    /// Returns the relationship changes committed AT the given revision, reconstructed from the row
+    /// created/deleted stamps. A row created at the revision surfaces as a touch (carrying the payload);
+    /// a row deleted at the revision surfaces as a delete (carrying the removed relationship). A touch
+    /// over an existing key produces both a delete of the old payload and a touch of the new — we emit
+    /// only the touch (the live result), matching SpiceDB's per-revision update semantics.
+    /// </summary>
+    public IReadOnlyList<RelationshipUpdate> ChangesAt(long atRevision)
+    {
+        var changes = new List<RelationshipUpdate>();
+        var touchedKeys = new HashSet<RelationshipKey>();
+
+        foreach (var row in Relationships)
+        {
+            if (row.CreatedRevision == atRevision)
+            {
+                changes.Add(new RelationshipUpdate(row.Relationship, UpdateOperation.Touch));
+                touchedKeys.Add(RelationshipKey.From(row.Relationship));
+            }
+        }
+
+        foreach (var row in Relationships)
+        {
+            if (row.DeletedRevision == atRevision && !touchedKeys.Contains(RelationshipKey.From(row.Relationship)))
+                changes.Add(new RelationshipUpdate(row.Relationship, UpdateOperation.Delete));
+        }
+
+        return changes;
+    }
+
+    /// <summary>True if the unified schema was (re)written exactly at the given revision.</summary>
+    public bool SchemaChangedAt(long atRevision)
+    {
+        foreach (var schema in Schemas)
+        {
+            if (schema.Revision == atRevision)
+                return true;
+        }
+        return false;
+    }
+
     /// <summary>Returns the schema bytes effective at the given revision, or null if none.</summary>
     public byte[]? SchemaAt(long atRevision)
     {
