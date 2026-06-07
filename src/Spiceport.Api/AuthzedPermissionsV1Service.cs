@@ -310,6 +310,161 @@ public sealed class AuthzedPermissionsV1Service(IPermissionChecker checker, IGra
         }
     }
 
+    public override async Task<V1::CheckBulkPermissionsResponse> CheckBulkPermissions(
+        V1::CheckBulkPermissionsRequest request, ServerCallContext context)
+    {
+        // Map every item to the grain batch shape, preserving request order. The whole batch shares ONE
+        // consistency / pinned revision; the grain fans the items out and returns index-aligned verdicts.
+        var items = request.Items.Select(it =>
+        {
+            var subjectRelation = string.IsNullOrEmpty(it.Subject.OptionalRelation)
+                ? CoreConstants.Ellipsis
+                : it.Subject.OptionalRelation;
+            return new BatchCheckItem(
+                it.Resource.ObjectType,
+                it.Resource.ObjectId,
+                it.Permission,
+                new ObjectAndRelation(it.Subject.Object.ObjectType, it.Subject.Object.ObjectId, subjectRelation),
+                StructToDict(it.Context));
+        }).ToList();
+
+        BatchCheckResult result;
+        try
+        {
+            result = await checker.BatchCheck(
+                items,
+                ToWire(request.Consistency).ToRequirement(),
+                context.CancellationToken);
+        }
+        catch (InvalidConsistencyTokenException ex)
+        {
+            throw new RpcException(new Status(StatusCode.InvalidArgument, ex.Message));
+        }
+
+        // One token for the whole batch (the single pinned revision every item was evaluated at).
+        var resp = new V1::CheckBulkPermissionsResponse
+        {
+            CheckedAt = new V1::ZedToken { Token = result.EvaluatedToken },
+        };
+
+        // Pairs are emitted in request order: each pair echoes its originating request item alongside its
+        // verdict. (BatchCheck never returns a per-item google.rpc.Status here; the error arm of the oneof is
+        // reserved for per-item failures the grain does not currently surface.)
+        for (var i = 0; i < result.Items.Count; i++)
+        {
+            var verdict = result.Items[i];
+            var ship = verdict.Verdict switch
+            {
+                Membership.Member => V1::CheckPermissionResponse.Types.Permissionship.HasPermission,
+                Membership.Caveated => V1::CheckPermissionResponse.Types.Permissionship.ConditionalPermission,
+                _ => V1::CheckPermissionResponse.Types.Permissionship.NoPermission,
+            };
+
+            var item = new V1::CheckBulkPermissionsResponseItem { Permissionship = ship };
+            if (verdict.Verdict == Membership.Caveated && verdict.MissingFields.Count > 0)
+            {
+                var partial = new V1::PartialCaveatInfo();
+                partial.MissingRequiredContext.AddRange(verdict.MissingFields);
+                item.PartialCaveatInfo = partial;
+            }
+
+            resp.Pairs.Add(new V1::CheckBulkPermissionsPair
+            {
+                Request = request.Items[i],
+                Item = item,
+            });
+        }
+
+        return resp;
+    }
+
+    public override async Task<V1::ImportBulkRelationshipsResponse> ImportBulkRelationships(
+        IAsyncStreamReader<V1::ImportBulkRelationshipsRequest> requestStream,
+        ServerCallContext context)
+    {
+        ArgumentNullException.ThrowIfNull(requestStream);
+
+        ulong total = 0;
+
+        // Consume the client stream batch by batch. Each batch is one all-or-nothing write transaction in
+        // the grain; the load is additive across the whole stream. Empty batches are skipped so they do not
+        // commit empty transactions. A CREATE-style conflict (relationship already exists) maps to
+        // AlreadyExists so the client does not retry the doomed import.
+        try
+        {
+            while (await requestStream.MoveNext(context.CancellationToken))
+            {
+                var batch = requestStream.Current;
+                if (batch.Relationships.Count == 0)
+                    continue;
+
+                var relationships = batch.Relationships.Select(ToWire).ToList();
+                var reply = await Relationships.BulkImportRelationships(
+                    new BulkImportRelationshipsArgs(relationships));
+                total += reply.NumLoaded;
+            }
+        }
+        catch (Spiceport.Datastore.SerializationException ex)
+        {
+            throw new RpcException(new Status(StatusCode.AlreadyExists, ex.Message));
+        }
+
+        // v1 ImportBulkRelationshipsResponse carries only num_loaded (no token).
+        return new V1::ImportBulkRelationshipsResponse { NumLoaded = total };
+    }
+
+    public override async Task ExportBulkRelationships(
+        V1::ExportBulkRelationshipsRequest request,
+        IServerStreamWriter<V1::ExportBulkRelationshipsResponse> responseStream,
+        ServerCallContext context)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        ArgumentNullException.ThrowIfNull(responseStream);
+
+        var filter = request.OptionalRelationshipFilter is { } f ? ToWire(f) : EmptyFilter;
+        var limit = (int)request.OptionalLimit;
+        var consistency = ToWire(request.Consistency);
+        var cursor = request.OptionalCursor is { Token.Length: > 0 } c ? c.Token : null;
+
+        // Page the grain over a single pinned snapshot. The first page resolves and pins the revision and
+        // returns a cursor encoding it; subsequent pages pass that cursor back so every page reads the SAME
+        // snapshot. Keep going while the grain hands back a continuation cursor.
+        while (!context.CancellationToken.IsCancellationRequested)
+        {
+            BulkExportRelationshipsReply reply;
+            try
+            {
+                reply = await Relationships.BulkExportRelationships(
+                    new BulkExportRelationshipsArgs(filter, limit, cursor, consistency));
+            }
+            catch (InvalidConsistencyTokenException ex)
+            {
+                throw new RpcException(new Status(StatusCode.InvalidArgument, ex.Message));
+            }
+            catch (FormatException ex)
+            {
+                throw new RpcException(new Status(StatusCode.InvalidArgument, ex.Message));
+            }
+
+            if (reply.Relationships.Count == 0)
+                break;
+
+            var response = new V1::ExportBulkRelationshipsResponse
+            {
+                AfterResultCursor = new V1::Cursor { Token = reply.Cursor ?? string.Empty },
+            };
+            response.Relationships.AddRange(reply.Relationships.Select(ToProto));
+            await responseStream.WriteAsync(response);
+
+            if (reply.Cursor is null)
+                break;
+            cursor = reply.Cursor;
+        }
+    }
+
+    private static readonly RelationshipsFilterWire EmptyFilter =
+        new(null, null, null, null, null, null, null);
+
     // ---- conversions ----
 
     private static V1::LookupPermissionship ToLookupPermissionship(WirePermissionship p) =>
@@ -407,7 +562,7 @@ public sealed class AuthzedPermissionsV1Service(IPermissionChecker checker, IGra
 
         return new RelationshipsFilterWire(
             NullIfEmpty(f.ResourceType),
-            null, // v1 RelationshipFilter has no resource-id prefix in this snapshot.
+            NullIfEmpty(f.OptionalResourceIdPrefix),
             resourceIds,
             NullIfEmpty(f.OptionalRelation),
             subjectType,

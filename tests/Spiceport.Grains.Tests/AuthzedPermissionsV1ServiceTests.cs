@@ -387,6 +387,176 @@ public class AuthzedPermissionsV1ServiceTests
         }
     }
 
+    [Fact]
+    public async Task CheckBulkPermissions_preserves_item_order_with_one_token()
+    {
+        await using var cluster = await MeshTestCluster.CreateAsync(Schema);
+        await SeedAsync(cluster.Datastore, ("readme", "viewer", "alice"));
+
+        var req = new V1::CheckBulkPermissionsRequest();
+        req.Items.Add(BulkItem("readme", "view", "alice")); // member
+        req.Items.Add(BulkItem("readme", "view", "bob"));   // non-member
+        req.Items.Add(BulkItem("other", "view", "alice"));  // non-member (no rel)
+
+        var resp = await Service(cluster).CheckBulkPermissions(req, FakeServerCallContext.Default);
+
+        Assert.False(string.IsNullOrEmpty(resp.CheckedAt.Token));
+        Assert.Equal(3, resp.Pairs.Count);
+
+        // Order preserved and each pair echoes its originating request.
+        Assert.Equal("alice", resp.Pairs[0].Request.Subject.Object.ObjectId);
+        Assert.Equal("bob", resp.Pairs[1].Request.Subject.Object.ObjectId);
+        Assert.Equal("other", resp.Pairs[2].Request.Resource.ObjectId);
+
+        Assert.Equal(V1::CheckPermissionResponse.Types.Permissionship.HasPermission, resp.Pairs[0].Item.Permissionship);
+        Assert.Equal(V1::CheckPermissionResponse.Types.Permissionship.NoPermission, resp.Pairs[1].Item.Permissionship);
+        Assert.Equal(V1::CheckPermissionResponse.Types.Permissionship.NoPermission, resp.Pairs[2].Item.Permissionship);
+
+        // One pinned revision -> all pairs share the single batch token.
+        Assert.All(resp.Pairs, p => Assert.Equal(V1::CheckBulkPermissionsPair.ResponseOneofCase.Item, p.ResponseCase));
+    }
+
+    [Fact]
+    public async Task CheckBulkPermissions_caveated_item_carries_partial_caveat_info()
+    {
+        await using var cluster = await MeshTestCluster.CreateAsync(Schema);
+        await SeedCaveatedViewerAsync(cluster.Datastore, "readme", "alice");
+
+        var req = new V1::CheckBulkPermissionsRequest();
+        req.Items.Add(BulkItem("readme", "view", "alice"));
+
+        var resp = await Service(cluster).CheckBulkPermissions(req, FakeServerCallContext.Default);
+
+        var pair = Assert.Single(resp.Pairs);
+        Assert.Equal(
+            V1::CheckPermissionResponse.Types.Permissionship.ConditionalPermission,
+            pair.Item.Permissionship);
+        Assert.NotNull(pair.Item.PartialCaveatInfo);
+        Assert.NotEmpty(pair.Item.PartialCaveatInfo.MissingRequiredContext);
+    }
+
+    [Fact]
+    public async Task CheckBulkPermissions_invalid_consistency_token_is_invalid_argument()
+    {
+        await using var cluster = await MeshTestCluster.CreateAsync(Schema);
+
+        var req = new V1::CheckBulkPermissionsRequest
+        {
+            Consistency = new V1::Consistency
+            {
+                AtExactSnapshot = new V1::ZedToken { Token = "not-a-real-token" },
+            },
+        };
+        req.Items.Add(BulkItem("readme", "view", "alice"));
+
+        var ex = await Assert.ThrowsAsync<RpcException>(() =>
+            Service(cluster).CheckBulkPermissions(req, FakeServerCallContext.Default));
+        Assert.Equal(StatusCode.InvalidArgument, ex.StatusCode);
+    }
+
+    [Fact]
+    public async Task ImportBulkRelationships_loads_across_batches_and_returns_count()
+    {
+        await using var cluster = await MeshTestCluster.CreateAsync(Schema);
+
+        var reader = new FakeAsyncStreamReader<V1::ImportBulkRelationshipsRequest>(
+            ImportBatch(("doc1", "alice"), ("doc1", "bob")),
+            new V1::ImportBulkRelationshipsRequest(), // empty batch -> skipped, no empty tx
+            ImportBatch(("doc2", "carol")));
+
+        var resp = await Service(cluster).ImportBulkRelationships(reader, FakeServerCallContext.Default);
+
+        Assert.Equal(3ul, resp.NumLoaded);
+
+        // The imported relationships are visible via a check.
+        var check = await Service(cluster).CheckPermission(new V1::CheckPermissionRequest
+        {
+            Resource = new V1::ObjectReference { ObjectType = "document", ObjectId = "doc2" },
+            Permission = "view",
+            Subject = UserSubject("carol"),
+        }, FakeServerCallContext.Default);
+        Assert.Equal(V1::CheckPermissionResponse.Types.Permissionship.HasPermission, check.Permissionship);
+    }
+
+    [Fact]
+    public async Task ExportBulkRelationships_pages_all_over_one_snapshot()
+    {
+        await using var cluster = await MeshTestCluster.CreateAsync(Schema);
+        await SeedAsync(cluster.Datastore,
+            ("doc1", "viewer", "alice"),
+            ("doc2", "viewer", "bob"),
+            ("doc3", "editor", "carol"),
+            ("doc4", "viewer", "dave"),
+            ("doc5", "viewer", "erin"));
+
+        var writer = new CollectingStreamWriter<V1::ExportBulkRelationshipsResponse>();
+        await Service(cluster).ExportBulkRelationships(new V1::ExportBulkRelationshipsRequest
+        {
+            OptionalLimit = 2, // force multiple pages
+        }, writer, FakeServerCallContext.Default);
+
+        var all = writer.Collected.SelectMany(p => p.Relationships).ToList();
+        Assert.Equal(5, all.Count);
+
+        // Every page carries a continuation cursor token.
+        Assert.All(writer.Collected, p => Assert.NotNull(p.AfterResultCursor));
+
+        // Multiple pages were produced under the limit.
+        Assert.True(writer.Collected.Count >= 2);
+
+        var resourceIds = all.Select(r => r.Resource.ObjectId).OrderBy(x => x, StringComparer.Ordinal).ToList();
+        Assert.Equal(new[] { "doc1", "doc2", "doc3", "doc4", "doc5" }, resourceIds);
+    }
+
+    [Fact]
+    public async Task ExportBulkRelationships_filter_narrows_results()
+    {
+        await using var cluster = await MeshTestCluster.CreateAsync(Schema);
+        await SeedAsync(cluster.Datastore,
+            ("doc1", "viewer", "alice"),
+            ("doc1", "editor", "bob"),
+            ("doc2", "viewer", "carol"));
+
+        var writer = new CollectingStreamWriter<V1::ExportBulkRelationshipsResponse>();
+        await Service(cluster).ExportBulkRelationships(new V1::ExportBulkRelationshipsRequest
+        {
+            OptionalRelationshipFilter = new V1::RelationshipFilter
+            {
+                ResourceType = "document",
+                OptionalResourceId = "doc1",
+                OptionalRelation = "viewer",
+            },
+        }, writer, FakeServerCallContext.Default);
+
+        var all = writer.Collected.SelectMany(p => p.Relationships).ToList();
+        var only = Assert.Single(all);
+        Assert.Equal("doc1", only.Resource.ObjectId);
+        Assert.Equal("viewer", only.Relation);
+        Assert.Equal("alice", only.Subject.Object.ObjectId);
+    }
+
+    private static V1::CheckBulkPermissionsRequestItem BulkItem(string doc, string perm, string user) => new()
+    {
+        Resource = new V1::ObjectReference { ObjectType = "document", ObjectId = doc },
+        Permission = perm,
+        Subject = UserSubject(user),
+    };
+
+    private static V1::ImportBulkRelationshipsRequest ImportBatch(params (string doc, string user)[] tuples)
+    {
+        var batch = new V1::ImportBulkRelationshipsRequest();
+        foreach (var (doc, user) in tuples)
+        {
+            batch.Relationships.Add(new V1::Relationship
+            {
+                Resource = new V1::ObjectReference { ObjectType = "document", ObjectId = doc },
+                Relation = "viewer",
+                Subject = UserSubject(user),
+            });
+        }
+        return batch;
+    }
+
     private static V1::WriteRelationshipsRequest WriteReq(
         V1::RelationshipUpdate.Types.Operation op, string doc, string user)
     {
@@ -414,6 +584,21 @@ public class AuthzedPermissionsV1ServiceTests
         {
             Collected.Add(message);
             return Task.CompletedTask;
+        }
+    }
+
+    /// <summary>A client-stream reader that replays a fixed sequence of inbound messages.</summary>
+    private sealed class FakeAsyncStreamReader<T>(params T[] messages) : IAsyncStreamReader<T>
+    {
+        private int _index = -1;
+
+        public T Current => messages[_index];
+
+        public Task<bool> MoveNext(CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            _index++;
+            return Task.FromResult(_index < messages.Length);
         }
     }
 
