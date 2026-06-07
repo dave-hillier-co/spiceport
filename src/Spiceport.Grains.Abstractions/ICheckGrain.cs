@@ -48,11 +48,17 @@ public sealed record DispatchCheckArgs(
 /// The serialized gating caveat expression, or null for unconditional membership / non-membership.
 /// </param>
 /// <param name="CycleCut">True if a visited-set cutoff was hit anywhere in this subtree.</param>
+/// <param name="DepthRequired">
+/// The recursion depth this sub-problem actually consumed below itself (leaf = 1). Travels back across
+/// the grain boundary so the silo-wide caching dispatcher can gate reuse on
+/// <c>DepthRemaining &gt;= DepthRequired</c> — mirroring SpiceDB's <c>ResponseMeta.DepthRequired</c>.
+/// </param>
 [GenerateSerializer]
 public sealed record DispatchCheckReply(
     [property: Id(0)] bool Member,
     [property: Id(1)] SerializedCaveat? Caveat,
-    [property: Id(2)] bool CycleCut);
+    [property: Id(2)] bool CycleCut,
+    [property: Id(3)] int DepthRequired = 1);
 
 /// <summary>
 /// A grain keyed by the canonical sub-problem identity. The grain's STRING KEY is, in order:

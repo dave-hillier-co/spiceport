@@ -67,6 +67,7 @@ public sealed class CheckGrain(
 
         var result = await local.DispatchCheck(request, CancellationToken.None).ConfigureAwait(false);
 
-        return new DispatchCheckReply(result.Member, CaveatWire.ToWire(result.Caveat), result.CycleCut);
+        return new DispatchCheckReply(
+            result.Member, CaveatWire.ToWire(result.Caveat), result.CycleCut, result.DepthRequired);
     }
 }

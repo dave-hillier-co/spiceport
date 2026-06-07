@@ -64,8 +64,13 @@ public sealed class LocalDispatcher : IDispatcher
         var subject = request.Subject;
         var meta = request.Meta;
 
+        // Depth exhaustion is an ERROR, not a verdict. SpiceDB's dispatch.CheckDepth raises
+        // MaxDepthExceededError (gRPC FailedPrecondition) here rather than returning a definitive
+        // non-member, so a graph deeper than maxDepth — or a true cycle the bloom would otherwise have
+        // to bound — fails the request instead of producing a confident (and cacheable) false negative.
+        // This is distinct from the bloom cycle-cut below, which is a genuine, non-erroring cut.
         if (meta.DepthRemaining <= 0)
-            return DispatchCheckResult.None;
+            throw new MaxDepthExceededException();
 
         // Fast path: the resource ONR is literally the subject ONR.
         if (OnrEquals(resource, subject))
@@ -91,11 +96,15 @@ public sealed class LocalDispatcher : IDispatcher
     }
 
     /// <summary>Dispatches a sub-problem at a decremented depth through the injected dispatcher.</summary>
-    private Task<DispatchCheckResult> Sub(
+    private async Task<DispatchCheckResult> Sub(
         ObjectAndRelation resource, ObjectAndRelation subject, ResolverMeta meta, CancellationToken ct)
     {
         var subMeta = meta with { DepthRemaining = meta.DepthRemaining - 1 };
-        return Dispatcher.DispatchCheck(new DispatchCheckRequest(resource, subject, subMeta), ct);
+        var child = await Dispatcher.DispatchCheck(new DispatchCheckRequest(resource, subject, subMeta), ct)
+            .ConfigureAwait(false);
+        // This dispatch hop consumes one level of depth: the result this node returns requires one more
+        // than whatever its child required. Mirrors SpiceDB's addCallToResponseMetadata (DepthRequired+1).
+        return child with { DepthRequired = child.DepthRequired + 1 };
     }
 
     /// <summary>Matches a base relation's directly-written tuples, walking non-terminal subjects.</summary>
@@ -152,11 +161,18 @@ public sealed class LocalDispatcher : IDispatcher
         foreach (var (intermediate, parent) in intermediates)
         {
             var sub = await Sub(intermediate, subject, meta, ct).ConfigureAwait(false);
-            found = found with { CycleCut = found.CycleCut || sub.CycleCut };
+            // Carry the cycle-cut AND the depth this child consumed up into the accumulator, even when the
+            // child is a non-member: the depth we walked is what gates cache reuse, regardless of verdict.
+            found = found with
+            {
+                CycleCut = found.CycleCut || sub.CycleCut,
+                DepthRequired = Math.Max(found.DepthRequired, sub.DepthRequired),
+            };
             if (!sub.Member)
                 continue;
 
-            var combined = CaveatedMember(CaveatExpression.CombineAnd(parent, sub.Caveat));
+            var combined = CaveatedMember(CaveatExpression.CombineAnd(parent, sub.Caveat))
+                with { DepthRequired = sub.DepthRequired };
             found = Or(found, combined);
             if (found.Member && found.Caveat is null)
                 return found;
@@ -196,15 +212,17 @@ public sealed class LocalDispatcher : IDispatcher
                     return DispatchCheckResult.None;
                 var acc = DispatchCheckResult.DefiniteMember;
                 var cut = false;
+                var depth = 1;
                 foreach (var child in operation.Children)
                 {
                     var b = await CheckChild(reader, resource, subject, child, meta, ct).ConfigureAwait(false);
                     cut = cut || b.CycleCut;
+                    depth = Math.Max(depth, b.DepthRequired);
                     if (!b.Member)
-                        return DispatchCheckResult.None with { CycleCut = cut };
+                        return DispatchCheckResult.None with { CycleCut = cut, DepthRequired = depth };
                     acc = And(acc, b);
                 }
-                return acc with { CycleCut = cut };
+                return acc with { CycleCut = cut, DepthRequired = depth };
             }
 
             case SetOperationType.Exclusion:
@@ -214,18 +232,20 @@ public sealed class LocalDispatcher : IDispatcher
 
                 var acc = await CheckChild(reader, resource, subject, operation.Children[0], meta, ct).ConfigureAwait(false);
                 var cut = acc.CycleCut;
+                var depth = acc.DepthRequired;
                 if (!acc.Member)
-                    return DispatchCheckResult.None with { CycleCut = cut };
+                    return DispatchCheckResult.None with { CycleCut = cut, DepthRequired = depth };
 
                 for (var i = 1; i < operation.Children.Count; i++)
                 {
                     var excluded = await CheckChild(reader, resource, subject, operation.Children[i], meta, ct).ConfigureAwait(false);
                     cut = cut || excluded.CycleCut;
+                    depth = Math.Max(depth, excluded.DepthRequired);
                     acc = Subtract(acc, excluded);
                     if (!acc.Member)
-                        return DispatchCheckResult.None with { CycleCut = cut };
+                        return DispatchCheckResult.None with { CycleCut = cut, DepthRequired = depth };
                 }
-                return acc with { CycleCut = cut };
+                return acc with { CycleCut = cut, DepthRequired = depth };
             }
 
             default:
@@ -321,25 +341,33 @@ public sealed class LocalDispatcher : IDispatcher
         {
             var acc = DispatchCheckResult.DefiniteMember;
             var cut = false;
+            var depth = 1;
             foreach (var (target, parent) in targets)
             {
                 var sub = await Sub(target, subject, meta, ct).ConfigureAwait(false);
                 cut = cut || sub.CycleCut;
+                depth = Math.Max(depth, sub.DepthRequired);
                 if (!sub.Member)
-                    return DispatchCheckResult.None with { CycleCut = cut };
-                acc = And(acc, CaveatedMember(CaveatExpression.CombineAnd(parent, sub.Caveat)));
+                    return DispatchCheckResult.None with { CycleCut = cut, DepthRequired = depth };
+                acc = And(acc, CaveatedMember(CaveatExpression.CombineAnd(parent, sub.Caveat))
+                    with { DepthRequired = sub.DepthRequired });
             }
-            return acc with { CycleCut = cut };
+            return acc with { CycleCut = cut, DepthRequired = depth };
         }
 
         var any = DispatchCheckResult.None;
         foreach (var (target, parent) in targets)
         {
             var sub = await Sub(target, subject, meta, ct).ConfigureAwait(false);
-            any = any with { CycleCut = any.CycleCut || sub.CycleCut };
+            any = any with
+            {
+                CycleCut = any.CycleCut || sub.CycleCut,
+                DepthRequired = Math.Max(any.DepthRequired, sub.DepthRequired),
+            };
             if (!sub.Member)
                 continue;
-            any = Or(any, CaveatedMember(CaveatExpression.CombineAnd(parent, sub.Caveat)));
+            any = Or(any, CaveatedMember(CaveatExpression.CombineAnd(parent, sub.Caveat))
+                with { DepthRequired = sub.DepthRequired });
             if (any.Member && any.Caveat is null)
                 return any;
         }
@@ -371,35 +399,40 @@ public sealed class LocalDispatcher : IDispatcher
 
     // --- Branch algebra over DispatchCheckResult (membership + caveat), preserving cycle-cut. ---
 
+    // DepthRequired propagates as the max consumed by any combined branch, so a result's required depth
+    // reflects the deepest sub-problem it actually walked (mirrors SpiceDB's max(DepthRequired) folding).
     private static DispatchCheckResult Or(DispatchCheckResult a, DispatchCheckResult b)
     {
         var cut = a.CycleCut || b.CycleCut;
+        var depth = Math.Max(a.DepthRequired, b.DepthRequired);
         if (a.IsDetermined || b.IsDetermined)
-            return new DispatchCheckResult(true, null, cut);
+            return new DispatchCheckResult(true, null, cut, depth);
         if (!a.Member)
-            return b with { CycleCut = cut };
+            return b with { CycleCut = cut, DepthRequired = depth };
         if (!b.Member)
-            return a with { CycleCut = cut };
-        return new DispatchCheckResult(true, CaveatExpression.CombineOr(a.Caveat, b.Caveat), cut);
+            return a with { CycleCut = cut, DepthRequired = depth };
+        return new DispatchCheckResult(true, CaveatExpression.CombineOr(a.Caveat, b.Caveat), cut, depth);
     }
 
     private static DispatchCheckResult And(DispatchCheckResult a, DispatchCheckResult b)
     {
         var cut = a.CycleCut || b.CycleCut;
+        var depth = Math.Max(a.DepthRequired, b.DepthRequired);
         if (!a.Member || !b.Member)
-            return new DispatchCheckResult(false, null, cut);
-        return new DispatchCheckResult(true, CaveatExpression.CombineAnd(a.Caveat, b.Caveat), cut);
+            return new DispatchCheckResult(false, null, cut, depth);
+        return new DispatchCheckResult(true, CaveatExpression.CombineAnd(a.Caveat, b.Caveat), cut, depth);
     }
 
     private static DispatchCheckResult Subtract(DispatchCheckResult baseResult, DispatchCheckResult excluded)
     {
         var cut = baseResult.CycleCut || excluded.CycleCut;
+        var depth = Math.Max(baseResult.DepthRequired, excluded.DepthRequired);
         if (!baseResult.Member)
-            return new DispatchCheckResult(false, null, cut);
+            return new DispatchCheckResult(false, null, cut, depth);
         if (excluded.IsDetermined)
-            return new DispatchCheckResult(false, null, cut);
+            return new DispatchCheckResult(false, null, cut, depth);
         if (!excluded.Member)
-            return baseResult with { CycleCut = cut };
-        return new DispatchCheckResult(true, CaveatExpression.Subtract(baseResult.Caveat, excluded.Caveat!), cut);
+            return baseResult with { CycleCut = cut, DepthRequired = depth };
+        return new DispatchCheckResult(true, CaveatExpression.Subtract(baseResult.Caveat, excluded.Caveat!), cut, depth);
     }
 }

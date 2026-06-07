@@ -135,7 +135,8 @@ public sealed class OrleansDispatcher : IDispatcher
 
         var reply = await grain.DispatchCheck(args).ConfigureAwait(false);
 
-        return new DispatchCheckResult(reply.Member, CaveatWire.FromWire(reply.Caveat), reply.CycleCut);
+        return new DispatchCheckResult(
+            reply.Member, CaveatWire.FromWire(reply.Caveat), reply.CycleCut, reply.DepthRequired);
     }
 
     /// <summary>

@@ -40,6 +40,9 @@ public class CheckEngineTests
     private static CheckEngine BuildEngine(string schemaText) =>
         new(SchemaCompiler.Compile(schemaText));
 
+    private static CheckEngine BuildEngine(string schemaText, int maxDepth) =>
+        new(SchemaCompiler.Compile(schemaText), maxDepth);
+
     private static async Task<(InMemoryDatastore Store, IRevision Rev)> Seed(params Relationship[] rels)
     {
         var store = new InMemoryDatastore();
@@ -239,6 +242,44 @@ public class CheckEngineTests
         var result = await engine.Check(reader, "group", "a", "member", Onr("user", "alice"));
 
         Assert.Equal(Membership.NotMember, result.Verdict);
+    }
+
+    [Fact]
+    public async Task DepthExhaustion_ThrowsMaxDepthExceeded_NotSilentNotMember()
+    {
+        // A linear chain group:g0#member -> group:g1#member -> ... -> group:g5#member <- user:alice.
+        // With a max depth small enough to run out before reaching alice, SpiceDB raises a max-depth
+        // error rather than returning a confident "not a member" (which would mask the misconfiguration
+        // AND let alice — a genuine member — be reported as denied).
+        var rels = new List<Relationship>();
+        for (var i = 0; i < 5; i++)
+            rels.Add(Tuple("group", $"g{i}", "member", Onr("group", $"g{i + 1}", "member")));
+        rels.Add(Tuple("group", "g5", "member", Onr("user", "alice")));
+
+        var (store, rev) = await Seed([.. rels]);
+        var engine = BuildEngine(Schema, maxDepth: 3);
+        var reader = store.SnapshotReader(rev);
+
+        await Assert.ThrowsAsync<MaxDepthExceededException>(
+            () => engine.Check(reader, "group", "g0", "member", Onr("user", "alice")));
+    }
+
+    [Fact]
+    public async Task DepthWithinBudget_StillResolves()
+    {
+        // The same chain resolves to Member when the depth budget is ample, proving the error above is
+        // depth exhaustion and not a structural failure.
+        var rels = new List<Relationship>();
+        for (var i = 0; i < 5; i++)
+            rels.Add(Tuple("group", $"g{i}", "member", Onr("group", $"g{i + 1}", "member")));
+        rels.Add(Tuple("group", "g5", "member", Onr("user", "alice")));
+
+        var (store, rev) = await Seed([.. rels]);
+        var engine = BuildEngine(Schema, maxDepth: 50);
+        var reader = store.SnapshotReader(rev);
+
+        var result = await engine.Check(reader, "group", "g0", "member", Onr("user", "alice"));
+        Assert.Equal(Membership.Member, result.Verdict);
     }
 
     [Fact]

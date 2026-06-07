@@ -169,6 +169,52 @@ public class CachingDispatcherTests
         Assert.Equal(0, cache.Count);
     }
 
+    // (c2) A cached result is only served when the request has at least as much depth budget as the
+    // result consumed (DepthRemaining >= DepthRequired). A result computed under a tighter budget (which
+    // may be truncated) must be recomputed, not reused, when entered with a smaller remaining budget.
+    private sealed class FixedDepthDispatcher(int depthRequired) : IDispatcher
+    {
+        public int Count { get; private set; }
+
+        public Task<DispatchCheckResult> DispatchCheck(DispatchCheckRequest request, CancellationToken ct)
+        {
+            Count++;
+            return Task.FromResult(new DispatchCheckResult(true, null, false, depthRequired));
+        }
+    }
+
+    [Fact]
+    public async Task CacheHit_GatedOnDepthRemainingGreaterOrEqualDepthRequired()
+    {
+        var namespaces = Compile(Schema);
+        var rev = Rev(3_000_000_000);
+        // The inner result claims it required 10 levels of depth.
+        var inner = new FixedDepthDispatcher(depthRequired: 10);
+        var cache = new InMemoryDispatchCache();
+        var caching = new CachingDispatcher(
+            inner, cache, new TimestampRevisionQuantizer(), new FixedSchemaHashSource(SchemaHash.Compute(namespaces)));
+
+        var resource = Onr("group", "eng", "member");
+        var subject = Onr("user", "alice");
+
+        // First request has ample budget (50): computes + caches the DepthRequired=10 result.
+        var ample = new DispatchCheckRequest(resource, subject, new ResolverMeta(rev, 50, TraversalBloom.Empty));
+        var first = await caching.DispatchCheck(ample, CancellationToken.None);
+        Assert.True(first.Member);
+        Assert.Equal(1, inner.Count);
+
+        // A request with LESS budget (5) than DepthRequired (10) must NOT serve the cached result — it
+        // could be a truncated answer — so the delegate is invoked again.
+        var tight = new DispatchCheckRequest(resource, subject, new ResolverMeta(rev, 5, TraversalBloom.Empty));
+        await caching.DispatchCheck(tight, CancellationToken.None);
+        Assert.Equal(2, inner.Count);
+
+        // A request with budget >= DepthRequired is served from cache (no new delegate call).
+        var enough = new DispatchCheckRequest(resource, subject, new ResolverMeta(rev, 10, TraversalBloom.Empty));
+        await caching.DispatchCheck(enough, CancellationToken.None);
+        Assert.Equal(2, inner.Count);
+    }
+
     // (d) Quantization buckets two near-in-time revisions together.
     [Fact]
     public void Quantization_BucketsNearRevisionsTogether()

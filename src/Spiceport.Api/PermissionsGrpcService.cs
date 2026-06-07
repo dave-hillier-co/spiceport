@@ -65,6 +65,10 @@ public sealed class PermissionsGrpcService(IPermissionChecker checker, IGrainFac
         {
             throw new RpcException(new Status(StatusCode.InvalidArgument, ex.Message));
         }
+        catch (MaxDepthExceededException ex)
+        {
+            throw new RpcException(new Status(StatusCode.FailedPrecondition, ex.Message));
+        }
 
         var ship = result.Verdict switch
         {

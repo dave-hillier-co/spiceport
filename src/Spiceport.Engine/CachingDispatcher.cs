@@ -66,8 +66,17 @@ public sealed class CachingDispatcher : IDispatcher
         var key = BuildKey(request);
         if (_cache.TryGet(key, out var cached))
         {
-            _metrics?.RecordCacheHit();
-            return cached;
+            // SpiceDB's caching guard (internal/dispatch/caching/caching.go): only serve a cached result
+            // when the current request has at least as much depth budget as the cached result CONSUMED
+            // (DepthRemaining >= DepthRequired). The same structural sub-problem can be entered at
+            // different remaining depths on different parent paths; a result computed under a tighter
+            // budget might have bottomed out on depth, so reusing it under a larger budget could serve a
+            // wrong verdict. On an insufficient-depth miss, fall through and recompute under this budget.
+            if (request.Meta.DepthRemaining >= cached.DepthRequired)
+            {
+                _metrics?.RecordCacheHit();
+                return cached;
+            }
         }
 
         _metrics?.RecordCacheMiss();

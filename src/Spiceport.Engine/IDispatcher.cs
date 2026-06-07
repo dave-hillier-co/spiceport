@@ -74,11 +74,19 @@ public sealed record DispatchCheckRequest(
 /// <see cref="CycleCut"/> is true when the computation bottomed out on a visited-set cutoff anywhere
 /// in its subtree. It is propagated upward and does not change the verdict; a later caching phase
 /// uses it to avoid caching cycle-affected results.
+/// <para>
+/// <see cref="DepthRequired"/> is the recursion depth this result actually consumed below itself
+/// (a leaf = 1, a combining node = max(children) + 1), mirroring SpiceDB's <c>ResponseMeta.DepthRequired</c>.
+/// The caching layer gates a cache HIT on <c>DepthRemaining &gt;= DepthRequired</c> so a result computed
+/// under a tighter budget — which may be truncated — is never reused under a larger budget.
+/// </para>
 /// </remarks>
 /// <param name="Member">True if the subject is a (possibly caveated) member.</param>
 /// <param name="Caveat">An optional caveat expression gating membership; null = unconditional.</param>
 /// <param name="CycleCut">True if a visited-set cutoff was hit anywhere in this subtree.</param>
-public readonly record struct DispatchCheckResult(bool Member, CaveatExpression? Caveat, bool CycleCut)
+/// <param name="DepthRequired">The recursion depth consumed below this node (leaf = 1).</param>
+public readonly record struct DispatchCheckResult(
+    bool Member, CaveatExpression? Caveat, bool CycleCut, int DepthRequired = 1)
 {
     /// <summary>A fully-determined member (no caveat, no cycle cut).</summary>
     public static readonly DispatchCheckResult DefiniteMember = new(true, null, false);

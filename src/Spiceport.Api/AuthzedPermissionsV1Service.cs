@@ -52,6 +52,13 @@ public sealed class AuthzedPermissionsV1Service(IPermissionChecker checker, IGra
         {
             throw new RpcException(new Status(StatusCode.InvalidArgument, ex.Message));
         }
+        catch (MaxDepthExceededException ex)
+        {
+            // The check exhausted its recursion budget (deep schema/data or a cycle). SpiceDB surfaces
+            // this as FailedPrecondition, NOT a NoPermission verdict, so the client can tell "the server
+            // gave up" apart from "not authorized".
+            throw new RpcException(new Status(StatusCode.FailedPrecondition, ex.Message));
+        }
 
         var ship = result.Verdict switch
         {
