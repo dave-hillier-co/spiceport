@@ -10,6 +10,13 @@ import "google/protobuf/struct.proto";
 service PermissionsService {
   rpc CheckPermission(CheckPermissionRequest) returns (CheckPermissionResponse);
 
+  // Check a batch of items against ONE pinned revision. Items fan out over the shared dispatch mesh;
+  // sub-problems shared across items are computed once and reused, so a batch performs materially fewer
+  // underlying dispatches/datastore reads than the naive sum of independent checks. Mirrors SpiceDB's
+  // CheckBulkPermissions: one consistency for the whole batch, pairs index-aligned to the request, and
+  // a single checked_at ZedToken.
+  rpc BatchCheckPermission(BatchCheckPermissionRequest) returns (BatchCheckPermissionResponse);
+
   // ---- Data plane ----
   // Schema read/write and relationship read/write/delete. Unary; relationship reads page with an
   // opaque cursor (same convention as the lookup ops). Tokens are opaque ZedTokens.
@@ -214,6 +221,47 @@ message CheckPermissionResponse {
   repeated string partial_caveat_missing_fields = 2;
   // The ZedToken for the revision the check actually evaluated against (chain into at_least_as_fresh).
   ZedToken checked_at = 3;
+}
+
+// ---- BatchCheckPermission ----
+
+// One item of a batch check: a resource/permission/subject triple with its OWN caveat context. There is
+// deliberately NO per-item consistency — the whole batch pins one revision.
+message BatchCheckPermissionRequestItem {
+  ObjectReference resource = 1;
+  string permission = 2;
+  SubjectReference subject = 3;
+  // Per-item request-time caveat context (overrides relationship context).
+  google.protobuf.Struct context = 4;
+}
+
+message BatchCheckPermissionRequest {
+  repeated BatchCheckPermissionRequestItem items = 1;
+  // ONE consistency requirement for the whole batch; unset = minimize_latency.
+  Consistency consistency = 2;
+}
+
+// One item's per-item verdict. The evaluated revision/token live ONCE on the response (checked_at).
+message BatchCheckPermissionResponseItem {
+  CheckPermissionResponse.Permissionship permissionship = 1;
+  // Caveat parameter names missing from this item's context when permissionship is CONDITIONAL.
+  repeated string partial_caveat_missing_fields = 2;
+}
+
+// A request/response pair, index-aligned to the request items. The `error` arm is reserved for forward
+// compatibility (per-item errors); this slice surfaces batch-level errors as a single RPC status.
+message BatchCheckPermissionPair {
+  BatchCheckPermissionRequestItem request = 1;
+  oneof response {
+    BatchCheckPermissionResponseItem item = 2;
+  }
+}
+
+message BatchCheckPermissionResponse {
+  // Pairs index-aligned to the request items.
+  repeated BatchCheckPermissionPair pairs = 1;
+  // The SINGLE ZedToken for the revision the whole batch evaluated against.
+  ZedToken checked_at = 2;
 }
 
 // ---- Data plane: schema ----

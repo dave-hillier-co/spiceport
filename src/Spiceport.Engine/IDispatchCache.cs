@@ -34,6 +34,8 @@ public sealed class InMemoryDispatchCache : IDispatchCache
     private readonly int _maxSize;
     private readonly TimeSpan? _ttl;
     private readonly Func<DateTimeOffset> _clock;
+    private long _hits;
+    private long _misses;
 
     /// <summary>Creates an in-memory cache.</summary>
     /// <param name="maxSize">Maximum number of entries (0 or less = unbounded).</param>
@@ -49,6 +51,19 @@ public sealed class InMemoryDispatchCache : IDispatchCache
     /// <summary>The current number of stored entries (including any not-yet-evicted expired ones).</summary>
     public int Count => _entries.Count;
 
+    /// <summary>
+    /// The number of <see cref="TryGet"/> calls that returned a live (present, unexpired) entry.
+    /// Pure observability for the dedup/cache-reuse assertions; never affects cache behaviour, keys
+    /// or verdicts.
+    /// </summary>
+    public long Hits => Interlocked.Read(ref _hits);
+
+    /// <summary>
+    /// The number of <see cref="TryGet"/> calls that found no live entry (absent or expired).
+    /// Pure observability; see <see cref="Hits"/>.
+    /// </summary>
+    public long Misses => Interlocked.Read(ref _misses);
+
     /// <inheritdoc/>
     public bool TryGet(string key, out DispatchCheckResult result)
     {
@@ -58,12 +73,15 @@ public sealed class InMemoryDispatchCache : IDispatchCache
             if (_ttl is { } ttl && _clock() - entry.StoredAt > ttl)
             {
                 _entries.TryRemove(key, out _);
+                Interlocked.Increment(ref _misses);
                 result = default;
                 return false;
             }
+            Interlocked.Increment(ref _hits);
             result = entry.Result;
             return true;
         }
+        Interlocked.Increment(ref _misses);
         result = default;
         return false;
     }

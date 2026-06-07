@@ -25,10 +25,15 @@ public static class ServiceCollectionExtensions
     /// <param name="services">The service collection to add to.</param>
     /// <param name="schemaText">The schema DSL text to seed the provider with at startup.</param>
     /// <param name="maxDepth">The check engine's maximum recursion depth.</param>
+    /// <param name="batchConcurrency">
+    /// The bounded fan-out width for <see cref="IPermissionChecker.BatchCheck"/>, mirroring SpiceDB's
+    /// bulk-check <c>maxConcurrency</c>.
+    /// </param>
     public static IServiceCollection AddSpiceportGrainServices(
         this IServiceCollection services,
         string schemaText,
-        int maxDepth = CheckEngine.DefaultMaxDepth)
+        int maxDepth = CheckEngine.DefaultMaxDepth,
+        int batchConcurrency = PermissionChecker.DefaultBatchConcurrency)
     {
         ArgumentNullException.ThrowIfNull(services);
         ArgumentNullException.ThrowIfNull(schemaText);
@@ -65,7 +70,8 @@ public static class ServiceCollectionExtensions
             sp.GetRequiredService<IDatastore>(),
             sp.GetRequiredService<ISiloDispatcher>(),
             sp.GetRequiredService<ISchemaProvider>(),
-            maxDepth));
+            maxDepth,
+            batchConcurrency));
 
         return services;
     }

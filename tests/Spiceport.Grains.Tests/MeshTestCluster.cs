@@ -50,9 +50,16 @@ public sealed class MeshTestCluster : IAsyncDisposable
         Relationships.WriteSchema(new Abstractions.WriteSchemaArgs(schemaText));
 
     /// <summary>Builds and starts a cluster for the given schema DSL text.</summary>
-    public static async Task<MeshTestCluster> CreateAsync(string schemaText)
+    /// <param name="schemaText">The schema DSL to compile into the silo.</param>
+    /// <param name="batchConcurrency">
+    /// The bounded fan-out width for <see cref="IPermissionChecker.BatchCheck"/>; pass 1 to serialize the
+    /// fan-out so the shared-branch cache behaviour is deterministic (no concurrent-miss races).
+    /// </param>
+    public static async Task<MeshTestCluster> CreateAsync(
+        string schemaText, int batchConcurrency = PermissionChecker.DefaultBatchConcurrency)
     {
         SchemaHolder.SchemaText = schemaText;
+        SchemaHolder.BatchConcurrency = batchConcurrency;
 
         var builder = new TestClusterBuilder(initialSilosCount: 1);
         builder.AddSiloBuilderConfigurator<SiloConfigurator>();
@@ -74,6 +81,7 @@ public sealed class MeshTestCluster : IAsyncDisposable
     private static class SchemaHolder
     {
         public static string SchemaText = string.Empty;
+        public static int BatchConcurrency = PermissionChecker.DefaultBatchConcurrency;
     }
 
     private sealed class SiloConfigurator : ISiloConfigurator
@@ -83,7 +91,8 @@ public sealed class MeshTestCluster : IAsyncDisposable
             // Exactly the silo's DI: grain mesh services + a single host-owned in-memory datastore.
             siloBuilder.ConfigureServices(services =>
             {
-                services.AddSpiceportGrainServices(SchemaHolder.SchemaText);
+                services.AddSpiceportGrainServices(
+                    SchemaHolder.SchemaText, batchConcurrency: SchemaHolder.BatchConcurrency);
                 services.AddSingleton<IDatastore>(new InMemoryDatastore());
             });
         }

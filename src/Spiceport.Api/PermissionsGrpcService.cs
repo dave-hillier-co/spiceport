@@ -82,6 +82,56 @@ public sealed class PermissionsGrpcService(IPermissionChecker checker, IGrainFac
         return resp;
     }
 
+    public override async Task<BatchCheckPermissionResponse> BatchCheckPermission(
+        BatchCheckPermissionRequest request, ServerCallContext context)
+    {
+        var items = request.Items.Select(it =>
+        {
+            var subjectRelation = string.IsNullOrEmpty(it.Subject.OptionalRelation)
+                ? CoreConstants.Ellipsis
+                : it.Subject.OptionalRelation;
+            return new BatchCheckItem(
+                it.Resource.ObjectType,
+                it.Resource.ObjectId,
+                it.Permission,
+                new ObjectAndRelation(it.Subject.Object.ObjectType, it.Subject.Object.ObjectId, subjectRelation),
+                StructToDict(it.Context));
+        }).ToList();
+
+        BatchCheckResult result;
+        try
+        {
+            result = await checker.BatchCheck(
+                items,
+                ToWire(request.Consistency).ToRequirement(),
+                context.CancellationToken);
+        }
+        catch (InvalidConsistencyTokenException ex)
+        {
+            throw new RpcException(new Status(StatusCode.InvalidArgument, ex.Message));
+        }
+
+        var resp = new BatchCheckPermissionResponse
+        {
+            CheckedAt = new ZedToken { Token = result.EvaluatedToken },
+        };
+        for (var i = 0; i < result.Items.Count; i++)
+        {
+            var verdict = result.Items[i];
+            var ship = verdict.Verdict switch
+            {
+                Membership.Member => CheckPermissionResponse.Types.Permissionship.HasPermission,
+                Membership.Caveated => CheckPermissionResponse.Types.Permissionship.ConditionalPermission,
+                _ => CheckPermissionResponse.Types.Permissionship.NoPermission,
+            };
+            var item = new BatchCheckPermissionResponseItem { Permissionship = ship };
+            item.PartialCaveatMissingFields.AddRange(verdict.MissingFields);
+            resp.Pairs.Add(new BatchCheckPermissionPair { Request = request.Items[i], Item = item });
+        }
+
+        return resp;
+    }
+
     public override async Task<WriteSchemaResponse> WriteSchema(
         WriteSchemaRequest request, ServerCallContext context)
     {
