@@ -15,4 +15,8 @@
     <Nullable>enable</Nullable>
   </PropertyGroup>
 
+  <ItemGroup>
+    <InternalsVisibleTo Include="Spiceport.Datastore.Postgres.Tests" />
+  </ItemGroup>
+
 </Project>

@@ -251,4 +251,36 @@ public class CachingDispatcherTests
         Assert.Equal(u.Verdict, c2.Verdict);
         Assert.Equal(Membership.Member, c2.Verdict);
     }
+
+    // A reused caching engine MUST key by the real read revision, not a single constant "in-process"
+    // token. Otherwise a Check at an earlier revision (no access) caches a result that is wrongly served
+    // for a Check at a later revision (access granted by an intervening write). Passing the reader's
+    // actual revision yields a distinct keyspace per revision, so read-your-writes holds.
+    [Fact]
+    public async Task CachingEngine_KeyedByRealRevision_DoesNotServeStaleResultAcrossRevisions()
+    {
+        var store = new InMemoryDatastore();
+        // Revision 1: no relationships -> alice is NOT a viewer.
+        var rev1 = await store.ReadWriteTx(_ => Task.CompletedTask);
+        // Revision 2: grant alice viewer on the document.
+        var rev2 = await store.ReadWriteTx(async tx =>
+            await tx.WriteRelationships(
+                [new RelationshipUpdate(Tuple("document", "readme", "viewer", Onr("user", "alice")), UpdateOperation.Create)]));
+
+        var ns = Compile(Schema).Values.ToList();
+        var engine = CheckEngine.WithCaching(ns); // one engine, one shared cache, reused across revisions
+
+        var reader1 = store.SnapshotReader(rev1);
+        var reader2 = store.SnapshotReader(rev2);
+
+        // Check at the OLDER revision first (populates the cache for rev1's keyspace).
+        var atRev1 = await engine.Check(
+            reader1, "document", "readme", "view", Onr("user", "alice"), atRevision: rev1);
+        Assert.Equal(Membership.NotMember, atRev1.Verdict);
+
+        // Same sub-problem at the NEWER revision must reflect the write, not the cached rev1 verdict.
+        var atRev2 = await engine.Check(
+            reader2, "document", "readme", "view", Onr("user", "alice"), atRevision: rev2);
+        Assert.Equal(Membership.Member, atRev2.Verdict);
+    }
 }

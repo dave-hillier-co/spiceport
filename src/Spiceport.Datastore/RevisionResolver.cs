@@ -99,8 +99,12 @@ public static class RevisionResolver
         }
 
         // Valid or LegacyEmptyDatastoreId: pick max(optimized, token).
-        // If optimized is strictly fresher, use the optimized (cacheable) revision.
-        if (opt.Revision.CompareTo(decoded.Revision) > 0)
+        // Use the optimized (cacheable) revision only if it is STRICTLY fresher than the token. Use
+        // GreaterThan, not CompareTo > 0: for concurrent (incomparable) snapshots GreaterThan is false,
+        // so we fall through to the token and preserve read-your-writes — exactly as SpiceDB's
+        // pickBestRevision does. CompareTo would fall back to an ordinal string tiebreak that could
+        // wrongly pick the optimized revision, which may not include the token's writes.
+        if (opt.Revision.GreaterThan(decoded.Revision))
             return new ResolvedRevision(opt.Revision, opt.SchemaHash, RevisionMode.Optimized);
 
         // The token is at least as fresh as the optimized bucket (read-your-writes): use it exactly.

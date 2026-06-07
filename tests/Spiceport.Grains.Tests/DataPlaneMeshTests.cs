@@ -118,8 +118,13 @@ public class DataPlaneMeshTests
         var delReply = await cluster.Relationships.DeleteRelationships(new DeleteRelationshipsArgs(delFilter, null));
         Assert.Equal(2UL, delReply.DeletedCount);
 
-        // Reads pin a fresh snapshot (no dispatch cache), so they reflect the delete immediately.
-        var afterRead = await cluster.Relationships.ReadRelationships(new ReadRelationshipsArgs(readFilter, null, null));
+        // Read FullyConsistent to observe the delete immediately: a default (minimize-latency) read
+        // resolves to the optimized revision, a real-but-cached head held stable for the quantization
+        // window (matching SpiceDB's CachedOptimizedRevisions / memdb floored bucket), so a write that
+        // lands mid-window is not yet reflected. To see one's own just-committed mutation deterministically
+        // a caller asks for full consistency (or reads at the mutation's returned token).
+        var afterRead = await cluster.Relationships.ReadRelationships(
+            new ReadRelationshipsArgs(readFilter, null, null, ConsistencyWire.FullyConsistent));
         Assert.Empty(afterRead.Relationships);
     }
 

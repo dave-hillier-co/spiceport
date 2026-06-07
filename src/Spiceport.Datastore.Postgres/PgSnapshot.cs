@@ -114,4 +114,13 @@ internal sealed record PgSnapshot(ulong Xmin, ulong Xmax, IReadOnlyList<ulong> X
             _ => 0,
         };
     }
+
+    /// <summary>
+    /// True iff this snapshot is STRICTLY greater than <paramref name="other"/> (it sees everything
+    /// <paramref name="other"/> sees and more). Mirrors SpiceDB's <c>pgSnapshot.GreaterThan</c>: two
+    /// concurrent (incomparable) snapshots are NOT greater than one another, so this returns false for
+    /// the concurrent case — unlike <see cref="Compare"/>, whose <c>int.MaxValue</c> concurrent sentinel
+    /// is misleadingly &gt; 0.
+    /// </summary>
+    public bool GreaterThan(PgSnapshot other) => Compare(other) == 1;
 }

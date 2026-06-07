@@ -312,7 +312,7 @@ public sealed class LookupResourcesEngine
             var result = await _check.Check(
                 reader,
                 new ObjectAndRelation(containingRelation.Namespace, resourceId, containingRelation.Relation),
-                terminalSubject, caveatContext, now, ct).ConfigureAwait(false);
+                terminalSubject, caveatContext, now, cancellationToken: ct).ConfigureAwait(false);
 
             if (result.Verdict == Membership.Member)
             {

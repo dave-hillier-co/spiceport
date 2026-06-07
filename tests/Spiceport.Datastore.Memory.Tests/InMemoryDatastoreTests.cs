@@ -405,4 +405,39 @@ public class InMemoryDatastoreTests
         gate.SetResult();
         await Assert.ThrowsAsync<SerializationException>(async () => await first);
     }
+
+    // The optimized revision is a real, committed head sampled when a window opens — never floored BELOW
+    // head — so a minimize-latency read at it sees everything committed before the window opened and is
+    // snapshot-readable. (SpiceDB's CachedOptimizedRevisions / memdb behaviour.)
+    [Fact]
+    public async Task OptimizedRevision_IsAtOrAboveHead_AndSnapshotReadable()
+    {
+        var ds = new InMemoryDatastore();
+        var committed = await ds.ReadWriteTx(async tx =>
+            await tx.WriteRelationships([new RelationshipUpdate(Rel("document", "doc1", "viewer", "user", "alice"), UpdateOperation.Create)]));
+        var head = await ds.HeadRevision();
+
+        var opt = await ds.OptimizedRevision();
+
+        // Not pinned below head: the optimized read sees the committed write (no silent stale read).
+        Assert.True(opt.Revision.CompareTo(committed) >= 0);
+        Assert.True(opt.Revision.Equals(head.Revision));
+        // And it is a snapshot the datastore can actually read at.
+        Assert.True(ds.SnapshotReader(opt.Revision).IsValid);
+    }
+
+    // Within one quantization window the optimized revision is STABLE, so near-in-time minimize-latency
+    // checks share a single revision — and therefore a single cache key (read snapshot == cache key).
+    [Fact]
+    public async Task OptimizedRevision_IsStableWithinTheQuantizationWindow()
+    {
+        var ds = new InMemoryDatastore(quantization: TimeSpan.FromSeconds(5));
+        await ds.ReadWriteTx(async tx =>
+            await tx.WriteRelationships([new RelationshipUpdate(Rel("document", "doc1", "viewer", "user", "alice"), UpdateOperation.Create)]));
+
+        var first = await ds.OptimizedRevision();
+        var second = await ds.OptimizedRevision();
+
+        Assert.True(first.Revision.Equals(second.Revision));
+    }
 }

@@ -30,6 +30,9 @@ public sealed record ConsistencyWire(
     /// <summary>The minimize-latency requirement (the server default).</summary>
     public static ConsistencyWire MinimizeLatency { get; } = new(ConsistencyModeWire.MinimizeLatency);
 
+    /// <summary>The fully-consistent requirement (read at head; reflects all committed writes).</summary>
+    public static ConsistencyWire FullyConsistent { get; } = new(ConsistencyModeWire.FullyConsistent);
+
     /// <summary>Converts to the domain <see cref="ConsistencyRequirement"/>.</summary>
     public ConsistencyRequirement ToRequirement() => Mode switch
     {

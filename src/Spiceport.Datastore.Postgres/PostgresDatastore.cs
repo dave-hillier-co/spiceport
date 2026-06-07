@@ -181,10 +181,13 @@ public sealed class PostgresDatastore : IDatastore, IAsyncDisposable
         var earliest = PgSnapshot.Parse(reader.GetString(1)).MarkComplete(
             ulong.Parse(reader.GetString(2), System.Globalization.CultureInfo.InvariantCulture));
 
-        // Not from the future, and not older than the earliest retained revision.
-        if (pg.Snapshot.Compare(current) > 0)
+        // Not from the future, and not older than the earliest retained revision. Use GreaterThan
+        // (strict, concurrent => false), NOT Compare > 0 — Compare returns the int.MaxValue concurrent
+        // sentinel, which is > 0, so a snapshot merely CONCURRENT with the current/earliest bound would
+        // be wrongly rejected as future/stale. SpiceDB accepts concurrent snapshots here.
+        if (pg.Snapshot.GreaterThan(current))
             return false;
-        if (earliest.Compare(pg.Snapshot) > 0)
+        if (earliest.GreaterThan(pg.Snapshot))
             return false;
         return true;
     }

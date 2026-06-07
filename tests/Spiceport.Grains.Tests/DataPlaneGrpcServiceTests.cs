@@ -89,18 +89,26 @@ public class DataPlaneGrpcServiceTests
         var writeResp = await service.WriteRelationships(writeReq, FakeContext.Instance);
         Assert.False(string.IsNullOrEmpty(writeResp.WrittenAt.Token));
 
-        // 3. CheckPermission -> HasPermission.
-        var checkAfterWrite = await service.CheckPermission(
-            CheckOf("readme", "view", "alice"), FakeContext.Instance);
+        // 3. CheckPermission -> HasPermission. Use full consistency to observe the relationship just
+        // written above: a default (minimize-latency) check resolves to the optimized revision, a real
+        // but window-stable cached head (matching SpiceDB's CachedOptimizedRevisions); the earlier
+        // ReadSchema opened that window before this write committed, so a minimize-latency check could
+        // still read the pre-write head. Read-your-writes is expressed via full consistency (or the
+        // write's returned token).
+        var checkReq = CheckOf("readme", "view", "alice");
+        checkReq.Consistency = new Consistency { FullyConsistent = true };
+        var checkAfterWrite = await service.CheckPermission(checkReq, FakeContext.Instance);
         Assert.Equal(
             CheckPermissionResponse.Types.Permissionship.HasPermission,
             checkAfterWrite.Permissionship);
 
-        // ReadRelationships returns what was written.
+        // ReadRelationships returns what was written (full consistency: read-your-writes within the
+        // current quantization window, where the minimize-latency optimized revision may lag head).
         var readResp = await service.ReadRelationships(
             new ReadRelationshipsRequest
             {
                 Filter = new RelationshipFilter { ResourceType = "document", OptionalResourceRelation = "viewer" },
+                Consistency = new Consistency { FullyConsistent = true },
             },
             FakeContext.Instance);
         Assert.Single(readResp.Relationships);
@@ -118,11 +126,15 @@ public class DataPlaneGrpcServiceTests
             FakeContext.Instance);
         Assert.Equal(1UL, delResp.DeletedCount);
 
-        // ReadRelationships now empty (reads pin a fresh snapshot, no dispatch cache).
+        // ReadRelationships now empty. Ask for full consistency so the read reflects the just-committed
+        // delete: a default (minimize-latency) read resolves to the optimized revision — a real but
+        // window-stable cached head (matching SpiceDB's CachedOptimizedRevisions) — which need not yet
+        // include a mutation that landed within the current quantization window.
         var readAfterDelete = await service.ReadRelationships(
             new ReadRelationshipsRequest
             {
                 Filter = new RelationshipFilter { ResourceType = "document", OptionalResourceRelation = "viewer" },
+                Consistency = new Consistency { FullyConsistent = true },
             },
             FakeContext.Instance);
         Assert.Empty(readAfterDelete.Relationships);

@@ -66,6 +66,17 @@ public sealed class PostgresRevision : IRevision
         return cmp;
     }
 
+    /// <summary>
+    /// True iff this revision is STRICTLY greater than <paramref name="other"/>. Unlike
+    /// <see cref="CompareTo"/> (which falls back to an ordinal string tiebreak for concurrent snapshots
+    /// to satisfy <see cref="IComparable{T}"/>'s total order), this returns false for concurrent
+    /// snapshots, mirroring SpiceDB's <c>postgresRevision.GreaterThan</c>. Use this — not
+    /// <c>CompareTo &gt; 0</c> — anywhere "is strictly newer" semantics matter (revision-window checks,
+    /// pick-best-revision), so a merely-concurrent snapshot is not wrongly rejected or preferred.
+    /// </summary>
+    public bool GreaterThan(IRevision? other) =>
+        other is PostgresRevision pg && Snapshot.GreaterThan(pg.Snapshot);
+
     /// <inheritdoc />
     public bool Equals(IRevision? other) =>
         other is PostgresRevision pg && Snapshot.Compare(pg.Snapshot) == 0;

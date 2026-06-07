@@ -145,12 +145,13 @@ public sealed class CheckEngine
         ObjectAndRelation subject,
         IReadOnlyDictionary<string, object?>? caveatContext = null,
         DateTimeOffset? evaluationTime = null,
+        IRevision? atRevision = null,
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(reader);
         ArgumentNullException.ThrowIfNull(subject);
         var resource = new ObjectAndRelation(resourceType, resourceId, relation);
-        return Check(reader, resource, subject, caveatContext, evaluationTime, cancellationToken);
+        return Check(reader, resource, subject, caveatContext, evaluationTime, atRevision, cancellationToken);
     }
 
     /// <summary>
@@ -170,6 +171,7 @@ public sealed class CheckEngine
         ObjectAndRelation subject,
         IReadOnlyDictionary<string, object?>? caveatContext = null,
         DateTimeOffset? evaluationTime = null,
+        IRevision? atRevision = null,
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(reader);
@@ -200,7 +202,15 @@ public sealed class CheckEngine
             dispatcher = cachingDispatcher;
         }
 
-        var meta = new ResolverMeta(InProcessRevision.Instance, _maxDepth, TraversalBloom.ForDepth(_maxDepth));
+        // Key the cache by the caller-supplied real read revision when available, so a reused caching
+        // engine (which holds the shared cache) yields a distinct keyspace per datastore revision rather
+        // than collapsing every Check onto the single "in-process" token. A supplied revision is keyed
+        // EXACTLY (RevisionMode.Exact) so it can never read an entry quantized down to an older bucket.
+        // When no revision is supplied, fall back to the placeholder identity (single-revision callers).
+        var (revision, mode) = atRevision is null
+            ? ((IRevision)InProcessRevision.Instance, RevisionMode.Optimized)
+            : (atRevision, RevisionMode.Exact);
+        var meta = new ResolverMeta(revision, _maxDepth, TraversalBloom.ForDepth(_maxDepth), mode);
         var request = new DispatchCheckRequest(resource, subject, meta);
         var result = await dispatcher.DispatchCheck(request, cancellationToken).ConfigureAwait(false);
 

@@ -20,6 +20,12 @@ public sealed class InMemoryDatastore : IDatastore
     private long _lastRevision;
     private DatastoreState _current;
 
+    // Cached optimized-revision candidate (SpiceDB's CachedOptimizedRevisions): a real head snapshot held
+    // stable for the quantization window so near-in-time minimize-latency checks share a single revision —
+    // and therefore a single cache key. Guarded by _writeLock.
+    private RevisionWithSchemaHash? _optimizedCache;
+    private long _optimizedValidThroughNanos;
+
     // Ordered list of revisions that have been committed by a write transaction (the changefeed). The
     // datastore's initial empty revision is not a write and is not listed. Used by Watch to enumerate
     // which revisions carry changes after a cursor. Bounded by the GC window in lockstep with reads.
@@ -67,17 +73,30 @@ public sealed class InMemoryDatastore : IDatastore
     {
         lock (_writeLock)
         {
-            var head = _current.HeadRevision;
-            // Quantize the clock DOWN to a bucket so near-in-time checks share a revision, but never
-            // below the latest committed revision: a snapshot at an older bucket would silently drop
-            // already-committed writes. When the bucket floor falls before head's commit (the common
-            // case immediately after a write), pin to head — which is still snapshot-able and reflects
-            // all committed data. Cache bucketing across the mesh is handled separately by the
-            // IRevisionQuantizer over this revision, so correctness here costs no cache locality.
-            var quantized = _quantizationNanos > 0 ? head - (head % _quantizationNanos) : head;
-            if (quantized < head || !IsRevisionValid(quantized))
-                quantized = head;
-            return Task.FromResult(new RevisionWithSchemaHash(new TimestampRevision(quantized), _current.SchemaHashAt(quantized)));
+            // SpiceDB's optimized revision (revisions/optimized.go CachedOptimizedRevisions) is a CACHED
+            // candidate: the real HEAD revision sampled when a window opens, then returned UNCHANGED for
+            // the whole quantization window. It is a genuine committed snapshot (never floored BELOW head,
+            // so minimize-latency never silently drops already-committed writes) AND it is stable for the
+            // window so near-in-time checks share it. Crucially this exact value is used as BOTH the read
+            // snapshot AND the cache key's AtRevision (the key is NOT separately time-floored): all
+            // requests in one window read at, and key by, the SAME cached head, so a write that advances
+            // head mid-window cannot be served an older-snapshot result under a colliding bucket.
+            var now = NowNanos();
+            if (_quantizationNanos <= 0 ||
+                _optimizedCache is not { } cached ||
+                now >= _optimizedValidThroughNanos)
+            {
+                var head = _current.HeadRevision;
+                cached = new RevisionWithSchemaHash(new TimestampRevision(head), _current.SchemaHashAt(head));
+                if (_quantizationNanos > 0)
+                {
+                    _optimizedCache = cached;
+                    // Hold this candidate until the end of the current bucket window so the cached value
+                    // aligns to a stable boundary that is shared across the mesh.
+                    _optimizedValidThroughNanos = now - (now % _quantizationNanos) + _quantizationNanos;
+                }
+            }
+            return Task.FromResult(cached);
         }
     }
 
