@@ -26,6 +26,13 @@ await SeedData.SeedAsync(app.Services.GetRequiredService<IDatastore>());
 app.MapGrpcService<PermissionsGrpcService>();
 app.MapGrpcService<WatchGrpcService>();
 app.MapGrpcService<BulkGrpcService>();
+
+// authzed.api.v1 service surface, served from the SAME grain mesh as the internal services above. The
+// two proto families coexist because they live in distinct C# namespaces.
+app.MapGrpcService<AuthzedPermissionsV1Service>();
+app.MapGrpcService<AuthzedSchemaV1Service>();
+app.MapGrpcService<AuthzedWatchV1Service>();
+
 app.MapGet("/", () => "Spiceport API up.");
 
 app.Run();

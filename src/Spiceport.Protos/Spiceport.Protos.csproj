@@ -11,6 +11,15 @@
   </ItemGroup>
 
   <ItemGroup>
+    <!-- authzed.api.v1 service protos: emit messages + abstract server bases -->
+    <Protobuf Include="Protos\authzed\authzed\api\v1\permission_service.proto;Protos\authzed\authzed\api\v1\schema_service.proto;Protos\authzed\authzed\api\v1\watch_service.proto" ProtoRoot="Protos\authzed" AdditionalImportDirs="Protos\authzed" GrpcServices="Server" />
+    <!-- authzed.api.v1 core shared messages (no service) -->
+    <Protobuf Include="Protos\authzed\authzed\api\v1\core.proto" ProtoRoot="Protos\authzed" AdditionalImportDirs="Protos\authzed" GrpcServices="None" />
+    <!-- import-only annotation/validation deps (messages-only, kept out of public surface) -->
+    <Protobuf Include="Protos\authzed\validate\validate.proto;Protos\authzed\google\api\annotations.proto;Protos\authzed\google\api\http.proto" ProtoRoot="Protos\authzed" AdditionalImportDirs="Protos\authzed" GrpcServices="None" />
+  </ItemGroup>
+
+  <ItemGroup>
     <PackageReference Include="Google.Protobuf" Version="3.35.0" />
     <PackageReference Include="Grpc.Core.Api" Version="2.80.0" />
     <PackageReference Include="Grpc.Tools" Version="2.81.0">

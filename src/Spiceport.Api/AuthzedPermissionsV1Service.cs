@@ -1,0 +1,523 @@
+using Google.Protobuf.WellKnownTypes;
+using Grpc.Core;
+using Spiceport.Core;
+using Spiceport.Engine;
+using Spiceport.Grains;
+using Spiceport.Grains.Abstractions;
+using V1 = Authzed.Api.V1;
+using WirePermissionship = Spiceport.Grains.Abstractions.Permissionship;
+using WireConsistency = Spiceport.Grains.Abstractions.ConsistencyWire;
+using WireConsistencyMode = Spiceport.Grains.Abstractions.ConsistencyModeWire;
+
+namespace Spiceport.Api;
+
+/// <summary>
+/// gRPC front door for the <c>authzed.api.v1.PermissionsService</c>. A pure translation layer over the
+/// SAME grain mesh the internal <see cref="PermissionsGrpcService"/> uses: unary check/expand/write/delete
+/// dispatch through <see cref="IPermissionChecker"/> / <see cref="IReverseOpsGrain"/> /
+/// <see cref="IRelationshipsGrain"/>; the read + lookup RPCs are server-streaming and page the grain's
+/// opaque cursor internally over a single pinned snapshot (mirroring <see cref="BulkGrpcService"/>).
+/// </summary>
+public sealed class AuthzedPermissionsV1Service(IPermissionChecker checker, IGrainFactory grains)
+    : V1::PermissionsService.PermissionsServiceBase
+{
+    private IReverseOpsGrain ReverseOps => grains.GetGrain<IReverseOpsGrain>(IReverseOpsGrain.Key);
+    private IRelationshipsGrain Relationships => grains.GetGrain<IRelationshipsGrain>(IRelationshipsGrain.Key);
+
+    public override async Task<V1::CheckPermissionResponse> CheckPermission(
+        V1::CheckPermissionRequest request, ServerCallContext context)
+    {
+        var subjectRelation = string.IsNullOrEmpty(request.Subject.OptionalRelation)
+            ? CoreConstants.Ellipsis
+            : request.Subject.OptionalRelation;
+
+        var subject = new ObjectAndRelation(
+            request.Subject.Object.ObjectType,
+            request.Subject.Object.ObjectId,
+            subjectRelation);
+
+        PermissionCheckResult result;
+        try
+        {
+            result = await checker.Check(
+                request.Resource.ObjectType,
+                request.Resource.ObjectId,
+                request.Permission,
+                subject,
+                StructToDict(request.Context),
+                ToWire(request.Consistency).ToRequirement(),
+                context.CancellationToken);
+        }
+        catch (InvalidConsistencyTokenException ex)
+        {
+            throw new RpcException(new Status(StatusCode.InvalidArgument, ex.Message));
+        }
+
+        var ship = result.Verdict switch
+        {
+            Membership.Member => V1::CheckPermissionResponse.Types.Permissionship.HasPermission,
+            Membership.Caveated => V1::CheckPermissionResponse.Types.Permissionship.ConditionalPermission,
+            _ => V1::CheckPermissionResponse.Types.Permissionship.NoPermission,
+        };
+
+        var resp = new V1::CheckPermissionResponse
+        {
+            Permissionship = ship,
+            CheckedAt = new V1::ZedToken { Token = result.EvaluatedToken },
+        };
+
+        // partial_caveat_info carries a min_items=1 repeated field, so only populate it when the verdict is
+        // caveated AND there is at least one missing field to report.
+        if (result.Verdict == Membership.Caveated && result.MissingFields.Count > 0)
+        {
+            var partial = new V1::PartialCaveatInfo();
+            partial.MissingRequiredContext.AddRange(result.MissingFields);
+            resp.PartialCaveatInfo = partial;
+        }
+
+        return resp;
+    }
+
+    public override async Task<V1::WriteRelationshipsResponse> WriteRelationships(
+        V1::WriteRelationshipsRequest request, ServerCallContext context)
+    {
+        var updates = request.Updates.Select(ToWire).ToList();
+        var preconditions = ToWire(request.OptionalPreconditions);
+        try
+        {
+            var reply = await Relationships.WriteRelationships(new WriteRelationshipsArgs(updates, preconditions));
+            return new V1::WriteRelationshipsResponse { WrittenAt = new V1::ZedToken { Token = reply.WrittenAtToken } };
+        }
+        catch (PreconditionFailedException ex)
+        {
+            throw new RpcException(new Status(StatusCode.FailedPrecondition, ex.Message));
+        }
+        catch (Spiceport.Datastore.SerializationException ex)
+        {
+            // A CREATE op on an already-existing relationship. SpiceDB returns AlreadyExists here;
+            // mapping it to the proper gRPC code (not Unknown) stops zed from retrying the conflict.
+            throw new RpcException(new Status(StatusCode.AlreadyExists, ex.Message));
+        }
+    }
+
+    public override async Task ReadRelationships(
+        V1::ReadRelationshipsRequest request,
+        IServerStreamWriter<V1::ReadRelationshipsResponse> responseStream,
+        ServerCallContext context)
+    {
+        var filter = ToWire(request.RelationshipFilter);
+        var consistency = ToWire(request.Consistency);
+        string? cursor = null;
+
+        // Page the grain over one pinned snapshot: the first page resolves and pins a revision and returns
+        // a cursor encoding it; subsequent pages pass it back so every page reads the SAME snapshot.
+        while (!context.CancellationToken.IsCancellationRequested)
+        {
+            ReadRelationshipsReply reply;
+            try
+            {
+                reply = await Relationships.ReadRelationships(
+                    new ReadRelationshipsArgs(filter, null, cursor, consistency));
+            }
+            catch (InvalidConsistencyTokenException ex)
+            {
+                throw new RpcException(new Status(StatusCode.InvalidArgument, ex.Message));
+            }
+
+            foreach (var rel in reply.Relationships)
+            {
+                await responseStream.WriteAsync(new V1::ReadRelationshipsResponse
+                {
+                    ReadAt = new V1::ZedToken { Token = reply.ReadAtToken },
+                    Relationship = ToProto(rel),
+                });
+            }
+
+            if (reply.Relationships.Count == 0 || string.IsNullOrEmpty(reply.Cursor))
+                break;
+
+            cursor = reply.Cursor;
+        }
+    }
+
+    public override async Task<V1::DeleteRelationshipsResponse> DeleteRelationships(
+        V1::DeleteRelationshipsRequest request, ServerCallContext context)
+    {
+        try
+        {
+            var reply = await Relationships.DeleteRelationships(new DeleteRelationshipsArgs(
+                ToWire(request.RelationshipFilter),
+                null,
+                ToWire(request.OptionalPreconditions)));
+
+            // v1 DeleteRelationshipsResponse carries only deleted_at in this snapshot; count/limit discarded.
+            return new V1::DeleteRelationshipsResponse
+            {
+                DeletedAt = new V1::ZedToken { Token = reply.DeletedAtToken },
+            };
+        }
+        catch (PreconditionFailedException ex)
+        {
+            throw new RpcException(new Status(StatusCode.FailedPrecondition, ex.Message));
+        }
+    }
+
+    public override async Task<V1::ExpandPermissionTreeResponse> ExpandPermissionTree(
+        V1::ExpandPermissionTreeRequest request, ServerCallContext context)
+    {
+        // v1 ExpandPermissionTreeRequest has no mode field; authzed's expand is the recursive walk.
+        var reply = await ReverseOps.ExpandPermissionTree(new ExpandTreeArgs(
+            request.Resource.ObjectType,
+            request.Resource.ObjectId,
+            request.Permission,
+            ExpandModeWire.Recursive,
+            ToWire(request.Consistency)));
+
+        return new V1::ExpandPermissionTreeResponse
+        {
+            TreeRoot = ToProto(reply.Root),
+            ExpandedAt = new V1::ZedToken { Token = reply.ExpandedAtToken },
+        };
+    }
+
+    public override async Task LookupResources(
+        V1::LookupResourcesRequest request,
+        IServerStreamWriter<V1::LookupResourcesResponse> responseStream,
+        ServerCallContext context)
+    {
+        var subjectRelation = string.IsNullOrEmpty(request.Subject.OptionalRelation)
+            ? CoreConstants.Ellipsis
+            : request.Subject.OptionalRelation;
+
+        var context5 = StructToDict(request.Context);
+        var consistency = ToWire(request.Consistency);
+        string? cursor = null;
+
+        while (!context.CancellationToken.IsCancellationRequested)
+        {
+            LookupResourcesReply reply;
+            try
+            {
+                reply = await ReverseOps.LookupResources(new LookupResourcesArgs(
+                    request.ResourceObjectType,
+                    request.Permission,
+                    request.Subject.Object.ObjectType,
+                    request.Subject.Object.ObjectId,
+                    subjectRelation,
+                    context5,
+                    null,
+                    cursor,
+                    consistency));
+            }
+            catch (InvalidConsistencyTokenException ex)
+            {
+                throw new RpcException(new Status(StatusCode.InvalidArgument, ex.Message));
+            }
+
+            foreach (var r in reply.Resources)
+            {
+                var resp = new V1::LookupResourcesResponse
+                {
+                    LookedUpAt = new V1::ZedToken { Token = reply.LookedUpAtToken },
+                    ResourceObjectId = r.ResourceId,
+                    Permissionship = ToLookupPermissionship(r.Permissionship),
+                };
+                if (r.Permissionship.IsCaveated && r.Permissionship.MissingContextParams.Count > 0)
+                {
+                    var partial = new V1::PartialCaveatInfo();
+                    partial.MissingRequiredContext.AddRange(r.Permissionship.MissingContextParams);
+                    resp.PartialCaveatInfo = partial;
+                }
+                await responseStream.WriteAsync(resp);
+            }
+
+            if (reply.Resources.Count == 0 || string.IsNullOrEmpty(reply.Cursor))
+                break;
+
+            cursor = reply.Cursor;
+        }
+    }
+
+    public override async Task LookupSubjects(
+        V1::LookupSubjectsRequest request,
+        IServerStreamWriter<V1::LookupSubjectsResponse> responseStream,
+        ServerCallContext context)
+    {
+        var subjectRelation = string.IsNullOrEmpty(request.OptionalSubjectRelation)
+            ? CoreConstants.Ellipsis
+            : request.OptionalSubjectRelation;
+
+        var context6 = StructToDict(request.Context);
+        var consistency = ToWire(request.Consistency);
+        string? cursor = null;
+
+        while (!context.CancellationToken.IsCancellationRequested)
+        {
+            LookupSubjectsReply reply;
+            try
+            {
+                reply = await ReverseOps.LookupSubjects(new LookupSubjectsArgs(
+                    request.Resource.ObjectType,
+                    request.Resource.ObjectId,
+                    request.Permission,
+                    request.SubjectObjectType,
+                    subjectRelation,
+                    context6,
+                    null,
+                    cursor,
+                    consistency));
+            }
+            catch (InvalidConsistencyTokenException ex)
+            {
+                throw new RpcException(new Status(StatusCode.InvalidArgument, ex.Message));
+            }
+
+            foreach (var s in reply.Subjects)
+            {
+                var ship = ToLookupPermissionship(s.Permissionship);
+                V1::PartialCaveatInfo? partial = null;
+                if (s.Permissionship.IsCaveated && s.Permissionship.MissingContextParams.Count > 0)
+                {
+                    partial = new V1::PartialCaveatInfo();
+                    partial.MissingRequiredContext.AddRange(s.Permissionship.MissingContextParams);
+                }
+
+                var resp = new V1::LookupSubjectsResponse
+                {
+                    LookedUpAt = new V1::ZedToken { Token = reply.LookedUpAtToken },
+                    // Modern field.
+                    Subject = new V1::ResolvedSubject
+                    {
+                        SubjectObjectId = s.SubjectId,
+                        Permissionship = ship,
+                    },
+                    // Deprecated mirror fields for older clients.
+                    SubjectObjectId = s.SubjectId,
+                    Permissionship = ship,
+                };
+                if (partial is not null)
+                {
+                    resp.Subject.PartialCaveatInfo = partial;
+                    resp.PartialCaveatInfo = partial.Clone();
+                }
+                await responseStream.WriteAsync(resp);
+            }
+
+            if (reply.Subjects.Count == 0 || string.IsNullOrEmpty(reply.Cursor))
+                break;
+
+            cursor = reply.Cursor;
+        }
+    }
+
+    // ---- conversions ----
+
+    private static V1::LookupPermissionship ToLookupPermissionship(WirePermissionship p) =>
+        p.IsCaveated
+            ? V1::LookupPermissionship.ConditionalPermission
+            : V1::LookupPermissionship.HasPermission;
+
+    private static IReadOnlyList<PreconditionWire>? ToWire(
+        Google.Protobuf.Collections.RepeatedField<V1::Precondition> preconditions)
+    {
+        if (preconditions.Count == 0)
+            return null;
+
+        return preconditions.Select(p =>
+        {
+            var op = p.Operation switch
+            {
+                V1::Precondition.Types.Operation.MustMatch => PreconditionOpWire.MustMatch,
+                V1::Precondition.Types.Operation.MustNotMatch => PreconditionOpWire.MustNotMatch,
+                _ => throw new RpcException(new Status(
+                    StatusCode.InvalidArgument, "precondition operation is unspecified")),
+            };
+            return new PreconditionWire(op, ToWire(p.Filter));
+        }).ToList();
+    }
+
+    private static RelationshipUpdateWire ToWire(V1::RelationshipUpdate u)
+    {
+        var op = u.Operation switch
+        {
+            V1::RelationshipUpdate.Types.Operation.Create => RelationshipUpdateOpWire.Create,
+            V1::RelationshipUpdate.Types.Operation.Touch => RelationshipUpdateOpWire.Touch,
+            V1::RelationshipUpdate.Types.Operation.Delete => RelationshipUpdateOpWire.Delete,
+            _ => throw new RpcException(new Status(
+                StatusCode.InvalidArgument, "relationship update operation is unspecified")),
+        };
+        return new RelationshipUpdateWire(op, ToWire(u.Relationship));
+    }
+
+    private static RelationshipWire ToWire(V1::Relationship r)
+    {
+        var subjectRelation = string.IsNullOrEmpty(r.Subject.OptionalRelation)
+            ? CoreConstants.Ellipsis
+            : r.Subject.OptionalRelation;
+        // v1 core.proto Relationship has no expiration field in this snapshot.
+        return new RelationshipWire(
+            r.Resource.ObjectType, r.Resource.ObjectId, r.Relation,
+            r.Subject.Object.ObjectType, r.Subject.Object.ObjectId, subjectRelation,
+            r.OptionalCaveat is { CaveatName.Length: > 0 } c ? c.CaveatName : null,
+            r.OptionalCaveat is { } cc ? StructToDict(cc.Context) : null,
+            null);
+    }
+
+    private static V1::Relationship ToProto(RelationshipWire w)
+    {
+        var rel = new V1::Relationship
+        {
+            Resource = new V1::ObjectReference { ObjectType = w.ResourceType, ObjectId = w.ResourceId },
+            Relation = w.ResourceRelation,
+            Subject = new V1::SubjectReference
+            {
+                Object = new V1::ObjectReference { ObjectType = w.SubjectType, ObjectId = w.SubjectId },
+                OptionalRelation = w.SubjectRelation == CoreConstants.Ellipsis ? string.Empty : w.SubjectRelation,
+            },
+        };
+        if (w.CaveatName is { Length: > 0 })
+        {
+            rel.OptionalCaveat = new V1::ContextualizedCaveat
+            {
+                CaveatName = w.CaveatName,
+                Context = DictToStruct(w.CaveatContext),
+            };
+        }
+
+        return rel;
+    }
+
+    private static RelationshipsFilterWire ToWire(V1::RelationshipFilter f)
+    {
+        var resourceIds = string.IsNullOrEmpty(f.OptionalResourceId)
+            ? null
+            : new List<string> { f.OptionalResourceId };
+
+        string? subjectType = null;
+        IReadOnlyList<string>? subjectIds = null;
+        string? subjectRelation = null;
+        if (f.OptionalSubjectFilter is { } sub)
+        {
+            subjectType = NullIfEmpty(sub.SubjectType);
+            subjectIds = string.IsNullOrEmpty(sub.OptionalSubjectId)
+                ? null
+                : new List<string> { sub.OptionalSubjectId };
+            subjectRelation = sub.OptionalRelation is { } rf ? NullIfEmpty(rf.Relation) : null;
+        }
+
+        return new RelationshipsFilterWire(
+            NullIfEmpty(f.ResourceType),
+            null, // v1 RelationshipFilter has no resource-id prefix in this snapshot.
+            resourceIds,
+            NullIfEmpty(f.OptionalRelation),
+            subjectType,
+            subjectIds,
+            subjectRelation);
+    }
+
+    private static V1::PermissionRelationshipTree ToProto(ExpandTreeNodeWire node)
+    {
+        var result = new V1::PermissionRelationshipTree
+        {
+            ExpandedObject = new V1::ObjectReference
+            {
+                ObjectType = node.ExpandedType,
+                ObjectId = node.ExpandedId,
+            },
+            ExpandedRelation = node.ExpandedRelation,
+        };
+
+        if (node.IsLeaf)
+        {
+            // v1 DirectSubjectSet carries plain SubjectReferences with no per-subject caveat slots; a
+            // wildcard is represented by object_id == "*".
+            var leaf = new V1::DirectSubjectSet();
+            leaf.Subjects.AddRange(node.Subjects.Select(ToProto));
+            result.Leaf = leaf;
+        }
+        else
+        {
+            var intermediate = new V1::AlgebraicSubjectSet { Operation = ToProto(node.Operation) };
+            intermediate.Children.AddRange(node.Children.Select(ToProto));
+            result.Intermediate = intermediate;
+        }
+
+        return result;
+    }
+
+    private static V1::SubjectReference ToProto(ExpandSubjectWire s) => new()
+    {
+        Object = new V1::ObjectReference { ObjectType = s.SubjectType, ObjectId = s.SubjectId },
+        OptionalRelation = s.SubjectRelation == CoreConstants.Ellipsis ? string.Empty : s.SubjectRelation,
+    };
+
+    private static V1::AlgebraicSubjectSet.Types.Operation ToProto(SetOpWire op) => op switch
+    {
+        SetOpWire.Union => V1::AlgebraicSubjectSet.Types.Operation.Union,
+        SetOpWire.Intersection => V1::AlgebraicSubjectSet.Types.Operation.Intersection,
+        SetOpWire.Exclusion => V1::AlgebraicSubjectSet.Types.Operation.Exclusion,
+        _ => V1::AlgebraicSubjectSet.Types.Operation.Unspecified,
+    };
+
+    private static WireConsistency ToWire(V1::Consistency? consistency) => consistency?.RequirementCase switch
+    {
+        V1::Consistency.RequirementOneofCase.AtLeastAsFresh =>
+            new WireConsistency(WireConsistencyMode.AtLeastAsFresh, consistency.AtLeastAsFresh.Token),
+        V1::Consistency.RequirementOneofCase.FullyConsistent =>
+            new WireConsistency(WireConsistencyMode.FullyConsistent),
+        V1::Consistency.RequirementOneofCase.AtExactSnapshot =>
+            new WireConsistency(WireConsistencyMode.AtExactSnapshot, consistency.AtExactSnapshot.Token),
+        _ => WireConsistency.MinimizeLatency,
+    };
+
+    private static string? NullIfEmpty(string s) => string.IsNullOrEmpty(s) ? null : s;
+
+    private static IReadOnlyDictionary<string, object?>? StructToDict(Struct? s)
+    {
+        if (s is null || s.Fields.Count == 0)
+            return null;
+
+        var d = new Dictionary<string, object?>();
+        foreach (var (k, v) in s.Fields)
+            d[k] = ValueToObject(v);
+        return d;
+    }
+
+    private static Struct? DictToStruct(IReadOnlyDictionary<string, object?>? dict)
+    {
+        if (dict is null || dict.Count == 0)
+            return null;
+
+        var s = new Struct();
+        foreach (var (k, v) in dict)
+            s.Fields[k] = ObjectToValue(v);
+        return s;
+    }
+
+    private static Value ObjectToValue(object? o) => o switch
+    {
+        null => Value.ForNull(),
+        bool b => Value.ForBool(b),
+        string str => Value.ForString(str),
+        double d => Value.ForNumber(d),
+        int i => Value.ForNumber(i),
+        long l => Value.ForNumber(l),
+        IReadOnlyDictionary<string, object?> map => Value.ForStruct(DictToStruct(map) ?? new Struct()),
+        System.Collections.IEnumerable list => Value.ForList(
+            list.Cast<object?>().Select(ObjectToValue).ToArray()),
+        _ => Value.ForString(o.ToString() ?? string.Empty),
+    };
+
+    private static object? ValueToObject(Value v) => v.KindCase switch
+    {
+        Value.KindOneofCase.NullValue => null,
+        Value.KindOneofCase.NumberValue => v.NumberValue,
+        Value.KindOneofCase.StringValue => v.StringValue,
+        Value.KindOneofCase.BoolValue => v.BoolValue,
+        Value.KindOneofCase.StructValue =>
+            v.StructValue.Fields.ToDictionary(p => p.Key, p => ValueToObject(p.Value)),
+        Value.KindOneofCase.ListValue =>
+            v.ListValue.Values.Select(ValueToObject).ToList(),
+        _ => null,
+    };
+}
