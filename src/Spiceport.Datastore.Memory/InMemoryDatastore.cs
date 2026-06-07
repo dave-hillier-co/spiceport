@@ -28,7 +28,9 @@ public sealed class InMemoryDatastore : IDatastore
 
     // Ordered list of revisions that have been committed by a write transaction (the changefeed). The
     // datastore's initial empty revision is not a write and is not listed. Used by Watch to enumerate
-    // which revisions carry changes after a cursor. Bounded by the GC window in lockstep with reads.
+    // which revisions carry changes after a cursor. Pruned in lockstep with the GC window on each commit:
+    // a revision older than (head - gcWindow) can no longer be a valid Watch cursor (IsRevisionValid
+    // rejects it), so retaining it only grows the list unbounded and slows the per-poll re-scan.
     private ImmutableList<long> _committedRevisions = ImmutableList<long>.Empty;
 
     // A signal completed whenever a new revision commits, so live Watch tailers wake without polling.
@@ -120,7 +122,7 @@ public sealed class InMemoryDatastore : IDatastore
             if (!ReferenceEquals(_current, baseState))
                 throw new SerializationException();
             _current = tx.Commit();
-            _committedRevisions = _committedRevisions.Add(newRevision);
+            _committedRevisions = PruneExpiredRevisions(_committedRevisions.Add(newRevision), newRevision);
             // Wake any live Watch tailers, then arm a fresh signal for the next commit.
             var signal = _commitSignal;
             _commitSignal = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -184,6 +186,16 @@ public sealed class InMemoryDatastore : IDatastore
                 cursor = rev;
             }
 
+            // When checkpoints are requested, emit one after the batch so a consumer watching only a
+            // subset of content still observes that the revision advanced. Mirrors SpiceDB's Watch
+            // checkpoint emission (postgres watch.go:184-194; memdb behaves equivalently).
+            if (pending.Count > 0 && (options.Content & WatchContent.Checkpoints) != 0)
+            {
+                yield return new RevisionChange(
+                    new TimestampRevision(cursor), Array.Empty<RelationshipUpdate>(),
+                    SchemaChanged: false, IsCheckpoint: true);
+            }
+
             if (pending.Count == 0)
             {
                 // Nothing new: wait for the next commit or cancellation.
@@ -228,6 +240,19 @@ public sealed class InMemoryDatastore : IDatastore
         var next = now > _lastRevision ? now : _lastRevision + 1;
         _lastRevision = next;
         return next;
+    }
+
+    // Drop changefeed entries that have fallen out of the GC window. A revision strictly below the GC
+    // floor (head - gcWindow) can never again be a valid Watch cursor, so it carries no information for
+    // any future tailer and is safe to discard. The list stays in ascending order, so the survivors are
+    // a contiguous suffix. Caller holds _writeLock.
+    private ImmutableList<long> PruneExpiredRevisions(ImmutableList<long> revisions, long head)
+    {
+        var floor = head - _gcWindowNanos;
+        var firstKept = 0;
+        while (firstKept < revisions.Count && revisions[firstKept] < floor)
+            firstKept++;
+        return firstKept == 0 ? revisions : revisions.RemoveRange(0, firstKept);
     }
 
     private bool IsRevisionValid(long rev)

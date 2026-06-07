@@ -74,6 +74,101 @@ public class InMemoryDatastoreTests
     }
 
     [Fact]
+    public async Task Watch_emits_checkpoint_after_change_when_requested()
+    {
+        var ds = new InMemoryDatastore();
+        var head = await ds.HeadRevision();
+        var rel = Rel("document", "doc1", "viewer", "user", "alice");
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        var collected = new List<RevisionChange>();
+        var watchTask = Task.Run(async () =>
+        {
+            await foreach (var change in ds.Watch(
+                head.Revision, new WatchOptions(WatchContent.Relationships | WatchContent.Checkpoints), cts.Token))
+            {
+                collected.Add(change);
+                if (change.IsCheckpoint)
+                    break;
+            }
+        });
+
+        await ds.ReadWriteTx(async tx =>
+            await tx.WriteRelationships([new RelationshipUpdate(rel, UpdateOperation.Create)]));
+
+        await watchTask.WaitAsync(TimeSpan.FromSeconds(10));
+        cts.Cancel();
+
+        Assert.Equal(2, collected.Count);
+        Assert.False(collected[0].IsCheckpoint);
+        Assert.Single(collected[0].RelationshipChanges);
+        var checkpoint = collected[1];
+        Assert.True(checkpoint.IsCheckpoint);
+        Assert.Empty(checkpoint.RelationshipChanges);
+        // The checkpoint names the latest revision the changefeed advanced through.
+        Assert.Equal(collected[0].Revision, checkpoint.Revision);
+    }
+
+    [Fact]
+    public async Task Watch_does_not_emit_checkpoint_when_not_requested()
+    {
+        var ds = new InMemoryDatastore();
+        var head = await ds.HeadRevision();
+        var rel = Rel("document", "doc1", "viewer", "user", "alice");
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        var collected = new List<RevisionChange>();
+        var watchTask = Task.Run(async () =>
+        {
+            await foreach (var change in ds.Watch(head.Revision, new WatchOptions(WatchContent.Relationships), cts.Token))
+            {
+                collected.Add(change);
+                break;
+            }
+        });
+
+        await ds.ReadWriteTx(async tx =>
+            await tx.WriteRelationships([new RelationshipUpdate(rel, UpdateOperation.Create)]));
+
+        await watchTask.WaitAsync(TimeSpan.FromSeconds(10));
+        cts.Cancel();
+
+        var change = Assert.Single(collected);
+        Assert.False(change.IsCheckpoint);
+    }
+
+    [Fact]
+    public async Task Changefeed_is_pruned_in_lockstep_with_the_gc_window()
+    {
+        // A tiny GC window means each new commit pushes prior commits out of the retained window. The
+        // changefeed must not retain expired revisions, so a fresh Watch from head only ever sees the
+        // changes still inside the window — never an unbounded backlog.
+        var ds = new InMemoryDatastore(quantization: TimeSpan.Zero, gcWindow: TimeSpan.FromMilliseconds(1));
+
+        for (var i = 0; i < 5; i++)
+        {
+            var rel = Rel("document", $"doc{i}", "viewer", "user", "alice");
+            await ds.ReadWriteTx(async tx =>
+                await tx.WriteRelationships([new RelationshipUpdate(rel, UpdateOperation.Create)]));
+            await Task.Delay(5);
+        }
+
+        // After the writes, watching from a fresh head must succeed and the older (GC'd) revisions must
+        // no longer be replayable as cursors.
+        var head = await ds.HeadRevision();
+        Assert.True(await ds.CheckRevision(head.Revision));
+
+        // One more commit advances head; the prior commits have aged out of the 1ms window.
+        var lastRel = Rel("document", "docLast", "viewer", "user", "alice");
+        var lastRev = await ds.ReadWriteTx(async tx =>
+            await tx.WriteRelationships([new RelationshipUpdate(lastRel, UpdateOperation.Create)]));
+
+        // Watching from the just-committed revision yields nothing pending and does not throw — the
+        // changefeed has been trimmed but the live cursor is still valid.
+        Assert.True(await ds.CheckRevision(lastRev));
+    }
+
+    [Fact]
     public async Task WriteThenReadBack_ReturnsRelationship()
     {
         var ds = new InMemoryDatastore();

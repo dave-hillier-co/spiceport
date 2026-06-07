@@ -65,6 +65,17 @@ public sealed class CounterAlreadyRegisteredException : DatastoreException
         : base($"counter with name `{name}` is already registered") => CounterName = name;
 }
 
+/// <summary>
+/// Thrown when <see cref="IDatastore.Watch"/> cannot run because the backend is not configured to
+/// support it. SpiceDB's <c>WatchDisabledErr</c>: Postgres must run with
+/// <c>track_commit_timestamp=on</c> so the changefeed can emit in commit order.
+/// </summary>
+public sealed class WatchDisabledException : DatastoreException
+{
+    /// <summary>Creates a watch-disabled exception.</summary>
+    public WatchDisabledException(string message) : base(message) { }
+}
+
 /// <summary>Thrown when reading, counting, or unregistering a counter that is not live.</summary>
 public sealed class CounterNotRegisteredException : DatastoreException
 {

@@ -203,28 +203,49 @@ public sealed class PostgresDatastore : IDatastore, IAsyncDisposable
         ArgumentNullException.ThrowIfNull(afterRevision);
         ArgumentNullException.ThrowIfNull(options);
 
+        // SpiceDB requires track_commit_timestamp=on so the changefeed can order by commit time (see
+        // watch.go:79-89). Without it pg_xact_commit_timestamp returns NULL and Watch cannot guarantee
+        // commit-ordered emission, so refuse to start — mirroring SpiceDB's WatchDisabledErr.
+        if (!await IsWatchEnabled(cancellationToken).ConfigureAwait(false))
+            throw new WatchDisabledException(
+                "postgres must be run with track_commit_timestamp=on for watch to be enabled");
+
         var cursor = AsPostgres(afterRevision);
         if (!await CheckRevision(cursor, cancellationToken).ConfigureAwait(false))
             throw new RevisionNotFoundException(afterRevision);
 
         // The cursor's snapshot defines what is already seen. Poll the transaction table for committed
-        // transactions whose xid is not yet visible to the cursor, emit their relationship diffs in xid
-        // order, and advance the cursor by folding each emitted xid into its snapshot.
+        // transactions whose xid is not yet visible to the cursor, emit their relationship diffs in
+        // COMMIT-TIMESTAMP order, and advance the cursor by folding each emitted xid into its snapshot.
         var seen = cursor.Snapshot;
+        var requestedCheckpoints = (options.Content & WatchContent.Checkpoints) != 0;
 
         while (!cancellationToken.IsCancellationRequested)
         {
             var pending = await PollNewTransactions(seen, cancellationToken).ConfigureAwait(false);
 
-            foreach (var xid in pending)
+            if (pending.Count > 0)
             {
-                var change = await BuildChange(xid, seen, options, cancellationToken).ConfigureAwait(false);
-                seen = seen.MarkComplete(xid);
-                if (change is not null)
-                    yield return change;
-            }
+                foreach (var xid in pending)
+                {
+                    var change = await BuildChange(xid, seen, options, cancellationToken).ConfigureAwait(false);
+                    seen = seen.MarkComplete(xid);
+                    if (change is not null)
+                        yield return change;
+                }
 
-            if (pending.Count == 0)
+                // When checkpoints are requested, emit one after the batch so consumers watching only a
+                // subset of content still observe that the revision advanced through the latest xid.
+                // Mirrors SpiceDB watch.go:184-194.
+                if (requestedCheckpoints)
+                {
+                    var checkpointXid = pending[^1];
+                    var revision = new PostgresRevision(seen, checkpointXid);
+                    yield return new RevisionChange(
+                        revision, Array.Empty<RelationshipUpdate>(), SchemaChanged: false, IsCheckpoint: true);
+                }
+            }
+            else
             {
                 try
                 {
@@ -238,14 +259,35 @@ public sealed class PostgresDatastore : IDatastore, IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// True if the server has <c>track_commit_timestamp=on</c>, the prerequisite for commit-ordered
+    /// Watch emission. SpiceDB checks this once at startup (watch.go).
+    /// </summary>
+    private async Task<bool> IsWatchEnabled(CancellationToken cancellationToken)
+    {
+        await using var conn = await _dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = "SHOW track_commit_timestamp";
+        var value = (string?)(await cmd.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false));
+        return string.Equals(value, "on", StringComparison.OrdinalIgnoreCase);
+    }
+
     private async Task<List<ulong>> PollNewTransactions(PgSnapshot seen, CancellationToken cancellationToken)
     {
         await using var conn = await _dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
         await using var cmd = conn.CreateCommand();
         // Transactions with xid >= seen.xmax are guaranteed unseen; those in [xmin,xmax) may be in the
         // xip list. Fetch xids at/after xmin and filter by the snapshot's visibility (NOT yet visible).
+        //
+        // Order by COMMIT TIMESTAMP (then xid as a tiebreak), matching SpiceDB's newRevisionsQuery
+        // (watch.go:32-36). Postgres xid allocation order is NOT commit order — a lower xid can commit
+        // after a higher one — so ordering by xid alone can emit out of commit order, violating the
+        // strictly-increasing-revision Watch contract. pg_xact_commit_timestamp requires
+        // track_commit_timestamp=on (guarded by IsWatchEnabled before this runs); it takes an xid, so
+        // cast the xid8 down (safe: GC keeps the live window well under ~2^31 transactions).
         cmd.CommandText =
-            $"SELECT {ColXid}::text FROM {TableTransaction} WHERE {ColXid} >= @minxid::text::xid8 ORDER BY {ColXid} ASC";
+            $"SELECT {ColXid}::text FROM {TableTransaction} WHERE {ColXid} >= @minxid::text::xid8 " +
+            $"ORDER BY pg_xact_commit_timestamp({ColXid}::xid), {ColXid} ASC";
         cmd.Parameters.AddWithValue("minxid", seen.Xmin.ToString(System.Globalization.CultureInfo.InvariantCulture));
 
         var result = new List<ulong>();

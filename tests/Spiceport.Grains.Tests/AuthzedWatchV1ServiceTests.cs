@@ -148,6 +148,64 @@ public class AuthzedWatchV1ServiceTests
             r => Assert.All(r.Updates, u => Assert.Equal("document", u.Relationship.Resource.ObjectType)));
     }
 
+    [Fact]
+    public async Task Watch_with_checkpoints_emits_a_checkpoint_response_after_a_change()
+    {
+        await using var cluster = await MeshTestCluster.CreateAsync(Schema);
+        var service = Service(cluster);
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        var writer = new CollectingStreamWriter<V1::WatchResponse>();
+        var ctx = new FakeServerCallContext(cts.Token);
+
+        var request = new V1::WatchRequest();
+        request.OptionalUpdateKinds.Add(V1::WatchKind.IncludeRelationshipUpdates);
+        request.OptionalUpdateKinds.Add(V1::WatchKind.IncludeCheckpoints);
+        var watchTask = service.Watch(request, writer, ctx);
+
+        await WriteViewer(cluster, "document", "doc1", "alice");
+
+        // First the content response, then the checkpoint marking the revision progressed through.
+        var content = await writer.WaitForNext(TimeSpan.FromSeconds(10), watchTask);
+        var checkpoint = await writer.WaitForNext(TimeSpan.FromSeconds(10), watchTask);
+        cts.Cancel();
+        await watchTask;
+
+        Assert.False(content.IsCheckpoint);
+        Assert.Single(content.Updates);
+        Assert.True(checkpoint.IsCheckpoint);
+        Assert.Empty(checkpoint.Updates);
+        Assert.False(string.IsNullOrEmpty(checkpoint.ChangesThrough.Token));
+    }
+
+    [Fact]
+    public async Task Watch_with_checkpoints_emits_checkpoint_even_when_filter_excludes_the_change()
+    {
+        await using var cluster = await MeshTestCluster.CreateAsync(Schema);
+        var service = Service(cluster);
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        var writer = new CollectingStreamWriter<V1::WatchResponse>();
+        var ctx = new FakeServerCallContext(cts.Token);
+
+        var request = new V1::WatchRequest();
+        request.OptionalObjectTypes.Add("document");
+        request.OptionalUpdateKinds.Add(V1::WatchKind.IncludeRelationshipUpdates);
+        request.OptionalUpdateKinds.Add(V1::WatchKind.IncludeCheckpoints);
+        var watchTask = service.Watch(request, writer, ctx);
+
+        // A folder write is filtered out of content, but the checkpoint must still surface so the
+        // consumer sees the revision advanced (liveness for a filtered subset).
+        await WriteViewer(cluster, "folder", "f1", "alice");
+
+        var first = await writer.WaitForNext(TimeSpan.FromSeconds(10), watchTask);
+        cts.Cancel();
+        await watchTask;
+
+        Assert.True(first.IsCheckpoint);
+        Assert.Empty(first.Updates);
+    }
+
     private sealed class CollectingStreamWriter<T> : IServerStreamWriter<T>
     {
         private readonly Channel<T> _channel = Channel.CreateUnbounded<T>();

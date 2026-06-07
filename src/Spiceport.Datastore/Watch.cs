@@ -12,6 +12,13 @@ public enum WatchContent
     /// <summary>A signal that the schema changed at the revision (no detailed diff for this slice).</summary>
     Schema = 2,
 
+    /// <summary>
+    /// Emit checkpoint markers that carry only a revision (no content). Mirrors SpiceDB's
+    /// <c>WatchCheckpoints</c>: a consumer watching a subset of content still sees revision progress
+    /// (a liveness signal) even when nothing matching its filter changed.
+    /// </summary>
+    Checkpoints = 4,
+
     /// <summary>Both relationship updates and schema-change signals.</summary>
     All = Relationships | Schema,
 }
@@ -32,7 +39,13 @@ public sealed record WatchOptions(WatchContent Content = WatchContent.Relationsh
 /// <see cref="UpdateOperation.Delete"/> carrying the removed relationship.
 /// </param>
 /// <param name="SchemaChanged">True if the unified schema was (re)written at this revision.</param>
+/// <param name="IsCheckpoint">
+/// True if this is a checkpoint marker (no content): it signals that the changefeed has progressed
+/// through <paramref name="Revision"/> so a consumer filtering to a subset of content still observes
+/// revision progress. Mirrors SpiceDB's <c>RevisionChanges.IsCheckpoint</c>.
+/// </param>
 public sealed record RevisionChange(
     IRevision Revision,
     IReadOnlyList<RelationshipUpdate> RelationshipChanges,
-    bool SchemaChanged = false);
+    bool SchemaChanged = false,
+    bool IsCheckpoint = false);

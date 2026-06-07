@@ -54,20 +54,11 @@ public sealed class AuthzedWatchV1Service(IDatastore datastore, ISchemaProvider 
         }
 
         var datastoreId = await datastore.GetUniqueId(cancellationToken);
-        // This snapshot's WatchRequest has no update-kind selector: watch relationships only.
-        var options = new WatchOptions(WatchContent.Relationships);
+        var options = new WatchOptions(ResolveContent(request));
 
-        IAsyncEnumerator<RevisionChange> enumerator;
-        try
-        {
-            enumerator = datastore.Watch(afterRevision, options, cancellationToken).GetAsyncEnumerator(cancellationToken);
-        }
-        catch (RevisionNotFoundException ex)
-        {
-            // The cursor is older than the retained GC window — cannot replay from it.
-            throw new RpcException(new Status(StatusCode.FailedPrecondition, ex.Message));
-        }
-
+        // The datastore Watch is a lazy iterator: cursor-validity and watch-enablement checks throw on
+        // the first MoveNextAsync, not at GetAsyncEnumerator, so the catch must wrap the iteration.
+        var enumerator = datastore.Watch(afterRevision, options, cancellationToken).GetAsyncEnumerator(cancellationToken);
         try
         {
             while (true)
@@ -81,6 +72,16 @@ public sealed class AuthzedWatchV1Service(IDatastore datastore, ISchemaProvider 
                 {
                     break;
                 }
+                catch (RevisionNotFoundException ex)
+                {
+                    // The cursor is older than the retained GC window — cannot replay from it.
+                    throw new RpcException(new Status(StatusCode.FailedPrecondition, ex.Message));
+                }
+                catch (WatchDisabledException ex)
+                {
+                    // The backend cannot support Watch (e.g. Postgres without track_commit_timestamp=on).
+                    throw new RpcException(new Status(StatusCode.FailedPrecondition, ex.Message));
+                }
 
                 if (!moved)
                     break;
@@ -91,9 +92,13 @@ public sealed class AuthzedWatchV1Service(IDatastore datastore, ISchemaProvider 
                 var change = enumerator.Current;
                 var response = ToResponse(change, datastoreId, objectTypeFilter);
 
-                // Skip empty responses that result from filtering out every update in a change.
-                if (response.Updates.Count == 0 && objectTypeFilter is not null)
+                // Checkpoints always flow through (they carry revision-progress liveness for filtered
+                // consumers). Otherwise skip a content response whose every update was filtered out.
+                if (!change.IsCheckpoint && response.Updates.Count == 0 &&
+                    !change.SchemaChanged && objectTypeFilter is not null)
+                {
                     continue;
+                }
 
                 await responseStream.WriteAsync(response);
             }
@@ -111,7 +116,13 @@ public sealed class AuthzedWatchV1Service(IDatastore datastore, ISchemaProvider 
         var response = new V1::WatchResponse
         {
             ChangesThrough = new V1::ZedToken { Token = token.Token },
+            SchemaUpdated = change.SchemaChanged,
+            IsCheckpoint = change.IsCheckpoint,
         };
+
+        // A checkpoint carries no content, only the revision.
+        if (change.IsCheckpoint)
+            return response;
 
         foreach (var update in change.RelationshipChanges)
         {
@@ -125,6 +136,31 @@ public sealed class AuthzedWatchV1Service(IDatastore datastore, ISchemaProvider 
         }
 
         return response;
+    }
+
+    /// <summary>
+    /// Maps the request's <c>optional_update_kinds</c> to the datastore's <see cref="WatchContent"/>.
+    /// An empty selector defaults to relationships only (backwards-compatible).
+    /// </summary>
+    private static WatchContent ResolveContent(V1::WatchRequest request)
+    {
+        if (request.OptionalUpdateKinds.Count == 0)
+            return WatchContent.Relationships;
+
+        WatchContent content = 0;
+        foreach (var kind in request.OptionalUpdateKinds)
+        {
+            content |= kind switch
+            {
+                V1::WatchKind.IncludeSchemaUpdates => WatchContent.Schema,
+                V1::WatchKind.IncludeCheckpoints => WatchContent.Checkpoints,
+                _ => WatchContent.Relationships,
+            };
+        }
+
+        // If only checkpoints (or only schema) were selected, we still need a content slice or the
+        // changefeed would emit nothing to checkpoint over; SpiceDB's content selection is additive.
+        return content;
     }
 
     private static V1::RelationshipUpdate ToProto(Core.RelationshipUpdate update)
