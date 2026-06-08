@@ -424,74 +424,108 @@ public sealed class AuthzedPermissionsV1Service(
     public override async Task<V1::CheckBulkPermissionsResponse> CheckBulkPermissions(
         V1::CheckBulkPermissionsRequest request, ServerCallContext context)
     {
-        // Map every item to the grain batch shape, preserving request order. The whole batch shares ONE
-        // consistency / pinned revision; the grain fans the items out and returns index-aligned verdicts.
-        var items = request.Items.Select(it =>
-        {
-            // A wildcard ("*") subject is rejected per item, matching SpiceDB's checkInternal guard.
-            SchemaValidation.RejectWildcardSubject(it.Subject.Object.ObjectId);
+        var snapshot = schema.Current;
 
+        // Validate each pair against the schema UP FRONT and PER PAIR. An unknown resource definition,
+        // unknown relation/permission, or a wildcard ("*") check subject is a client schema/typo bug for
+        // that one pair; SpiceDB's CheckBulkPermissions surfaces it as that pair's google.rpc.Status error
+        // (CheckBulkPermissionsPair_Error) rather than failing the whole RPC. Valid pairs are dispatched;
+        // invalid pairs are short-circuited to their error and never sent to the grain.
+        //
+        // (Oversized request caveat context remains a WHOLE-request InvalidArgument, matching SpiceDB's
+        // groupItems/GetCaveatContext which aborts the entire bulk request.)
+        var pairErrors = new Google.Rpc.Status?[request.Items.Count];
+        var validItems = new List<BatchCheckItem>();
+
+        for (var i = 0; i < request.Items.Count; i++)
+        {
+            var it = request.Items[i];
             var subjectRelation = string.IsNullOrEmpty(it.Subject.OptionalRelation)
                 ? CoreConstants.Ellipsis
                 : it.Subject.OptionalRelation;
-            return new BatchCheckItem(
+
+            var perPairError =
+                SchemaValidation.WildcardSubjectError(it.Subject.Object.ObjectId)
+                ?? SchemaValidation.TryCheckNamespaceAndRelations(
+                    snapshot,
+                    new SchemaValidation.TypeAndRelation(it.Resource.ObjectType, it.Permission, AllowEllipsis: false),
+                    new SchemaValidation.TypeAndRelation(it.Subject.Object.ObjectType, subjectRelation, AllowEllipsis: true));
+
+            if (perPairError is not null)
+            {
+                pairErrors[i] = SchemaValidation.ToRpcStatus(perPairError);
+                continue;
+            }
+
+            validItems.Add(new BatchCheckItem(
                 it.Resource.ObjectType,
                 it.Resource.ObjectId,
                 it.Permission,
                 new ObjectAndRelation(it.Subject.Object.ObjectType, it.Subject.Object.ObjectId, subjectRelation),
-                // Reject an oversized per-item caveat context (SpiceDB: GetCaveatContext) -> InvalidArgument.
-                StructToDict(RequestLimits.ValidateCaveatContextSize(it.Context)));
-        }).ToList();
-
-        BatchCheckResult result;
-        try
-        {
-            result = await checker.BatchCheck(
-                items,
-                ToWire(request.Consistency).ToRequirement(),
-                context.CancellationToken);
-        }
-        catch (InvalidConsistencyTokenException ex)
-        {
-            throw new RpcException(new Status(StatusCode.InvalidArgument, ex.Message));
-        }
-        catch (CaveatEvaluationException ex)
-        {
-            throw ToRpc(ex);
+                // Reject an oversized per-item caveat context (SpiceDB: GetCaveatContext) -> whole-request InvalidArgument.
+                StructToDict(RequestLimits.ValidateCaveatContextSize(it.Context))));
         }
 
-        // One token for the whole batch (the single pinned revision every item was evaluated at).
-        var resp = new V1::CheckBulkPermissionsResponse
+        BatchCheckResult? result = null;
+        if (validItems.Count > 0)
         {
-            CheckedAt = new V1::ZedToken { Token = result.EvaluatedToken },
-        };
-
-        // Pairs are emitted in request order: each pair echoes its originating request item alongside its
-        // verdict. (BatchCheck never returns a per-item google.rpc.Status here; the error arm of the oneof is
-        // reserved for per-item failures the grain does not currently surface.)
-        for (var i = 0; i < result.Items.Count; i++)
-        {
-            var verdict = result.Items[i];
-            var ship = verdict.Verdict switch
+            try
             {
-                Membership.Member => V1::CheckPermissionResponse.Types.Permissionship.HasPermission,
-                Membership.Caveated => V1::CheckPermissionResponse.Types.Permissionship.ConditionalPermission,
-                _ => V1::CheckPermissionResponse.Types.Permissionship.NoPermission,
-            };
-
-            var item = new V1::CheckBulkPermissionsResponseItem { Permissionship = ship };
-            if (verdict.Verdict == Membership.Caveated && verdict.MissingFields.Count > 0)
+                result = await checker.BatchCheck(
+                    validItems,
+                    ToWire(request.Consistency).ToRequirement(),
+                    context.CancellationToken);
+            }
+            catch (InvalidConsistencyTokenException ex)
             {
-                var partial = new V1::PartialCaveatInfo();
-                partial.MissingRequiredContext.AddRange(verdict.MissingFields);
-                item.PartialCaveatInfo = partial;
+                throw new RpcException(new Status(StatusCode.InvalidArgument, ex.Message));
+            }
+            catch (CaveatEvaluationException ex)
+            {
+                throw ToRpc(ex);
+            }
+        }
+
+        // One token for the whole batch (the single pinned revision every dispatched item was evaluated at).
+        // When every pair failed validation, no revision was pinned, so no CheckedAt is emitted.
+        var resp = new V1::CheckBulkPermissionsResponse();
+        if (result is not null)
+            resp.CheckedAt = new V1::ZedToken { Token = result.EvaluatedToken };
+
+        // Re-interleave verdicts (from valid items, in dispatch order) and per-pair errors back into the
+        // original request order. Each pair echoes its originating request item alongside either its verdict
+        // or its google.rpc.Status error.
+        var verdictPos = 0;
+        for (var i = 0; i < request.Items.Count; i++)
+        {
+            var pair = new V1::CheckBulkPermissionsPair { Request = request.Items[i] };
+
+            if (pairErrors[i] is { } error)
+            {
+                pair.Error = error;
+            }
+            else
+            {
+                var verdict = result!.Items[verdictPos++];
+                var ship = verdict.Verdict switch
+                {
+                    Membership.Member => V1::CheckPermissionResponse.Types.Permissionship.HasPermission,
+                    Membership.Caveated => V1::CheckPermissionResponse.Types.Permissionship.ConditionalPermission,
+                    _ => V1::CheckPermissionResponse.Types.Permissionship.NoPermission,
+                };
+
+                var item = new V1::CheckBulkPermissionsResponseItem { Permissionship = ship };
+                if (verdict.Verdict == Membership.Caveated && verdict.MissingFields.Count > 0)
+                {
+                    var partial = new V1::PartialCaveatInfo();
+                    partial.MissingRequiredContext.AddRange(verdict.MissingFields);
+                    item.PartialCaveatInfo = partial;
+                }
+
+                pair.Item = item;
             }
 
-            resp.Pairs.Add(new V1::CheckBulkPermissionsPair
-            {
-                Request = request.Items[i],
-                Item = item,
-            });
+            resp.Pairs.Add(pair);
         }
 
         return resp;

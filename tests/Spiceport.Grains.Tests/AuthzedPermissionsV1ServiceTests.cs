@@ -178,10 +178,12 @@ public class AuthzedPermissionsV1ServiceTests
     }
 
     [Fact]
-    public async Task CheckBulkPermissions_wildcard_subject_is_invalid_argument()
+    public async Task CheckBulkPermissions_wildcard_subject_is_per_pair_error()
     {
-        // Each bulk item is rejected the same way CheckPermission is; a wildcard subject in any item
-        // fails the whole request with InvalidArgument before dispatch.
+        // SpiceDB's CheckBulkPermissions validates each pair independently and reports a bad pair via that
+        // pair's google.rpc.Status error (CheckBulkPermissionsPair_Error), NOT by failing the whole RPC. A
+        // wildcard ("*") check subject in one item must therefore error ONLY that pair; valid items still
+        // return their verdict.
         await using var cluster = await MeshTestCluster.CreateAsync(Schema);
         await SeedAsync(cluster.Datastore, ("readme", "viewer", "alice"));
 
@@ -189,10 +191,84 @@ public class AuthzedPermissionsV1ServiceTests
         req.Items.Add(BulkItem("readme", "view", "alice"));
         req.Items.Add(BulkItem("readme", "view", "*"));
 
-        var ex = await Assert.ThrowsAsync<RpcException>(() =>
-            Service(cluster).CheckBulkPermissions(req, FakeServerCallContext.Default));
-        Assert.Equal(StatusCode.InvalidArgument, ex.StatusCode);
-        Assert.Contains("cannot perform check on wildcard subject", ex.Status.Detail);
+        var resp = await Service(cluster).CheckBulkPermissions(req, FakeServerCallContext.Default);
+
+        Assert.Equal(2, resp.Pairs.Count);
+        Assert.Equal(V1::CheckBulkPermissionsPair.ResponseOneofCase.Item, resp.Pairs[0].ResponseCase);
+        Assert.Equal(V1::CheckPermissionResponse.Types.Permissionship.HasPermission, resp.Pairs[0].Item.Permissionship);
+
+        Assert.Equal(V1::CheckBulkPermissionsPair.ResponseOneofCase.Error, resp.Pairs[1].ResponseCase);
+        Assert.Equal((int)StatusCode.InvalidArgument, resp.Pairs[1].Error.Code);
+        Assert.Contains("cannot perform check on wildcard subject", resp.Pairs[1].Error.Message);
+    }
+
+    [Fact]
+    public async Task CheckBulkPermissions_unknown_definition_is_per_pair_error()
+    {
+        // An unknown resource definition is a client schema/typo bug for that one pair: SpiceDB surfaces it
+        // as ERROR_REASON_UNKNOWN_DEFINITION in the pair's error (FailedPrecondition code), not a whole-RPC
+        // failure and not a silent NO_PERMISSION verdict. The other (valid) pair still returns its verdict.
+        await using var cluster = await MeshTestCluster.CreateAsync(Schema);
+        await SeedAsync(cluster.Datastore, ("readme", "viewer", "alice"));
+
+        var req = new V1::CheckBulkPermissionsRequest();
+        req.Items.Add(BulkItem("readme", "view", "alice"));
+        req.Items.Add(new V1::CheckBulkPermissionsRequestItem
+        {
+            Resource = new V1::ObjectReference { ObjectType = "missing_type", ObjectId = "x" },
+            Permission = "view",
+            Subject = UserSubject("alice"),
+        });
+
+        var resp = await Service(cluster).CheckBulkPermissions(req, FakeServerCallContext.Default);
+
+        Assert.Equal(2, resp.Pairs.Count);
+        Assert.Equal(V1::CheckBulkPermissionsPair.ResponseOneofCase.Item, resp.Pairs[0].ResponseCase);
+        Assert.Equal(V1::CheckPermissionResponse.Types.Permissionship.HasPermission, resp.Pairs[0].Item.Permissionship);
+
+        Assert.Equal(V1::CheckBulkPermissionsPair.ResponseOneofCase.Error, resp.Pairs[1].ResponseCase);
+        Assert.Equal((int)StatusCode.FailedPrecondition, resp.Pairs[1].Error.Code);
+        Assert.Contains("missing_type", resp.Pairs[1].Error.Message);
+    }
+
+    [Fact]
+    public async Task CheckBulkPermissions_unknown_relation_is_per_pair_error()
+    {
+        // An unknown relation/permission on a known definition is ERROR_REASON_UNKNOWN_RELATION_OR_PERMISSION
+        // per pair (FailedPrecondition code), again leaving sibling valid pairs untouched.
+        await using var cluster = await MeshTestCluster.CreateAsync(Schema);
+        await SeedAsync(cluster.Datastore, ("readme", "viewer", "alice"));
+
+        var req = new V1::CheckBulkPermissionsRequest();
+        req.Items.Add(BulkItem("readme", "nonexistent_perm", "alice"));
+        req.Items.Add(BulkItem("readme", "view", "alice"));
+
+        var resp = await Service(cluster).CheckBulkPermissions(req, FakeServerCallContext.Default);
+
+        Assert.Equal(2, resp.Pairs.Count);
+        Assert.Equal(V1::CheckBulkPermissionsPair.ResponseOneofCase.Error, resp.Pairs[0].ResponseCase);
+        Assert.Equal((int)StatusCode.FailedPrecondition, resp.Pairs[0].Error.Code);
+        Assert.Contains("nonexistent_perm", resp.Pairs[0].Error.Message);
+
+        Assert.Equal(V1::CheckBulkPermissionsPair.ResponseOneofCase.Item, resp.Pairs[1].ResponseCase);
+        Assert.Equal(V1::CheckPermissionResponse.Types.Permissionship.HasPermission, resp.Pairs[1].Item.Permissionship);
+    }
+
+    [Fact]
+    public async Task CheckBulkPermissions_all_pairs_invalid_emits_no_token()
+    {
+        // When every pair fails validation no revision is pinned (nothing is dispatched), so the response
+        // carries per-pair errors and no batch CheckedAt token.
+        await using var cluster = await MeshTestCluster.CreateAsync(Schema);
+
+        var req = new V1::CheckBulkPermissionsRequest();
+        req.Items.Add(BulkItem("readme", "nonexistent_perm", "alice"));
+
+        var resp = await Service(cluster).CheckBulkPermissions(req, FakeServerCallContext.Default);
+
+        var pair = Assert.Single(resp.Pairs);
+        Assert.Equal(V1::CheckBulkPermissionsPair.ResponseOneofCase.Error, pair.ResponseCase);
+        Assert.Null(resp.CheckedAt);
     }
 
     [Fact]
