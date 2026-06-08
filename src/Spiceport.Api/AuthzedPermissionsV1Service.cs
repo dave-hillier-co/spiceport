@@ -50,6 +50,10 @@ public sealed class AuthzedPermissionsV1Service(
             request.Subject.Object.ObjectId,
             subjectRelation);
 
+        // A wildcard ("*") subject is not a valid thing to check (SpiceDB: checkInternal returns
+        // NewWildcardNotAllowedErr -> InvalidArgument). It is only meaningful as a stored subject.
+        SchemaValidation.RejectWildcardSubject(request.Subject.Object.ObjectId);
+
         // Validate the resource definition+permission and the subject definition+relation up front, as
         // SpiceDB does (namespace.CheckNamespaceAndRelations). An unknown definition/relation is a client
         // schema/typo bug surfaced as FailedPrecondition, NOT silently masked as a NO_PERMISSION verdict.
@@ -415,6 +419,9 @@ public sealed class AuthzedPermissionsV1Service(
         // consistency / pinned revision; the grain fans the items out and returns index-aligned verdicts.
         var items = request.Items.Select(it =>
         {
+            // A wildcard ("*") subject is rejected per item, matching SpiceDB's checkInternal guard.
+            SchemaValidation.RejectWildcardSubject(it.Subject.Object.ObjectId);
+
             var subjectRelation = string.IsNullOrEmpty(it.Subject.OptionalRelation)
                 ? CoreConstants.Ellipsis
                 : it.Subject.OptionalRelation;

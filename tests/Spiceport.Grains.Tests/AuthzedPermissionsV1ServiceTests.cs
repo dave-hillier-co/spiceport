@@ -156,6 +156,46 @@ public class AuthzedPermissionsV1ServiceTests
     }
 
     [Fact]
+    public async Task CheckPermission_wildcard_subject_is_invalid_argument()
+    {
+        // A "*"-id subject is not a valid thing to check (SpiceDB: checkInternal returns
+        // NewWildcardNotAllowedErr -> InvalidArgument). It must be rejected up front rather than
+        // silently evaluated (where it could even match a stored wildcard tuple).
+        await using var cluster = await MeshTestCluster.CreateAsync(Schema);
+        await SeedAsync(cluster.Datastore, ("readme", "viewer", "alice"));
+
+        var ex = await Assert.ThrowsAsync<RpcException>(() => Service(cluster).CheckPermission(
+            new V1::CheckPermissionRequest
+            {
+                Resource = new V1::ObjectReference { ObjectType = "document", ObjectId = "readme" },
+                Permission = "view",
+                Subject = UserSubject("*"),
+            },
+            FakeServerCallContext.Default));
+
+        Assert.Equal(StatusCode.InvalidArgument, ex.StatusCode);
+        Assert.Contains("cannot perform check on wildcard subject", ex.Status.Detail);
+    }
+
+    [Fact]
+    public async Task CheckBulkPermissions_wildcard_subject_is_invalid_argument()
+    {
+        // Each bulk item is rejected the same way CheckPermission is; a wildcard subject in any item
+        // fails the whole request with InvalidArgument before dispatch.
+        await using var cluster = await MeshTestCluster.CreateAsync(Schema);
+        await SeedAsync(cluster.Datastore, ("readme", "viewer", "alice"));
+
+        var req = new V1::CheckBulkPermissionsRequest();
+        req.Items.Add(BulkItem("readme", "view", "alice"));
+        req.Items.Add(BulkItem("readme", "view", "*"));
+
+        var ex = await Assert.ThrowsAsync<RpcException>(() =>
+            Service(cluster).CheckBulkPermissions(req, FakeServerCallContext.Default));
+        Assert.Equal(StatusCode.InvalidArgument, ex.StatusCode);
+        Assert.Contains("cannot perform check on wildcard subject", ex.Status.Detail);
+    }
+
+    [Fact]
     public async Task WriteRelationships_create_existing_is_already_exists()
     {
         // A CREATE on an already-existing relationship is a permanent duplicate-create: AlreadyExists,

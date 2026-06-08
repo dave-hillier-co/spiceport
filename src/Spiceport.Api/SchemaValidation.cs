@@ -48,6 +48,20 @@ internal static class SchemaValidation
         }
     }
 
+    /// <summary>
+    /// Rejects a check whose subject is the public wildcard (object id <c>*</c>), mirroring SpiceDB's
+    /// <c>checkInternal</c> guard (<c>internal/graph/check.go</c>): a wildcard is only meaningful as a
+    /// stored subject in a relationship, never as the subject being checked. Surfaces as
+    /// <see cref="StatusCode.InvalidArgument"/> with SpiceDB's exact message, rather than letting the
+    /// engine silently evaluate it (where a <c>*</c>-id subject could even match a stored wildcard tuple).
+    /// </summary>
+    internal static void RejectWildcardSubject(string subjectObjectId)
+    {
+        if (subjectObjectId == CoreConstants.PublicWildcard)
+            throw new RpcException(new Status(
+                StatusCode.InvalidArgument, "invalid argument: cannot perform check on wildcard subject"));
+    }
+
     private static RpcException NamespaceNotFound(string definition) =>
         new(new Status(StatusCode.FailedPrecondition, $"object definition `{definition}` not found"));
 
