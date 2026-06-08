@@ -19,8 +19,8 @@
   </ItemGroup>
 
   <ItemGroup>
-    <ProjectReference Include="..\..\src\Spiceport.Schema\Spiceport.Schema.csproj" />
     <ProjectReference Include="..\..\src\Spiceport.Core\Spiceport.Core.csproj" />
+    <ProjectReference Include="..\..\src\Spiceport.Server\Spiceport.Server.csproj" />
   </ItemGroup>
 
 </Project>

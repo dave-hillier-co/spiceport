@@ -22,18 +22,15 @@
   </ItemGroup>
 
   <ItemGroup>
-    <None Include="..\Spiceport.Conformance.Tests\TestData\**\*.yaml"
-          Link="TestData\%(RecursiveDir)%(Filename)%(Extension)"
-          CopyToOutputDirectory="PreserveNewest" />
+    <None Include="..\Spiceport.Conformance.Tests\TestData\**\*.yaml" Link="TestData\%(RecursiveDir)%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
   <ItemGroup>
     <ProjectReference Include="..\..\src\Spiceport.Datastore.Postgres\Spiceport.Datastore.Postgres.csproj" />
     <ProjectReference Include="..\..\src\Spiceport.Datastore\Spiceport.Datastore.csproj" />
     <ProjectReference Include="..\..\src\Spiceport.Core\Spiceport.Core.csproj" />
-    <ProjectReference Include="..\..\src\Spiceport.Engine\Spiceport.Engine.csproj" />
-    <ProjectReference Include="..\..\src\Spiceport.Schema\Spiceport.Schema.csproj" />
     <ProjectReference Include="..\Spiceport.Conformance.Tests\Spiceport.Conformance.Tests.csproj" />
+    <ProjectReference Include="..\..\src\Spiceport.Server\Spiceport.Server.csproj" />
   </ItemGroup>
 
 </Project>

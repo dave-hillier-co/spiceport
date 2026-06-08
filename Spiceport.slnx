@@ -5,11 +5,8 @@
     <Project Path="src/Spiceport.Datastore.Memory/Spiceport.Datastore.Memory.csproj" />
     <Project Path="src/Spiceport.Datastore.Postgres/Spiceport.Datastore.Postgres.csproj" />
     <Project Path="src/Spiceport.Datastore/Spiceport.Datastore.csproj" />
-    <Project Path="src/Spiceport.Engine/Spiceport.Engine.csproj" />
-    <Project Path="src/Spiceport.Grains.Abstractions/Spiceport.Grains.Abstractions.csproj" />
-    <Project Path="src/Spiceport.Grains/Spiceport.Grains.csproj" />
     <Project Path="src/Spiceport.Protos/Spiceport.Protos.csproj" />
-    <Project Path="src/Spiceport.Schema/Spiceport.Schema.csproj" />
+    <Project Path="src/Spiceport.Server/Spiceport.Server.csproj" />
     <Project Path="src/Spiceport.Silo/Spiceport.Silo.csproj" />
   </Folder>
   <Folder Name="/tests/">

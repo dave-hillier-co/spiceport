@@ -1,13 +1,10 @@
 <Project Sdk="Microsoft.NET.Sdk.Web">
 
   <ItemGroup>
-    <ProjectReference Include="..\Spiceport.Grains.Abstractions\Spiceport.Grains.Abstractions.csproj" />
     <ProjectReference Include="..\Spiceport.Protos\Spiceport.Protos.csproj" />
-    <ProjectReference Include="..\Spiceport.Grains\Spiceport.Grains.csproj" />
-    <ProjectReference Include="..\Spiceport.Engine\Spiceport.Engine.csproj" />
     <ProjectReference Include="..\Spiceport.Datastore\Spiceport.Datastore.csproj" />
     <ProjectReference Include="..\Spiceport.Datastore.Memory\Spiceport.Datastore.Memory.csproj" />
-    <ProjectReference Include="..\Spiceport.Schema\Spiceport.Schema.csproj" />
+    <ProjectReference Include="..\Spiceport.Server\Spiceport.Server.csproj" />
   </ItemGroup>
 
   <ItemGroup>
