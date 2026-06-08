@@ -3,7 +3,8 @@ using Spiceport.Core;
 namespace Spiceport.Engine;
 
 /// <summary>
-/// A visited-set key identifying an in-flight (resource, subject) check, used by the cycle guard.
+/// A key identifying an in-flight (resource, subject) check. Recorded into the traversal bloom so the
+/// dispatcher can detect a LIKELY loop and bypass a same-key grain re-entry; it does not gate verdicts.
 /// </summary>
 /// <remarks>
 /// Carried inside <see cref="ResolverMeta"/> rather than a closure so that a dispatch request is a
@@ -28,20 +29,20 @@ public readonly record struct VisitKey(
 
 /// <summary>
 /// The cross-cutting metadata threaded through every dispatched sub-problem: which revision to
-/// evaluate against, how much recursion budget remains, and the cycle-guard visited set.
+/// evaluate against, how much recursion budget remains, and the traversal-bloom loop hint.
 /// </summary>
 /// <remarks>
 /// Deliberately carries the revision <em>identity</em> (an <see cref="IRevision"/>), not an
 /// <c>IDatastoreReader</c>, so the request is serializable: a dispatcher resolves a reader for the
 /// revision itself. <see cref="Bloom"/> is an immutable (copy-on-add) bounded Bloom filter so each
-/// sub-problem can extend the cycle guard without mutating its parent's — replacing the exact
-/// <c>ImmutableHashSet&lt;VisitKey&gt;</c> with a fixed-size structure that survives a grain hop at a
-/// bounded wire/CPU cost (SpiceDB's traversal-bloom design). The guard is conservative: a Bloom
-/// false-positive can only cut a branch (CycleCut), never grant.
+/// sub-problem can extend the loop hint without mutating its parent's, at a bounded wire/CPU cost
+/// (SpiceDB's traversal-bloom design). Termination rests SOLELY on <see cref="DepthRemaining"/>; the
+/// bloom never affects a verdict. Its only job is the dispatcher's singleflight-style loop bypass: a
+/// bloom hit forces a (correct) in-process step instead of re-entering a busy same-key grain.
 /// </remarks>
 /// <param name="Revision">The pinned revision identity to evaluate against.</param>
-/// <param name="DepthRemaining">The remaining recursion depth budget.</param>
-/// <param name="Bloom">The bounded cycle-guard of (resource, subject) pairs in-flight on this path.</param>
+/// <param name="DepthRemaining">The remaining recursion depth budget (the sole termination guarantee).</param>
+/// <param name="Bloom">The bounded traversal-bloom loop hint over (resource, subject) pairs on this path.</param>
 /// <param name="Mode">
 /// Whether <paramref name="Revision"/> is the optimized (quantizable) bucket revision or an exact
 /// revision that must NEVER be folded into the optimized cache bucket. Defaults to
@@ -71,9 +72,11 @@ public sealed record DispatchCheckRequest(
 /// plus an optional gating caveat) augmented with a cycle-cut flag.
 /// </summary>
 /// <remarks>
-/// <see cref="CycleCut"/> is true when the computation bottomed out on a visited-set cutoff anywhere
-/// in its subtree. It is propagated upward and does not change the verdict; a later caching phase
-/// uses it to avoid caching cycle-affected results.
+/// <see cref="CycleCut"/> is the "depth/loop-affected, non-cacheable" flag. It no longer signals a
+/// visited-set cycle cut (correctness now rests solely on <see cref="ResolverMeta.DepthRemaining"/>);
+/// it marks a subtree whose result may have been shaped by the depth budget or a loop bypass and so must
+/// not be written to the shared branch cache. It is propagated upward and does not change the verdict; a
+/// later caching phase uses it to avoid caching depth/loop-affected results.
 /// <para>
 /// <see cref="DepthRequired"/> is the recursion depth this result actually consumed below itself
 /// (a leaf = 1, a combining node = max(children) + 1), mirroring SpiceDB's <c>ResponseMeta.DepthRequired</c>.
@@ -83,18 +86,18 @@ public sealed record DispatchCheckRequest(
 /// </remarks>
 /// <param name="Member">True if the subject is a (possibly caveated) member.</param>
 /// <param name="Caveat">An optional caveat expression gating membership; null = unconditional.</param>
-/// <param name="CycleCut">True if a visited-set cutoff was hit anywhere in this subtree.</param>
+/// <param name="CycleCut">True if this subtree was depth- or loop-affected and must not be cached.</param>
 /// <param name="DepthRequired">The recursion depth consumed below this node (leaf = 1).</param>
 public readonly record struct DispatchCheckResult(
     bool Member, CaveatExpression? Caveat, bool CycleCut, int DepthRequired = 1)
 {
-    /// <summary>A fully-determined member (no caveat, no cycle cut).</summary>
+    /// <summary>A fully-determined member (no caveat, not depth/loop-affected).</summary>
     public static readonly DispatchCheckResult DefiniteMember = new(true, null, false);
 
-    /// <summary>Not a member (no cycle cut).</summary>
+    /// <summary>Not a member (not depth/loop-affected).</summary>
     public static readonly DispatchCheckResult None = new(false, null, false);
 
-    /// <summary>Not a member, reached via a visited-set cutoff (cycle cut set).</summary>
+    /// <summary>Not a member, marked depth/loop-affected (non-cacheable).</summary>
     public static readonly DispatchCheckResult Cut = new(false, null, true);
 
     /// <summary>True if this is a member with no caveat (enables short-circuiting unions/arrows).</summary>

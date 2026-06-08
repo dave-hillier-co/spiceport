@@ -8,11 +8,14 @@ namespace Spiceport.Core;
 /// <c>FailedPrecondition</c>, matching observable <c>zed</c>/SpiceDB behaviour.
 /// </summary>
 /// <remarks>
-/// Round-trips the Orleans grain boundary via Orleans' exception serializer (a depth-exhausted
-/// sub-problem may be evaluated on a remote silo, where the exception is raised and must travel back to
-/// the caller). Modelled on the peer <see cref="InvalidConsistencyTokenException"/>, which is likewise a
-/// plain <see cref="Exception"/> in this assembly thrown below the grain and caught in the API layer.
+/// Annotated <c>[GenerateSerializer]</c> so it round-trips the Orleans grain boundary cleanly: a graph
+/// deeper than maxDepth (or a genuine cycle) may exhaust its depth several hops below the API call, on a
+/// remote silo, and the resulting error must travel back to the caller with its concrete type intact so
+/// the API layer maps it to gRPC <c>FailedPrecondition</c>. (CLAUDE.md requires every exception that
+/// crosses a grain boundary to be <c>[GenerateSerializer]</c>.) It carries no extra serialized state
+/// beyond the base <see cref="Exception"/> message.
 /// </remarks>
+[GenerateSerializer]
 public sealed class MaxDepthExceededException : Exception
 {
     /// <summary>Creates the exception with a human-readable reason.</summary>

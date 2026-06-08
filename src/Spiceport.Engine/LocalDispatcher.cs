@@ -64,11 +64,11 @@ public sealed class LocalDispatcher : IDispatcher
         var subject = request.Subject;
         var meta = request.Meta;
 
-        // Depth exhaustion is an ERROR, not a verdict. SpiceDB's dispatch.CheckDepth raises
-        // MaxDepthExceededError (gRPC FailedPrecondition) here rather than returning a definitive
-        // non-member, so a graph deeper than maxDepth — or a true cycle the bloom would otherwise have
-        // to bound — fails the request instead of producing a confident (and cacheable) false negative.
-        // This is distinct from the bloom cycle-cut below, which is a genuine, non-erroring cut.
+        // Depth exhaustion is the ONLY termination guarantee (SpiceDB's dispatch.CheckDepth). It raises
+        // MaxDepthExceededError (gRPC FailedPrecondition) rather than returning a definitive non-member,
+        // so a graph deeper than maxDepth — or a genuine cycle — fails the request instead of producing a
+        // confident (and cacheable) false negative. A true cycle simply consumes depth here until it
+        // throws, matching SpiceDB exactly: there is NO visited-set cut on the verdict path.
         if (meta.DepthRemaining <= 0)
             throw new MaxDepthExceededException();
 
@@ -76,12 +76,12 @@ public sealed class LocalDispatcher : IDispatcher
         if (OnrEquals(resource, subject))
             return DispatchCheckResult.DefiniteMember;
 
-        // Cycle guard: a repeated (resource, subject) on this path is a cut. The guard is a bounded
-        // Bloom filter (conservative: a false-positive cuts the branch, never grants), so it survives a
-        // grain hop at a fixed cost. CycleCut results are never cached, so a spurious cut is harmless.
+        // Record this (resource, subject) into the traversal bloom — RECORD ONLY, never Contains->Cut.
+        // Correctness no longer rests on the bloom; it is kept solely so the dispatcher (OrleansDispatcher)
+        // can detect a LIKELY loop on the next hop and bypass a re-entry into the same (busy) grain key,
+        // mirroring SpiceDB's singleflight loop guard. A bloom false-positive can therefore only force a
+        // (correct) local step — it can never change a verdict.
         var key = VisitKey.Of(resource, subject);
-        if (meta.Bloom.Contains(key))
-            return DispatchCheckResult.Cut;
         meta = meta with { Bloom = meta.Bloom.Add(key) };
 
         var relation = LookupRelation(resource.ObjectType, resource.Relation);

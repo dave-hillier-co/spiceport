@@ -28,9 +28,11 @@ namespace Spiceport.Grains;
 /// is a REMOTE silo it makes the grain call as before. If the owner is the LOCAL silo it runs the one
 /// expansion step IN-PROCESS via a <see cref="LocalDispatcher"/> whose onward dispatcher is the same
 /// silo-wide caching dispatcher the grain would have used — so the branch cache is consulted and
-/// populated EXACTLY as on the grain path (no cache bypass, dedup preserved), but with no cross-silo
-/// message and no grain-activation/scheduler overhead. Because consistent-hash placement guarantees a
-/// grain activates on its hash owner, this is the cheapest correct path for a locally-owned key.
+/// populated through the same shared cache, with no cross-silo message and no grain-activation/scheduler
+/// overhead. Placement skew is benign: during membership churn the dispatcher's ownership prediction and
+/// the director's actual placement can disagree, so the same sub-problem MAY be computed in two places;
+/// both populate the shared cache identically against the same schema/datastore snapshot, so the verdicts
+/// agree and the only cost is a little duplicated work, never a wrong answer.
 /// </para>
 /// </remarks>
 public sealed class OrleansDispatcher : IDispatcher
@@ -112,6 +114,27 @@ public sealed class OrleansDispatcher : IDispatcher
             _schemaHash.CurrentSchemaHash,
             request.Meta.Mode);
 
+        // SINGLEFLIGHT-STYLE LOOP BYPASS (SpiceDB singleflight.go:69-81): if the traversal bloom already
+        // contains this sub-problem's (resource, subject) key, this is a LIKELY loop back to a grain key
+        // that is (or would be) busy on the path above us. Re-entering that same-key grain would deadlock
+        // a non-reentrant activation, so instead recurse IN-PROCESS via the LocalStep path. This consumes
+        // one depth level and is bounded by DepthRemaining — a genuine same-key cycle terminates at the
+        // depth limit (MaxDepthExceededException) instead of blocking on the grain. This is a pure
+        // perf/deadlock hint: a bloom false-positive only forces a (correct) local step, never a verdict.
+        if (_localRecurse is not null)
+        {
+            var visit = VisitKey.Of(request.Resource, request.Subject);
+            if (request.Meta.Bloom.Contains(visit))
+            {
+                _metrics?.RecordLocalRecurse();
+                var bypass = await LocalStep(request, ct).ConfigureAwait(false);
+                // A loop-bypassed subtree is path-dependent (it was reached via a likely-loop hit, so its
+                // result reflects the in-flight path, not a context-free sub-problem). Flag it CycleCut so
+                // the silo-wide CachingDispatcher above never writes it to the shared branch cache.
+                return bypass with { CycleCut = true };
+            }
+        }
+
         // HYBRID: if local-recurse is enabled and we can compute ownership, take the in-process path for
         // a locally-owned sub-problem (no cross-silo message), else fall through to the grain call.
         if (_options.LocalRecurseEnabled
@@ -180,9 +203,11 @@ public sealed class OrleansDispatcher : IDispatcher
     }
 
     /// <summary>
-    /// Runs ONE expansion step in-process for a locally-owned sub-problem, routing children back through
-    /// the silo-wide caching dispatcher — identical onward wiring to <c>CheckGrain.DispatchCheck</c>, so
-    /// the shared branch cache is consulted/populated exactly as on the grain path (no bypass).
+    /// Runs ONE expansion step in-process (for a locally-owned sub-problem, or to bypass a likely same-key
+    /// loop), routing children back through the silo-wide caching dispatcher — identical onward wiring to
+    /// <c>CheckGrain.DispatchCheck</c>, so the shared branch cache is consulted/populated through the same
+    /// shared cache (no bypass). The same sub-problem may be computed both here and on a remote activation
+    /// during churn; both write the shared cache identically, so verdicts agree.
     /// </summary>
     private Task<DispatchCheckResult> LocalStep(DispatchCheckRequest request, CancellationToken ct)
     {

@@ -3,17 +3,18 @@ using System.Text;
 namespace Spiceport.Engine;
 
 /// <summary>
-/// A bounded, immutable Bloom filter carrying the cycle-guard "visited" set across dispatch (and grain)
-/// boundaries at a fixed wire/CPU cost, replacing the exact <c>ImmutableHashSet&lt;VisitKey&gt;</c>.
+/// A bounded, immutable Bloom filter carrying the traversal loop hint across dispatch (and grain)
+/// boundaries at a fixed wire/CPU cost.
 /// </summary>
 /// <remarks>
 /// <para>
-/// This mirrors SpiceDB's traversal bloom (<c>ResolverMeta.RecordTraversal</c>): the filter is sized for
-/// the maximum number of distinct in-flight visit keys on a single path (≈ the max recursion depth) at a
-/// low false-positive rate, and the cycle guard is conservative — a positive <see cref="Contains"/>
-/// returns a cut. A false positive can only turn a would-be member branch into a CycleCut (NotMember on
-/// that branch), never a false grant; and cycle-cut results are never cached, so a spurious cut can never
-/// poison the shared branch cache.
+/// This mirrors SpiceDB's traversal bloom (<c>ResolverMeta.RecordTraversal</c> + the singleflight loop
+/// guard): the filter is sized for the maximum number of distinct in-flight visit keys on a single path
+/// (≈ the max recursion depth) at a low false-positive rate. It is NOT on the correctness path —
+/// termination rests solely on the depth budget. A positive <see cref="Contains"/> only tells the
+/// dispatcher "this is a LIKELY loop", which it uses to recurse in-process instead of re-entering a busy
+/// same-key grain (a deadlock guard). A bloom false-positive can therefore only force a (correct) local
+/// step; it can never change a verdict, and depth/loop-affected results are never cached anyway.
 /// </para>
 /// <para>
 /// Sizing (default, matching SpiceDB's <c>bloom.NewWithEstimates(maxDepth, 0.001)</c> for maxDepth = 50):

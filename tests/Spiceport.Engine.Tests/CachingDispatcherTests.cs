@@ -142,9 +142,49 @@ public class CachingDispatcherTests
         Assert.Equal(Membership.NotMember, under.Verdict);
     }
 
-    // (c) A cycle-cut result is not cached.
+    // (c) A depth/loop-affected (CycleCut) result is not cached, and a marker result that claims it is
+    // depth-affected is recomputed (not served) — protecting against caching a path-dependent verdict.
+    private sealed class CycleCutMarkerDispatcher : IDispatcher
+    {
+        public int Count { get; private set; }
+
+        public Task<DispatchCheckResult> DispatchCheck(DispatchCheckRequest request, CancellationToken ct)
+        {
+            Count++;
+            // A member result flagged depth/loop-affected: it must never be written to the shared cache.
+            return Task.FromResult(new DispatchCheckResult(true, null, CycleCut: true, DepthRequired: 1));
+        }
+    }
+
     [Fact]
-    public async Task CycleCutResult_IsNotCached()
+    public async Task DepthOrLoopAffectedResult_IsNotCached_AndIsRecomputed()
+    {
+        var namespaces = Compile(Schema);
+        var rev = Rev(2_000_000_000);
+
+        var cache = new InMemoryDispatchCache();
+        var inner = new CycleCutMarkerDispatcher();
+        var caching = new CachingDispatcher(
+            inner, cache, new TimestampRevisionQuantizer(), new FixedSchemaHashSource(SchemaHash.Compute(namespaces)));
+
+        var request = Request(rev, Onr("group", "a", "member"), Onr("user", "ghost"));
+
+        var first = await caching.DispatchCheck(request, CancellationToken.None);
+        Assert.True(first.CycleCut);
+        // The depth/loop-affected branch must NOT have been stored.
+        Assert.Equal(0, cache.Count);
+
+        // A second identical dispatch must recompute (not serve a cached value), because nothing was cached.
+        var second = await caching.DispatchCheck(request, CancellationToken.None);
+        Assert.True(second.CycleCut);
+        Assert.Equal(2, inner.Count);
+    }
+
+    // (c1) A genuine same-key cycle now ERRORS on depth rather than returning a cacheable verdict, so no
+    // confident NotMember can ever be cached for a cyclic schema. Correctness rests solely on the depth
+    // budget (SpiceDB's dispatch.CheckDepth), not on a probabilistic bloom cut.
+    [Fact]
+    public async Task SameKeyCycle_ThroughCachingDispatcher_ThrowsMaxDepthExceeded()
     {
         // group:a#member -> group:b#member -> group:a#member  (a self-referential cycle)
         var reader = await Seed(
@@ -152,7 +192,7 @@ public class CachingDispatcherTests
             Tuple("group", "b", "member", Onr("group", "a", "member")));
         var namespaces = Compile(Schema);
         var state = new CheckState();
-        var rev = Rev(2_000_000_000);
+        var rev = Rev(2_500_000_000);
 
         var cache = new InMemoryDispatchCache();
         var local = new LocalDispatcher(namespaces, _ => reader, DateTimeOffset.UtcNow, state);
@@ -161,12 +201,9 @@ public class CachingDispatcherTests
         local.Dispatcher = caching;
 
         var request = Request(rev, Onr("group", "a", "member"), Onr("user", "ghost"));
-        var result = await caching.DispatchCheck(request, CancellationToken.None);
 
-        Assert.False(result.Member);
-        Assert.True(result.CycleCut);
-        // The cycle-cut top-level branch must not have been stored.
-        Assert.Equal(0, cache.Count);
+        await Assert.ThrowsAsync<MaxDepthExceededException>(
+            () => caching.DispatchCheck(request, CancellationToken.None));
     }
 
     // (c2) A cached result is only served when the request has at least as much depth budget as the

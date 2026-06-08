@@ -32,8 +32,10 @@ public interface ISiloOwnership
 /// version). In this homogeneous deployment every silo runs the same <c>CheckGrain</c>, so the
 /// compatible set equals the active set and this oracle's owner computation matches the director's. A
 /// transient disagreement (membership churn between the two reads, or a heterogeneous-version cluster)
-/// can only cost an extra hop — never correctness — because the grain key fully determines identity and
-/// the director remains authoritative for where the activation actually lands.
+/// can only cause the same sub-problem to be computed in two places during churn; both populate the
+/// shared cache identically against the same schema/datastore snapshot, so verdicts agree and the only
+/// cost is a little duplicated work — never correctness — because the grain key fully determines identity
+/// and the director remains authoritative for where the activation actually lands.
 /// </remarks>
 public sealed class SiloOwnership(
     ILocalSiloDetails localDetails,

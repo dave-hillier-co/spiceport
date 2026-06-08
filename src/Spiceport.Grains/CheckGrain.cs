@@ -1,4 +1,5 @@
 using System.Collections.Immutable;
+using Orleans.Concurrency;
 using Spiceport.Core;
 using Spiceport.Datastore;
 using Spiceport.Engine;
@@ -26,6 +27,8 @@ namespace Spiceport.Grains;
 /// </para>
 /// </remarks>
 [ConsistentHashPlacement]
+[Reentrant] // holds no per-activation mutable state (reads its key + a fresh CheckState per call), so a
+            // same-key re-entry on a genuine cycle is accepted, never blocked — no deadlock is possible.
 public sealed class CheckGrain(
     IDatastore datastore,
     ISchemaProvider schemaProvider,

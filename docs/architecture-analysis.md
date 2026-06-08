@@ -149,15 +149,20 @@ grain mesh**, with results identical to the in-process engine.
   same membership view (`ISiloOwnership`, a pure `HashRing.Owner`) without activating the grain:
   when a sub-problem hashes to the local silo it recurses in-process through the same silo-wide
   caching dispatcher (no cache bypass, dedup preserved); only a shard miss grain-hops across
-  silos — exactly how SpiceDB only RPCs across nodes. Grain-per-sub-problem is kept (the
-  activation remains the cache entry for remote keys). Toggleable via
-  `OrleansDispatcherOptions.LocalRecurseEnabled` (on by default).
-- **Traversal bloom** — the visited set crosses grain boundaries as a bounded bloom filter
+  silos — mirroring how SpiceDB only RPCs across nodes. Grain-per-sub-problem is kept (the
+  activation remains the cache entry for remote keys). Placement skew is benign: during membership
+  churn the dispatcher's ownership prediction and the director's actual placement may disagree, so
+  the same sub-problem may be computed in two places; both populate the shared cache identically
+  against the same schema/datastore snapshot, so verdicts agree and the only cost is duplicated
+  work. Toggleable via `OrleansDispatcherOptions.LocalRecurseEnabled` (on by default).
+- **Traversal bloom** — a bounded loop hint that crosses grain boundaries as a bounded bloom filter
   (`TraversalBloom`, ≤1KB, as SpiceDB) rather than an exact set: 1024 bits / 10 hashes by default,
-  FNV-1a with Kirsch–Mitzenmacher double hashing (process-stable). A positive is a conservative
-  cycle cut; cut results are never cached, so a false positive can never poison the cache. The
-  full conformance corpus runs through the grain mesh with the bloom enabled with zero false cuts,
-  including every recursive schema.
+  FNV-1a with Kirsch–Mitzenmacher double hashing (process-stable). It is NOT on the correctness path:
+  termination rests solely on `depthRemaining`, and a genuine cycle consumes depth until
+  `MaxDepthExceededException` (gRPC `FailedPrecondition`), exactly as SpiceDB does. The bloom's only
+  job is SpiceDB's singleflight-style loop bypass — a hit makes the dispatcher recurse in-process
+  rather than re-enter a busy same-key grain (a deadlock guard), so a false positive can only force a
+  correct local step, never change a verdict, and loop/depth-affected results are never cached.
 
 **Remaining tuning (not correctness):**
 - **Revision quantization** — every write mints a fresh revision, so an un-quantized cache key
@@ -179,8 +184,9 @@ grain mesh**, with results identical to the in-process engine.
 - **Fan-out concurrency** → `Task.WhenAll` over sub-problem grain calls, bounded by a
   semaphore that mirrors SpiceDB's `ConcurrencyLimits`. Orleans turn-based single-threading is
   fine here because dispatch grains are stateless workers and scale out.
-- **Cycle/depth control** → stays in the request arguments (bloom + `depthRemaining`), exactly
-  as SpiceDB does. No actor state required.
+- **Cycle/depth control** → termination rests on `depthRemaining` (a genuine cycle errors at the
+  depth limit), with the bloom carried in the request only as a singleflight-style loop-bypass hint,
+  exactly as SpiceDB does. No actor state required.
 
 ---
 
