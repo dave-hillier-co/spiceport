@@ -85,8 +85,19 @@ internal static class RelationshipQuery
         return cmd;
     }
 
+    // BySubject keyset columns, in order. Ordinal/byte ordering is forced with COLLATE "C" so the SQL sort
+    // and keyset comparison match the in-memory reader's StringComparer.Ordinal exactly (SpiceDB object ids
+    // are ASCII-only, where byte order == UTF-16 ordinal).
+    private static readonly string[] BySubjectColumns =
+    [
+        ColSubjectNamespace, ColSubjectObjectId, ColSubjectRelation,
+        ColResourceNamespace, ColResourceObjectId, ColResourceRelation,
+    ];
+
     /// <summary>Builds the reverse (subject-side) query for a snapshot read.</summary>
-    public static NpgsqlCommand BuildReverse(NpgsqlConnection conn, NpgsqlTransaction? tx, PgSnapshot snapshot, SubjectsFilter filter)
+    public static NpgsqlCommand BuildReverse(
+        NpgsqlConnection conn, NpgsqlTransaction? tx, PgSnapshot snapshot, SubjectsFilter filter,
+        ReverseQueryOptions? options = null)
     {
         var sql = new StringBuilder($"SELECT {AllColumns} FROM {TableTuple} WHERE ");
         var cmd = NewCommand(conn, tx);
@@ -100,8 +111,38 @@ internal static class RelationshipQuery
         if (filter.OptionalResourceRelation is { } rr)
             AppendEq(sql, cmd, ColResourceRelation, rr);
 
+        if (options is { Sort: ReverseQuerySort.BySubject })
+        {
+            if (options.After is { } after)
+                AppendBySubjectKeyset(sql, cmd, after);
+            sql.Append(" ORDER BY ")
+               .Append(string.Join(", ", BySubjectColumns.Select(c => $"{c} COLLATE \"C\"")));
+        }
+
         cmd.CommandText = sql.ToString();
         return cmd;
+    }
+
+    // Exclusive keyset: (subj_ns, subj_id, subj_rel, res_ns, res_id, res_rel) > (a0..a5) under "C" collation.
+    private static void AppendBySubjectKeyset(StringBuilder sql, NpgsqlCommand cmd, RelationshipReference after)
+    {
+        string[] values =
+        [
+            after.Subject.ObjectType, after.Subject.ObjectId, after.Subject.Relation,
+            after.Resource.ObjectType, after.Resource.ObjectId, after.Resource.Relation,
+        ];
+
+        var lhs = string.Join(", ", BySubjectColumns.Select(c => $"{c} COLLATE \"C\""));
+        var rhs = new StringBuilder();
+        for (var i = 0; i < values.Length; i++)
+        {
+            var name = $"p{cmd.Parameters.Count}";
+            cmd.Parameters.AddWithValue(name, values[i]);
+            if (i > 0)
+                rhs.Append(", ");
+            rhs.Append('@').Append(name);
+        }
+        sql.Append($" AND ({lhs}) > ({rhs})");
     }
 
     private static NpgsqlCommand NewCommand(NpgsqlConnection conn, NpgsqlTransaction? tx)

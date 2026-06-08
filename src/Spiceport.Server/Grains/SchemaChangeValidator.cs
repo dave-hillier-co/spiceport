@@ -110,7 +110,7 @@ public static class SchemaChangeValidator
         var subjectFilter = new SubjectsFilter(
             SubjectType: definition,
             RelationFilter: new SubjectRelationFilter(NonEllipsisRelation: relation));
-        await foreach (var rel in reader.ReverseQueryRelationships(subjectFilter, ct).ConfigureAwait(false))
+        await foreach (var rel in reader.ReverseQueryRelationships(subjectFilter, cancellationToken: ct).ConfigureAwait(false))
         {
             throw new SchemaWriteValidationException(
                 $"cannot remove relation `{relation}` in definition `{definition}`: at least one relationship references it as part of a subject (e.g. {rel})");

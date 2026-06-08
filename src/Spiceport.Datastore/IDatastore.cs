@@ -16,8 +16,16 @@ public interface IDatastoreReader
         CancellationToken cancellationToken = default);
 
     /// <summary>Queries relationships from the subject side, matching the given subject filter.</summary>
+    /// <param name="subjectsFilter">The subject-side filter to match.</param>
+    /// <param name="options">
+    /// Optional ordering and keyset-resume controls. When null the query is unordered and unbounded
+    /// (the original behaviour). A <see cref="ReverseQuerySort.BySubject"/> sort yields a deterministic
+    /// total order that <see cref="ReverseQueryOptions.After"/> can resume after.
+    /// </param>
+    /// <param name="cancellationToken">A cancellation token.</param>
     IAsyncEnumerable<Relationship> ReverseQueryRelationships(
         SubjectsFilter subjectsFilter,
+        ReverseQueryOptions? options = null,
         CancellationToken cancellationToken = default);
 
     /// <summary>Reads the unified stored schema bytes at this revision, or null if none has been written.</summary>

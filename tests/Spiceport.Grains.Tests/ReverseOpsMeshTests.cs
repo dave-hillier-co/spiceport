@@ -145,4 +145,68 @@ public class ReverseOpsMeshTests
         var all = page1.Resources.Concat(page2.Resources).Select(r => r.ResourceId).ToHashSet();
         Assert.Equal(new HashSet<string> { "d1", "d2", "d3" }, all);
     }
+
+    private const string NestedSchemaText = """
+        definition user {}
+
+        definition group {
+            relation member: user | group#member
+        }
+
+        definition document {
+            relation viewer: user | group#member
+            permission view = viewer
+        }
+        """;
+
+    [Fact]
+    public async Task LookupResources_PagesMultiLevelCursor_Through_Grain_Codec()
+    {
+        // alice -> g1#member -> g2#member -> {g3a,g3b}#member -> document#viewer. Paging one result at a
+        // time forces the opaque page cursor (a multi-section, keyset-bearing token) to round-trip through
+        // the grain's codec on every page. The concatenation must equal the unpaged set with no drops/dupes.
+        await using var cluster = await MeshTestCluster.CreateAsync(NestedSchemaText);
+        await cluster.Datastore.ReadWriteTx(tx => tx.WriteRelationships(
+        [
+            Member("g1", new ObjectAndRelation("user", "alice", CoreConstants.Ellipsis)),
+            Member("g2", new ObjectAndRelation("group", "g1", "member")),
+            Member("g3a", new ObjectAndRelation("group", "g2", "member")),
+            Member("g3b", new ObjectAndRelation("group", "g2", "member")),
+            Viewer("doc_a", new ObjectAndRelation("group", "g3a", "member")),
+            Viewer("doc_z", new ObjectAndRelation("group", "g3a", "member")),
+            Viewer("doc_b", new ObjectAndRelation("group", "g3b", "member")),
+            Viewer("doc_m", new ObjectAndRelation("group", "g3b", "member")),
+        ]));
+        var grain = Grain(cluster);
+
+        var unpaged = await grain.LookupResources(new LookupResourcesArgs(
+            "document", "view", "user", "alice", CoreConstants.Ellipsis,
+            Context: null, Limit: null, Cursor: null));
+        var expected = unpaged.Resources.Select(r => r.ResourceId)
+            .OrderBy(x => x, StringComparer.Ordinal).ToArray();
+        Assert.Equal(["doc_a", "doc_b", "doc_m", "doc_z"], expected);
+
+        var paged = new List<string>();
+        string? cursor = null;
+        while (paged.Count <= unpaged.Resources.Count)
+        {
+            var page = await grain.LookupResources(new LookupResourcesArgs(
+                "document", "view", "user", "alice", CoreConstants.Ellipsis,
+                Context: null, Limit: 1, Cursor: cursor));
+            if (page.Resources.Count == 0)
+                break;
+            paged.Add(page.Resources[0].ResourceId);
+            cursor = page.Cursor;
+            if (string.IsNullOrEmpty(cursor))
+                break;
+        }
+
+        Assert.Equal(expected, paged.OrderBy(x => x, StringComparer.Ordinal).ToArray());
+    }
+
+    private static RelationshipUpdate Member(string group, ObjectAndRelation subject) =>
+        new(Relationship.Create(new ObjectAndRelation("group", group, "member"), subject), UpdateOperation.Touch);
+
+    private static RelationshipUpdate Viewer(string document, ObjectAndRelation subject) =>
+        new(Relationship.Create(new ObjectAndRelation("document", document, "viewer"), subject), UpdateOperation.Touch);
 }

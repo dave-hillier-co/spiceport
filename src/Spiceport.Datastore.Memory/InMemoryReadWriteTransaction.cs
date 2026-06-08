@@ -131,16 +131,43 @@ internal sealed class InMemoryReadWriteTransaction : IReadWriteTransaction
 
     public async IAsyncEnumerable<Relationship> ReverseQueryRelationships(
         SubjectsFilter subjectsFilter,
+        ReverseQueryOptions? options = null,
         [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
         var now = DateTimeOffset.UtcNow;
+
+        if (options is null || options.Sort == ReverseQuerySort.Unsorted)
+        {
+            foreach (var rel in _live.Values)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                if (IsExpired(rel, now))
+                    continue;
+                if (subjectsFilter.Matches(rel))
+                    yield return rel;
+            }
+            await Task.CompletedTask;
+            yield break;
+        }
+
+        var matches = new List<Relationship>();
         foreach (var rel in _live.Values)
         {
             cancellationToken.ThrowIfCancellationRequested();
             if (IsExpired(rel, now))
                 continue;
             if (subjectsFilter.Matches(rel))
-                yield return rel;
+                matches.Add(rel);
+        }
+
+        matches.Sort(ReverseQueryOptions.CompareBySubject);
+        foreach (var rel in matches)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (options.After is { } after &&
+                ReverseQueryOptions.CompareBySubject(rel.Reference, after) <= 0)
+                continue;
+            yield return rel;
         }
         await Task.CompletedTask;
     }

@@ -293,6 +293,52 @@ public class LookupResourcesEngineTests
     }
 
     [Fact]
+    public async Task MultiLevelCursor_PagedResumeEqualsUnpaged()
+    {
+        // A deep chain alice -> g1#member -> g2#member -> {g3a,g3b}#member -> document#viewer -> view.
+        // Two sibling groups at the deepest level mean the viewer reverse-query yields docs in BySubject
+        // order (by group, then doc id): doc_a, doc_z (g3a) then doc_b, doc_m (g3b) -- which is NOT sorted
+        // by doc id. Resuming by a resource-id comparison would drop doc_b/doc_m (they sort before doc_z
+        // already yielded); resuming by the datastore keyset, carried per nesting level, does not. Paging
+        // one result at a time must reproduce the unpaged set exactly.
+        var (store, rev) = await Seed(
+            Tuple("group", "g1", "member", Onr("user", "alice")),
+            Tuple("group", "g2", "member", Onr("group", "g1", "member")),
+            Tuple("group", "g3a", "member", Onr("group", "g2", "member")),
+            Tuple("group", "g3b", "member", Onr("group", "g2", "member")),
+            Tuple("document", "doc_a", "viewer", Onr("group", "g3a", "member")),
+            Tuple("document", "doc_z", "viewer", Onr("group", "g3a", "member")),
+            Tuple("document", "doc_b", "viewer", Onr("group", "g3b", "member")),
+            Tuple("document", "doc_m", "viewer", Onr("group", "g3b", "member")));
+        var engine = BuildEngine(Schema);
+        var reader = store.SnapshotReader(rev);
+
+        var unpaged = await Collect(engine.LookupResources(
+            reader, "user", "alice", CoreConstants.Ellipsis, "document", "view"));
+        var expected = unpaged.Select(r => r.ResourceId).OrderBy(x => x, StringComparer.Ordinal).ToArray();
+        Assert.Equal(["doc_a", "doc_b", "doc_m", "doc_z"], expected);
+
+        // The walk is deep enough that at least one result carries a multi-section (multi-level) cursor.
+        Assert.Contains(unpaged, r => r.AfterCursor is { Sections.Count: > 1 });
+
+        var paged = new List<string>();
+        LookupResourcesCursor? cursor = null;
+        while (paged.Count <= unpaged.Count) // bounded so a resume regression cannot loop forever
+        {
+            var page = await Collect(engine.LookupResources(
+                reader, "user", "alice", CoreConstants.Ellipsis, "document", "view",
+                cursor: cursor, limit: 1));
+            if (page.Count == 0)
+                break;
+            paged.Add(page[0].ResourceId);
+            cursor = page[0].AfterCursor;
+        }
+
+        // No drops and no cross-page duplicates: the paged multiset equals the unpaged one.
+        Assert.Equal(expected, paged.OrderBy(x => x, StringComparer.Ordinal).ToArray());
+    }
+
+    [Fact]
     public async Task Portion1SelfMatch_CarriesResumeCursor()
     {
         // A recursive relation (group.member admits group#member) makes a matched group both a

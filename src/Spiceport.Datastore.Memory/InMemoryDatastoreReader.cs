@@ -37,16 +37,48 @@ internal sealed class InMemoryDatastoreReader : IDatastoreReader
 
     public async IAsyncEnumerable<Relationship> ReverseQueryRelationships(
         SubjectsFilter subjectsFilter,
+        ReverseQueryOptions? options = null,
         [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
         var now = DateTimeOffset.UtcNow;
+
+        if (options is null || options.Sort == ReverseQuerySort.Unsorted)
+        {
+            // Fast path: stream in storage order, no materialization.
+            foreach (var rel in _state.LiveAt(_revision))
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                if (IsExpired(rel, now))
+                    continue;
+                if (subjectsFilter.Matches(rel))
+                    yield return rel;
+            }
+            await Task.CompletedTask;
+            yield break;
+        }
+
+        // Ordered path: materialize matching rows, sort by the requested key, then apply the exclusive
+        // keyset so resumption sees only strictly-greater rows. The six-tuple is unique, so there are no
+        // ties and the order is total.
+        var matches = new List<Relationship>();
         foreach (var rel in _state.LiveAt(_revision))
         {
             cancellationToken.ThrowIfCancellationRequested();
             if (IsExpired(rel, now))
                 continue;
             if (subjectsFilter.Matches(rel))
-                yield return rel;
+                matches.Add(rel);
+        }
+
+        matches.Sort(ReverseQueryOptions.CompareBySubject);
+
+        foreach (var rel in matches)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (options.After is { } after &&
+                ReverseQueryOptions.CompareBySubject(rel.Reference, after) <= 0)
+                continue;
+            yield return rel;
         }
         await Task.CompletedTask;
     }

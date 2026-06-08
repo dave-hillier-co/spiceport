@@ -53,7 +53,7 @@ public sealed class LookupResourcesEngine
         ArgumentNullException.ThrowIfNull(namespaces);
         _namespaces = namespaces.ToImmutableDictionary(ns => ns.Name);
         var caveatList = caveats?.ToList();
-        _reachability = ReachabilityGraph.ForSchema(_namespaces);
+        _reachability = ReachabilityGraph.ForSchema(_namespaces, ReachabilityMode.First);
         _check = new CheckEngine(_namespaces.Values, caveatList, maxDepth);
         _caveats = new CaveatEvaluator(caveatList ?? []);
         _maxDepth = maxDepth;
@@ -106,20 +106,26 @@ public sealed class LookupResourcesEngine
             [subjectId] = new ResourceState([subjectId], Membership.Member, []),
         };
 
-        var seen = new HashSet<string>();
+        // No global dedup: like SpiceDB, the traversal is a single deterministic stream and the cursor is a
+        // position in it, so a resource reachable via several entrypoints is emitted once per entrypoint.
+        // This is what makes a paged enumeration equal the unpaged one — a bounded cursor cannot carry a
+        // cross-page "already seen" set. Within a chunk, duplicate (resource,subject) pairs are still merged.
         var emitted = 0;
         await foreach (var found in LookupRec(
             reader, subjectRel, initial, target, terminalSubject, caveatContext, now,
             _maxDepth, ImmutableHashSet<string>.Empty, sections, cancellationToken))
         {
-            if (!seen.Add(found.ResourceId))
-                continue;
             yield return found;
             emitted++;
             if (limit is { } l && emitted >= l)
                 yield break;
         }
     }
+
+    /// <summary>How many raw relationships a query entrypoint consumes per streamed chunk. The datastore
+    /// keyset advances one chunk at a time, so chunk boundaries must be deterministic over the ordered
+    /// stream; chunking by a fixed raw count satisfies that.</summary>
+    private const int ChunkSize = 100;
 
     // Finds resources of `target` reachable from the given subjects (keyed by id with back-mapping).
     private async IAsyncEnumerable<FoundResource> LookupRec(
@@ -139,25 +145,24 @@ public sealed class LookupResourcesEngine
         if (subjects.Count == 0)
             yield break;
 
-        // Portion #1: the subjects already ARE resources of the target relation.
-        // We still fall through to Portion #2 afterwards: when the target is a *recursive*
-        // relation (one that admits a userset subject of its own (namespace, relation), e.g.
-        // `member: user | group#member`), a matched userset is simultaneously a resource AND a
-        // subject of further resources up the chain, so the reverse walk must continue. For the
-        // common terminal case there is no such self-referential entrypoint, so Portion #2 yields
-        // nothing and the behaviour is unchanged. Duplicate resource ids are deduped by the caller.
-        // The section (if any) for this nesting level positions the resume. A sentinel entrypoint
-        // index of -1 marks a resume *within* Portion #1 (the self-match results); a non-negative
-        // index marks a resume in Portion #2, meaning Portion #1 was already fully drained on a prior
-        // page and must be skipped entirely here.
+        // The cursor section (if any) for this nesting level positions the resume; deeper sections
+        // position the levels below. A sentinel entrypoint index of -1 marks a resume *within* Portion #1
+        // (the self-match results); a non-negative index marks a resume in Portion #2, meaning Portion #1
+        // was already fully drained on a prior page and must be skipped entirely here.
         var thisSection = cursorSections.Count > 0 ? cursorSections[0] : null;
         var deeperSections = cursorSections.Count > 0 ? cursorSections.RemoveAt(0) : [];
 
         const int Portion1Section = -1;
-        var resumingPortion2 = thisSection is { } topSec && topSec.EntrypointIndex >= 0;
+        var resumingPortion2 = thisSection is { EntrypointIndex: >= 0 };
+
+        // Portion #1: the subjects already ARE resources of the target relation. We still fall through to
+        // Portion #2 afterwards: when the target is a *recursive* relation (one admitting a userset subject
+        // of its own (namespace, relation), e.g. `member: user | group#member`), a matched userset is
+        // simultaneously a resource AND a subject of further resources up the chain, so the reverse walk
+        // must continue. For the common terminal case Portion #2 yields nothing.
         if (subjectRel.Namespace == target.Namespace && subjectRel.Relation == target.Relation && !resumingPortion2)
         {
-            var portion1SkipUpTo = thisSection is { } p1 && p1.EntrypointIndex == Portion1Section
+            var portion1SkipUpTo = thisSection is { EntrypointIndex: Portion1Section } p1
                 ? p1.LastResourceId
                 : null;
 
@@ -167,10 +172,10 @@ public sealed class LookupResourcesEngine
                     continue;
 
                 var state = subjects[id];
-                // Decorate every self-match with a resume cursor so a limited page resumes correctly
-                // instead of silently dropping the remaining self-matches.
+                // Decorate every self-match with a single-section leaf cursor; parent levels prepend their
+                // own sections as it bubbles up, building the full nesting stack.
                 var cursorOut = new LookupResourcesCursor(
-                    ImmutableList.Create(new LookupResourcesCursorSection(Portion1Section, id)));
+                    ImmutableList.Create(new LookupResourcesCursorSection(Portion1Section, LastResourceId: id)));
                 yield return new FoundResource(id, state.ForSubjectIds, state.Membership, state.Missing)
                     with { AfterCursor = cursorOut };
             }
@@ -190,131 +195,157 @@ public sealed class LookupResourcesEngine
         if (entrypoints.Count == 0)
             yield break;
 
-        // Portion #2 resume positioning: only honour the section's entrypoint index when it is a
-        // Portion #2 section (>= 0). A Portion #1 section (-1) means "resume mid self-match"; Portion
-        // #2 then starts from its first entrypoint with no skip.
-        var p2Section = thisSection is { } ts && ts.EntrypointIndex >= 0 ? thisSection : null;
+        // Only honour the section's entrypoint index when it is a Portion #2 section (>= 0). A Portion #1
+        // section (-1) means "resume mid self-match"; Portion #2 then starts from its first entrypoint.
+        var p2Section = thisSection is { EntrypointIndex: >= 0 } ? thisSection : null;
 
         for (var epIndex = 0; epIndex < entrypoints.Count; epIndex++)
         {
             ct.ThrowIfCancellationRequested();
 
+            // Entrypoints before the resumed one were fully drained on a prior page; skip them.
             if (p2Section is { } sec && epIndex < sec.EntrypointIndex)
                 continue;
 
-            var skipUpToResourceId = p2Section is { } s && epIndex == s.EntrypointIndex
-                ? s.LastResourceId
-                : null;
-
+            var isResumeEp = p2Section is { } s && epIndex == s.EntrypointIndex;
             var entrypoint = entrypoints[epIndex];
 
-            // Candidate (resource id -> back-mapped state) of the entrypoint's containing relation.
-            var candidates = await CollectCandidates(
-                reader, entrypoint, subjectRel, subjectIds, subjects, caveatContext, now, ct)
-                .ConfigureAwait(false);
-            if (candidates.Count == 0)
-                continue;
-
-            // Check-filter conditional entrypoints (intersection / exclusion / .all()): confirm the
-            // candidate genuinely holds the containing relation for the terminal subject.
-            if (!entrypoint.IsDirectResult)
-                candidates = await FilterByCheck(
-                    reader, entrypoint.ContainingRelation, candidates, terminalSubject, caveatContext, now, ct)
-                    .ConfigureAwait(false);
-
-            if (candidates.Count == 0)
-                continue;
-
-            var nestedSections = p2Section is { } s2 && epIndex == s2.EntrypointIndex ? deeperSections : [];
-            await foreach (var found in LookupRec(
-                reader, entrypoint.ContainingRelation, candidates, target, terminalSubject, caveatContext, now,
-                depthRemaining - 1, visited, nestedSections, ct).ConfigureAwait(false))
+            if (entrypoint.Kind is ReachabilityEntrypointKind.Self or ReachabilityEntrypointKind.ComputedUserset)
             {
-                if (skipUpToResourceId is { } skip && string.CompareOrdinal(found.ResourceId, skip) <= 0)
+                // Structural rewrite: re-key the (bounded) input subject set as the containing relation and
+                // recurse once. No datastore scan, so the within-level position is carried entirely by the
+                // deeper sections; the section emitted for this level is structural (null keyset).
+                var candidates = new Dictionary<string, ResourceState>();
+                foreach (var id in subjectIds)
+                    Merge(candidates, id, subjects[id]);
+
+                if (!entrypoint.IsDirectResult)
+                    candidates = await FilterByCheck(
+                        reader, entrypoint.ContainingRelation, candidates, terminalSubject, caveatContext, now, ct)
+                        .ConfigureAwait(false);
+                if (candidates.Count == 0)
                     continue;
 
-                var cursorOut = new LookupResourcesCursor(
-                    ImmutableList.Create(new LookupResourcesCursorSection(epIndex, found.ResourceId)));
-                yield return found with { AfterCursor = cursorOut };
+                var innerSections = isResumeEp ? deeperSections : [];
+                var section = new LookupResourcesCursorSection(epIndex);
+                await foreach (var found in LookupRec(
+                    reader, entrypoint.ContainingRelation, candidates, target, terminalSubject, caveatContext, now,
+                    depthRemaining - 1, visited, innerSections, ct).ConfigureAwait(false))
+                {
+                    yield return Prepend(found, section);
+                }
+                continue;
+            }
+
+            // Query entrypoint (Relation / arrow): stream the reverse query in the deterministic BySubject
+            // order, in fixed-size chunks, resuming after the keyset carried in the cursor. Each emitted
+            // result's section keyset is the PRIOR chunk's final relationship, so resuming re-fetches the
+            // in-progress chunk and re-positions within it via the deeper sections.
+            var afterKeyset = isResumeEp ? p2Section!.AfterKeyset : null;
+            var sectionKeyset = afterKeyset;
+            var firstChunk = true;
+
+            await foreach (var chunk in StreamCandidateChunks(
+                reader, entrypoint, subjectRel, subjectIds, subjects, caveatContext, afterKeyset, ct)
+                .ConfigureAwait(false))
+            {
+                var candidates = chunk.Candidates;
+                if (candidates.Count > 0 && !entrypoint.IsDirectResult)
+                    candidates = await FilterByCheck(
+                        reader, entrypoint.ContainingRelation, candidates, terminalSubject, caveatContext, now, ct)
+                        .ConfigureAwait(false);
+
+                if (candidates.Count > 0)
+                {
+                    var innerSections = firstChunk && isResumeEp ? deeperSections : [];
+                    var section = new LookupResourcesCursorSection(epIndex, AfterKeyset: sectionKeyset);
+                    await foreach (var found in LookupRec(
+                        reader, entrypoint.ContainingRelation, candidates, target, terminalSubject, caveatContext, now,
+                        depthRemaining - 1, visited, innerSections, ct).ConfigureAwait(false))
+                    {
+                        yield return Prepend(found, section);
+                    }
+                }
+
+                sectionKeyset = chunk.LastKeyset;
+                firstChunk = false;
             }
         }
     }
 
+    /// <summary>Prepends this nesting level's resume section onto a bubbled-up result's cursor stack.</summary>
+    private static FoundResource Prepend(FoundResource found, LookupResourcesCursorSection section)
+    {
+        var inner = found.AfterCursor?.Sections ?? ImmutableList<LookupResourcesCursorSection>.Empty;
+        return found with { AfterCursor = new LookupResourcesCursor(inner.Insert(0, section)) };
+    }
+
+    /// <summary>One streamed chunk of candidate resources plus the datastore keyset of its final relationship.</summary>
+    private readonly record struct CandidateChunk(
+        Dictionary<string, ResourceState> Candidates,
+        RelationshipReference LastKeyset);
+
     /// <summary>
-    /// Collects candidate resources of the entrypoint's containing relation reachable from the input
-    /// subjects via this entrypoint, applying early caveat shearing. Port of <c>entrypointIter</c>.
+    /// Streams candidate resources of a query entrypoint's containing relation in the deterministic
+    /// BySubject order, grouped into fixed-size chunks, applying early caveat shearing. The chunk's
+    /// <see cref="CandidateChunk.LastKeyset"/> is the last raw relationship consumed, so resuming the scan
+    /// after it continues exactly where the chunk ended. Port of SpiceDB's <c>relationshipsChunk</c> stream.
     /// </summary>
-    private async Task<Dictionary<string, ResourceState>> CollectCandidates(
+    private async IAsyncEnumerable<CandidateChunk> StreamCandidateChunks(
         IDatastoreReader reader,
         ReachabilityEntrypoint entrypoint,
         RelationReference subjectRel,
         IReadOnlyList<string> subjectIds,
         IReadOnlyDictionary<string, ResourceState> subjects,
         IReadOnlyDictionary<string, object?>? caveatContext,
-        DateTimeOffset now,
-        CancellationToken ct)
+        RelationshipReference? afterKeyset,
+        [EnumeratorCancellation] CancellationToken ct)
     {
-        var result = new Dictionary<string, ResourceState>();
+        var filter = BuildEntrypointFilter(entrypoint, subjectRel, subjectIds);
+        var options = new ReverseQueryOptions(ReverseQuerySort.BySubject, afterKeyset);
 
-        switch (entrypoint.Kind)
+        // The datastore already applies expiration + the subject/resource filter and yields in BySubject
+        // order, so each yielded relationship is a real, deterministic stream position. We chunk by raw
+        // count so chunk boundaries reproduce exactly on resume.
+        var current = new Dictionary<string, ResourceState>();
+        RelationshipReference? last = null;
+        var count = 0;
+
+        await foreach (var rel in reader.ReverseQueryRelationships(filter, options, ct).ConfigureAwait(false))
         {
-            case ReachabilityEntrypointKind.Self:
-            case ReachabilityEntrypointKind.ComputedUserset:
-            {
-                // Structural rewrite: re-key the input subject set as the containing relation. No query.
-                foreach (var id in subjectIds)
-                    Merge(result, id, subjects[id]);
-                return result;
-            }
+            AddCandidate(current, rel, subjects, caveatContext);
+            last = rel.Reference;
+            if (++count < ChunkSize)
+                continue;
 
-            case ReachabilityEntrypointKind.Relation:
-            {
-                var filter = BuildSubjectsFilter(
-                    subjectRel, subjectIds, entrypoint.TargetRelation,
-                    includeWildcard: subjectRel.Relation == CoreConstants.Ellipsis);
-
-                await foreach (var rel in reader.ReverseQueryRelationships(filter, ct).ConfigureAwait(false))
-                {
-                    if (IsExpired(rel, now))
-                        continue;
-                    if (rel.Resource.ObjectType != entrypoint.TargetRelation.Namespace ||
-                        rel.Resource.Relation != entrypoint.TargetRelation.Relation)
-                        continue;
-
-                    AddCandidate(result, rel, subjects, caveatContext);
-                }
-                return result;
-            }
-
-            case ReachabilityEntrypointKind.TupleToUserset:
-            {
-                // Arrow: reverse-query the tupleset relation of the containing namespace. Arrows ignore
-                // the subject's own relation, so match on namespace only.
-                var tupleset = entrypoint.TuplesetRelation!;
-                var containerNs = entrypoint.ContainingRelation.Namespace;
-
-                var filter = new SubjectsFilter(
-                    SubjectType: subjectRel.Namespace,
-                    OptionalSubjectIds: subjectIds,
-                    RelationFilter: SubjectRelationFilter.Any,
-                    OptionalResourceType: containerNs,
-                    OptionalResourceRelation: tupleset);
-
-                await foreach (var rel in reader.ReverseQueryRelationships(filter, ct).ConfigureAwait(false))
-                {
-                    if (IsExpired(rel, now))
-                        continue;
-                    if (rel.Resource.ObjectType != containerNs || rel.Resource.Relation != tupleset)
-                        continue;
-
-                    AddCandidate(result, rel, subjects, caveatContext);
-                }
-                return result;
-            }
-
-            default:
-                return result;
+            yield return new CandidateChunk(current, last);
+            current = new Dictionary<string, ResourceState>();
+            count = 0;
         }
+
+        if (count > 0)
+            yield return new CandidateChunk(current, last!);
+    }
+
+    /// <summary>Builds the subject-side filter for a query entrypoint (Relation or arrow).</summary>
+    private static SubjectsFilter BuildEntrypointFilter(
+        ReachabilityEntrypoint entrypoint, RelationReference subjectRel, IReadOnlyList<string> subjectIds)
+    {
+        if (entrypoint.Kind == ReachabilityEntrypointKind.TupleToUserset)
+        {
+            // Arrow: reverse-query the tupleset relation of the containing namespace. Arrows ignore the
+            // subject's own relation, so match on namespace only.
+            return new SubjectsFilter(
+                SubjectType: subjectRel.Namespace,
+                OptionalSubjectIds: subjectIds,
+                RelationFilter: SubjectRelationFilter.Any,
+                OptionalResourceType: entrypoint.ContainingRelation.Namespace,
+                OptionalResourceRelation: entrypoint.TuplesetRelation!);
+        }
+
+        return BuildSubjectsFilter(
+            subjectRel, subjectIds, entrypoint.TargetRelation,
+            includeWildcard: subjectRel.Relation == CoreConstants.Ellipsis);
     }
 
     /// <summary>Confirms candidates via Check against the terminal subject, keeping Member/Caveated.</summary>

@@ -170,6 +170,30 @@ public class PostgresDatastoreTests
     }
 
     [Fact]
+    public async Task ReverseQuery_BySubject_OrdersAndResumesAfterKeyset()
+    {
+        var ds = await _fixture.NewDatastore();
+        var rev = await ds.ReadWriteTx(async tx => await tx.WriteRelationships(
+        [
+            // Inserted out of order; the BySubject sort (ORDER BY ... COLLATE "C") must yield doc1, doc2, doc3.
+            new RelationshipUpdate(Rel("document", "doc3", "viewer", "user", "alice"), UpdateOperation.Create),
+            new RelationshipUpdate(Rel("document", "doc1", "viewer", "user", "alice"), UpdateOperation.Create),
+            new RelationshipUpdate(Rel("document", "doc2", "viewer", "user", "alice"), UpdateOperation.Create),
+        ]));
+        var reader = ds.SnapshotReader(rev);
+        var filter = new SubjectsFilter("user", OptionalSubjectIds: ["alice"]);
+
+        var ordered = await Collect(reader.ReverseQueryRelationships(
+            filter, new ReverseQueryOptions(ReverseQuerySort.BySubject)));
+        Assert.Equal(["doc1", "doc2", "doc3"], ordered.Select(r => r.Resource.ObjectId).ToArray());
+
+        // Exclusive keyset resume after the first row (the SQL row-comparison keyset) does not repeat it.
+        var after = await Collect(reader.ReverseQueryRelationships(
+            filter, new ReverseQueryOptions(ReverseQuerySort.BySubject, After: ordered[0].Reference)));
+        Assert.Equal(["doc2", "doc3"], after.Select(r => r.Resource.ObjectId).ToArray());
+    }
+
+    [Fact]
     public async Task FilterByCaveat_Matches()
     {
         var ds = await _fixture.NewDatastore();

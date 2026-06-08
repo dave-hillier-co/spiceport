@@ -52,11 +52,12 @@ internal sealed class PostgresDatastoreReader : IDatastoreReader
 
     public async IAsyncEnumerable<Relationship> ReverseQueryRelationships(
         SubjectsFilter subjectsFilter,
+        ReverseQueryOptions? options = null,
         [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
         var now = DateTimeOffset.UtcNow;
         await using var conn = await _dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
-        await using var cmd = RelationshipQuery.BuildReverse(conn, null, _revision.Snapshot, subjectsFilter);
+        await using var cmd = RelationshipQuery.BuildReverse(conn, null, _revision.Snapshot, subjectsFilter, options);
         await using var reader = await cmd.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
         while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
         {

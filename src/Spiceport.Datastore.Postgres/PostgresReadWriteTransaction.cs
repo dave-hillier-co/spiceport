@@ -145,8 +145,9 @@ internal sealed class PostgresReadWriteTransaction : IReadWriteTransaction
 
     public IAsyncEnumerable<Relationship> ReverseQueryRelationships(
         SubjectsFilter subjectsFilter,
+        ReverseQueryOptions? options = null,
         CancellationToken cancellationToken = default)
-        => Query(RelationshipQuery.BuildReverse(_conn, _tx, _readSnapshot, subjectsFilter), subjectsFilter.Matches, cancellationToken);
+        => Query(RelationshipQuery.BuildReverse(_conn, _tx, _readSnapshot, subjectsFilter, options), subjectsFilter.Matches, cancellationToken);
 
     private static async IAsyncEnumerable<Relationship> Query(
         NpgsqlCommand cmd, Func<Relationship, bool> residual,

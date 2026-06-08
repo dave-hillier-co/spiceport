@@ -4,6 +4,19 @@ using Spiceport.Core;
 
 namespace Spiceport.Engine;
 
+/// <summary>How an intersection/exclusion contributes entrypoints when building a reachability graph.</summary>
+public enum ReachabilityMode
+{
+    /// <summary>Every operand of an intersection/exclusion contributes entrypoints (full dependent set).</summary>
+    Full = 0,
+
+    /// <summary>
+    /// Only the first operand of an intersection/exclusion contributes entrypoints; the rest are validated
+    /// by Check. Port of SpiceDB's optimized <c>reachabilityFirst</c>, used by LookupResources.
+    /// </summary>
+    First = 1,
+}
+
 /// <summary>
 /// The structural precompute that lets <c>LookupResources</c> follow only productive edges from a
 /// subject type to a resource relation.
@@ -26,26 +39,37 @@ public sealed class ReachabilityGraph
     private static readonly ConcurrentDictionary<string, ReachabilityGraph> Cache = new();
 
     private readonly ImmutableDictionary<string, NamespaceDefinition> _namespaces;
+    private readonly ReachabilityMode _mode;
 
     // (resourceNs, resourceRel) -> per-target reachability indices.
     private readonly Dictionary<RelationReference, TargetGraph> _byTarget;
 
-    private ReachabilityGraph(ImmutableDictionary<string, NamespaceDefinition> namespaces)
+    private ReachabilityGraph(ImmutableDictionary<string, NamespaceDefinition> namespaces, ReachabilityMode mode)
     {
         _namespaces = namespaces;
+        _mode = mode;
         _byTarget = new Dictionary<RelationReference, TargetGraph>();
         Build();
     }
 
     /// <summary>
     /// Returns the reachability graph for the given schema, building it once and reusing it for any
-    /// schema with the same <see cref="SchemaHash"/>.
+    /// schema with the same <see cref="SchemaHash"/> and <paramref name="mode"/>.
     /// </summary>
-    public static ReachabilityGraph ForSchema(ImmutableDictionary<string, NamespaceDefinition> namespaces)
+    /// <param name="namespaces">The compiled namespace definitions.</param>
+    /// <param name="mode">
+    /// <see cref="ReachabilityMode.Full"/> (the default) emits entrypoints for every operand of an
+    /// intersection/exclusion; <see cref="ReachabilityMode.First"/> emits only the first operand's (the
+    /// rest being validated by Check), matching SpiceDB's optimized <c>FirstEntrypointsForSubjectToResource</c>
+    /// that LookupResources uses.
+    /// </param>
+    public static ReachabilityGraph ForSchema(
+        ImmutableDictionary<string, NamespaceDefinition> namespaces,
+        ReachabilityMode mode = ReachabilityMode.Full)
     {
         ArgumentNullException.ThrowIfNull(namespaces);
-        var key = SchemaHash.Compute(namespaces);
-        return Cache.GetOrAdd(key, _ => new ReachabilityGraph(namespaces));
+        var key = $"{(int)mode}:{SchemaHash.Compute(namespaces)}";
+        return Cache.GetOrAdd(key, _ => new ReachabilityGraph(namespaces, mode));
     }
 
     /// <summary>
@@ -64,8 +88,9 @@ public sealed class ReachabilityGraph
     /// <param name="subject">The subject (type, relation) holding the permission.</param>
     /// <param name="resource">The resource (type, relation/permission) being reached.</param>
     /// <param name="optimizedFirstOnly">
-    /// When true, stop after the first matching entrypoint (port of <c>FirstEntrypointsForSubjectToResource</c>).
-    /// LookupResources uses false (full set) for correctness, filtering via Check.
+    /// When true, stop collecting after the first matching entrypoint (port of the <c>entrypointLookupFindOne</c>
+    /// existence check). Independent of the build-time <see cref="ReachabilityMode"/>; both current callers
+    /// pass false and rely on the build mode to scope intersection/exclusion entrypoints.
     /// </param>
     public IReadOnlyList<ReachabilityEntrypoint> EntrypointsForSubjectToResource(
         RelationReference subject,
@@ -185,11 +210,18 @@ public sealed class ReachabilityGraph
         EntrypointResultStatus status)
     {
         // Intersection/exclusion children are reachable only conditionally.
-        var childStatus = operation.Type == SetOperationType.Union
-            ? status
-            : EntrypointResultStatus.ConditionalResult;
+        var isUnion = operation.Type == SetOperationType.Union;
+        var childStatus = isUnion ? status : EntrypointResultStatus.ConditionalResult;
 
-        foreach (var child in operation.Children)
+        // In First mode, an intersection/exclusion contributes entrypoints from only its first operand
+        // (a necessary condition for the whole expression); the remaining operands are validated by Check.
+        // This mirrors SpiceDB's reachabilityFirst (Child[0:1]) and avoids sourcing the same resource from
+        // several operands of one intersection. Unions always contribute every operand.
+        var children = !isUnion && _mode == ReachabilityMode.First && operation.Children.Count > 0
+            ? [operation.Children[0]]
+            : operation.Children;
+
+        foreach (var child in children)
             WalkChild(graph, thisNs, target, child, childStatus);
     }
 
