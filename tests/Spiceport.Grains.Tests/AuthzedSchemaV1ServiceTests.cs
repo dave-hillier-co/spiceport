@@ -129,6 +129,89 @@ public class AuthzedSchemaV1ServiceTests
     }
 
     [Fact]
+    public async Task WriteSchema_removing_expiration_trait_with_expiring_relationship_is_failed_precondition()
+    {
+        await using var cluster = await MeshTestCluster.CreateAsync(EmptySchema);
+        var service = Service(cluster);
+
+        // `user with expiration` requires the expiration trait. The trait is part of the allowed-type
+        // identity, so dropping it is a RelationSubjectTypeRemoved delta that the orphan check inspects.
+        var withExpiration = """
+            use expiration
+
+            definition user {}
+            definition document {
+                relation viewer: user with expiration
+            }
+            """;
+        await service.WriteSchema(
+            new V1::WriteSchemaRequest { Schema = withExpiration }, FakeServerCallContext.Default);
+
+        // A relationship that actually carries an expiration: it references `user with expiration`.
+        await cluster.Relationships.WriteRelationships(new Abstractions.WriteRelationshipsArgs(
+            new List<Abstractions.RelationshipUpdateWire>
+            {
+                new(Abstractions.RelationshipUpdateOpWire.Touch,
+                    new Abstractions.RelationshipWire(
+                        "document", "readme", "viewer", "user", "alice", "...", null, null,
+                        DateTimeOffset.UtcNow.AddDays(7))),
+            }));
+
+        // Dropping the expiration trait orphans that relationship, so the change is rejected.
+        var withoutExpiration = """
+            definition user {}
+            definition document {
+                relation viewer: user
+            }
+            """;
+        var ex = await Assert.ThrowsAsync<RpcException>(() => service.WriteSchema(
+            new V1::WriteSchemaRequest { Schema = withoutExpiration }, FakeServerCallContext.Default));
+        Assert.Equal(StatusCode.FailedPrecondition, ex.StatusCode);
+    }
+
+    [Fact]
+    public async Task WriteSchema_removing_expiration_trait_with_non_expiring_relationship_is_allowed()
+    {
+        await using var cluster = await MeshTestCluster.CreateAsync(EmptySchema);
+        var service = Service(cluster);
+
+        // The relation allows BOTH an expiring and a non-expiring `user` subject, so a relationship
+        // without an expiration references the plain `user` allowed type, not `user with expiration`.
+        var withBoth = """
+            use expiration
+
+            definition user {}
+            definition document {
+                relation viewer: user | user with expiration
+            }
+            """;
+        await service.WriteSchema(
+            new V1::WriteSchemaRequest { Schema = withBoth }, FakeServerCallContext.Default);
+
+        await cluster.Relationships.WriteRelationships(new Abstractions.WriteRelationshipsArgs(
+            new List<Abstractions.RelationshipUpdateWire>
+            {
+                new(Abstractions.RelationshipUpdateOpWire.Touch,
+                    new Abstractions.RelationshipWire(
+                        "document", "readme", "viewer", "user", "alice", "...", null, null, null)),
+            }));
+
+        // Dropping only the `with expiration` allowed type: the non-expiring relationship is filtered
+        // out by the orphan check's expiration filter, so the change is accepted.
+        var withoutExpiration = """
+            definition user {}
+            definition document {
+                relation viewer: user
+            }
+            """;
+        await service.WriteSchema(
+            new V1::WriteSchemaRequest { Schema = withoutExpiration }, FakeServerCallContext.Default);
+
+        var read = await service.ReadSchema(new V1::ReadSchemaRequest(), FakeServerCallContext.Default);
+        Assert.Contains("relation viewer: user", read.SchemaText);
+    }
+
+    [Fact]
     public async Task ReadSchema_on_fresh_cluster_is_not_found()
     {
         await using var cluster = await MeshTestCluster.CreateAsync(EmptySchema);
@@ -259,6 +342,44 @@ public class AuthzedSchemaV1ServiceTests
             && d.RelationSubjectTypeAdded.ChangedSubjectType.SubjectDefinitionName == "group");
         Assert.Contains(resp.Diffs, d => d.DiffCase == V1::ReflectionSchemaDiff.DiffOneofCase.PermissionExprChanged
             && d.PermissionExprChanged.Name == "view");
+    }
+
+    [Fact]
+    public async Task DiffSchema_adding_expiration_trait_reports_subject_type_add_and_remove()
+    {
+        await using var cluster = await MeshTestCluster.CreateAsync(EmptySchema);
+        var service = Service(cluster);
+
+        // The expiration trait is part of the allowed-type identity, so `user` -> `user with expiration`
+        // is a genuine subject-type change: the old `user` is removed and `user with expiration` is added.
+        var baseSchema = """
+            use expiration
+
+            definition user {}
+            definition document {
+                relation viewer: user
+            }
+            """;
+        await service.WriteSchema(new V1::WriteSchemaRequest { Schema = baseSchema }, FakeServerCallContext.Default);
+
+        var comparison = """
+            use expiration
+
+            definition user {}
+            definition document {
+                relation viewer: user with expiration
+            }
+            """;
+
+        var resp = await service.DiffSchema(
+            new V1::DiffSchemaRequest { ComparisonSchema = comparison }, FakeServerCallContext.Default);
+
+        Assert.Contains(resp.Diffs, d => d.DiffCase == V1::ReflectionSchemaDiff.DiffOneofCase.RelationSubjectTypeRemoved
+            && d.RelationSubjectTypeRemoved.Relation.Name == "viewer"
+            && d.RelationSubjectTypeRemoved.ChangedSubjectType.SubjectDefinitionName == "user");
+        Assert.Contains(resp.Diffs, d => d.DiffCase == V1::ReflectionSchemaDiff.DiffOneofCase.RelationSubjectTypeAdded
+            && d.RelationSubjectTypeAdded.Relation.Name == "viewer"
+            && d.RelationSubjectTypeAdded.ChangedSubjectType.SubjectDefinitionName == "user");
     }
 
     [Fact]
