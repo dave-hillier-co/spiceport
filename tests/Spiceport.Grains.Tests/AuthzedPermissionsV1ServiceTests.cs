@@ -214,6 +214,165 @@ public class AuthzedPermissionsV1ServiceTests
     }
 
     [Fact]
+    public async Task WriteRelationships_duplicate_relationship_is_invalid_argument()
+    {
+        // A relationship may appear in an update only once per request (SpiceDB:
+        // NewDuplicateRelationshipErr -> InvalidArgument). The key ignores caveat/expiration, so a
+        // CREATE + DELETE of the same tuple in one request is a duplicate too.
+        await using var cluster = await MeshTestCluster.CreateAsync(Schema);
+
+        var req = new V1::WriteRelationshipsRequest();
+        req.Updates.Add(new V1::RelationshipUpdate
+        {
+            Operation = V1::RelationshipUpdate.Types.Operation.Touch,
+            Relationship = new V1::Relationship
+            {
+                Resource = new V1::ObjectReference { ObjectType = "document", ObjectId = "readme" },
+                Relation = "viewer",
+                Subject = UserSubject("alice"),
+            },
+        });
+        req.Updates.Add(new V1::RelationshipUpdate
+        {
+            Operation = V1::RelationshipUpdate.Types.Operation.Delete,
+            Relationship = new V1::Relationship
+            {
+                Resource = new V1::ObjectReference { ObjectType = "document", ObjectId = "readme" },
+                Relation = "viewer",
+                Subject = UserSubject("alice"),
+            },
+        });
+
+        var ex = await Assert.ThrowsAsync<RpcException>(() =>
+            Service(cluster).WriteRelationships(req, FakeServerCallContext.Default));
+        Assert.Equal(StatusCode.InvalidArgument, ex.StatusCode);
+        Assert.Contains("more than one update with relationship", ex.Status.Detail);
+    }
+
+    [Fact]
+    public async Task WriteRelationships_too_many_updates_is_invalid_argument()
+    {
+        // More than MaxUpdatesPerWrite (1000) updates is rejected up front with InvalidArgument
+        // (SpiceDB: NewExceedsMaximumUpdatesErr).
+        await using var cluster = await MeshTestCluster.CreateAsync(Schema);
+
+        var req = new V1::WriteRelationshipsRequest();
+        for (var i = 0; i <= 1000; i++)
+        {
+            req.Updates.Add(new V1::RelationshipUpdate
+            {
+                Operation = V1::RelationshipUpdate.Types.Operation.Touch,
+                Relationship = new V1::Relationship
+                {
+                    Resource = new V1::ObjectReference { ObjectType = "document", ObjectId = $"doc{i}" },
+                    Relation = "viewer",
+                    Subject = UserSubject("alice"),
+                },
+            });
+        }
+
+        var ex = await Assert.ThrowsAsync<RpcException>(() =>
+            Service(cluster).WriteRelationships(req, FakeServerCallContext.Default));
+        Assert.Equal(StatusCode.InvalidArgument, ex.StatusCode);
+        Assert.Contains("too many updates", ex.Status.Detail);
+    }
+
+    [Fact]
+    public async Task WriteRelationships_too_many_preconditions_is_invalid_argument()
+    {
+        // More than MaxPreconditionsCount (1000) preconditions is rejected with InvalidArgument
+        // (SpiceDB: NewExceedsMaximumPreconditionsErr).
+        await using var cluster = await MeshTestCluster.CreateAsync(Schema);
+
+        var req = WriteReq(V1::RelationshipUpdate.Types.Operation.Touch, "readme", "alice");
+        for (var i = 0; i <= 1000; i++)
+        {
+            req.OptionalPreconditions.Add(new V1::Precondition
+            {
+                Operation = V1::Precondition.Types.Operation.MustMatch,
+                Filter = new V1::RelationshipFilter { ResourceType = "document", OptionalResourceId = $"doc{i}" },
+            });
+        }
+
+        var ex = await Assert.ThrowsAsync<RpcException>(() =>
+            Service(cluster).WriteRelationships(req, FakeServerCallContext.Default));
+        Assert.Equal(StatusCode.InvalidArgument, ex.StatusCode);
+        Assert.Contains("precondition count", ex.Status.Detail);
+    }
+
+    [Fact]
+    public async Task WriteRelationships_oversized_relationship_caveat_context_is_invalid_argument()
+    {
+        // A per-relationship caveat context larger than MaxRelationshipContextSize (25000 bytes) is
+        // rejected with InvalidArgument (SpiceDB: NewMaxRelationshipContextError).
+        await using var cluster = await MeshTestCluster.CreateAsync(Schema);
+
+        var ctx = new Google.Protobuf.WellKnownTypes.Struct();
+        ctx.Fields["blob"] = Google.Protobuf.WellKnownTypes.Value.ForString(new string('x', 30_000));
+
+        var req = new V1::WriteRelationshipsRequest();
+        req.Updates.Add(new V1::RelationshipUpdate
+        {
+            Operation = V1::RelationshipUpdate.Types.Operation.Touch,
+            Relationship = new V1::Relationship
+            {
+                Resource = new V1::ObjectReference { ObjectType = "document", ObjectId = "readme" },
+                Relation = "viewer",
+                Subject = UserSubject("alice"),
+                OptionalCaveat = new V1::ContextualizedCaveat { CaveatName = "over_limit", Context = ctx },
+            },
+        });
+
+        var ex = await Assert.ThrowsAsync<RpcException>(() =>
+            Service(cluster).WriteRelationships(req, FakeServerCallContext.Default));
+        Assert.Equal(StatusCode.InvalidArgument, ex.StatusCode);
+        Assert.Contains("exceeded maximum allowed caveat size", ex.Status.Detail);
+    }
+
+    [Fact]
+    public async Task CheckPermission_oversized_caveat_context_is_invalid_argument()
+    {
+        // A request caveat context larger than MaxCaveatContextSize (4096 bytes) is rejected with
+        // InvalidArgument (SpiceDB: GetCaveatContext).
+        await using var cluster = await MeshTestCluster.CreateAsync(Schema);
+
+        var ctx = new Google.Protobuf.WellKnownTypes.Struct();
+        ctx.Fields["blob"] = Google.Protobuf.WellKnownTypes.Value.ForString(new string('x', 5000));
+
+        var ex = await Assert.ThrowsAsync<RpcException>(() => Service(cluster).CheckPermission(
+            new V1::CheckPermissionRequest
+            {
+                Resource = new V1::ObjectReference { ObjectType = "document", ObjectId = "readme" },
+                Permission = "view",
+                Subject = UserSubject("alice"),
+                Context = ctx,
+            },
+            FakeServerCallContext.Default));
+
+        Assert.Equal(StatusCode.InvalidArgument, ex.StatusCode);
+        Assert.Contains("request caveat context should have less than", ex.Status.Detail);
+    }
+
+    [Fact]
+    public async Task CheckBulkPermissions_oversized_caveat_context_is_invalid_argument()
+    {
+        await using var cluster = await MeshTestCluster.CreateAsync(Schema);
+
+        var ctx = new Google.Protobuf.WellKnownTypes.Struct();
+        ctx.Fields["blob"] = Google.Protobuf.WellKnownTypes.Value.ForString(new string('x', 5000));
+
+        var req = new V1::CheckBulkPermissionsRequest();
+        var item = BulkItem("readme", "view", "alice");
+        item.Context = ctx;
+        req.Items.Add(item);
+
+        var ex = await Assert.ThrowsAsync<RpcException>(() =>
+            Service(cluster).CheckBulkPermissions(req, FakeServerCallContext.Default));
+        Assert.Equal(StatusCode.InvalidArgument, ex.StatusCode);
+        Assert.Contains("request caveat context should have less than", ex.Status.Detail);
+    }
+
+    [Fact]
     public async Task CheckPermission_caveated_missing_context_populates_partial_caveat_info()
     {
         await using var cluster = await MeshTestCluster.CreateAsync(Schema);

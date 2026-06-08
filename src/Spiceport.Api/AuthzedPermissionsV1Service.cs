@@ -62,6 +62,9 @@ public sealed class AuthzedPermissionsV1Service(
             new SchemaValidation.TypeAndRelation(request.Resource.ObjectType, request.Permission, AllowEllipsis: false),
             new SchemaValidation.TypeAndRelation(request.Subject.Object.ObjectType, subjectRelation, AllowEllipsis: true));
 
+        // Reject an oversized request caveat context (SpiceDB: GetCaveatContext) -> InvalidArgument.
+        RequestLimits.ValidateCaveatContextSize(request.Context);
+
         PermissionCheckResult result;
         try
         {
@@ -118,6 +121,10 @@ public sealed class AuthzedPermissionsV1Service(
     public override async Task<V1::WriteRelationshipsResponse> WriteRelationships(
         V1::WriteRelationshipsRequest request, ServerCallContext context)
     {
+        // Reject over-limit/duplicate/oversized-context requests up front (SpiceDB validates the request
+        // shape before applying it). All of these are InvalidArgument, not FailedPrecondition.
+        RequestLimits.ValidateWriteRelationships(request);
+
         var updates = request.Updates.Select(ToWire).ToList();
         var preconditions = ToWire(request.OptionalPreconditions);
         try
@@ -238,7 +245,8 @@ public sealed class AuthzedPermissionsV1Service(
             ? CoreConstants.Ellipsis
             : request.Subject.OptionalRelation;
 
-        var context5 = StructToDict(request.Context);
+        // Reject an oversized request caveat context (SpiceDB: GetCaveatContext) -> InvalidArgument.
+        var context5 = StructToDict(RequestLimits.ValidateCaveatContextSize(request.Context));
         var consistency = ToWire(request.Consistency);
 
         // v1 contract: optional_limit (field 6) caps the resources returned; optional_cursor (field 7)
@@ -324,7 +332,8 @@ public sealed class AuthzedPermissionsV1Service(
             ? CoreConstants.Ellipsis
             : request.OptionalSubjectRelation;
 
-        var context6 = StructToDict(request.Context);
+        // Reject an oversized request caveat context (SpiceDB: GetCaveatContext) -> InvalidArgument.
+        var context6 = StructToDict(RequestLimits.ValidateCaveatContextSize(request.Context));
         var consistency = ToWire(request.Consistency);
         string? cursor = null;
 
@@ -430,7 +439,8 @@ public sealed class AuthzedPermissionsV1Service(
                 it.Resource.ObjectId,
                 it.Permission,
                 new ObjectAndRelation(it.Subject.Object.ObjectType, it.Subject.Object.ObjectId, subjectRelation),
-                StructToDict(it.Context));
+                // Reject an oversized per-item caveat context (SpiceDB: GetCaveatContext) -> InvalidArgument.
+                StructToDict(RequestLimits.ValidateCaveatContextSize(it.Context)));
         }).ToList();
 
         BatchCheckResult result;
