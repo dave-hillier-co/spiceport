@@ -37,6 +37,23 @@ public sealed class PermissionsGrpcService(IPermissionChecker checker, IGrainFac
 {
     private IReverseOpsGrain ReverseOps => grains.GetGrain<IReverseOpsGrain>(IReverseOpsGrain.Key);
     private IRelationshipsGrain Relationships => grains.GetGrain<IRelationshipsGrain>(IRelationshipsGrain.Key);
+    /// <summary>
+    /// Maps a cross-silo dispatch failure surfaced by <c>OrleansDispatcher</c> onto its deliberately
+    /// chosen gRPC status (cf. SpiceDB <c>rewriteError</c>): transient transport/silo-availability is
+    /// retriable <c>Unavailable</c>; cancellation is <c>Cancelled</c>; a deadline is
+    /// <c>DeadlineExceeded</c>; anything else is <c>Internal</c>.
+    /// </summary>
+    private static RpcException ToRpc(DispatchFailedException ex) =>
+        new(new Status(
+            ex.Code switch
+            {
+                DispatchErrorCode.Unavailable => StatusCode.Unavailable,
+                DispatchErrorCode.Cancelled => StatusCode.Cancelled,
+                DispatchErrorCode.DeadlineExceeded => StatusCode.DeadlineExceeded,
+                _ => StatusCode.Internal,
+            },
+            ex.Message));
+
     public override async Task<CheckPermissionResponse> CheckPermission(
         CheckPermissionRequest request, ServerCallContext context)
     {
@@ -76,6 +93,10 @@ public sealed class PermissionsGrpcService(IPermissionChecker checker, IGrainFac
                     ? StatusCode.InvalidArgument
                     : StatusCode.FailedPrecondition,
                 ex.Message));
+        }
+        catch (DispatchFailedException ex)
+        {
+            throw ToRpc(ex);
         }
 
         var ship = result.Verdict switch
@@ -121,6 +142,10 @@ public sealed class PermissionsGrpcService(IPermissionChecker checker, IGrainFac
         catch (InvalidConsistencyTokenException ex)
         {
             throw new RpcException(new Status(StatusCode.InvalidArgument, ex.Message));
+        }
+        catch (DispatchFailedException ex)
+        {
+            throw ToRpc(ex);
         }
 
         var resp = new BatchCheckPermissionResponse

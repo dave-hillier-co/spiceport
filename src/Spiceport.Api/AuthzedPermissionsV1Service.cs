@@ -38,6 +38,23 @@ public sealed class AuthzedPermissionsV1Service(
                 : StatusCode.FailedPrecondition,
             ex.Message));
 
+    /// <summary>
+    /// Maps a cross-silo dispatch failure surfaced by <c>OrleansDispatcher</c> onto its deliberately
+    /// chosen gRPC status (cf. SpiceDB <c>rewriteError</c>): a transient transport/silo-availability
+    /// failure is retriable <c>Unavailable</c>; a cancellation is <c>Cancelled</c>; a deadline is
+    /// <c>DeadlineExceeded</c>; anything else is <c>Internal</c>.
+    /// </summary>
+    private static RpcException ToRpc(DispatchFailedException ex) =>
+        new(new Status(
+            ex.Code switch
+            {
+                DispatchErrorCode.Unavailable => StatusCode.Unavailable,
+                DispatchErrorCode.Cancelled => StatusCode.Cancelled,
+                DispatchErrorCode.DeadlineExceeded => StatusCode.DeadlineExceeded,
+                _ => StatusCode.Internal,
+            },
+            ex.Message));
+
     public override async Task<V1::CheckPermissionResponse> CheckPermission(
         V1::CheckPermissionRequest request, ServerCallContext context)
     {
@@ -89,6 +106,10 @@ public sealed class AuthzedPermissionsV1Service(
             throw new RpcException(new Status(StatusCode.FailedPrecondition, ex.Message));
         }
         catch (CaveatEvaluationException ex)
+        {
+            throw ToRpc(ex);
+        }
+        catch (DispatchFailedException ex)
         {
             throw ToRpc(ex);
         }
@@ -222,12 +243,24 @@ public sealed class AuthzedPermissionsV1Service(
             new SchemaValidation.TypeAndRelation(request.Resource.ObjectType, request.Permission, AllowEllipsis: false));
 
         // v1 ExpandPermissionTreeRequest has no mode field; authzed's expand is the recursive walk.
-        var reply = await ReverseOps.ExpandPermissionTree(new ExpandTreeArgs(
-            request.Resource.ObjectType,
-            request.Resource.ObjectId,
-            request.Permission,
-            ExpandModeWire.Recursive,
-            ToWire(request.Consistency)));
+        ExpandTreeReply reply;
+        try
+        {
+            reply = await ReverseOps.ExpandPermissionTree(new ExpandTreeArgs(
+                request.Resource.ObjectType,
+                request.Resource.ObjectId,
+                request.Permission,
+                ExpandModeWire.Recursive,
+                ToWire(request.Consistency)));
+        }
+        catch (InvalidConsistencyTokenException ex)
+        {
+            throw new RpcException(new Status(StatusCode.InvalidArgument, ex.Message));
+        }
+        catch (DispatchFailedException ex)
+        {
+            throw ToRpc(ex);
+        }
 
         return new V1::ExpandPermissionTreeResponse
         {
@@ -285,6 +318,10 @@ public sealed class AuthzedPermissionsV1Service(
                 throw new RpcException(new Status(StatusCode.InvalidArgument, ex.Message));
             }
             catch (CaveatEvaluationException ex)
+            {
+                throw ToRpc(ex);
+            }
+            catch (DispatchFailedException ex)
             {
                 throw ToRpc(ex);
             }
@@ -376,6 +413,10 @@ public sealed class AuthzedPermissionsV1Service(
                 throw new RpcException(new Status(StatusCode.InvalidArgument, ex.Message));
             }
             catch (CaveatEvaluationException ex)
+            {
+                throw ToRpc(ex);
+            }
+            catch (DispatchFailedException ex)
             {
                 throw ToRpc(ex);
             }
@@ -481,6 +522,10 @@ public sealed class AuthzedPermissionsV1Service(
                 throw new RpcException(new Status(StatusCode.InvalidArgument, ex.Message));
             }
             catch (CaveatEvaluationException ex)
+            {
+                throw ToRpc(ex);
+            }
+            catch (DispatchFailedException ex)
             {
                 throw ToRpc(ex);
             }

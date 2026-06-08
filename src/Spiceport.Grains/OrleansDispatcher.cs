@@ -133,10 +133,50 @@ public sealed class OrleansDispatcher : IDispatcher
             request.Meta.Bloom.Hashes,
             request.Meta.Mode);
 
-        var reply = await grain.DispatchCheck(args).ConfigureAwait(false);
+        DispatchCheckReply reply;
+        try
+        {
+            reply = await grain.DispatchCheck(args).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            // Deliberate cross-silo error mapping (cf. SpiceDB rewriteError / remote cluster boundary):
+            // classify the failure and translate it to a stable, documented gRPC code. Known typed
+            // domain exceptions keep their own semantics and pass through; transport/availability
+            // failures become a RETRIABLE Unavailable; cancellation/deadline are preserved; anything
+            // else collapses to Internal. The mapped failure travels back as a [GenerateSerializer]
+            // DispatchFailedException so its code survives any further grain hops up the recursion.
+            throw Translate(ex);
+        }
 
         return new DispatchCheckResult(
             reply.Member, CaveatWire.FromWire(reply.Caveat), reply.CycleCut, reply.DepthRequired);
+    }
+
+    /// <summary>
+    /// Translates an exception surfaced from a remote grain dispatch into the exception the caller should
+    /// see: a known domain exception (and an already-classified <see cref="DispatchFailedException"/>) is
+    /// re-thrown unchanged; everything else is collapsed to a <see cref="DispatchFailedException"/>
+    /// carrying its deliberately-mapped <see cref="DispatchErrorCode"/>. Pure given
+    /// <see cref="DispatchErrorMapper.Classify"/>.
+    /// </summary>
+    private static Exception Translate(Exception ex)
+    {
+        var classification = DispatchErrorMapper.Classify(ex);
+        if (classification.PassThrough)
+            return ex;
+
+        var reason = classification.Code switch
+        {
+            DispatchErrorCode.Unavailable =>
+                "the permission check could not reach the silo that owns this sub-problem; the failure " +
+                "is transient and the request may be retried",
+            DispatchErrorCode.Cancelled => "the permission check was cancelled",
+            DispatchErrorCode.DeadlineExceeded => "the permission check exceeded its deadline",
+            _ => "the permission check failed with an unexpected dispatch error",
+        };
+
+        return new DispatchFailedException(classification.Code, reason, ex);
     }
 
     /// <summary>

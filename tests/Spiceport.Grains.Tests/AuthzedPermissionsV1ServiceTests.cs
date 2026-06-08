@@ -4,6 +4,7 @@ using Spiceport.Api;
 using Spiceport.Core;
 using Spiceport.Datastore;
 using Spiceport.Grains;
+using Spiceport.Grains.Abstractions;
 using V1 = Authzed.Api.V1;
 using CoreRelationship = Spiceport.Core.Relationship;
 using CoreRelationshipUpdate = Spiceport.Core.RelationshipUpdate;
@@ -935,6 +936,51 @@ public class AuthzedPermissionsV1ServiceTests
             Collected.Add(message);
             return Task.CompletedTask;
         }
+    }
+
+    // A cross-silo dispatch failure (which OrleansDispatcher re-raises as a [GenerateSerializer]
+    // DispatchFailedException carrying its mapped code) must surface at the v1 front door as the
+    // corresponding stable gRPC status, NOT as an opaque error. A genuine Orleans transport failure
+    // cannot be injected into the in-process TestCluster, so we drive the SAME exception the dispatcher
+    // would raise through the service via a fake checker, asserting the front-door mapping; the
+    // dispatcher's classification of raw Orleans exceptions is covered by DispatchErrorMapperTests.
+    [Theory]
+    [InlineData(DispatchErrorCode.Unavailable, StatusCode.Unavailable)]
+    [InlineData(DispatchErrorCode.Cancelled, StatusCode.Cancelled)]
+    [InlineData(DispatchErrorCode.DeadlineExceeded, StatusCode.DeadlineExceeded)]
+    [InlineData(DispatchErrorCode.Internal, StatusCode.Internal)]
+    public async Task CheckPermission_maps_a_cross_silo_dispatch_failure_to_its_grpc_code(
+        DispatchErrorCode code, StatusCode expected)
+    {
+        await using var cluster = await MeshTestCluster.CreateAsync(Schema);
+        var service = new AuthzedPermissionsV1Service(
+            new ThrowingChecker(new DispatchFailedException(code, "boom")),
+            cluster.GrainFactory,
+            cluster.Services.GetRequiredService<ISchemaProvider>());
+
+        var ex = await Assert.ThrowsAsync<RpcException>(() => service.CheckPermission(
+            new V1::CheckPermissionRequest
+            {
+                Resource = new V1::ObjectReference { ObjectType = "document", ObjectId = "readme" },
+                Permission = "view",
+                Subject = UserSubject("alice"),
+            },
+            FakeServerCallContext.Default));
+
+        Assert.Equal(expected, ex.StatusCode);
+    }
+
+    /// <summary>An <see cref="IPermissionChecker"/> that always throws the supplied exception.</summary>
+    private sealed class ThrowingChecker(Exception ex) : IPermissionChecker
+    {
+        public Task<PermissionCheckResult> Check(
+            string resourceType, string resourceId, string permission, ObjectAndRelation subject,
+            IReadOnlyDictionary<string, object?>? caveatContext, ConsistencyRequirement? consistency = null,
+            CancellationToken ct = default) => throw ex;
+
+        public Task<BatchCheckResult> BatchCheck(
+            IReadOnlyList<BatchCheckItem> items, ConsistencyRequirement? consistency = null,
+            CancellationToken ct = default) => throw ex;
     }
 
     /// <summary>A client-stream reader that replays a fixed sequence of inbound messages.</summary>
