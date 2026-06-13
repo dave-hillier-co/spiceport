@@ -138,19 +138,10 @@ public class SteelThreadTests
         }
     }
 
-    // Excluded-subject bracket syntax is not exposed by Spiceport's FoundSubject (known gap):
-    // the wildcard-exclusion string '* - [user-0, ...]' cannot be reconstructed.
-    private static readonly HashSet<string> KnownGaps = new(StringComparer.Ordinal)
-    {
-        "ls publicdoc",
-    };
-
-    [SkippableTheory]
+    [Theory]
     [MemberData(nameof(AllOperations))]
     public async Task SteelThread(string datafile, Case @case, Op op)
     {
-        Skip.If(KnownGaps.Contains(op.Name), $"{op.Name}: excluded-subject formatting not exposed by FoundSubject");
-
         var fixture = await Fixture.Load(datafile);
 
         switch (op)
@@ -379,7 +370,16 @@ public class SteelThreadTests
         var sb = new StringBuilder();
         sb.Append(s.IsWildcard ? CoreConstants.PublicWildcard : s.SubjectId);
 
-        // NOTE: excluded-subject brackets are not representable from FoundSubject (known gap).
+        // Port of SpiceDB formatResolvedSubject: a wildcard renders its excluded subjects as a sorted
+        // bracket list, each marked "(conditional)" when conditionally excluded.
+        if (s.ExcludedSubjects is { Count: > 0 } excluded)
+        {
+            var parts = excluded
+                .Select(e => e.Caveat is not null ? $"{e.SubjectId} (conditional)" : e.SubjectId)
+                .OrderBy(x => x, StringComparer.Ordinal);
+            sb.Append(" - [").Append(string.Join(", ", parts)).Append(']');
+        }
+
         if (s.Caveat is not null)
         {
             sb.Append(" (conditional)");

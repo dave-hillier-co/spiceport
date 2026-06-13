@@ -14,7 +14,14 @@ namespace Spiceport.Engine;
 /// <param name="SubjectId">The concrete subject id, or <c>"*"</c> for a wildcard match.</param>
 /// <param name="Caveat">The accumulated caveat, or null if unconditional.</param>
 /// <param name="IsWildcard">True when <see cref="SubjectId"/> is the public wildcard <c>"*"</c>.</param>
+/// <param name="ExcludedSubjects">
+/// For a wildcard match, the concrete subjects excluded from it (SpiceDB's
+/// <c>excluded_subjects</c>): the wildcard means "every subject of the type <em>except</em> these".
+/// Each excluded entry carries its own optional <see cref="Caveat"/> (a conditionally-excluded
+/// subject). Null/empty for concrete subjects and for wildcards with no exclusions.
+/// </param>
 public sealed record FoundSubject(
     string SubjectId,
     CaveatExpression? Caveat = null,
-    bool IsWildcard = false);
+    bool IsWildcard = false,
+    IReadOnlyList<FoundSubject>? ExcludedSubjects = null);

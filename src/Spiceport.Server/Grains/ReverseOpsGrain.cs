@@ -82,6 +82,10 @@ public sealed class ReverseOpsGrain(
                 break;
             }
 
+            // NOTE: FoundSubject.ExcludedSubjects (wildcard exclusions) are not yet carried over the
+            // wire — FoundSubjectWire has no excluded-subjects field, so the cross-silo LookupSubjects
+            // path drops them. The in-process engine preserves them. Threading them through the wire +
+            // both gRPC services (proto excluded_subjects) is a separate, larger change.
             page.Add(new FoundSubjectWire(found.SubjectId, found.IsWildcard, permissionship));
             lastId = found.SubjectId;
         }
