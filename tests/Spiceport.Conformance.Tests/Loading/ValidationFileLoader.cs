@@ -39,6 +39,54 @@ public static class ValidationFileLoader
         return new ValidationFile(schemaText, relationships, assertions);
     }
 
+    /// <summary>
+    /// Loads a validation file, resolving a <c>schemaFile</c> reference relative to the file's own
+    /// directory. Mirrors SpiceDB's validationfile loader: schema/schemaFile are mutually exclusive,
+    /// a schemaFile must be local (no "../" escape), and the legacy <c>validation_tuples</c> key is rejected.
+    /// </summary>
+    public static ValidationFile LoadResolved(string path)
+    {
+        var yaml = File.ReadAllText(path);
+
+        // Legacy key: SpiceDB rejects files declaring relationships via `validation_tuples`.
+        if (yaml.Contains("validation_tuples", StringComparison.Ordinal))
+        {
+            throw new ValidationFileLoadException("relationships must be specified in `relationships`");
+        }
+
+        var raw = Deserializer.Deserialize<RawValidationFile>(yaml)
+                  ?? throw new FormatException("Validation file is empty.");
+
+        var hasSchema = !string.IsNullOrWhiteSpace(raw.Schema);
+        var hasSchemaFile = !string.IsNullOrWhiteSpace(raw.SchemaFile);
+        if (hasSchema && hasSchemaFile)
+        {
+            throw new ValidationFileLoadException("only one of schema or schemaFile can be specified");
+        }
+
+        string schemaText;
+        if (hasSchemaFile)
+        {
+            var baseDir = Path.GetDirectoryName(Path.GetFullPath(path))!;
+            var relative = raw.SchemaFile!.Trim();
+            var full = Path.GetFullPath(Path.Combine(baseDir, relative));
+            if (!full.StartsWith(baseDir + Path.DirectorySeparatorChar, StringComparison.Ordinal))
+            {
+                throw new ValidationFileLoadException($"schema file \"{relative}\" is not local");
+            }
+
+            schemaText = File.ReadAllText(full).TrimEnd(); // FileNotFoundException -> missing-schemafile case
+        }
+        else
+        {
+            schemaText = (raw.Schema ?? string.Empty).TrimEnd();
+        }
+
+        var relationships = ParseRelationships(raw.Relationships ?? string.Empty);
+        var assertions = ParseAssertions(raw.Assertions);
+        return new ValidationFile(schemaText, relationships, assertions);
+    }
+
     private static ImmutableList<Relationship> ParseRelationships(string block)
     {
         var builder = ImmutableList.CreateBuilder<Relationship>();
@@ -162,3 +210,9 @@ public static class ValidationFileLoader
         public List<string>? AssertCaveated { get; set; }
     }
 }
+
+/// <summary>
+/// Raised for loader-level (not schema-compile) validation failures: mutually-exclusive
+/// schema/schemaFile, a non-local schemaFile, or the legacy <c>validation_tuples</c> key.
+/// </summary>
+public sealed class ValidationFileLoadException(string message) : Exception(message);
