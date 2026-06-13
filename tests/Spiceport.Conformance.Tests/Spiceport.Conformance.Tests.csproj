@@ -18,6 +18,9 @@
 
   <ItemGroup>
     <None Include="TestData\**\*.yaml" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="TestData\**\*.zed" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="SteelThread\TestData\**\*" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="SteelThread\Results\**\*" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
   <ItemGroup>

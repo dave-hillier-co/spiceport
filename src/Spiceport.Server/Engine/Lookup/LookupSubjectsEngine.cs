@@ -402,7 +402,15 @@ public sealed class LookupSubjectsEngine
             foreach (var c in _concrete.Values)
                 yield return new FoundSubject(c.Id, c.Caveat, IsWildcard: false);
             if (_wildcard is { } w)
-                yield return new FoundSubject(CoreConstants.PublicWildcard, w.Caveat, IsWildcard: true);
+            {
+                var excluded = w.Excluded.Count == 0
+                    ? null
+                    : w.Excluded
+                        .Select(e => new FoundSubject(e.Id, e.Caveat, IsWildcard: false))
+                        .ToList();
+                yield return new FoundSubject(
+                    CoreConstants.PublicWildcard, w.Caveat, IsWildcard: true, ExcludedSubjects: excluded);
+            }
         }
 
         public static SubjectSet Union(IReadOnlyList<SubjectSet> sets)
