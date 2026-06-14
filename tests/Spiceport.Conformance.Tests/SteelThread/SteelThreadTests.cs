@@ -43,6 +43,7 @@ public class SteelThreadTests
     private const string LsIntersectArrow = "lookup-subjects-intersection-arrow-uncursored-lookup-subjects-for-somedoc-results.yaml";
     private const string LrFred = "basic-lookup-resources-uncursored-lookup-resources-for-fred-results.yaml";
     private const string LrIntersect = "lookup-resources-with-intersection-uncursored-indirect-lookup-resources-for-user-fred-results.yaml";
+    private const string LrNested = "nested-groups-and-folders-lookup-resources-for-alice-results.yaml";
 
     private static IReadOnlyList<Case> Cases() =>
     [
@@ -72,6 +73,20 @@ public class SteelThreadTests
         [
             new LookupResourcesOp("lr-i view", "document", "view", "user", "fred", LrIntersect),
             new CursoredLookupResourcesOp("clr-i view", "document", "view", "user", "fred", 18, LrIntersect),
+        ]),
+        // Multi-level reverse-reachability (nested groups + folder parents + a diamond): the cursored
+        // resume must keep paged-union == unpaged across nesting levels. Page sizes 1/2/3/5/7 do not
+        // divide the 7-document result, so they also exercise the full-page invariant at boundaries.
+        // This is the §5.4 cross-check for the multi-level-cursor rework (issue #3, finding 2/3).
+        new("lookup resources nested groups and folders", "document-with-nested-groups-and-folders.yaml",
+        [
+            new LookupResourcesOp("lr-nested view", "document", "view", "user", "alice", LrNested),
+            new CursoredLookupResourcesOp("clr-nested view p1", "document", "view", "user", "alice", 1, LrNested),
+            new CursoredLookupResourcesOp("clr-nested view p2", "document", "view", "user", "alice", 2, LrNested),
+            new CursoredLookupResourcesOp("clr-nested view p3", "document", "view", "user", "alice", 3, LrNested),
+            new CursoredLookupResourcesOp("clr-nested view p5", "document", "view", "user", "alice", 5, LrNested),
+            new CursoredLookupResourcesOp("clr-nested view p7", "document", "view", "user", "alice", 7, LrNested),
+            new CursoredLookupResourcesOp("clr-nested view p100", "document", "view", "user", "alice", 100, LrNested),
         ]),
         new("basic import export", "document-with-a-few-relationships.yaml",
         [
