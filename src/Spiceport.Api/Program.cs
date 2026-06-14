@@ -1,27 +1,30 @@
 using Spiceport.Api;
 using Spiceport.Datastore;
-using Spiceport.Datastore.Memory;
 using Spiceport.Grains;
+using Spiceport.Server.Hosting;
 
 var builder = WebApplication.CreateBuilder(args);
 
 // Co-host the Orleans silo in this process. With an in-process silo, Orleans auto-provides
 // IGrainFactory / IClusterClient to DI, so the gRPC service can resolve grains directly.
-builder.Host.UseOrleans(silo => silo.UseLocalhostClustering());
+builder.Host.UseOrleans(silo =>
+{
+    silo.UseLocalhostClustering();
+    // Storage for the singleton datastore grain (the single source of truth). Durable Postgres when
+    // ConnectionStrings:OrleansStorage is configured; otherwise in-memory (default localhost dev = no Postgres).
+    silo.AddDatastoreGrainStorage(builder.Configuration);
+});
 
 // Schema + check-engine singletons (compiled once from the embedded seed schema).
 builder.Services.AddSpiceportGrainServices(SeedData.SchemaText);
 
-// The datastore is host-owned (must persist writes across calls) and is therefore registered
-// here rather than by the grain DI extension.
-builder.Services.AddSingleton<IDatastore>(new InMemoryDatastore());
+// The datastore delegates to the cluster-singleton datastore grain.
+builder.Services.AddSingleton<IDatastore>(sp =>
+    new GrainBackedDatastore(sp.GetRequiredService<IGrainFactory>()));
 
 builder.Services.AddGrpc();
 
 var app = builder.Build();
-
-// Seed relationships once at startup so CheckPermission returns a real answer.
-await SeedData.SeedAsync(app.Services.GetRequiredService<IDatastore>());
 
 app.MapGrpcService<PermissionsGrpcService>();
 app.MapGrpcService<WatchGrpcService>();
@@ -36,4 +39,11 @@ app.MapGrpcService<AuthzedExperimentalV1Service>();
 
 app.MapGet("/", () => "Spiceport API up.");
 
-app.Run();
+// The datastore now lives behind the Orleans grain, so the cluster must be running before seeding.
+// Start the host, seed once the singleton grain is reachable, then block until shutdown.
+await app.StartAsync();
+
+// Seed relationships once at startup so CheckPermission returns a real answer.
+await SeedData.SeedAsync(app.Services.GetRequiredService<IDatastore>());
+
+await app.WaitForShutdownAsync();

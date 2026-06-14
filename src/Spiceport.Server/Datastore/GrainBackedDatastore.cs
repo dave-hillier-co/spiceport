@@ -1,0 +1,336 @@
+using System.Runtime.CompilerServices;
+using Spiceport.Core;
+using Spiceport.Datastore;
+using Spiceport.Datastore.Memory;
+using Spiceport.Grains.Abstractions;
+
+namespace Spiceport.Grains;
+
+/// <summary>
+/// An <see cref="IDatastore"/> that delegates all state to the cluster-singleton
+/// <see cref="IDatastoreGrain"/> (the single source of truth) and reuses the in-memory MVCC mechanics
+/// (<see cref="InMemoryReadWriteTransaction"/>, <see cref="InMemoryDatastoreReader"/>, the
+/// <c>DatastoreState</c> fold) by converting the grain wire state to/from the in-memory state. It holds
+/// NO persistent local state cache: every read reads the current grain state (correct multi-silo reads
+/// with zero replica lag). Writes use an optimistic compare-and-swap retry loop. This is a DI service,
+/// not a grain, so <c>ConfigureAwait(false)</c> is correct here.
+/// </summary>
+public sealed class GrainBackedDatastore : IDatastore
+{
+    /// <summary>Bound on CAS retries before surfacing a serialization conflict.</summary>
+    private const int MaxCasAttempts = 50;
+
+    /// <summary>
+    /// A stable, cluster-wide datastore id. It must be identical on every silo so a token minted on one
+    /// silo decodes Valid on another (a per-instance Guid would make every cross-silo token mismatch).
+    /// There is exactly one logical datastore (the singleton grain), so a fixed id is correct.
+    /// </summary>
+    private const string UniqueId = "grain-backed-datastore";
+
+    private readonly IGrainFactory _grainFactory;
+    private readonly long _quantizationNanos;
+    private readonly long _gcWindowNanos;
+
+    // Cached optimized-revision candidate (mirrors InMemoryDatastore's CachedOptimizedRevisions): a real
+    // head sampled when a window opens, held stable until the bucket boundary so near-in-time
+    // minimize-latency checks WITHIN THIS SILO share one revision (and therefore one dispatch cache key).
+    // NOTE: this cache is per-silo (one GrainBackedDatastore per DI container), so two silos can sample the
+    // grain head at slightly different times in the same window and key under different revisions — bounded
+    // min-latency staleness, never a stale-under-fresh-token serve (each value is a real committed head).
+    // Cross-mesh parity would need a quantized GetHead on the grain; left as a later optimization.
+    // Guarded by _optLock.
+    private readonly object _optLock = new();
+    private RevisionWithSchemaHash? _optimizedCache;
+    private long _optimizedValidThroughNanos;
+
+    /// <summary>Creates a grain-backed datastore.</summary>
+    /// <param name="grainFactory">The Orleans grain factory used to reach the singleton datastore grain.</param>
+    /// <param name="quantization">Quantization window for <see cref="OptimizedRevision"/> (default 5s).</param>
+    /// <param name="gcWindow">How long old revisions remain valid (default 24h).</param>
+    public GrainBackedDatastore(IGrainFactory grainFactory, TimeSpan? quantization = null, TimeSpan? gcWindow = null)
+    {
+        _grainFactory = grainFactory;
+        _quantizationNanos = (long)((quantization ?? TimeSpan.FromSeconds(5)).TotalMilliseconds) * 1_000_000L;
+        _gcWindowNanos = (long)((gcWindow ?? TimeSpan.FromHours(24)).TotalMilliseconds) * 1_000_000L;
+    }
+
+    private IDatastoreGrain Grain => _grainFactory.GetGrain<IDatastoreGrain>(IDatastoreGrain.Key);
+
+    public IDatastoreReader SnapshotReader(IRevision revision) => new LazyGrainReader(this, ToNanos(revision));
+
+    public async Task<RevisionWithSchemaHash> HeadRevision(CancellationToken cancellationToken = default)
+    {
+        var head = await Grain.GetHead().ConfigureAwait(false);
+        return new RevisionWithSchemaHash(new TimestampRevision(head.Head), head.SchemaHash);
+    }
+
+    public async Task<RevisionWithSchemaHash> OptimizedRevision(CancellationToken cancellationToken = default)
+    {
+        var now = NowNanos();
+        lock (_optLock)
+        {
+            if (_quantizationNanos > 0 && _optimizedCache is { } cached && now < _optimizedValidThroughNanos)
+                return cached;
+        }
+
+        // Cache miss: sample the real head from the grain (await OUTSIDE the lock).
+        var head = await Grain.GetHead().ConfigureAwait(false);
+        var sampled = new RevisionWithSchemaHash(new TimestampRevision(head.Head), head.SchemaHash);
+        // Recompute now AFTER the grain hop so the window boundary is not skewed past its bucket by hop
+        // latency (InMemoryDatastore samples under its lock with no intervening await).
+        var nowAfter = NowNanos();
+
+        lock (_optLock)
+        {
+            // Re-check: another caller may have populated an in-window candidate while we fetched. Keep it
+            // so all callers in one window (within this silo) share a single value.
+            if (_quantizationNanos > 0 && _optimizedCache is { } c && nowAfter < _optimizedValidThroughNanos)
+                return c;
+            if (_quantizationNanos > 0)
+            {
+                _optimizedCache = sampled;
+                _optimizedValidThroughNanos = nowAfter - (nowAfter % _quantizationNanos) + _quantizationNanos;
+            }
+            return sampled;
+        }
+    }
+
+    public async Task<IRevision> ReadWriteTx(
+        Func<IReadWriteTransaction, Task> transaction,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(transaction);
+
+        for (var attempt = 0; ; attempt++)
+        {
+            // 1. Read the current grain state (the CAS base).
+            var grainState = await Grain.ReadState().ConfigureAwait(false);
+            var baseState = DatastoreStateConverters.ToMemory(grainState);
+            var expectedHead = baseState.HeadRevision;
+
+            // 2. Mint the new revision monotonically over the observed head (mirrors InMemoryDatastore).
+            var now = NowNanos();
+            var newRevision = now > expectedHead ? now : expectedHead + 1;
+
+            // 3. Run the caller lambda over an in-memory tx pinned to this base. Preconditions and
+            //    SchemaChangeValidator read the tx reader (the staged-view over the snapshot). Any
+            //    exception thrown by the lambda (create-conflict, precondition, schema-validation, counter
+            //    conflict) propagates AS-IS and aborts the whole call — it is NOT a CAS retry.
+            var tx = new InMemoryReadWriteTransaction(baseState, newRevision);
+            await transaction(tx).ConfigureAwait(false);
+
+            // 4. Compute the new committed state locally (reuse Commit()).
+            var newState = DatastoreStateConverters.ToGrain(tx.Commit());
+
+            // 5. CAS into the grain: applies only if the grain head still equals expectedHead.
+            var ok = await Grain.CompareAndSwap(expectedHead, newState).ConfigureAwait(false);
+            if (ok)
+                return new TimestampRevision(newRevision);
+
+            // 6. CAS failed: the head moved under us. Reload and re-run the WHOLE lambda (so preconditions
+            //    and validation re-evaluate against the new base — race-free). Bounded retries; on
+            //    exhaustion surface the same exception type InMemoryDatastore throws on a concurrent write.
+            if (attempt + 1 >= MaxCasAttempts)
+                throw new SerializationException();
+        }
+    }
+
+    public async Task<bool> CheckRevision(IRevision revision, CancellationToken cancellationToken = default)
+    {
+        var head = await Grain.GetHead().ConfigureAwait(false);
+        var rev = ToNanos(revision);
+        return rev <= head.Head && rev >= head.Head - _gcWindowNanos;
+    }
+
+    public async IAsyncEnumerable<RevisionChange> Watch(
+        IRevision afterRevision,
+        WatchOptions options,
+        [EnumeratorCancellation] CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(afterRevision);
+        ArgumentNullException.ThrowIfNull(options);
+
+        var cursor = ToNanos(afterRevision);
+
+        // Validate the cursor is within the GC window (mirror InMemoryDatastore: RevisionNotFoundException).
+        var head0 = await Grain.GetHead().ConfigureAwait(false);
+        if (!(cursor <= head0.Head && cursor >= head0.Head - _gcWindowNanos))
+            throw new RevisionNotFoundException(afterRevision);
+
+        var pollDelay = TimeSpan.FromMilliseconds(50);
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            var state = DatastoreStateConverters.ToMemory(await Grain.ReadState().ConfigureAwait(false));
+            var revs = CollectChangedRevisions(state, cursor);
+
+            foreach (var rev in revs)
+            {
+                var change = BuildChange(state, rev, options);
+                if (change is not null)
+                    yield return change;
+                cursor = rev;
+            }
+
+            if (revs.Count > 0 && (options.Content & WatchContent.Checkpoints) != 0)
+            {
+                yield return new RevisionChange(
+                    new TimestampRevision(cursor), Array.Empty<RelationshipUpdate>(),
+                    SchemaChanged: false, IsCheckpoint: true);
+            }
+
+            if (revs.Count == 0)
+            {
+                try
+                {
+                    await Task.Delay(pollDelay, cancellationToken).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                    yield break;
+                }
+            }
+        }
+    }
+
+    public Task<string> GetUniqueId(CancellationToken cancellationToken = default) => Task.FromResult(UniqueId);
+
+    public Task<IRevisionParser> GetRevisionParser(CancellationToken cancellationToken = default) =>
+        Task.FromResult<IRevisionParser>(new InMemoryRevisionParser(UniqueId));
+
+    public Task Close() => Task.CompletedTask;
+
+    // --- internals ---
+
+    /// <summary>
+    /// The revisions strictly after <paramref name="cursor"/> (up to head) that carry any change: from the
+    /// relationship created/deleted stamps, schema versions, and counter versions. Ascending, distinct.
+    /// Replaces InMemoryDatastore's separate changefeed list (the grain keeps no such list).
+    /// </summary>
+    private static List<long> CollectChangedRevisions(DatastoreState state, long cursor)
+    {
+        var head = state.HeadRevision;
+        var set = new SortedSet<long>();
+        foreach (var row in state.Relationships)
+        {
+            if (row.CreatedRevision > cursor && row.CreatedRevision <= head)
+                set.Add(row.CreatedRevision);
+            if (row.DeletedRevision is { } d && d > cursor && d <= head)
+                set.Add(d);
+        }
+        foreach (var schema in state.Schemas)
+        {
+            if (schema.Revision > cursor && schema.Revision <= head)
+                set.Add(schema.Revision);
+        }
+        foreach (var counter in state.Counters)
+        {
+            if (counter.Revision > cursor && counter.Revision <= head)
+                set.Add(counter.Revision);
+        }
+        return set.ToList();
+    }
+
+    private static RevisionChange? BuildChange(DatastoreState state, long revision, WatchOptions options)
+    {
+        var rev = new TimestampRevision(revision);
+        var includeRels = (options.Content & WatchContent.Relationships) != 0;
+        var includeSchema = (options.Content & WatchContent.Schema) != 0;
+
+        var relChanges = includeRels ? state.ChangesAt(revision) : Array.Empty<RelationshipUpdate>();
+        var schemaChanged = includeSchema && state.SchemaChangedAt(revision);
+
+        if (relChanges.Count == 0 && !schemaChanged)
+            return null;
+
+        return new RevisionChange(rev, relChanges, schemaChanged);
+    }
+
+    private static long ToNanos(IRevision revision) => revision switch
+    {
+        TimestampRevision t => t.TimestampNanosSinceEpoch,
+        _ => throw new InvalidRevisionException($"unsupported revision type: {revision.GetType().Name}"),
+    };
+
+    private static long NowNanos() => (DateTimeOffset.UtcNow - DateTimeOffset.UnixEpoch).Ticks * 100L;
+
+    /// <summary>
+    /// An <see cref="IDatastoreReader"/> that fetches the grain state ONCE, lazily on the first query, then
+    /// serves all subsequent reads in-process via an <see cref="InMemoryDatastoreReader"/>. Because
+    /// <see cref="IDatastore.SnapshotReader"/> is synchronous but the grain fetch is async, the fetch is
+    /// deferred to the first (async) read. The local dispatcher pins one reader per Check and queries it
+    /// many times, so this is exactly one grain hop per Check.
+    /// </summary>
+    private sealed class LazyGrainReader(GrainBackedDatastore owner, long revision) : IDatastoreReader
+    {
+        private readonly SemaphoreSlim _gate = new(1, 1);
+        private InMemoryDatastoreReader? _inner;
+
+        private async ValueTask<InMemoryDatastoreReader> Inner(CancellationToken ct)
+        {
+            if (_inner is { } r)
+                return r;
+            await _gate.WaitAsync(ct).ConfigureAwait(false);
+            try
+            {
+                if (_inner is { } r2)
+                    return r2;
+                var state = DatastoreStateConverters.ToMemory(await owner.Grain.ReadState().ConfigureAwait(false));
+                // The grain never GCs rows, so the MVCC fold via IsVisibleAt is exact at any revision; a
+                // permissive validator is sound (validity is enforced upstream by CheckRevision).
+                _inner = new InMemoryDatastoreReader(state, revision, _ => true);
+                return _inner;
+            }
+            finally
+            {
+                _gate.Release();
+            }
+        }
+
+        public async IAsyncEnumerable<Relationship> QueryRelationships(
+            RelationshipsFilter filter,
+            [EnumeratorCancellation] CancellationToken cancellationToken = default)
+        {
+            var inner = await Inner(cancellationToken).ConfigureAwait(false);
+            await foreach (var rel in inner.QueryRelationships(filter, cancellationToken).ConfigureAwait(false))
+                yield return rel;
+        }
+
+        public async IAsyncEnumerable<Relationship> ReverseQueryRelationships(
+            SubjectsFilter subjectsFilter,
+            ReverseQueryOptions? options = null,
+            [EnumeratorCancellation] CancellationToken cancellationToken = default)
+        {
+            var inner = await Inner(cancellationToken).ConfigureAwait(false);
+            await foreach (var rel in inner.ReverseQueryRelationships(subjectsFilter, options, cancellationToken).ConfigureAwait(false))
+                yield return rel;
+        }
+
+        public async Task<byte[]?> ReadStoredSchema(CancellationToken cancellationToken = default)
+        {
+            var inner = await Inner(cancellationToken).ConfigureAwait(false);
+            return await inner.ReadStoredSchema(cancellationToken).ConfigureAwait(false);
+        }
+
+        public async Task<RelationshipsFilter?> ReadCounterFilter(string name, CancellationToken cancellationToken = default)
+        {
+            var inner = await Inner(cancellationToken).ConfigureAwait(false);
+            return await inner.ReadCounterFilter(name, cancellationToken).ConfigureAwait(false);
+        }
+
+        public async Task<ulong> CountRelationships(string name, CancellationToken cancellationToken = default)
+        {
+            var inner = await Inner(cancellationToken).ConfigureAwait(false);
+            return await inner.CountRelationships(name, cancellationToken).ConfigureAwait(false);
+        }
+
+        public async IAsyncEnumerable<RegisteredCounter> LookupCounters(
+            [EnumeratorCancellation] CancellationToken cancellationToken = default)
+        {
+            var inner = await Inner(cancellationToken).ConfigureAwait(false);
+            await foreach (var counter in inner.LookupCounters(cancellationToken).ConfigureAwait(false))
+                yield return counter;
+        }
+
+        public bool IsValid => _inner is null || _inner.IsValid;
+    }
+}

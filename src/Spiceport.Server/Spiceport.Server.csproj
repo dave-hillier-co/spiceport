@@ -8,13 +8,17 @@
 
   <ItemGroup>
     <PackageReference Include="Cel" Version="0.3.2" />
+    <PackageReference Include="Microsoft.Orleans.Persistence.AdoNet" Version="10.1.0" />
+    <PackageReference Include="Microsoft.Orleans.Persistence.Memory" Version="10.1.0" />
     <PackageReference Include="Microsoft.Orleans.Sdk" Version="10.1.0" />
     <PackageReference Include="Microsoft.Orleans.Server" Version="10.1.0" />
+    <PackageReference Include="Npgsql" Version="10.0.3" />
   </ItemGroup>
 
   <ItemGroup>
     <ProjectReference Include="..\Spiceport.Core\Spiceport.Core.csproj" />
     <ProjectReference Include="..\Spiceport.Datastore\Spiceport.Datastore.csproj" />
+    <ProjectReference Include="..\Spiceport.Datastore.Memory\Spiceport.Datastore.Memory.csproj" />
   </ItemGroup>
 
 </Project>

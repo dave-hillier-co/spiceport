@@ -438,21 +438,9 @@ public sealed class RelationshipsGrain(
         return new RelationshipUpdate(ToRelationship(wire.Relationship), op);
     }
 
-    private static Relationship ToRelationship(RelationshipWire wire)
-    {
-        var resource = new ObjectAndRelation(wire.ResourceType, wire.ResourceId, wire.ResourceRelation);
-        var subjectRelation = string.IsNullOrEmpty(wire.SubjectRelation) ? CoreConstants.Ellipsis : wire.SubjectRelation;
-        var subject = new ObjectAndRelation(wire.SubjectType, wire.SubjectId, subjectRelation);
-        var caveat = wire.CaveatName is { Length: > 0 }
-            ? new ContextualizedCaveat(wire.CaveatName, wire.CaveatContext)
-            : null;
-        return Relationship.Create(resource, subject, caveat, wire.Expiration);
-    }
+    private static Relationship ToRelationship(RelationshipWire wire) => WireConvert.ToRelationship(wire);
 
-    private static RelationshipWire ToWire(Relationship rel) => new(
-        rel.Resource.ObjectType, rel.Resource.ObjectId, rel.Resource.Relation,
-        rel.Subject.ObjectType, rel.Subject.ObjectId, rel.Subject.Relation,
-        rel.OptionalCaveat?.CaveatName, rel.OptionalCaveat?.Context, rel.OptionalExpiration);
+    private static RelationshipWire ToWire(Relationship rel) => WireConvert.ToWire(rel);
 
     private static RelationshipsFilter ToFilter(RelationshipsFilterWire wire)
     {
