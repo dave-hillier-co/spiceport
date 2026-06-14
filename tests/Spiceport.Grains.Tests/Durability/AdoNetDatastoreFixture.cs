@@ -30,17 +30,21 @@ public sealed class AdoNetDatastoreFixture : IAsyncLifetime
         try
         {
             await _container.StartAsync();
-            ConnectionString = _container.GetConnectionString();
-            await ApplyOrleansSchema(ConnectionString);
-            Available = true;
         }
         catch (Exception ex)
         {
-            // Docker not available (or container failed): mark unavailable so the test SKIPS rather than
-            // fails the fast suite. The rest of the Postgres-backed suite has the same Docker requirement.
+            // ONLY container start is skip-worthy: Docker absent / image pull failure means the test cannot
+            // run, so it SKIPS rather than failing the fast suite (the Postgres-backed suite has the same
+            // Docker requirement). Anything AFTER the container is up (schema apply) is a real defect and
+            // must FAIL the test, so it is deliberately outside this catch.
             Available = false;
             SkipReason = $"Docker/Testcontainers unavailable: {ex.GetType().Name}: {ex.Message}";
+            return;
         }
+
+        ConnectionString = _container.GetConnectionString();
+        await ApplyOrleansSchema(ConnectionString);
+        Available = true;
     }
 
     public async Task DisposeAsync() => await _container.DisposeAsync();

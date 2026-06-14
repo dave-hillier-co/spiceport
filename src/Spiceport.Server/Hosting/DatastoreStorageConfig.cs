@@ -1,7 +1,5 @@
-using System.Data.Common;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
-using Npgsql;
 using Orleans.Hosting;
 using Orleans.Serialization;
 using Orleans.Storage;
@@ -34,19 +32,6 @@ public static class DatastoreStorageConfig
     public const string FallbackConnectionStringKey = "Storage:ConnectionString";
 
     /// <summary>
-    /// Ensures the Npgsql <see cref="DbProviderFactory"/> is registered for the AdoNet invariant. AdoNet
-    /// grain storage resolves its driver via <see cref="DbProviderFactories"/> by invariant string, and
-    /// .NET does not auto-discover ADO factories. Idempotent and process-global (guarded by
-    /// <see cref="DbProviderFactories.TryGetFactory(string, out DbProviderFactory)"/>) so it is safe when
-    /// Silo+Api configurators run in one process and when a test harness rebuilds clusters.
-    /// </summary>
-    public static void EnsureNpgsqlFactoryRegistered()
-    {
-        if (!DbProviderFactories.TryGetFactory(NpgsqlInvariant, out _))
-            DbProviderFactories.RegisterFactory(NpgsqlInvariant, NpgsqlFactory.Instance);
-    }
-
-    /// <summary>
     /// Registers the "datastore" provider: durable AdoNet Postgres when a connection string is configured,
     /// otherwise non-durable in-memory. The AdoNet path FORCES the BINARY
     /// <see cref="OrleansGrainStorageSerializer"/>, because boxed <see cref="System.Text.Json.JsonElement"/>
@@ -65,7 +50,9 @@ public static class DatastoreStorageConfig
         if (string.IsNullOrWhiteSpace(connectionString))
             return silo.AddMemoryGrainStorage(ProviderName);
 
-        EnsureNpgsqlFactoryRegistered();
+        // Orleans AdoNet resolves the Npgsql driver by loading the assembly and reflecting on a built-in
+        // invariant->factory map; it does NOT consult System.Data.Common.DbProviderFactories, so no factory
+        // registration is needed here — only the Npgsql package reference (so the assembly is loadable).
         // Bind the connection/invariant first, then resolve the BINARY serializer from DI (it needs the
         // silo's Serializer, available only via the OptionsBuilder/DI overload) and assign it explicitly.
         return silo.AddAdoNetGrainStorage(ProviderName, optionsBuilder =>
