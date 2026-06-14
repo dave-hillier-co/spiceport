@@ -2,22 +2,22 @@ using Microsoft.Extensions.DependencyInjection;
 using Orleans.Hosting;
 using Orleans.TestingHost;
 using Spiceport.Datastore;
-using Spiceport.Datastore.Memory;
 using Spiceport.Grains;
 
 namespace Spiceport.Grains.Tests;
 
 /// <summary>
 /// Stands up an Orleans <see cref="TestCluster"/> configured EXACTLY like the production silo
-/// (<c>src/Spiceport.Silo/Program.cs</c>): a single in-memory <see cref="IDatastore"/> singleton,
-/// the grain DI mesh (<see cref="ServiceCollectionExtensions.AddSpiceportGrainServices(IServiceCollection, string, int)"/>
+/// (<c>src/Spiceport.Silo/Program.cs</c>): a <see cref="GrainBackedDatastore"/> delegating to the
+/// cluster-singleton datastore grain, the grain DI mesh (<see cref="ServiceCollectionExtensions.AddSpiceportGrainServices(IServiceCollection, string, int)"/>
 /// — schema, schema hash, quantizer, dispatch cache, the Caching-over-Orleans root dispatcher and the
 /// top-level <see cref="IPermissionChecker"/>), so checks run THROUGH the real grain mesh.
 /// </summary>
 /// <remarks>
 /// One cluster is built per conformance schema because each file declares its own schema, and the silo
-/// compiles the schema once at startup. The datastore is a process-wide singleton seeded through the
-/// silo's own <see cref="IDatastore"/> so grains read the same data the checker pins a revision against.
+/// compiles the schema once at startup. The datastore is the cluster-singleton datastore grain; every
+/// silo's <see cref="IDatastore"/> delegates to it, so all silos read the same data the checker pins a
+/// revision against (with zero replica lag, since there is no per-silo state cache).
 /// </remarks>
 public sealed class MeshTestCluster : IAsyncDisposable
 {
@@ -36,7 +36,7 @@ public sealed class MeshTestCluster : IAsyncDisposable
     public IReadOnlyList<IServiceProvider> AllSiloServices =>
         _cluster.Silos.Cast<InProcessSiloHandle>().Select(h => h.SiloHost.Services).ToArray();
 
-    /// <summary>The in-memory datastore singleton shared by every grain in the silo.</summary>
+    /// <summary>The grain-backed datastore (delegating to the cluster-singleton datastore grain).</summary>
     public IDatastore Datastore => Services.GetRequiredService<IDatastore>();
 
     /// <summary>The top-level permission checker (root dispatcher over the grain mesh).</summary>
@@ -84,7 +84,6 @@ public sealed class MeshTestCluster : IAsyncDisposable
         SchemaHolder.SchemaText = schemaText;
         SchemaHolder.BatchConcurrency = batchConcurrency;
         SchemaHolder.LocalRecurseEnabled = true;
-        SchemaHolder.SharedDatastore = null;
 
         var builder = new TestClusterBuilder(initialSilosCount: 1);
         builder.AddSiloBuilderConfigurator<SiloConfigurator>();
@@ -96,9 +95,10 @@ public sealed class MeshTestCluster : IAsyncDisposable
     /// <summary>
     /// Builds and starts a MULTI-SILO cluster (<paramref name="siloCount"/> silos) for the given schema,
     /// with <see cref="ConsistentHashPlacement"/> wired so <c>CheckGrain</c> activations are placed by
-    /// the deterministic hash ring over the live membership view. All silos share ONE in-memory
-    /// datastore (a process-static handoff) so a grain on any silo reads the same data the checker pins a
-    /// revision against — mirroring the single shared datastore a real cluster has.
+    /// the deterministic hash ring over the live membership view. All silos delegate to the ONE
+    /// cluster-singleton datastore grain (single activation), so a grain on any silo reads the same data
+    /// the checker pins a revision against — the architectural payoff: correct multi-silo reads with zero
+    /// replica lag, without any process-static shared instance.
     /// </summary>
     /// <param name="schemaText">The schema DSL to compile into every silo.</param>
     /// <param name="siloCount">The number of silos to deploy (must be >= 1).</param>
@@ -115,8 +115,6 @@ public sealed class MeshTestCluster : IAsyncDisposable
         SchemaHolder.SchemaText = schemaText;
         SchemaHolder.BatchConcurrency = batchConcurrency;
         SchemaHolder.LocalRecurseEnabled = localRecurseEnabled;
-        // One datastore instance shared by every silo in this cluster.
-        SchemaHolder.SharedDatastore = new InMemoryDatastore();
 
         var builder = new TestClusterBuilder(initialSilosCount: (short)siloCount);
         builder.AddSiloBuilderConfigurator<MultiSiloConfigurator>();
@@ -139,7 +137,6 @@ public sealed class MeshTestCluster : IAsyncDisposable
     {
         public static string SchemaText = string.Empty;
         public static int BatchConcurrency = PermissionChecker.DefaultBatchConcurrency;
-        public static InMemoryDatastore? SharedDatastore;
         public static bool LocalRecurseEnabled = true;
     }
 
@@ -147,15 +144,18 @@ public sealed class MeshTestCluster : IAsyncDisposable
     {
         public void Configure(ISiloBuilder siloBuilder)
         {
-            // Exactly the silo's DI: grain mesh services + a single host-owned in-memory datastore.
-            // CheckGrain is marked [ConsistentHashPlacement], so its director must be registered on
-            // every cluster (with one silo the ring trivially resolves every key to that silo).
+            // Exactly the silo's DI: grain mesh services + the grain-backed datastore over the
+            // cluster-singleton datastore grain. CheckGrain is marked [ConsistentHashPlacement], so its
+            // director must be registered on every cluster (with one silo the ring trivially resolves
+            // every key to that silo).
             siloBuilder.AddConsistentHashPlacement();
+            siloBuilder.AddMemoryGrainStorage("datastore");
             siloBuilder.ConfigureServices(services =>
             {
                 services.AddSpiceportGrainServices(
                     SchemaHolder.SchemaText, batchConcurrency: SchemaHolder.BatchConcurrency);
-                services.AddSingleton<IDatastore>(new InMemoryDatastore());
+                services.AddSingleton<IDatastore>(sp =>
+                    new GrainBackedDatastore(sp.GetRequiredService<IGrainFactory>()));
                 services.AddSingleton(new OrleansDispatcherOptions
                 {
                     LocalRecurseEnabled = SchemaHolder.LocalRecurseEnabled,
@@ -168,14 +168,18 @@ public sealed class MeshTestCluster : IAsyncDisposable
     {
         public void Configure(ISiloBuilder siloBuilder)
         {
-            // Exactly the production silo's DI plus consistent-hash placement; every silo shares the
-            // ONE datastore captured for this cluster so they all see identical data.
+            // Exactly the production silo's DI plus consistent-hash placement; every silo delegates to
+            // the ONE cluster-singleton datastore grain so they all see identical data. The grain's
+            // persistent state lives on whichever silo holds its single activation; all silos route to it
+            // via the grain directory, so it is shared by construction (no process-static instance).
             siloBuilder.AddConsistentHashPlacement();
+            siloBuilder.AddMemoryGrainStorage("datastore");
             siloBuilder.ConfigureServices(services =>
             {
                 services.AddSpiceportGrainServices(
                     SchemaHolder.SchemaText, batchConcurrency: SchemaHolder.BatchConcurrency);
-                services.AddSingleton<IDatastore>(SchemaHolder.SharedDatastore!);
+                services.AddSingleton<IDatastore>(sp =>
+                    new GrainBackedDatastore(sp.GetRequiredService<IGrainFactory>()));
                 // Hybrid toggle for this cluster (last AddSingleton wins in the silo container), so a
                 // benchmark can deploy OFF (always grain-hop) vs ON (local-recurse shortcut) clusters.
                 services.AddSingleton(new OrleansDispatcherOptions
