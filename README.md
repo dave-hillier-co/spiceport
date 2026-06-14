@@ -96,6 +96,24 @@ zed permission check document:readme view user:alice --endpoint localhost:7022 -
 
 gRPC requires the HTTP/2 (https) endpoint.
 
+### Durable datastore storage
+
+The whole datastore (relationships, schema, counters) is the state of a single cluster-singleton
+Orleans grain. By default that grain uses in-memory grain storage, so the localhost dev host needs
+no external dependency but the state is lost on restart. To make it durable, point the silo at a
+Postgres database via the `ConnectionStrings:OrleansStorage` configuration key (env form
+`ConnectionStrings__OrleansStorage`, fallback key `Storage:ConnectionString`):
+
+```bash
+export ConnectionStrings__OrleansStorage="Host=localhost;Port=5432;Database=spiceport;Username=postgres;Password=postgres"
+```
+
+When that key is set the silo persists the grain via Orleans AdoNet grain storage and the state
+survives silo restart and activation migration. The target database must first have the Orleans
+AdoNet schema applied — run `PostgreSQL-Main.sql` then `PostgreSQL-Persistence.sql` (shipped with the
+`Microsoft.Orleans.Persistence.AdoNet` package / the Orleans repo). The provider is configured to use
+the binary grain-storage serializer so relationship caveat context (JSON values) round-trips intact.
+
 ## Attribution & license
 
 Spiceport is a derivative work of [SpiceDB](https://github.com/authzed/spicedb) by

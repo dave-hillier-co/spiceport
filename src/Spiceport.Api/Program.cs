@@ -1,6 +1,7 @@
 using Spiceport.Api;
 using Spiceport.Datastore;
 using Spiceport.Grains;
+using Spiceport.Server.Hosting;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -9,8 +10,9 @@ var builder = WebApplication.CreateBuilder(args);
 builder.Host.UseOrleans(silo =>
 {
     silo.UseLocalhostClustering();
-    // Persistent storage for the singleton datastore grain (the single source of truth).
-    silo.AddMemoryGrainStorage("datastore");
+    // Storage for the singleton datastore grain (the single source of truth). Durable Postgres when
+    // ConnectionStrings:OrleansStorage is configured; otherwise in-memory (default localhost dev = no Postgres).
+    silo.AddDatastoreGrainStorage(builder.Configuration);
 });
 
 // Schema + check-engine singletons (compiled once from the embedded seed schema).
