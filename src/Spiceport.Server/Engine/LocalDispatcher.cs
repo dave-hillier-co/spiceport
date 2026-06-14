@@ -16,6 +16,19 @@ namespace Spiceport.Engine;
 /// every sub-problem flows through that decorator. Readers are resolved per request via the supplied
 /// <see cref="_readerFor"/> resolver, keyed by the request's revision identity; for in-process use
 /// this typically returns a reader pinned to the revision the public <c>Check</c> was given.
+/// <para>
+/// <b>Caveat-completeness invariant.</b> This dispatcher models one (resource, subject) per dispatch,
+/// so it has no analogue of SpiceDB's batched <c>ResultsSetting</c>. SpiceDB batches many resource ids
+/// with an "allow single result" short-circuit and must force <c>REQUIRE_ALL_RESULTS</c> when any
+/// incoming relationship is caveated, so every caveat reaches the final expression
+/// (<c>internal/graph/check.go:482-512</c>). The equivalent guarantee here rests on a single rule:
+/// every union / arrow accumulation below short-circuits ONLY on a <em>definite, uncaveated</em> member
+/// (<c>IsDetermined</c>, or <c>Member &amp;&amp; Caveat is null</c>) — never on a caveated branch. Since
+/// <c>caveatExpr OR definitely-true</c> collapses to true, that drop cannot change a verdict, while
+/// every undetermined branch is OR-accumulated and survives to <see cref="CheckEngine.Collapse"/>. Do
+/// NOT add an "any member found" early return that fires on a caveated result: it would silently drop
+/// caveats and is the exact regression covered by <c>CaveatCompletenessTests</c> (issue #3, finding 5).
+/// </para>
 /// </remarks>
 public sealed class LocalDispatcher : IDispatcher
 {
@@ -200,6 +213,9 @@ public sealed class LocalDispatcher : IDispatcher
                     var b = await CheckChild(reader, resource, subject, child, meta, ct).ConfigureAwait(false);
                     acc = acc with { CycleCut = acc.CycleCut || b.CycleCut };
                     acc = Or(acc, b);
+                    // Caveat-completeness: only a DEFINITE (uncaveated) member short-circuits the union; a
+                    // caveated accumulator keeps gathering so every branch's caveat survives. See the
+                    // class remarks (issue #3, finding 5) — do not relax this to `acc.Member`.
                     if (acc.Member && acc.Caveat is null)
                         return acc;
                 }
