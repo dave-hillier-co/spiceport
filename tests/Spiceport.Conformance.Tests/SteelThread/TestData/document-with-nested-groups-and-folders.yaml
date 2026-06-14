@@ -1,0 +1,54 @@
+---
+# Multi-level reverse-reachability fixture for cursored LookupResources (issue #3, finding 5 / §5.4).
+# alice reaches documents through THREE distinct nesting depths:
+#   - nested group#member chains (alice -> g3* -> g2 -> g1), arrowed in via document.group->member
+#   - a folder parent chain (folder:f2 -> parent folder:f1, alice a viewer of f1), via document.parent->view
+#   - a diamond (doc-a reachable via BOTH a group and a folder) to prove single emission per page
+# Document ids are chosen to sort in the OPPOSITE order to the traversal depth (doc-a is the deepest
+# group hop, doc-z the shallowest) so a paged scan that skipped by emitted-resource-id would drop or
+# duplicate across pages. The cursored ops below assert paged-union == unpaged for page sizes that do
+# not divide the result count.
+schema: |-
+  definition user {}
+
+  definition group {
+    relation member: user | group#member
+  }
+
+  definition folder {
+    relation viewer: user
+    relation parent: folder
+    permission view = viewer + parent->view
+  }
+
+  definition document {
+    relation group: group
+    relation parent: folder
+    permission view = group->member + parent->view
+  }
+
+relationships: |-
+  // nested group chain: alice is a (transitive) member of g3a, g3b, g2, g1
+  group:g1#member@group:g2#member
+  group:g2#member@group:g3a#member
+  group:g2#member@group:g3b#member
+  group:g3a#member@user:alice
+  group:g3b#member@user:alice
+  // an unrelated group alice is NOT in (its documents must never be returned)
+  group:other#member@user:bob
+
+  // documents reached via the group arrow, ids deliberately anti-sorted vs. depth
+  document:doc-a#group@group:g1
+  document:doc-y#group@group:g1
+  document:doc-b#group@group:g2
+  document:doc-z#group@group:g3a
+  document:doc-m#group@group:g3b
+  document:doc-none#group@group:other
+
+  // documents reached via the folder parent chain
+  folder:f1#viewer@user:alice
+  folder:f2#parent@folder:f1
+  document:doc-c#parent@folder:f1
+  document:doc-d#parent@folder:f2
+  // diamond: doc-a is also reachable through the folder path
+  document:doc-a#parent@folder:f1
