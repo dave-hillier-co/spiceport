@@ -31,6 +31,12 @@ public sealed class GrainBackedDatastore : IDatastore
     private readonly long _quantizationNanos;
     private readonly long _gcWindowNanos;
 
+    // Per-silo materialized read projection (add-before-remove behind a flag). When non-null, reads serve
+    // from the incrementally-folded local projection (one ReadState bootstrap + log-tail catch-up) instead
+    // of a per-Check full-state fetch; when null, the legacy LazyGrainReader fetches the whole state per
+    // Check. This GrainBackedDatastore is itself the per-silo singleton, so the owned projection is per-silo.
+    private readonly SiloProjection? _projection;
+
     // Cached optimized-revision candidate (mirrors InMemoryDatastore's CachedOptimizedRevisions): a real
     // head sampled when a window opens, held stable until the bucket boundary so near-in-time
     // minimize-latency checks WITHIN THIS SILO share one revision (and therefore one dispatch cache key).
@@ -47,16 +53,37 @@ public sealed class GrainBackedDatastore : IDatastore
     /// <param name="grainFactory">The Orleans grain factory used to reach the singleton datastore grain.</param>
     /// <param name="quantization">Quantization window for <see cref="OptimizedRevision"/> (default 5s).</param>
     /// <param name="gcWindow">How long old revisions remain valid (default 24h).</param>
-    public GrainBackedDatastore(IGrainFactory grainFactory, TimeSpan? quantization = null, TimeSpan? gcWindow = null)
+    /// <param name="useProjection">
+    /// When true, reads serve from a per-silo <see cref="SiloProjection"/> (incremental log-tail fold) instead
+    /// of fetching the whole grain state per Check. Defaults to false (the legacy full-fetch reader) so the
+    /// projection can soak behind a flag before becoming the default.
+    /// </param>
+    public GrainBackedDatastore(
+        IGrainFactory grainFactory, TimeSpan? quantization = null, TimeSpan? gcWindow = null, bool useProjection = false)
     {
         _grainFactory = grainFactory;
         _quantizationNanos = (long)((quantization ?? TimeSpan.FromSeconds(5)).TotalMilliseconds) * 1_000_000L;
         _gcWindowNanos = (long)((gcWindow ?? TimeSpan.FromHours(24)).TotalMilliseconds) * 1_000_000L;
+        _projection = useProjection
+            ? new SiloProjection(grainFactory.GetGrain<IDatastoreGrain>(IDatastoreGrain.Key))
+            : null;
     }
 
     private IDatastoreGrain Grain => _grainFactory.GetGrain<IDatastoreGrain>(IDatastoreGrain.Key);
 
-    public IDatastoreReader SnapshotReader(IRevision revision) => new LazyGrainReader(this, ToNanos(revision));
+    public IDatastoreReader SnapshotReader(IRevision revision)
+    {
+        var rev = ToNanos(revision);
+        // Both paths defer the (async) state acquisition to the first read and then serve every subsequent
+        // query in-process via one InMemoryDatastoreReader. The projection path catches up on demand (and
+        // blocks until watermark >= rev, the closed-timestamp gate); the legacy path fetches the whole state.
+        return _projection is { } projection
+            ? new DeferredReader(async ct =>
+                new InMemoryDatastoreReader(await projection.StateAtLeast(rev, ct).ConfigureAwait(false), rev, _ => true))
+            : new DeferredReader(async ct =>
+                new InMemoryDatastoreReader(
+                    DatastoreStateConverters.ToMemory(await Grain.ReadState().ConfigureAwait(false)), rev, _ => true));
+    }
 
     public async Task<RevisionWithSchemaHash> HeadRevision(CancellationToken cancellationToken = default)
     {
@@ -274,13 +301,17 @@ public sealed class GrainBackedDatastore : IDatastore
     private static long NowNanos() => (DateTimeOffset.UtcNow - DateTimeOffset.UnixEpoch).Ticks * 100L;
 
     /// <summary>
-    /// An <see cref="IDatastoreReader"/> that fetches the grain state ONCE, lazily on the first query, then
-    /// serves all subsequent reads in-process via an <see cref="InMemoryDatastoreReader"/>. Because
-    /// <see cref="IDatastore.SnapshotReader"/> is synchronous but the grain fetch is async, the fetch is
-    /// deferred to the first (async) read. The local dispatcher pins one reader per Check and queries it
-    /// many times, so this is exactly one grain hop per Check.
+    /// An <see cref="IDatastoreReader"/> that acquires its inner <see cref="InMemoryDatastoreReader"/> ONCE,
+    /// lazily on the first query (via <paramref name="acquire"/>), then serves all subsequent reads in-process.
+    /// Because <see cref="IDatastore.SnapshotReader"/> is synchronous but acquiring the state is async, the
+    /// acquisition is deferred to the first (async) read. The local dispatcher pins one reader per Check and
+    /// queries it many times, so the acquisition happens exactly once per Check. The acquire delegate either
+    /// fetches the whole grain state (legacy) or catches up the per-silo projection — the grain never GCs
+    /// rows, so the MVCC fold via <c>IsVisibleAt</c> is exact at any revision and a permissive validator is
+    /// sound (validity is enforced upstream by <see cref="CheckRevision"/>).
     /// </summary>
-    private sealed class LazyGrainReader(GrainBackedDatastore owner, long revision) : IDatastoreReader
+    private sealed class DeferredReader(Func<CancellationToken, ValueTask<InMemoryDatastoreReader>> acquire)
+        : IDatastoreReader
     {
         private readonly SemaphoreSlim _gate = new(1, 1);
         private InMemoryDatastoreReader? _inner;
@@ -292,13 +323,7 @@ public sealed class GrainBackedDatastore : IDatastore
             await _gate.WaitAsync(ct).ConfigureAwait(false);
             try
             {
-                if (_inner is { } r2)
-                    return r2;
-                var state = DatastoreStateConverters.ToMemory(await owner.Grain.ReadState().ConfigureAwait(false));
-                // The grain never GCs rows, so the MVCC fold via IsVisibleAt is exact at any revision; a
-                // permissive validator is sound (validity is enforced upstream by CheckRevision).
-                _inner = new InMemoryDatastoreReader(state, revision, _ => true);
-                return _inner;
+                return _inner ??= await acquire(ct).ConfigureAwait(false);
             }
             finally
             {

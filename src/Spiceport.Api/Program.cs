@@ -21,9 +21,10 @@ builder.Host.UseOrleans(silo =>
 // Schema + check-engine singletons (compiled once from the embedded seed schema).
 builder.Services.AddSpiceportGrainServices(SeedData.SchemaText);
 
-// The datastore delegates to the cluster-singleton datastore grain.
+// The datastore delegates to the cluster-singleton datastore grain. Reads serve from the per-silo
+// materialized projection (folded incrementally from the event log) instead of a per-Check full fetch.
 builder.Services.AddSingleton<IDatastore>(sp =>
-    new GrainBackedDatastore(sp.GetRequiredService<IGrainFactory>()));
+    new GrainBackedDatastore(sp.GetRequiredService<IGrainFactory>(), useProjection: true));
 
 builder.Services.AddGrpc();
 
