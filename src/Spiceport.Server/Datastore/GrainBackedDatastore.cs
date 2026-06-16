@@ -15,10 +15,13 @@ namespace Spiceport.Grains;
 /// with zero replica lag). Writes use an optimistic compare-and-swap retry loop. This is a DI service,
 /// not a grain, so <c>ConfigureAwait(false)</c> is correct here.
 /// </summary>
-public sealed class GrainBackedDatastore : IDatastore
+public sealed class GrainBackedDatastore : IDatastore, IAsyncDisposable
 {
     /// <summary>Bound on CAS retries before surfacing a serialization conflict.</summary>
     private const int MaxCasAttempts = 50;
+
+    /// <summary>Log-tail page size for the Watch changefeed.</summary>
+    private const int WatchBatchSize = 256;
 
     /// <summary>
     /// A stable, cluster-wide datastore id. It must be identical on every silo so a token minted on one
@@ -36,6 +39,11 @@ public sealed class GrainBackedDatastore : IDatastore
     // of a per-Check full-state fetch; when null, the legacy LazyGrainReader fetches the whole state per
     // Check. This GrainBackedDatastore is itself the per-silo singleton, so the owned projection is per-silo.
     private readonly SiloProjection? _projection;
+
+    // Per-silo Watch notifier (created lazily on the first Watch). The local write path pulses it on commit
+    // for instant same-silo Watch latency; its background loop covers cross-silo commits. Guarded by _hubLock.
+    private readonly object _hubLock = new();
+    private LogWatchHub? _hub;
 
     // Cached optimized-revision candidate (mirrors InMemoryDatastore's CachedOptimizedRevisions): a real
     // head sampled when a window opens, held stable until the bucket boundary so near-in-time
@@ -158,7 +166,11 @@ public sealed class GrainBackedDatastore : IDatastore
             //    AUTHORITATIVE revision the grain minted, or null if the head moved.
             var minted = await Grain.AppendCommit(expectedHead, proposal).ConfigureAwait(false);
             if (minted is { } revision)
+            {
+                // Wake any local Watch stream immediately (same-silo commits skip the poll latency).
+                _hub?.Pulse(revision);
                 return new TimestampRevision(revision);
+            }
 
             // 6. Head moved under us. Reload and re-run the WHOLE lambda (so preconditions and validation
             //    re-evaluate against the new base — race-free). Bounded retries; on exhaustion surface the
@@ -190,38 +202,55 @@ public sealed class GrainBackedDatastore : IDatastore
         if (!(cursor <= head0.Head && cursor >= head0.Head - _gcWindowNanos))
             throw new RevisionNotFoundException(afterRevision);
 
-        var pollDelay = TimeSpan.FromMilliseconds(50);
+        var hub = Hub();
+        hub.EnsureStarted();
+
         while (!cancellationToken.IsCancellationRequested)
         {
-            var state = DatastoreStateConverters.ToMemory(await Grain.ReadState().ConfigureAwait(false));
-            var revs = CollectChangedRevisions(state, cursor);
+            // Pull only the changes since the cursor straight from the log (the diff), not the whole state.
+            var segment = await Grain.ReadFrom(cursor, WatchBatchSize).ConfigureAwait(false);
 
-            foreach (var rev in revs)
+            if (segment.Events.Count > 0)
             {
-                var change = BuildChange(state, rev, options);
-                if (change is not null)
-                    yield return change;
-                cursor = rev;
-            }
-
-            if (revs.Count > 0 && (options.Content & WatchContent.Checkpoints) != 0)
-            {
-                yield return new RevisionChange(
-                    new TimestampRevision(cursor), Array.Empty<RelationshipUpdate>(),
-                    SchemaChanged: false, IsCheckpoint: true);
-            }
-
-            if (revs.Count == 0)
-            {
-                try
+                foreach (var ev in segment.Events)
                 {
-                    await Task.Delay(pollDelay, cancellationToken).ConfigureAwait(false);
+                    var change = BuildChange(ev, options);
+                    if (change is not null)
+                        yield return change;
+                    cursor = ev.Revision;
                 }
-                catch (OperationCanceledException)
-                {
-                    yield break;
-                }
+
+                // The checkpoint rides the revision the feed has now progressed through, so a consumer
+                // filtering to a content subset still observes liveness even if nothing matched its filter.
+                if ((options.Content & WatchContent.Checkpoints) != 0)
+                    yield return new RevisionChange(
+                        new TimestampRevision(cursor), Array.Empty<RelationshipUpdate>(),
+                        SchemaChanged: false, IsCheckpoint: true);
+
+                // Drain any further already-committed events before parking on the signal.
+                continue;
             }
+
+            // Caught up: park until a commit advances the head past the cursor (a local commit pulses the hub
+            // directly; cross-silo commits are picked up by the hub's poll). No per-stream timer.
+            try
+            {
+                await hub.WaitForChangeAfter(cursor, cancellationToken).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                yield break;
+            }
+        }
+    }
+
+    private LogWatchHub Hub()
+    {
+        if (_hub is { } existing)
+            return existing;
+        lock (_hubLock)
+        {
+            return _hub ??= new LogWatchHub(Grain);
         }
     }
 
@@ -230,53 +259,47 @@ public sealed class GrainBackedDatastore : IDatastore
     public Task<IRevisionParser> GetRevisionParser(CancellationToken cancellationToken = default) =>
         Task.FromResult<IRevisionParser>(new InMemoryRevisionParser(UniqueId));
 
-    public Task Close() => Task.CompletedTask;
+    public Task Close() => DisposeAsync().AsTask();
+
+    public async ValueTask DisposeAsync()
+    {
+        LogWatchHub? hub;
+        lock (_hubLock)
+        {
+            hub = _hub;
+            _hub = null;
+        }
+        if (hub is not null)
+            await hub.DisposeAsync().ConfigureAwait(false);
+    }
 
     // --- internals ---
 
     /// <summary>
-    /// The revisions strictly after <paramref name="cursor"/> (up to head) that carry any change: from the
-    /// relationship created/deleted stamps, schema versions, and counter versions. Ascending, distinct.
-    /// Replaces InMemoryDatastore's separate changefeed list (the grain keeps no such list).
+    /// Maps a single <see cref="LogEvent"/> to the <see cref="RevisionChange"/> the Watch feed emits, honoring
+    /// the requested content flags. Returns null when nothing in the event matches the requested content (the
+    /// caller still rides a checkpoint at the revision if checkpoints were requested). This is the Stage-0
+    /// payload equivalence (the log carries the same per-revision diff the state-derived feed produced).
     /// </summary>
-    private static List<long> CollectChangedRevisions(DatastoreState state, long cursor)
+    private static RevisionChange? BuildChange(LogEvent ev, WatchOptions options)
     {
-        var head = state.HeadRevision;
-        var set = new SortedSet<long>();
-        foreach (var row in state.Relationships)
-        {
-            if (row.CreatedRevision > cursor && row.CreatedRevision <= head)
-                set.Add(row.CreatedRevision);
-            if (row.DeletedRevision is { } d && d > cursor && d <= head)
-                set.Add(d);
-        }
-        foreach (var schema in state.Schemas)
-        {
-            if (schema.Revision > cursor && schema.Revision <= head)
-                set.Add(schema.Revision);
-        }
-        foreach (var counter in state.Counters)
-        {
-            if (counter.Revision > cursor && counter.Revision <= head)
-                set.Add(counter.Revision);
-        }
-        return set.ToList();
-    }
-
-    private static RevisionChange? BuildChange(DatastoreState state, long revision, WatchOptions options)
-    {
-        var rev = new TimestampRevision(revision);
         var includeRels = (options.Content & WatchContent.Relationships) != 0;
         var includeSchema = (options.Content & WatchContent.Schema) != 0;
 
-        var relChanges = includeRels ? state.ChangesAt(revision) : Array.Empty<RelationshipUpdate>();
-        var schemaChanged = includeSchema && state.SchemaChangedAt(revision);
+        var relChanges = includeRels && ev.RelationshipChanges.Count > 0
+            ? ev.RelationshipChanges.Select(MapUpdate).ToList()
+            : (IReadOnlyList<RelationshipUpdate>)Array.Empty<RelationshipUpdate>();
+        var schemaChanged = includeSchema && ev.SchemaChange is not null;
 
         if (relChanges.Count == 0 && !schemaChanged)
             return null;
 
-        return new RevisionChange(rev, relChanges, schemaChanged);
+        return new RevisionChange(new TimestampRevision(ev.Revision), relChanges, schemaChanged);
     }
+
+    private static RelationshipUpdate MapUpdate(RelationshipUpdateWire u) =>
+        new(WireConvert.ToRelationship(u.Relationship),
+            u.Operation == RelationshipUpdateOpWire.Delete ? UpdateOperation.Delete : UpdateOperation.Touch);
 
     /// <summary>
     /// Builds the <see cref="ProposedWrite"/> for a committed transaction by reusing the single per-revision
