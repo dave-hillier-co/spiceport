@@ -150,6 +150,7 @@ public sealed class MeshTestCluster : IAsyncDisposable
             // every key to that silo).
             siloBuilder.AddConsistentHashPlacement();
             siloBuilder.AddMemoryGrainStorage("datastore");
+            siloBuilder.AddCustomStorageBasedLogConsistencyProvider("CustomStorage");
             siloBuilder.ConfigureServices(services =>
             {
                 services.AddSpiceportGrainServices(
@@ -174,6 +175,7 @@ public sealed class MeshTestCluster : IAsyncDisposable
             // via the grain directory, so it is shared by construction (no process-static instance).
             siloBuilder.AddConsistentHashPlacement();
             siloBuilder.AddMemoryGrainStorage("datastore");
+            siloBuilder.AddCustomStorageBasedLogConsistencyProvider("CustomStorage");
             siloBuilder.ConfigureServices(services =>
             {
                 services.AddSpiceportGrainServices(

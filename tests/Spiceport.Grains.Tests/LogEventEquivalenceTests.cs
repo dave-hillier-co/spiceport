@@ -56,14 +56,14 @@ public sealed class LogEventEquivalenceTests
             // 2. factory vs an independent re-derivation of the touch/delete rule over the wire rows.
             Assert.Equal(ExpectedFromWire(grainState, rev), fromFactory);
 
-            // 3. schema flag matches.
-            Assert.Equal(state.SchemaChangedAt(rev), ev.SchemaChanged);
+            // 3. schema flag matches (the bool is now derived from the self-contained SchemaChange payload).
+            Assert.Equal(state.SchemaChangedAt(rev), ev.SchemaChange is not null);
         }
 
         // Spot-check the tricky cases explicitly.
         Assert.Equal(new[] { "Touch:doc:a#viewer@user:alice#...", "Touch:doc:b#viewer@user:bob#..." },
             LogEventFactory.EventFromState(state, 10).RelationshipChanges.Select(Canonical).OrderBy(s => s));
-        Assert.True(LogEventFactory.EventFromState(state, 20).SchemaChanged);
+        Assert.NotNull(LogEventFactory.EventFromState(state, 20).SchemaChange);
         var rev30 = LogEventFactory.EventFromState(state, 30).RelationshipChanges;
         Assert.Single(rev30); // touch-over-existing yields one Touch, not a Touch + Delete
         Assert.Equal("Touch:doc:a#viewer@user:alice#...", Canonical(rev30[0]));

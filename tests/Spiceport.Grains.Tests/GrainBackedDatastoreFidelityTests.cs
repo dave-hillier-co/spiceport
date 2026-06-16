@@ -31,7 +31,11 @@ public sealed class GrainBackedDatastoreFidelityTests
 {
     private sealed class DatastoreSiloConfigurator : ISiloConfigurator
     {
-        public void Configure(ISiloBuilder b) => b.AddMemoryGrainStorage("datastore");
+        public void Configure(ISiloBuilder b)
+        {
+            b.AddMemoryGrainStorage("datastore");
+            b.AddCustomStorageBasedLogConsistencyProvider("CustomStorage");
+        }
     }
 
     private static async Task<TestCluster> NewClusterAsync()

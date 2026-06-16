@@ -26,6 +26,14 @@ internal static class LogEventFactory
             .Select(c => new CounterDeltaWire(c.Name, c.Filter is { } f ? WireConvert.ToFullFilter(f) : null))
             .ToList();
 
-        return new LogEvent(revision, relationshipChanges, state.SchemaChangedAt(revision), counterChanges);
+        // The schema written exactly at this revision (null = no schema change). Carrying the full version
+        // (revision + bytes + hash) makes the event self-contained: a fold can append the schema version
+        // without re-reading the source state. There is at most one schema version per revision.
+        var schemaChange = state.Schemas
+            .Where(s => s.Revision == revision)
+            .Select(s => new SchemaVersionWire(s.Revision, s.Bytes, s.Hash))
+            .FirstOrDefault();
+
+        return new LogEvent(revision, relationshipChanges, schemaChange, counterChanges);
     }
 }

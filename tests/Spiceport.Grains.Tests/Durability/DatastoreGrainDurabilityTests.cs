@@ -29,10 +29,10 @@ namespace Spiceport.Grains.Tests.Durability;
 /// clustering), so B is fully independent of A — there is no shared membership table.
 /// </para>
 /// <para>
-/// Negative control: <c>DatastoreGrain.OnActivateAsync</c> re-seeds <c>Empty(NowNanos)</c> ONLY when the
-/// loaded HeadRevision == 0. If durable state were lost, cluster B's activation would re-seed a fresh,
-/// larger head with zero relationships — so the head-equality and relationship-count assertions below are
-/// exactly what makes this test FAIL on data loss rather than silently pass.
+/// Negative control: the grain re-seeds <c>Empty(NowNanos)</c> in <c>ReadStateFromStorage</c> ONLY when no
+/// durable <c>head</c> entry exists. If durable state were lost, cluster B's activation would re-seed a
+/// fresh, larger head with zero relationships — so the head-equality and relationship-count assertions
+/// below are exactly what makes this test FAIL on data loss rather than silently pass.
 /// </para>
 /// <para>
 /// Binary-serializer proof: caveat context is boxed <see cref="JsonElement"/>. Under a JSON storage
@@ -80,6 +80,7 @@ public sealed class DatastoreGrainDurabilityTests
                 })
                 .Build();
             siloBuilder.AddDatastoreGrainStorage(config);
+            siloBuilder.AddCustomStorageBasedLogConsistencyProvider("CustomStorage");
             siloBuilder.ConfigureServices(services =>
             {
                 services.AddSpiceportGrainServices(SchemaText);
@@ -89,19 +90,16 @@ public sealed class DatastoreGrainDurabilityTests
         }
     }
 
-    /// <summary>
-    /// A FIXED ServiceId so cluster A and cluster B share the same Orleans grain-storage key namespace
-    /// (the AdoNet OrleansStorage row key is derived from ServiceId + GrainId). TestClusterBuilder
-    /// randomizes ServiceId per build by default, which would make B unable to find A's persisted row —
-    /// pinning it is what makes the cross-cluster reactivation read A's durable state.
-    /// </summary>
-    private const string SharedServiceId = "spiceport-durability-test";
-
-    private static async Task<TestCluster> BuildAdoNetClusterAsync(string connectionString)
+    // A FIXED ServiceId so cluster A and cluster B share the same Orleans grain-storage key namespace (the
+    // AdoNet OrleansStorage row key is derived from ServiceId + GrainId; TestClusterBuilder randomizes it per
+    // build by default, which would stop B finding A's row). It must be UNIQUE PER TEST: this collection is
+    // serialized and shares one Postgres database, so two tests using the same ServiceId would collide on the
+    // singleton grain's keys (Key=0). Each test passes its own stable id.
+    private static async Task<TestCluster> BuildAdoNetClusterAsync(string connectionString, string serviceId)
     {
         ConnHolder.ConnectionString = connectionString;
         var builder = new TestClusterBuilder(initialSilosCount: 1);
-        builder.Options.ServiceId = SharedServiceId;
+        builder.Options.ServiceId = serviceId;
         builder.AddSiloBuilderConfigurator<AdoNetSiloConfigurator>();
         var cluster = builder.Build();
         await cluster.DeployAsync();
@@ -121,7 +119,7 @@ public sealed class DatastoreGrainDurabilityTests
         long writtenHead;
 
         // --- Phase 1: write through cluster A, then fully dispose it. ---
-        var clusterA = await BuildAdoNetClusterAsync(_fixture.ConnectionString);
+        var clusterA = await BuildAdoNetClusterAsync(_fixture.ConnectionString, "spiceport-durability-single");
         try
         {
             // Assert the "datastore" provider really uses the BINARY grain-storage serializer (not JSON).
@@ -186,7 +184,7 @@ public sealed class DatastoreGrainDurabilityTests
         }
 
         // --- Phase 2: read through a BRAND-NEW cluster B over the same Postgres (TRUE reactivation). ---
-        var clusterB = await BuildAdoNetClusterAsync(_fixture.ConnectionString);
+        var clusterB = await BuildAdoNetClusterAsync(_fixture.ConnectionString, "spiceport-durability-single");
         try
         {
             var dsB = Datastore(clusterB);
@@ -238,6 +236,86 @@ public sealed class DatastoreGrainDurabilityTests
             Assert.Equal("doc", counterFilterRead!.OptionalResourceType);
             Assert.Equal("viewer", counterFilterRead.OptionalResourceRelation);
             Assert.Equal(3ul, await reader.CountRelationships("doc_viewers"));
+        }
+        finally
+        {
+            await clusterB.DisposeAsync();
+        }
+    }
+
+    /// <summary>
+    /// Crosses the snapshot/compaction interval (&gt; 64 commits) so reactivation must rebuild from a
+    /// COMPACTED snapshot + a post-snapshot log tail (not the version-0 seed). Proves snapshot serialization
+    /// of a non-empty state (incl. boxed-JsonElement caveat context written BEFORE the snapshot boundary, so
+    /// it can only survive through the snapshot), the compaction loop, and replay-from-compacted-snapshot.
+    /// </summary>
+    [SkippableFact]
+    public async Task GrainState_Survives_Reactivation_AcrossSnapshotCompaction()
+    {
+        Skip.IfNot(_fixture.Available, _fixture.SkipReason ?? "Postgres fixture unavailable");
+
+        const int commits = 70; // > SnapshotInterval (64): forces at least one snapshot + compaction.
+        long writtenHead;
+
+        var clusterA = await BuildAdoNetClusterAsync(_fixture.ConnectionString, "spiceport-durability-snapshot");
+        try
+        {
+            var dsA = Datastore(clusterA);
+
+            // Commit 0: a caveated relationship, written FIRST so it is subsumed into the compacted snapshot.
+            var caveatContext =
+                JsonSerializer.Deserialize<Dictionary<string, object?>>("""{"region":"eu","level":7}""")!;
+            await dsA.ReadWriteTx(tx => tx.WriteRelationships(new[]
+            {
+                new RelationshipUpdate(
+                    Relationship.Create(
+                        new ObjectAndRelation("doc", "early", "viewer"),
+                        new ObjectAndRelation("user", "alice", CoreConstants.Ellipsis),
+                        caveat: new ContextualizedCaveat("is_active", caveatContext)),
+                    UpdateOperation.Create),
+            }));
+
+            // Commits 1..68: one relationship each, crossing the snapshot boundary.
+            long last = 0;
+            for (var i = 1; i < commits; i++)
+            {
+                var rev = await dsA.ReadWriteTx(tx => tx.WriteRelationships(new[]
+                {
+                    new RelationshipUpdate(
+                        Relationship.Create(
+                            new ObjectAndRelation("doc", $"r{i}", "viewer"),
+                            new ObjectAndRelation("user", $"u{i}", CoreConstants.Ellipsis)),
+                        UpdateOperation.Create),
+                }));
+                last = ((TimestampRevision)rev).TimestampNanosSinceEpoch;
+            }
+            writtenHead = last;
+        }
+        finally
+        {
+            await clusterA.DisposeAsync();
+        }
+
+        // Reactivate via a brand-new cluster: state must rebuild from the compacted snapshot + tail.
+        var clusterB = await BuildAdoNetClusterAsync(_fixture.ConnectionString, "spiceport-durability-snapshot");
+        try
+        {
+            var dsB = Datastore(clusterB);
+
+            var head = await dsB.HeadRevision();
+            Assert.Equal(writtenHead, ((TimestampRevision)head.Revision).TimestampNanosSinceEpoch);
+
+            var reader = dsB.SnapshotReader(head.Revision);
+            var rels = new List<Relationship>();
+            await foreach (var rel in reader.QueryRelationships(new RelationshipsFilter { OptionalResourceType = "doc" }))
+                rels.Add(rel);
+            Assert.Equal(commits, rels.Count); // all relationships survived snapshot+compaction
+
+            // The pre-boundary caveat row survived through the SNAPSHOT with its context intact.
+            var early = rels.Single(r => r.Resource.ObjectId == "early");
+            Assert.Equal("is_active", early.OptionalCaveat!.CaveatName);
+            Assert.Equal("\"eu\"", ((JsonElement)early.OptionalCaveat.Context!["region"]!).GetRawText());
+            Assert.Equal("7", ((JsonElement)early.OptionalCaveat.Context!["level"]!).GetRawText());
         }
         finally
         {

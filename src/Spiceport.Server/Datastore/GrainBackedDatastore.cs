@@ -103,33 +103,39 @@ public sealed class GrainBackedDatastore : IDatastore
 
         for (var attempt = 0; ; attempt++)
         {
-            // 1. Read the current grain state (the CAS base).
+            // 1. Read the current grain state (the write base).
             var grainState = await Grain.ReadState().ConfigureAwait(false);
             var baseState = DatastoreStateConverters.ToMemory(grainState);
             var expectedHead = baseState.HeadRevision;
 
-            // 2. Mint the new revision monotonically over the observed head (mirrors InMemoryDatastore).
+            // 2. Mint a provisional revision monotonically over the observed head (mirrors InMemoryDatastore).
+            //    This revision pins the local tx so the staged view and preconditions are evaluated at a
+            //    fixed point; the grain mints the AUTHORITATIVE revision when it appends the event.
             var now = NowNanos();
             var newRevision = now > expectedHead ? now : expectedHead + 1;
 
             // 3. Run the caller lambda over an in-memory tx pinned to this base. Preconditions and
             //    SchemaChangeValidator read the tx reader (the staged-view over the snapshot). Any
             //    exception thrown by the lambda (create-conflict, precondition, schema-validation, counter
-            //    conflict) propagates AS-IS and aborts the whole call — it is NOT a CAS retry.
+            //    conflict) propagates AS-IS and aborts the whole call — it is NOT a retry.
             var tx = new InMemoryReadWriteTransaction(baseState, newRevision);
             await transaction(tx).ConfigureAwait(false);
 
-            // 4. Compute the new committed state locally (reuse Commit()).
-            var newState = DatastoreStateConverters.ToGrain(tx.Commit());
+            // 4. Derive the proposed change from the committed state: the net relationship/schema/counter
+            //    diff at this revision (reusing the single per-revision diff definition). The grain re-mints
+            //    the revision and stamps it, so the proposal carries no final revision.
+            var committed = tx.Commit();
+            var proposal = ProposalFromCommit(committed, newRevision);
 
-            // 5. CAS into the grain: applies only if the grain head still equals expectedHead.
-            var ok = await Grain.CompareAndSwap(expectedHead, newState).ConfigureAwait(false);
-            if (ok)
-                return new TimestampRevision(newRevision);
+            // 5. Append into the grain: applies only if the grain head still equals expectedHead. Returns the
+            //    AUTHORITATIVE revision the grain minted, or null if the head moved.
+            var minted = await Grain.AppendCommit(expectedHead, proposal).ConfigureAwait(false);
+            if (minted is { } revision)
+                return new TimestampRevision(revision);
 
-            // 6. CAS failed: the head moved under us. Reload and re-run the WHOLE lambda (so preconditions
-            //    and validation re-evaluate against the new base — race-free). Bounded retries; on
-            //    exhaustion surface the same exception type InMemoryDatastore throws on a concurrent write.
+            // 6. Head moved under us. Reload and re-run the WHOLE lambda (so preconditions and validation
+            //    re-evaluate against the new base — race-free). Bounded retries; on exhaustion surface the
+            //    same exception type InMemoryDatastore throws on a concurrent write.
             if (attempt + 1 >= MaxCasAttempts)
                 throw new SerializationException();
         }
@@ -243,6 +249,20 @@ public sealed class GrainBackedDatastore : IDatastore
             return null;
 
         return new RevisionChange(rev, relChanges, schemaChanged);
+    }
+
+    /// <summary>
+    /// Builds the <see cref="ProposedWrite"/> for a committed transaction by reusing the single per-revision
+    /// diff (<see cref="LogEventFactory.EventFromState"/>) over the committed state: the resolved
+    /// relationship Touch/Delete changes, the schema bytes written at this revision (if any), and the
+    /// counter deltas. The grain re-mints the authoritative revision, so the proposal carries no revision —
+    /// only the net diff. This is the inverse of the grain's <c>ApplyEvent</c> fold, keeping the write path
+    /// and the fold provably equal.
+    /// </summary>
+    private static ProposedWrite ProposalFromCommit(DatastoreState committed, long revision)
+    {
+        var ev = LogEventFactory.EventFromState(committed, revision);
+        return new ProposedWrite(ev.RelationshipChanges, ev.SchemaChange?.Bytes, ev.CounterChanges);
     }
 
     private static long ToNanos(IRevision revision) => revision switch

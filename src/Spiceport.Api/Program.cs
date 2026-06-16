@@ -13,6 +13,9 @@ builder.Host.UseOrleans(silo =>
     // Storage for the singleton datastore grain (the single source of truth). Durable Postgres when
     // ConnectionStrings:OrleansStorage is configured; otherwise in-memory (default localhost dev = no Postgres).
     silo.AddDatastoreGrainStorage(builder.Configuration);
+    // The event-sourced datastore grain owns its persistence via ICustomStorageInterface over the
+    // "datastore" grain-storage provider above.
+    silo.AddCustomStorageBasedLogConsistencyProvider("CustomStorage");
 });
 
 // Schema + check-engine singletons (compiled once from the embedded seed schema).

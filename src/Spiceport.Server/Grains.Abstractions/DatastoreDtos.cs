@@ -67,3 +67,44 @@ public sealed record CaveatNameFilterWire(
 public sealed record DatastoreHeadWire(
     [property: Id(0)] long Head,
     [property: Id(1)] string? SchemaHash);
+
+/// <summary>
+/// A proposed commit submitted to the event-sourced datastore grain WITHOUT a final revision: the
+/// resolved relationship changes (Touch / Delete on full payloads), an optional new schema (bytes), and
+/// the counter deltas (a null <see cref="CounterDeltaWire.Filter"/> being a tombstone). The grain — the
+/// single serialization point — mints the revision and stamps it onto a canonical <c>LogEvent</c>.
+/// Preconditions and create-conflicts are already resolved caller-side; this carries only the net diff.
+/// </summary>
+[GenerateSerializer]
+public sealed record ProposedWrite(
+    [property: Id(0)] IReadOnlyList<RelationshipUpdateWire> RelationshipChanges,
+    [property: Id(1)] byte[]? SchemaBytes,
+    [property: Id(2)] IReadOnlyList<CounterDeltaWire> CounterChanges);
+
+/// <summary>
+/// The durable "head" pointer entry for the event-sourced datastore grain (a single grain-storage row).
+/// It records the two distinct counters: the contiguous append-only log <see cref="LogVersion"/> (the
+/// CustomStorage optimistic-concurrency version, = the number of confirmed events), and the latest
+/// timestamp <see cref="HeadRevision"/> (the MVCC / zedtoken revision carried in the events). It also
+/// records the <see cref="SnapshotVersion"/> at which the latest periodic snapshot was taken, so a cold
+/// read replays only the log tail above the snapshot.
+/// </summary>
+[GenerateSerializer]
+public sealed record LogHeadEntry(
+    [property: Id(0)] int LogVersion,
+    [property: Id(1)] long HeadRevision,
+    [property: Id(2)] int SnapshotVersion);
+
+/// <summary>
+/// A mutable holder for the immutable <see cref="DatastoreGrainState"/>, required because
+/// <c>JournaledGrain&lt;TState,TEvent&gt;</c> mutates its state object in place via
+/// <c>TransitionState</c>, whereas <see cref="DatastoreGrainState"/> is an immutable record. The fold
+/// replaces <see cref="Value"/> with a new immutable state per applied event.
+/// </summary>
+[GenerateSerializer]
+public sealed class DatastoreStateHolder
+{
+    /// <summary>The current confirmed datastore state.</summary>
+    [Id(0)]
+    public DatastoreGrainState Value { get; set; } = new();
+}

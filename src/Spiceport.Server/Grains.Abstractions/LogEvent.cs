@@ -15,11 +15,18 @@ public sealed record CounterDeltaWire(
 /// <see cref="LogEvent"/>s reproduces the datastore state, and the same feed powers Watch and the
 /// per-silo read projections.
 /// </summary>
+/// <remarks>
+/// The event is SELF-CONTAINED / FOLDABLE: every payload needed to reproduce the committed state is
+/// carried inline. <see cref="RelationshipChanges"/> carry full relationship payloads, <see cref="SchemaChange"/>
+/// carries the new schema version (revision + bytes + hash; null = no schema change), and
+/// <see cref="CounterChanges"/> carry name + filter (null filter = tombstone). A consumer can fold the
+/// ordered event sequence from empty without any side state.
+/// </remarks>
 [GenerateSerializer]
 public sealed record LogEvent(
     [property: Id(0)] long Revision,
     [property: Id(1)] IReadOnlyList<RelationshipUpdateWire> RelationshipChanges,
-    [property: Id(2)] bool SchemaChanged,
+    [property: Id(2)] SchemaVersionWire? SchemaChange,
     [property: Id(3)] IReadOnlyList<CounterDeltaWire> CounterChanges);
 
 /// <summary>A bounded page of the event log, plus the head revision observed at read time.</summary>
