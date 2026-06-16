@@ -81,12 +81,14 @@ public sealed class MeshTestCluster : IAsyncDisposable
     public static async Task<MeshTestCluster> CreateAsync(
         string schemaText,
         int batchConcurrency = PermissionChecker.DefaultBatchConcurrency,
-        bool useProjection = true)
+        bool useProjection = true,
+        bool useMembershipIndex = false)
     {
         SchemaHolder.SchemaText = schemaText;
         SchemaHolder.BatchConcurrency = batchConcurrency;
         SchemaHolder.LocalRecurseEnabled = true;
         SchemaHolder.UseProjection = useProjection;
+        SchemaHolder.UseMembershipIndex = useMembershipIndex;
 
         var builder = new TestClusterBuilder(initialSilosCount: 1);
         builder.AddSiloBuilderConfigurator<SiloConfigurator>();
@@ -111,7 +113,8 @@ public sealed class MeshTestCluster : IAsyncDisposable
         int siloCount = 3,
         int batchConcurrency = PermissionChecker.DefaultBatchConcurrency,
         bool localRecurseEnabled = true,
-        bool useProjection = true)
+        bool useProjection = true,
+        bool useMembershipIndex = false)
     {
         if (siloCount < 1)
             throw new ArgumentOutOfRangeException(nameof(siloCount), "Need at least one silo.");
@@ -120,6 +123,7 @@ public sealed class MeshTestCluster : IAsyncDisposable
         SchemaHolder.BatchConcurrency = batchConcurrency;
         SchemaHolder.LocalRecurseEnabled = localRecurseEnabled;
         SchemaHolder.UseProjection = useProjection;
+        SchemaHolder.UseMembershipIndex = useMembershipIndex;
 
         var builder = new TestClusterBuilder(initialSilosCount: (short)siloCount);
         builder.AddSiloBuilderConfigurator<MultiSiloConfigurator>();
@@ -144,6 +148,7 @@ public sealed class MeshTestCluster : IAsyncDisposable
         public static int BatchConcurrency = PermissionChecker.DefaultBatchConcurrency;
         public static bool LocalRecurseEnabled = true;
         public static bool UseProjection;
+        public static bool UseMembershipIndex;
     }
 
     private sealed class SiloConfigurator : ISiloConfigurator
@@ -163,6 +168,7 @@ public sealed class MeshTestCluster : IAsyncDisposable
                     SchemaHolder.SchemaText, batchConcurrency: SchemaHolder.BatchConcurrency);
                 services.AddSingleton<IDatastore>(sp =>
                     new GrainBackedDatastore(sp.GetRequiredService<IGrainFactory>(), useProjection: SchemaHolder.UseProjection));
+                services.AddSingleton(new MembershipIndexOptions { Enabled = SchemaHolder.UseMembershipIndex });
                 services.AddSingleton(new OrleansDispatcherOptions
                 {
                     LocalRecurseEnabled = SchemaHolder.LocalRecurseEnabled,
@@ -188,6 +194,7 @@ public sealed class MeshTestCluster : IAsyncDisposable
                     SchemaHolder.SchemaText, batchConcurrency: SchemaHolder.BatchConcurrency);
                 services.AddSingleton<IDatastore>(sp =>
                     new GrainBackedDatastore(sp.GetRequiredService<IGrainFactory>(), useProjection: SchemaHolder.UseProjection));
+                services.AddSingleton(new MembershipIndexOptions { Enabled = SchemaHolder.UseMembershipIndex });
                 // Hybrid toggle for this cluster (last AddSingleton wins in the silo container), so a
                 // benchmark can deploy OFF (always grain-hop) vs ON (local-recurse shortcut) clusters.
                 services.AddSingleton(new OrleansDispatcherOptions

@@ -59,6 +59,10 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<OrleansDispatcherOptions>();
         services.AddSingleton<IDispatchMetrics, DispatchMetrics>();
 
+        // Per-silo Leopard membership-index accelerator (default OFF; flip via a registered options override).
+        services.AddSingleton<MembershipIndexOptions>();
+        services.AddSingleton<MembershipIndexCache>();
+
         // The Orleans dispatcher turns each sub-problem into a grain call; the caching dispatcher
         // wraps it so the pre-context branch cache is shared across the whole mesh. This single
         // Caching(Orleans) instance is the silo-wide root: the API enters through it AND each grain

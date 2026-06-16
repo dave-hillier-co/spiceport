@@ -24,7 +24,8 @@ namespace Spiceport.Grains;
 [StatelessWorker]
 public sealed class ReverseOpsGrain(
     IDatastore datastore,
-    ISchemaProvider schemaProvider) : Grain, IReverseOpsGrain
+    ISchemaProvider schemaProvider,
+    MembershipIndexCache membershipIndex) : Grain, IReverseOpsGrain
 {
     private ImmutableList<NamespaceDefinition> Namespaces => schemaProvider.Current.Namespaces;
     private ImmutableList<CaveatDefinition> Caveats => schemaProvider.Current.Caveats;
@@ -33,7 +34,7 @@ public sealed class ReverseOpsGrain(
     public async Task<ExpandTreeReply> ExpandPermissionTree(ExpandTreeArgs args)
     {
         ArgumentNullException.ThrowIfNull(args);
-        var (reader, now, token) = await PinReader(args.Consistency).ConfigureAwait(ContinueOnCapturedContext);
+        var (reader, now, token, _) = await PinReader(args.Consistency).ConfigureAwait(ContinueOnCapturedContext);
 
         var engine = new ExpandEngine(Namespaces);
         var mode = args.Mode == ExpandModeWire.Recursive ? ExpandMode.Recursive : ExpandMode.Shallow;
@@ -53,7 +54,7 @@ public sealed class ReverseOpsGrain(
     public async Task<LookupSubjectsReply> LookupSubjects(LookupSubjectsArgs args)
     {
         ArgumentNullException.ThrowIfNull(args);
-        var (reader, now, token) = await PinReader(args.Consistency).ConfigureAwait(ContinueOnCapturedContext);
+        var (reader, now, token, _) = await PinReader(args.Consistency).ConfigureAwait(ContinueOnCapturedContext);
 
         var engine = new LookupSubjectsEngine(Namespaces);
         var evaluator = new CaveatEvaluator(Caveats);
@@ -100,9 +101,12 @@ public sealed class ReverseOpsGrain(
     public async Task<LookupResourcesReply> LookupResources(LookupResourcesArgs args)
     {
         ArgumentNullException.ThrowIfNull(args);
-        var (reader, now, token) = await PinReader(args.Consistency).ConfigureAwait(ContinueOnCapturedContext);
+        var (reader, now, token, revision) = await PinReader(args.Consistency).ConfigureAwait(ContinueOnCapturedContext);
 
         var engine = new LookupResourcesEngine(Namespaces, Caveats);
+        // The Leopard accelerator (null unless enabled). The engine consults it only for a fresh, unpaged
+        // enumeration of a covered shape and confirms every candidate with Check, so verdicts are unchanged.
+        var index = await AcquireIndex(reader, revision).ConfigureAwait(ContinueOnCapturedContext);
         var startCursor = ReverseOpsCursorCodec.DecodeResources(args.Cursor);
         var limit = args.Limit is { } l && l > 0 ? l : (int?)null;
 
@@ -116,7 +120,7 @@ public sealed class ReverseOpsGrain(
 
         await foreach (var found in engine.LookupResources(
             reader, args.SubjectType, args.SubjectId, args.SubjectRelation,
-            args.ResourceType, args.Permission, args.Context, now, startCursor, fetch, CancellationToken.None))
+            args.ResourceType, args.Permission, index, args.Context, now, startCursor, fetch, CancellationToken.None))
         {
             if (limit is { } cap2 && produced >= cap2)
             {
@@ -140,7 +144,7 @@ public sealed class ReverseOpsGrain(
     // Orleans grain code must not ConfigureAwait(false); keep the captured context.
     private const ConfigureAwaitOptions ContinueOnCapturedContext = ConfigureAwaitOptions.ContinueOnCapturedContext;
 
-    private async Task<(IDatastoreReader Reader, DateTimeOffset Now, string Token)> PinReader(
+    private async Task<(IDatastoreReader Reader, DateTimeOffset Now, string Token, IRevision Revision)> PinReader(
         ConsistencyWire? consistency)
     {
         // Resolve the consistency requirement to the revision actually evaluated. Null (the default)
@@ -154,7 +158,20 @@ public sealed class ReverseOpsGrain(
         var datastoreId = await datastore.GetUniqueId(CancellationToken.None)
             .ConfigureAwait(ContinueOnCapturedContext);
         var token = ZedTokens.FromRevision(resolved.Revision, resolved.SchemaHash, datastoreId).Token;
-        return (reader, DateTimeOffset.UtcNow, token);
+        return (reader, DateTimeOffset.UtcNow, token, resolved.Revision);
+    }
+
+    /// <summary>
+    /// Acquires the trusted Leopard membership index for this request (built from the silo's current schema at
+    /// the resolved revision), or null when the accelerator is disabled — in which case the lookup engine runs
+    /// its unchanged live traversal.
+    /// </summary>
+    private async Task<MembershipIndex?> AcquireIndex(IDatastoreReader reader, IRevision revision)
+    {
+        var revisionNanos = revision is TimestampRevision t ? t.TimestampNanosSinceEpoch : 0;
+        return await membershipIndex
+            .TryGet(Namespaces, Caveats, reader, revisionNanos, CancellationToken.None)
+            .ConfigureAwait(ContinueOnCapturedContext);
     }
 
     /// <summary>
