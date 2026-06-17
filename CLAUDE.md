@@ -27,9 +27,23 @@ dotnet test tests/Spiceport.Conformance.Tests  # the SpiceDB conformance corpus 
 
 ## Architecture (the load-bearing ideas)
 
-- **Storage is not grain state.** Relationships live in an MVCC datastore (`Spiceport.Datastore`
-  + Memory/Postgres) and are read at a revision. Evaluation is a pure function of
-  `(schema@revision, tuples@revision, request)`. Grains never hold relationship data.
+- **Storage is not *dispatch*-grain state.** Evaluation is a pure function of
+  `(schema@revision, tuples@revision, request)`; dispatch grains never hold relationship data.
+  The MVCC mechanics (visibility at a revision, the per-revision diff) live in `Spiceport.Datastore`
+  + Memory and are reused everywhere — the conformance oracle and the silo projections share one fold.
+- **Storage is an event-sourced grain (the log is the storage/compute seam).** All
+  relationship/schema/counter state lives behind a single cluster-singleton `DatastoreGrain`, a
+  **journaled grain whose append-only `LogEvent` log is the source of truth**; the materialized state
+  is the fold. A commit is a version-checked **append** (the CAS serialization point), not a
+  whole-state rewrite; the single non-reentrant activation makes the minted revision the cluster-wide
+  global order. Persistence is the grain's own via `ICustomStorageInterface` over an Orleans
+  grain-storage provider — **no application SQL** (per-version log entries + periodic snapshots +
+  compaction). Each silo reads from a **`SiloProjection`** folded incrementally from the log
+  (`ReadFrom` tail, bootstrap-once) — no per-Check full fetch; exact/at-least-as-fresh reads block
+  until the projection watermark covers the pinned revision (closed-timestamp gate). The same log feed
+  drives **Watch** (per-silo `LogWatchHub` notifier, no polling) and an optional default-off
+  **Leopard `MembershipIndex`** for `LookupResources` (a complete candidate superset confirmed by
+  `CheckEngine`, never an oracle — it cannot change a verdict). See `docs/architecture-analysis.md` §3.5.
 - **The dispatcher seam is the core mechanism.** `Spiceport.Engine`'s `CheckEngine` never
   recurses into itself directly — every sub-problem flows through `IDispatcher.DispatchCheck`.
   Implementations compose as `Caching -> Orleans -> Local` (mirroring SpiceDB's combined

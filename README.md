@@ -40,8 +40,12 @@ The full design rationale is in [`docs/architecture-analysis.md`](docs/architect
 - **Consistency**: ZedTokens with minimize-latency / at-least-as-fresh / fully-consistent /
   at-exact-snapshot semantics (read-your-writes).
 - **Write safety**: preconditions (must-match / must-not-match) and schema-change validation.
-- **Storage backends**: an in-memory MVCC store and **PostgreSQL** (xid8 / `pg_snapshot` MVCC).
-  SpiceDB's own consistency conformance corpus passes against both.
+- **Storage**: the datastore is an **event-sourced cluster-singleton Orleans grain** — an
+  append-only log of changes is the source of truth, each silo reads from a projection folded from
+  that log, and the same feed drives Watch. Durable via Orleans grain storage (in-memory for dev,
+  **PostgreSQL** via AdoNet) with no application SQL schema. A standalone PostgreSQL MVCC datastore
+  backend (xid8 / `pg_snapshot`) also exists; SpiceDB's consistency conformance corpus passes against
+  the in-memory fold, the grain mesh, and that backend.
 - **Relationship counters** (ExperimentalService): register/unregister a named counter over a
   filter and count matching relationships at a revision (computed on demand).
 - **`authzed.api.v1`** gRPC surface — verified end to end with the real `zed` CLI (schema,
@@ -59,7 +63,8 @@ src/
   Spiceport.Datastore.Postgres PostgreSQL backend (Npgsql, xid8/pg_snapshot)
   Spiceport.Engine            Check/Expand/Lookup engine + the IDispatcher seam + caching dispatcher
   Spiceport.Grains.Abstractions  Orleans grain interfaces + serializable DTOs
-  Spiceport.Grains            grain implementations: dispatch mesh, placement, schema/relationships
+  Spiceport.Grains            grain implementations: dispatch mesh, placement, schema/relationships,
+                              the event-sourced datastore grain + per-silo projection, Watch, Leopard index
   Spiceport.Silo              standalone Orleans silo host
   Spiceport.Api               co-hosted silo + ASP.NET Core gRPC (authzed.api.v1 + internal)
   Spiceport.Protos            protobuf contracts (vendored authzed.api.v1 + internal)
@@ -98,10 +103,13 @@ gRPC requires the HTTP/2 (https) endpoint.
 
 ### Durable datastore storage
 
-The whole datastore (relationships, schema, counters) is the state of a single cluster-singleton
-Orleans grain. By default that grain uses in-memory grain storage, so the localhost dev host needs
-no external dependency but the state is lost on restart. To make it durable, point the silo at a
-Postgres database via the `ConnectionStrings:OrleansStorage` configuration key (env form
+The whole datastore (relationships, schema, counters) lives behind a single cluster-singleton Orleans
+grain. It is **event-sourced**: an append-only log of changes is the source of truth and the
+materialized state is the fold, so a write is a cheap version-checked append rather than a whole-state
+rewrite, the log offset is the global revision, and each silo reads from a projection folded from the
+log (no per-Check full fetch). By default the grain uses in-memory grain storage, so the localhost dev
+host needs no external dependency but the state is lost on restart. To make it durable, point the silo
+at a Postgres database via the `ConnectionStrings:OrleansStorage` configuration key (env form
 `ConnectionStrings__OrleansStorage`, fallback key `Storage:ConnectionString`):
 
 ```bash

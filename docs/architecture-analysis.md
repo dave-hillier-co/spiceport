@@ -91,7 +91,9 @@ is wrong for Zanzibar:
 - Writes need a **global monotonic revision** and cross-object snapshot consistency — that is
   a datastore's job (MVCC), not per-grain consistency.
 
-**Conclusion: relationship storage stays in a real MVCC datastore. It is not grain state.**
+**Conclusion: relationship storage stays in a real MVCC datastore, read at a revision. It is not
+*dispatch*-grain state.** Orleans then realizes that datastore *itself* natively, as a single
+event-sourced grain with per-silo read projections — see §3.5.
 
 ### 3.2 What a grain *should* be — dispatch as virtual actors
 
@@ -176,17 +178,73 @@ grain mesh**, with results identical to the in-process engine.
   `LookupResources`). Cheap to cache everywhere because it is small and versioned.
 - **Streaming queries** (`LookupResources`/`LookupSubjects`/`Expand`) → grain methods
   returning **`IAsyncEnumerable<T>`**, with the opaque cursor carried in the item stream
-  (matches SpiceDB's cursored LR3). Orleans Streams are *not* needed for the request path; they
-  fit the Watch fan-out.
-- **Watch / changefeed** → a hosted service or single `WatchGrain` tailing the datastore
-  (Postgres logical replication / transaction-table polling), publishing revisions via an
-  Orleans Stream to subscribers.
+  (matches SpiceDB's cursored LR3). Orleans Streams are *not* needed for the request path.
+  `LookupResources` prunes with the reachability graph and can be further accelerated by a
+  log-derived membership index (the Leopard projection — see §3.5).
+- **Watch / changefeed** → a consumer of the datastore's own event log (§3.5): a per-silo
+  notifier tails the log feed and fans out `RevisionChange`s to subscribers, rather than a
+  separate replication tap.
 - **Fan-out concurrency** → `Task.WhenAll` over sub-problem grain calls, bounded by a
   semaphore that mirrors SpiceDB's `ConcurrencyLimits`. Orleans turn-based single-threading is
   fine here because dispatch grains are stateless workers and scale out.
 - **Cycle/depth control** → termination rests on `depthRemaining` (a genuine cycle errors at the
   depth limit), with the bloom carried in the request only as a singleflight-style loop-bypass hint,
   exactly as SpiceDB does. No actor state required.
+
+### 3.5 Storage as an event-sourced grain (the log is the storage/compute seam)
+
+§3.1 ruled out per-object grains and concluded storage is an MVCC datastore read at a revision.
+Orleans realizes that datastore natively — as one event-sourced grain — without an external SQL
+schema of its own:
+
+- **One event-sourced cluster-singleton `DatastoreGrain`** owns all relationship/schema/counter
+  state. It is a **journaled grain whose append-only log of `LogEvent`s is the source of truth**;
+  the materialized MVCC state is the *fold* over that log. A commit is a single version-checked
+  **append** (the compare-and-swap serialization point), never a whole-state rewrite. Persistence
+  is the grain's own responsibility through a custom-storage interface over an Orleans grain-storage
+  provider (in-memory in dev, AdoNet/Postgres in production) — **no application SQL**: each event is
+  a per-version entry, with periodic snapshots plus log compaction bounding replay on reactivation.
+  The single non-reentrant activation makes the head-compare-and-append atomic, so the revision it
+  mints is the **cluster-wide global order**. *This single ordered log is the total order that
+  defeats Zanzibar's "new enemy" problem — the global-order point Spanner provides in the original.*
+
+- **The log is the seam between storage and compute.** Reads do not fetch the whole state per Check.
+  Each silo keeps a **materialized projection** folded incrementally from the log: it bootstraps once
+  from a snapshot, then advances by pulling only the log tail (`ReadFrom(afterRevision)`). A Check
+  reads its silo's local projection in-process — no grain hop, and no per-Check full-state fetch.
+
+- **Closed-timestamp consistency.** The projection carries an *applied watermark* (the highest
+  revision folded). A read pinned at revision `rev` blocks until `watermark ≥ rev` (catch-up-on-demand
+  over the log) before serving. Because the log is a single total order, once the watermark reaches
+  `rev` every commit `≤ rev` is present — read-your-writes / no new enemy — and `rev ≤ head`
+  guarantees the wait terminates. This sits *below* the reader seam, so the caching dispatcher's
+  quantization and exact-keying are unchanged and an exact-keyed entry is never derived from stale
+  state.
+
+- **Single-writer ceiling is intentional.** All writes serialize through the one ordered log (the
+  global-order point). The design scales *reads* (per-silo projections) and cheapens *writes*
+  (appends, not whole-blob rewrites), but does not raise the single-writer ceiling. Sharded
+  per-namespace logs are out of scope — they would reintroduce the cross-shard global-order problem.
+
+The evaluation contract is unchanged: a Check is still a pure function of `(schema@rev, tuples@rev,
+request)`. The grain never holds *dispatch* state; it holds the *log*, and the projections, Watch
+feed, and Leopard index below are all pure folds of that one log.
+
+**Two consumers ride the same log feed:**
+
+- **Watch (the changefeed)** consumes the `LogEvent` feed directly. A per-silo notifier samples the
+  head and pulses a shared async signal (and a local commit pulses it immediately); each Watch stream
+  tails `ReadFrom` from its own cursor, maps each event to a `RevisionChange`, and parks on the signal
+  rather than polling. One poller per silo, not one per stream; checkpoints ride the revision the feed
+  has progressed through, so a consumer filtering to a content subset still observes liveness.
+
+- **A Leopard-style membership index** (optional, off by default) is a projection over the same feed
+  that flattens nested-group / userset chains into reverse adjacency, so `LookupResources` can
+  enumerate candidate resources in-memory instead of by repeated reverse queries. It is **never an
+  oracle**: it produces a *complete candidate superset* that the trusted `CheckEngine` confirms, so a
+  stale or over-broad index can only cost an extra Check, never change a verdict. It engages only for
+  shapes it can fully flatten (no tuple-to-userset arrows) and only for fresh, unpaged enumerations,
+  leaving the cursored live traversal untouched.
 
 ---
 
@@ -209,9 +267,12 @@ These are pure CPU and must be ported faithfully; they carry the real porting ri
   `Caveated` verdict listing the missing fields (short-circuit handled natively by the library).
   Residual-AST fidelity (re-evaluating a partial later) is deferred. This was the flagged
   dependency risk; it is now retired.
-- **Datastore + revision model** — start with an in-memory MVCC store and Postgres (`xid8`
-  transaction-id revisions, ZedToken encode/decode). Npgsql for Postgres; defer crdb/mysql/
-  spanner.
+- **Datastore + revision model** — the in-memory MVCC mechanics (visibility at a revision, the
+  per-revision diff, ZedToken encode/decode) are a straight port and stay the reusable core: the
+  same `InMemoryDatastoreReader` fold serves both the conformance oracle and the silo projections.
+  Durability is *not* a hand-rolled SQL datastore but the event-sourced grain's own storage (§3.5) —
+  the log + snapshots persist via an Orleans grain-storage provider (AdoNet/Postgres), so there is no
+  bespoke `xid8`/tuple SQL schema to maintain.
 - **Protobuf API** — keep the **v1 gRPC API byte-compatible** so existing clients and the
   `zed` CLI work unchanged. .NET has first-class gRPC. The *internal* dispatch proto becomes
   Orleans grain interfaces (no gRPC between silos).
@@ -267,8 +328,13 @@ load test.
 
 ## 7. One-paragraph summary
 
-Storage and consistency stay exactly as Zanzibar designed them: an MVCC datastore with
-revision-scoped reads — *not* grain state. The win from Orleans is in the **dispatch layer**:
+Storage and consistency stay exactly as Zanzibar designed them: MVCC, revision-scoped reads —
+*not* dispatch-grain state. But Orleans realizes the datastore itself too, as a single
+**event-sourced grain** whose append-only log is the source of truth: the log offset is the global
+revision (the total order that defeats "new enemy"), commits are cheap appends, per-silo projections
+fold the log for local reads, and the same feed powers Watch and an optional Leopard index — with no
+bespoke SQL datastore (durability rides Orleans grain storage). The other win from Orleans is in the
+**dispatch layer**:
 SpiceDB's recursive Check decomposes into pure, cacheable sub-problems that it routes by
 consistent hashing, deduplicates with singleflight, and rebalances across a hashring — and
 those three mechanisms are precisely what Orleans virtual actors give for free via placement,
