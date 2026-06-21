@@ -57,14 +57,15 @@ The full design rationale is in [`docs/architecture-analysis.md`](docs/architect
 src/
   Spiceport.Core              core model: ObjectAndRelation, Relationship, schema model,
                               Revision/ZedToken, tuple string parsing
-  Spiceport.Schema            schema DSL compiler (lexer -> parser -> compiler), reachability graph
   Spiceport.Datastore         datastore abstraction (MVCC snapshot reads, Watch, revisions)
   Spiceport.Datastore.Memory  in-memory MVCC datastore
   Spiceport.Datastore.Postgres PostgreSQL backend (Npgsql, xid8/pg_snapshot)
-  Spiceport.Engine            Check/Expand/Lookup engine + the IDispatcher seam + caching dispatcher
-  Spiceport.Grains.Abstractions  Orleans grain interfaces + serializable DTOs
-  Spiceport.Grains            grain implementations: dispatch mesh, placement, schema/relationships,
-                              the event-sourced datastore grain + per-silo projection, Watch, Leopard index
+  Spiceport.Server            the engine and the mesh, in one project:
+                              Schema/  schema DSL compiler (lexer -> parser -> compiler) + reachability graph
+                              Engine/  Check/Expand/Lookup engine + the IDispatcher seam + caching dispatcher
+                              Grains/  dispatch mesh, placement, schema/relationships, the event-sourced
+                                       datastore grain + per-silo projection, Watch, Leopard index
+                              Grains.Abstractions/  grain interfaces + serializable DTOs
   Spiceport.Silo              standalone Orleans silo host
   Spiceport.Api               co-hosted silo + ASP.NET Core gRPC (authzed.api.v1 + internal)
   Spiceport.Protos            protobuf contracts (vendored authzed.api.v1 + internal)
