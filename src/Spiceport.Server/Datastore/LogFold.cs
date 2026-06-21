@@ -32,11 +32,7 @@ internal static class LogFold
 
         if (ev.RelationshipChanges.Count > 0)
         {
-            var updates = ev.RelationshipChanges
-                .Select(u => new RelationshipUpdate(
-                    WireConvert.ToRelationship(u.Relationship),
-                    u.Operation == RelationshipUpdateOpWire.Delete ? UpdateOperation.Delete : UpdateOperation.Touch))
-                .ToList();
+            var updates = ev.RelationshipChanges.Select(WireConvert.ToUpdate).ToList();
             // Synchronous completion: the in-memory tx stages immediately.
             tx.WriteRelationships(updates).GetAwaiter().GetResult();
         }

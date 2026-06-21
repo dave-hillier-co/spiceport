@@ -24,6 +24,15 @@ internal static class WireConvert
     }
 
     /// <summary>
+    /// Converts a wire relationship update to a core <see cref="RelationshipUpdate"/>. A log/Watch update only
+    /// ever carries a Touch (create-or-replace) or a Delete; the single mapping is shared by the log fold and
+    /// the Watch feed so they can never diverge on the operation or payload conversion.
+    /// </summary>
+    public static RelationshipUpdate ToUpdate(RelationshipUpdateWire u) => new(
+        ToRelationship(u.Relationship),
+        u.Operation == RelationshipUpdateOpWire.Delete ? UpdateOperation.Delete : UpdateOperation.Touch);
+
+    /// <summary>
     /// Converts a core relationship to its wire form. NOTE: <c>OptionalIntegrity</c> is intentionally
     /// dropped — the wire type carries no integrity field. This is the same loss the data-plane write
     /// path already incurs; integrity is unused by the engine and the conformance corpus.

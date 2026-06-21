@@ -12,9 +12,10 @@ public sealed class PostgresContainerFixture : IAsyncLifetime
 {
     private readonly PostgreSqlContainer _container = new PostgreSqlBuilder("postgres:17-alpine")
         // Many tests run in parallel, each on its own database with its own connection pool. Raise the
-        // server's connection ceiling so the suite has headroom (defaults to 100). The argument is appended
-        // to the image's default postgres entrypoint command.
-        .WithCommand("-c", "max_connections=500")
+        // server's connection ceiling so the suite has headroom (defaults to 100). The Watch changefeed
+        // additionally needs commit timestamps enabled (off by default) to order changes by commit time.
+        // These arguments are appended to the image's default postgres entrypoint command.
+        .WithCommand("-c", "max_connections=500", "-c", "track_commit_timestamp=on")
         .WithCleanUp(true)
         .Build();
 

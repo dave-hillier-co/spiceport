@@ -287,7 +287,7 @@ public sealed class GrainBackedDatastore : IDatastore, IAsyncDisposable
         var includeSchema = (options.Content & WatchContent.Schema) != 0;
 
         var relChanges = includeRels && ev.RelationshipChanges.Count > 0
-            ? ev.RelationshipChanges.Select(MapUpdate).ToList()
+            ? ev.RelationshipChanges.Select(WireConvert.ToUpdate).ToList()
             : (IReadOnlyList<RelationshipUpdate>)Array.Empty<RelationshipUpdate>();
         var schemaChanged = includeSchema && ev.SchemaChange is not null;
 
@@ -296,10 +296,6 @@ public sealed class GrainBackedDatastore : IDatastore, IAsyncDisposable
 
         return new RevisionChange(new TimestampRevision(ev.Revision), relChanges, schemaChanged);
     }
-
-    private static RelationshipUpdate MapUpdate(RelationshipUpdateWire u) =>
-        new(WireConvert.ToRelationship(u.Relationship),
-            u.Operation == RelationshipUpdateOpWire.Delete ? UpdateOperation.Delete : UpdateOperation.Touch);
 
     /// <summary>
     /// Builds the <see cref="ProposedWrite"/> for a committed transaction by reusing the single per-revision
