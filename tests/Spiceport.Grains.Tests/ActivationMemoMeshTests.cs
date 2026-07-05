@@ -11,8 +11,8 @@ namespace Spiceport.Grains.Tests;
 /// memoizes its computed pre-context reply in activation state, so a re-dispatch of the same canonical
 /// sub-problem to a warm activation is served without re-expanding the relation graph. Every test here
 /// resolves the <see cref="ICheckGrain"/> directly by its <see cref="GrainKey"/> and calls
-/// <see cref="ICheckGrain.DispatchCheck"/> itself — bypassing the silo-wide <see cref="CachingDispatcher"/>
-/// entirely — so only the grain's OWN memo behaviour is under test.
+/// <see cref="ICheckGrain.DispatchCheck"/> itself — bypassing the silo-wide <see cref="OrleansDispatcher"/>
+/// entry point entirely — so only the grain's OWN memo behaviour is under test.
 /// </summary>
 [Collection(MeshClusterCollection.Name)]
 public class ActivationMemoMeshTests
@@ -43,10 +43,11 @@ public class ActivationMemoMeshTests
     // the verdict path), so it can never surface a graceful CycleCut=true reply to assert against. Instead
     // this test hand-seeds the dispatched TraversalBloom with the SECOND hop's own visit key before
     // making the call, so the dispatcher believes (falsely, but harmlessly per the bloom's false-positive
-    // contract) that hop is already in flight and takes the local bypass — which resolves immediately
-    // (doc2 has a direct viewer tuple, no further recursion needed) and is unconditionally tagged
-    // CycleCut = true by OrleansDispatcher, regardless of whether that resolution itself needed the loop
-    // guard. This reaches a genuinely successful CycleCut = true reply out of a normal, finite graph.
+    // contract) that hop is already in flight and takes the loop-bypass path — the grain call still
+    // happens normally (doc2 has a direct viewer tuple, no further recursion needed) but the RETURNED
+    // result is unconditionally tagged CycleCut = true by OrleansDispatcher, regardless of whether that
+    // resolution itself needed the loop guard. This reaches a genuinely successful CycleCut = true reply
+    // out of a normal, finite graph.
     private const string ArrowSchema = """
         definition user {}
 
@@ -103,13 +104,86 @@ public class ActivationMemoMeshTests
         Assert.Equal(first, second);
         Assert.True(first.Member);
 
-        // First call: cold activation, no memo yet -> a miss (and nothing to hit).
-        Assert.Equal(before.MemoMiss + 1, afterFirst.MemoMiss);
+        // First call: TWO cold activations, not one — "view = viewer" compiles the bare "viewer" reference
+        // as a ComputedUsersetChild, so evaluating it is a genuine Sub-dispatch (a real grain call, now
+        // that there is no in-process local-recurse shortcut) to the document's OWN "viewer" grain, in
+        // addition to the root "view" grain itself.
+        Assert.Equal(before.MemoMiss + 2, afterFirst.MemoMiss);
         Assert.Equal(before.MemoHit, afterFirst.MemoHit);
 
-        // Second call: identical sub-problem on the SAME warm activation -> served from the memo.
+        // Second call: the ROOT's own memo answers immediately without re-expanding the relation graph at
+        // all, so the "viewer" child grain is never touched again — exactly one hit (the root), no misses.
         Assert.Equal(afterFirst.MemoHit + 1, afterSecond.MemoHit);
         Assert.Equal(afterFirst.MemoMiss, afterSecond.MemoMiss);
+    }
+
+    private const string CaveatSchema = """
+        caveat over_age(age int, min_age int) {
+          age >= min_age
+        }
+
+        definition user {}
+
+        definition document {
+          relation viewer: user with over_age
+          permission view = viewer
+        }
+        """;
+
+    [Fact]
+    public async Task Memoized_branch_collapses_correctly_under_different_caveat_contexts()
+    {
+        // (b) A pre-context branch served from a WARM activation's memo is not itself the verdict: the
+        // request-time caveat context is applied per-request at Collapse, so two callers of the exact
+        // same memoized sub-problem with different contexts correctly get different verdicts.
+        await using var cluster = await MeshTestCluster.CreateAsync(CaveatSchema);
+        await cluster.Datastore.ReadWriteTx(tx => tx.WriteRelationships([
+            new RelationshipUpdate(
+                Relationship.Create(
+                    Resource("document", "doc1", "viewer"),
+                    Subject("alice"),
+                    new ContextualizedCaveat("over_age", new Dictionary<string, object?> { ["min_age"] = 18 })),
+                UpdateOperation.Create),
+        ]));
+
+        var (grain, _) = await ResolveGrain(
+            cluster, Resource("document", "doc1", "view"), Subject("alice"));
+
+        using var ct1 = new GrainCancellationTokenSource();
+        using var ct2 = new GrainCancellationTokenSource();
+
+        var before = cluster.MetricsSnapshot();
+        var first = await grain.DispatchCheck(Args(50), ct1.Token);
+        var afterFirst = cluster.MetricsSnapshot();
+        // Second call to the SAME warm activation: served from the memo (a miss, then a hit).
+        var second = await grain.DispatchCheck(Args(50), ct2.Token);
+        var afterSecond = cluster.MetricsSnapshot();
+
+        // (Not asserting first == second by record equality: the caveat's Context dictionary has no
+        // value equality, so two independently-marshalled grain replies compare unequal by reference even
+        // when memoized. The memo-hit counter below is the real proof of reuse.)
+        Assert.True(first.Member);
+        Assert.True(second.Member);
+        // Same shape as the plain document schema: "view = viewer" dispatches the bare "viewer" reference
+        // as a genuine Sub to a second grain, so the first call is TWO misses (root + viewer), not one.
+        Assert.Equal(before.MemoMiss + 2, afterFirst.MemoMiss);
+        // Second call: served entirely from the root's own memo (no re-expansion, no touching the viewer
+        // grain again) — exactly one hit.
+        Assert.Equal(afterFirst.MemoHit + 1, afterSecond.MemoHit);
+
+        // Collapse the SAME memoized reply with two different request-time contexts.
+        var engine = new CheckEngine(cluster.SchemaProvider.Current.Namespaces, cluster.SchemaProvider.Current.Caveats);
+        var caveat = CaveatWire.FromWire(second.Caveat);
+
+        var over = engine.Collapse(
+            new DispatchCheckResult(second.Member, caveat, second.CycleCut, second.DepthRequired),
+            new Dictionary<string, object?> { ["age"] = 21 });
+        var under = engine.Collapse(
+            new DispatchCheckResult(second.Member, caveat, second.CycleCut, second.DepthRequired),
+            new Dictionary<string, object?> { ["age"] = 16 });
+
+        Assert.Equal(Membership.Member, over.Verdict);
+        Assert.Equal(Membership.NotMember, under.Verdict);
     }
 
     [Fact]
@@ -166,8 +240,17 @@ public class ActivationMemoMeshTests
         await Assert.ThrowsAsync<MaxDepthExceededException>(
             () => grain.DispatchCheck(Args(required - 1), ctTight.Token));
         var afterTight = cluster.MetricsSnapshot();
-        Assert.Equal(beforeTight.MemoMiss + 1, afterTight.MemoMiss);
-        Assert.Equal(beforeTight.MemoHit, afterTight.MemoHit);
+
+        // The root's own memo must NOT serve this call (its DepthRequired is one more than the offered
+        // budget), so the root itself recomputes — at least one new miss. (The chain's intermediate
+        // grains are each a REAL grain now that there is no local-recurse shortcut, and each one's own
+        // depth guard is re-evaluated against the ever-tighter budget the recompute passes down; whether
+        // any given intermediate hop is served from ITS OWN warm memo or itself falls through and misses
+        // is an implementation detail of how the tightened budget lines up with each grain's cached
+        // DepthRequired — not something this test needs to pin down. The one invariant that matters is
+        // proven above by the caught exception: a too-tight budget is never wrongly served from a memo.)
+        Assert.True(afterTight.MemoMiss > beforeTight.MemoMiss,
+            "a budget one short of what the root's memo required must fall through the memo and recompute.");
     }
 
     [Fact]
@@ -203,12 +286,20 @@ public class ActivationMemoMeshTests
 
         Assert.True(first.Member);
         Assert.True(first.CycleCut, "expected the pre-seeded bloom to provoke a cycle-cut reply.");
-        // A cycle-cut reply is a miss (it was computed), but it must NOT populate the memo.
-        Assert.Equal(before.MemoMiss + 1, afterFirst.MemoMiss);
+        // Every hop of this check is now a genuine grain, since there is no in-process local-recurse
+        // shortcut: the root (doc1/view), the root's bare "viewer" reference (doc1/viewer, a
+        // ComputedUsersetChild Sub), the arrow target (doc2/view, the loop-bypassed hop) and ITS bare
+        // "viewer" reference (doc2/viewer) — four cold activations, four misses. The root's own reply is
+        // a miss (it was computed) but must NOT populate ITS memo, because it inherited CycleCut = true
+        // from the force-tagged doc2/view branch.
+        Assert.Equal(before.MemoMiss + 4, afterFirst.MemoMiss);
 
-        // A second call with an EMPTY bloom (no seeding) asks the exact same sub-problem; if the
+        // A second call with an EMPTY bloom (no seeding) asks the exact same sub-problem; if the root's
         // cycle-cut reply had been (wrongly) memoized, this would be served from it. It must instead
-        // recompute — observable as a second miss, not a hit.
+        // recompute at the root (a miss) — but doc1/viewer and doc2/view are each warm from the first
+        // call (their OWN replies were computed with CycleCut = false, since the force-tag is applied only
+        // to what OrleansDispatcher hands back to the CALLER, never to a callee's own memo decision), so
+        // both are served from their own memos (two hits) without re-touching doc2/viewer at all.
         using var ct2 = new GrainCancellationTokenSource();
         var second = await grain.DispatchCheck(Args(50), ct2.Token);
         var afterSecond = cluster.MetricsSnapshot();
@@ -216,7 +307,7 @@ public class ActivationMemoMeshTests
         Assert.True(second.Member);
         Assert.False(second.CycleCut);
         Assert.Equal(afterFirst.MemoMiss + 1, afterSecond.MemoMiss);
-        Assert.Equal(afterFirst.MemoHit, afterSecond.MemoHit);
+        Assert.Equal(afterFirst.MemoHit + 2, afterSecond.MemoHit);
     }
 
     [Fact]

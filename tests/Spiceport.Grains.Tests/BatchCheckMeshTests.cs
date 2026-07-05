@@ -1,4 +1,3 @@
-using Microsoft.Extensions.DependencyInjection;
 using Spiceport.Core;
 using Spiceport.Datastore;
 using Spiceport.Engine;
@@ -7,12 +6,13 @@ namespace Spiceport.Grains.Tests;
 
 /// <summary>
 /// Exercises <see cref="IPermissionChecker.BatchCheck"/> THROUGH the real grain mesh: every item's root
-/// sub-problem fans out over the shared Caching-over-Orleans dispatcher against ONE pinned revision.
-/// Verifies (1) per-item verdicts equal the per-item <see cref="IPermissionChecker.Check"/> for each item
-/// (including a caveated item and a not-member item), all index-aligned and sharing ONE evaluated token;
-/// and (2) a batch sharing a common sub-problem performs materially fewer underlying dispatches/datastore
-/// reads than the naive sum of independent checks, observed via the shared dispatch cache's hit/miss
-/// counters.
+/// sub-problem fans out over the shared Orleans dispatcher against ONE pinned revision. Verifies (1)
+/// per-item verdicts equal the per-item <see cref="IPermissionChecker.Check"/> for each item (including a
+/// caveated item and a not-member item), all index-aligned and sharing ONE evaluated token; and (2) a
+/// batch sharing a common sub-problem performs materially fewer underlying dispatches than the naive sum
+/// of independent checks, observed via the shared sub-problem's <see cref="CheckGrain"/> activation memo
+/// hit/miss counters (every sub-problem is always a real grain call — there is no in-process
+/// local-recurse shortcut to bypass).
 /// </summary>
 [Collection(MeshClusterCollection.Name)]
 public class BatchCheckMeshTests
@@ -37,9 +37,6 @@ public class BatchCheckMeshTests
             permission restricted_view = restricted->member
         }
         """;
-
-    private static InMemoryDispatchCache Cache(MeshTestCluster cluster) =>
-        (InMemoryDispatchCache)cluster.Services.GetRequiredService<IDispatchCache>();
 
     private static async Task SeedSharedGroupFixture(MeshTestCluster cluster, int docCount)
     {
@@ -121,9 +118,12 @@ public class BatchCheckMeshTests
     {
         const int docCount = 20;
 
-        // Serialize the fan-out (concurrency = 1) so the shared-branch cache behaviour is deterministic:
-        // no two items race on the same key before either stores it.
-        await using var cluster = await MeshTestCluster.CreateAsync(SchemaText, batchConcurrency: 1);
+        // Serialize the fan-out (concurrency = 1) so the shared sub-problem's activation-memo behaviour
+        // is deterministic: no two items race on the same grain key before either populates its memo.
+        // Every sub-problem is always a real grain call now (there is no in-process local-recurse
+        // shortcut), so the activation memo is the dedup layer being exercised here.
+        await using var cluster = await MeshTestCluster.CreateMultiSiloAsync(
+            SchemaText, siloCount: 1, batchConcurrency: 1);
         await SeedSharedGroupFixture(cluster, docCount);
         var alice = new ObjectAndRelation("user", "alice", CoreConstants.Ellipsis);
 
@@ -133,32 +133,31 @@ public class BatchCheckMeshTests
             .Select(i => new BatchCheckItem("document", $"doc{i}", "view", alice, null))
             .ToList();
 
-        var cache = Cache(cluster);
-        var (hitsBefore, missesBefore) = (cache.Hits, cache.Misses);
+        cluster.ResetMetrics();
 
         var batch = await cluster.Checker.BatchCheck(items);
         Assert.All(batch.Items, item => Assert.Equal(Membership.Member, item.Verdict));
 
-        var batchHits = cache.Hits - hitsBefore;
-        var batchMisses = cache.Misses - missesBefore;
+        var snapshot = cluster.MetricsSnapshot();
 
         // The NAIVE sum: each of the docCount documents independently expands its `view` arrow, which
         // dispatches the shared group:eng#member@user:alice leaf once per document => docCount underlying
         // leaf dispatches, on top of each document's own distinct root sub-problem.
         const int naiveSharedLeafDispatches = docCount;
 
-        // Because all items share ONE pinned revision + schema hash, the common group leaf is COMPUTED
-        // ONCE (a single miss) and served from the shared branch cache for the other docCount-1 documents
-        // (docCount-1 hits). That is materially fewer underlying dispatches than the naive sum.
-        Assert.Equal(docCount - 1, batchHits);
-        Assert.True(batchHits > 0, $"expected batch cache hits > 0, got {batchHits}");
+        // Because all items share ONE pinned revision + schema hash, the common group leaf resolves to
+        // the SAME CheckGrain activation: it is computed ONCE (a single memo miss) and served from that
+        // activation's memo for the other docCount-1 documents (docCount-1 memo hits). That is materially
+        // fewer underlying dispatches than the naive sum.
+        Assert.Equal(docCount - 1, snapshot.MemoHit);
+        Assert.True(snapshot.MemoHit > 0, $"expected memo hits > 0, got {snapshot.MemoHit}");
 
         // Distinct misses (= distinct sub-problems actually dispatched) is the docCount distinct document
         // roots plus the ONE shared leaf = docCount + 1, strictly fewer than the naive sum which would
         // dispatch the shared leaf docCount times (docCount + naiveSharedLeafDispatches total for it).
-        Assert.True(batchMisses < docCount + naiveSharedLeafDispatches,
-            $"expected batch misses ({batchMisses}) materially below the naive dispatch sum");
-        Assert.Equal(docCount + 1, batchMisses);
+        Assert.True(snapshot.MemoMiss < docCount + naiveSharedLeafDispatches,
+            $"expected memo misses ({snapshot.MemoMiss}) materially below the naive dispatch sum");
+        Assert.Equal(docCount + 1, snapshot.MemoMiss);
 
         // Corroborating single-revision proof: every item shares ONE evaluated token.
         Assert.False(string.IsNullOrEmpty(batch.EvaluatedToken));

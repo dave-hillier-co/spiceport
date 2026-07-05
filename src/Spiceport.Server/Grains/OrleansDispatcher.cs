@@ -1,5 +1,3 @@
-using System.Collections.Immutable;
-using Orleans.Runtime;
 using Spiceport.Core;
 using Spiceport.Datastore;
 using Spiceport.Engine;
@@ -14,92 +12,42 @@ namespace Spiceport.Grains;
 /// <see cref="IGrainFactory"/>, and invokes <see cref="ICheckGrain.DispatchCheck"/>.
 /// </summary>
 /// <remarks>
-/// <para>
-/// This is how recursion crosses grain boundaries: a grain computing one sub-problem dispatches each
-/// of its children through an <see cref="OrleansDispatcher"/>, so every child becomes a (potentially
-/// remote) call to a different grain keyed by that child's identity. The dispatcher maps the engine's
-/// <see cref="DispatchCheckRequest"/> / <see cref="DispatchCheckResult"/> to and from the serializable
-/// grain <see cref="DispatchCheckArgs"/> / <see cref="DispatchCheckReply"/>.
-/// </para>
-/// <para>
-/// HYBRID local-recurse-vs-grain-hop (when an <see cref="ISiloOwnership"/> and the local-recurse
-/// dependencies are supplied and <see cref="OrleansDispatcherOptions.LocalRecurseEnabled"/> is on): the
-/// dispatcher computes the sub-problem's consistent-hash owner without sending a message. If the owner
-/// is a REMOTE silo it makes the grain call as before. If the owner is the LOCAL silo it runs the one
-/// expansion step IN-PROCESS via a <see cref="LocalDispatcher"/> whose onward dispatcher is the same
-/// silo-wide caching dispatcher the grain would have used — so the branch cache is consulted and
-/// populated through the same shared cache, with no cross-silo message and no grain-activation/scheduler
-/// overhead. Placement skew is benign: during membership churn the dispatcher's ownership prediction and
-/// the director's actual placement can disagree, so the same sub-problem MAY be computed in two places;
-/// both populate the shared cache identically against the same schema/datastore snapshot, so the verdicts
-/// agree and the only cost is a little duplicated work, never a wrong answer.
-/// </para>
+/// This is how ALL recursion crosses grain boundaries: a grain computing one sub-problem dispatches each
+/// of its children through an <see cref="OrleansDispatcher"/>, so every child becomes a call to a
+/// (potentially same-process, but always grain-addressed) <see cref="ICheckGrain"/> activation keyed by
+/// that child's identity. There is no in-process local-recurse shortcut — every sub-problem, local or
+/// remote, is a grain call; Orleans' own placement director and grain directory are the only router. The
+/// dispatcher maps the engine's <see cref="DispatchCheckRequest"/> / <see cref="DispatchCheckResult"/> to
+/// and from the serializable grain <see cref="DispatchCheckArgs"/> / <see cref="DispatchCheckReply"/>.
 /// </remarks>
 public sealed class OrleansDispatcher : IDispatcher
 {
     private readonly IGrainFactory _grains;
     private readonly ISchemaHashSource _schemaHash;
-    private readonly ISiloOwnership? _ownership;
-    private readonly OrleansDispatcherOptions _options;
     private readonly IDispatchMetrics? _metrics;
-    private readonly LocalRecurseContext? _localRecurse;
 
     /// <summary>Creates an Orleans dispatcher.</summary>
     /// <param name="grains">The grain factory used to resolve keyed check grains.</param>
     /// <param name="schemaHash">Supplies the live schema hash embedded in every grain key (scopes identity to the current schema).</param>
-    /// <param name="ownership">
-    /// Optional consistent-hash ownership oracle. When supplied (with <paramref name="localRecurse"/>),
-    /// the dispatcher can compute which silo a sub-problem's grain would activate on, using the SAME
-    /// membership view and hash ring as the placement director, and take the in-process local-recurse
-    /// shortcut for locally-owned sub-problems.
-    /// </param>
-    /// <param name="options">Hybrid toggle and tunables; defaults to local-recurse ON.</param>
-    /// <param name="metrics">Optional silo-wide hop counters for benchmarking.</param>
-    /// <param name="localRecurse">
-    /// Optional in-process recursion context (schema + datastore + onward silo dispatcher). Required for
-    /// the local-recurse shortcut; when absent, the dispatcher always makes the grain call.
-    /// </param>
+    /// <param name="metrics">Optional silo-wide counters (loop-bypass hits, activation-memo hit/miss).</param>
     public OrleansDispatcher(
         IGrainFactory grains,
         ISchemaHashSource schemaHash,
-        ISiloOwnership? ownership = null,
-        OrleansDispatcherOptions? options = null,
-        IDispatchMetrics? metrics = null,
-        LocalRecurseContext? localRecurse = null)
+        IDispatchMetrics? metrics = null)
     {
         ArgumentNullException.ThrowIfNull(grains);
         ArgumentNullException.ThrowIfNull(schemaHash);
         _grains = grains;
         _schemaHash = schemaHash;
-        _ownership = ownership;
-        _options = options ?? new OrleansDispatcherOptions();
         _metrics = metrics;
-        _localRecurse = localRecurse;
     }
 
     /// <summary>
     /// The canonical grain key for a sub-problem, identical to the key used to address its
-    /// <see cref="ICheckGrain"/>. Exposed so callers can ask the ownership oracle where it would land.
+    /// <see cref="ICheckGrain"/>.
     /// </summary>
     public string KeyFor(ObjectAndRelation resource, ObjectAndRelation subject, string revision, RevisionMode mode) =>
         GrainKey.Build(resource, subject, revision, _schemaHash.CurrentSchemaHash, mode);
-
-    /// <summary>
-    /// The silo that the sub-problem identified by <paramref name="request"/> would activate on under
-    /// consistent-hash placement, computed from the same membership view as the placement director —
-    /// without activating the grain. Requires an <see cref="ISiloOwnership"/> to have been supplied.
-    /// </summary>
-    public SiloAddress OwnerOf(DispatchCheckRequest request)
-    {
-        ArgumentNullException.ThrowIfNull(request);
-        if (_ownership is null)
-            throw new InvalidOperationException(
-                "OrleansDispatcher was constructed without an ISiloOwnership; owner computation is unavailable.");
-
-        var key = KeyFor(
-            request.Resource, request.Subject, request.Meta.Revision.ToString(), request.Meta.Mode);
-        return _ownership.OwnerOf(key);
-    }
 
     /// <inheritdoc/>
     public async Task<DispatchCheckResult> DispatchCheck(DispatchCheckRequest request, CancellationToken ct)
@@ -116,37 +64,16 @@ public sealed class OrleansDispatcher : IDispatcher
 
         // SINGLEFLIGHT-STYLE LOOP BYPASS (SpiceDB singleflight.go:69-81): if the traversal bloom already
         // contains this sub-problem's (resource, subject) key, this is a LIKELY loop back to a grain key
-        // that is (or would be) busy on the path above us. Re-entering that same-key grain would deadlock
-        // a non-reentrant activation, so instead recurse IN-PROCESS via the LocalStep path. This consumes
-        // one depth level and is bounded by DepthRemaining — a genuine same-key cycle terminates at the
-        // depth limit (MaxDepthExceededException) instead of blocking on the grain. This is a pure
-        // perf/deadlock hint: a bloom false-positive only forces a (correct) local step, never a verdict.
-        if (_localRecurse is not null)
-        {
-            var visit = VisitKey.Of(request.Resource, request.Subject);
-            if (request.Meta.Bloom.Contains(visit))
-            {
-                _metrics?.RecordLocalRecurse();
-                var bypass = await LocalStep(request, ct).ConfigureAwait(false);
-                // A loop-bypassed subtree is path-dependent (it was reached via a likely-loop hit, so its
-                // result reflects the in-flight path, not a context-free sub-problem). Flag it CycleCut so
-                // the silo-wide CachingDispatcher above never writes it to the shared branch cache.
-                return bypass with { CycleCut = true };
-            }
-        }
-
-        // HYBRID: if local-recurse is enabled and we can compute ownership, take the in-process path for
-        // a locally-owned sub-problem (no cross-silo message), else fall through to the grain call.
-        if (_options.LocalRecurseEnabled
-            && _ownership is not null
-            && _localRecurse is not null
-            && _ownership.IsLocal(key))
-        {
-            _metrics?.RecordLocalRecurse();
-            return await LocalStep(request, ct).ConfigureAwait(false);
-        }
-
-        _metrics?.RecordRemoteGrainHop();
+        // that is (or would be) busy on the path above us. The grain call still happens NORMALLY — the
+        // grain is [Reentrant], so a genuine same-key re-entry is accepted and terminates deterministically
+        // on the depth budget (MaxDepthExceededException), exactly as a fresh call would. What changes is
+        // the RETURNED result: it is force-tagged CycleCut so no CheckGrain activation memo up the call
+        // chain ever stores this path-dependent branch (see CheckGrain's CACHING remarks). A bloom
+        // false-positive is harmless here — same verdict, just an uncached hop.
+        var visit = VisitKey.Of(request.Resource, request.Subject);
+        var loopBypass = request.Meta.Bloom.Contains(visit);
+        if (loopBypass)
+            _metrics?.RecordLoopBypass();
 
         var grain = _grains.GetGrain<ICheckGrain>(key);
 
@@ -194,8 +121,12 @@ public sealed class OrleansDispatcher : IDispatcher
             throw Translate(ex);
         }
 
-        return new DispatchCheckResult(
+        var result = new DispatchCheckResult(
             reply.Member, CaveatWire.FromWire(reply.Caveat), reply.CycleCut, reply.DepthRequired);
+
+        // Force the loop-bypassed subtree CycleCut so it is never memoized upstream, regardless of what
+        // the (correctly computed) callee itself decided about its own memo.
+        return loopBypass ? result with { CycleCut = true } : result;
     }
 
     /// <summary>
@@ -223,42 +154,4 @@ public sealed class OrleansDispatcher : IDispatcher
 
         return new DispatchFailedException(classification.Code, reason, ex);
     }
-
-    /// <summary>
-    /// Runs ONE expansion step in-process (for a locally-owned sub-problem, or to bypass a likely same-key
-    /// loop), routing children back through the silo-wide caching dispatcher — identical onward wiring to
-    /// <c>CheckGrain.DispatchCheck</c>, so the shared branch cache is consulted/populated through the same
-    /// shared cache (no bypass). The same sub-problem may be computed both here and on a remote activation
-    /// during churn; both write the shared cache identically, so verdicts agree.
-    /// </summary>
-    private Task<DispatchCheckResult> LocalStep(DispatchCheckRequest request, CancellationToken ct)
-    {
-        var ctx = _localRecurse!;
-        var namespaces = ctx.SchemaProvider.Current.Namespaces.ToImmutableDictionary(ns => ns.Name);
-        var local = new LocalDispatcher(
-            namespaces,
-            ctx.Datastore.SnapshotReader,
-            DateTimeOffset.UtcNow,
-            new CheckState())
-        {
-            // Children flow back through the silo-wide Caching-over-Orleans dispatcher (the same onward
-            // path a grain uses), so non-local children still cross grain boundaries and the cache is shared.
-            Dispatcher = ctx.Onward.Dispatcher,
-        };
-
-        return local.DispatchCheck(request, ct);
-    }
 }
-
-/// <summary>
-/// The in-process recursion dependencies the <see cref="OrleansDispatcher"/> needs to run a locally-owned
-/// sub-problem's one expansion step without a grain hop: the live schema, the datastore (for a snapshot
-/// reader) and the silo-wide onward dispatcher children route back through.
-/// </summary>
-/// <param name="SchemaProvider">The live schema provider (current namespaces per request).</param>
-/// <param name="Datastore">The datastore singleton (resolves a snapshot reader at the request revision).</param>
-/// <param name="Onward">The silo-wide caching-over-Orleans dispatcher children recurse through.</param>
-public sealed record LocalRecurseContext(
-    ISchemaProvider SchemaProvider,
-    IDatastore Datastore,
-    ISiloDispatcher Onward);

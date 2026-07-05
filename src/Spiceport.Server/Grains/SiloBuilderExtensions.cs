@@ -4,21 +4,17 @@ using Orleans.Hosting;
 
 namespace Spiceport.Grains;
 
-/// <summary>Silo-builder wiring for the Spiceport consistent-hash placement.</summary>
+/// <summary>
+/// Silo-builder wiring for the check-grain mesh. <see cref="CheckGrain"/> carries no placement attribute
+/// of its own: with sub-problem recursion crossing every grain boundary (no in-process local-recurse
+/// shortcut) and the correctness of a check depending only on grain identity, Orleans' default placement
+/// plus the grain directory's single-activation guarantee is the whole router — there is no need for a
+/// custom consistent-hash placement strategy. Orleans' built-in resource-optimized placement strategy and
+/// activation rebalancing are host-level opt-ins a deployment can layer on later; this library does not
+/// enable either.
+/// </summary>
 public static class SiloBuilderExtensions
 {
-    /// <summary>
-    /// Registers the <see cref="ConsistentHashPlacementDirector"/> for
-    /// <see cref="ConsistentHashPlacementStrategy"/> so that grains marked with
-    /// <see cref="ConsistentHashPlacementAttribute"/> (e.g. <see cref="CheckGrain"/>) activate on the
-    /// silo chosen by the deterministic <see cref="HashRing"/> over the current membership view.
-    /// </summary>
-    public static ISiloBuilder AddConsistentHashPlacement(this ISiloBuilder siloBuilder)
-    {
-        ArgumentNullException.ThrowIfNull(siloBuilder);
-        return siloBuilder.AddPlacementDirector<ConsistentHashPlacementStrategy, ConsistentHashPlacementDirector>();
-    }
-
     /// <summary>
     /// Applies <see cref="ActivationMemoOptions.CollectionAge"/> as <see cref="CheckGrain"/>'s
     /// class-specific idle-collection age (<see cref="GrainCollectionOptions.ClassSpecificCollectionAge"/>),

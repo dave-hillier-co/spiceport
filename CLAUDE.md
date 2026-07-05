@@ -49,19 +49,19 @@ dotnet test tests/Spiceport.Conformance.Tests  # the SpiceDB conformance corpus 
   `CheckEngine`, never an oracle — it cannot change a verdict). See `docs/architecture-analysis.md` §3.5.
 - **The dispatcher seam is the core mechanism.** `Spiceport.Engine`'s `CheckEngine` never
   recurses into itself directly — every sub-problem flows through `IDispatcher.DispatchCheck`.
-  Implementations compose as `Caching -> Orleans -> Local` (mirroring SpiceDB's combined
-  dispatcher). The grain identity *is* the canonical sub-problem
+  Implementations are `OrleansDispatcher` (resolves a grain call via the Orleans directory) and
+  `LocalDispatcher` (one expansion step). The grain identity *is* the canonical sub-problem
   `(resourceType, resourceId, relation, subject, quantizedRevision, schemaHash)`.
-- **Performance hybrid.** A consistent-hash placement director makes a sub-problem's owner silo
-  computable without activating the grain; the dispatcher recurses in-process for locally-owned
-  sub-problems and only hops a grain across shards. A bounded **traversal bloom** carries the
+- **Dispatch via grain calls.** Every sub-problem is a grain call; the Orleans grain directory
+  owns location. `CheckGrain` activation state is the only dispatch cache, memoizing the
+  pre-context `Branch` with idle-collection eviction. A bounded **traversal bloom** carries the
   cycle guard across grain boundaries.
-- **Caching subtleties (do not regress):** the cache stores the *pre-context* `Branch`
-  (membership + caveat expression), never the collapsed verdict — caveat context is applied
-  per-request in `Collapse`. The cache key excludes the visited-set, depth, and caveat context.
-  Cycle-cut results are not cached. Revisions are quantized so cache keys are shared within a
-  window; `schemaHash` is in the key so a schema change yields a fresh keyspace. Both the
-  silo-wide `CachingDispatcher` and the `CheckGrain` activation memo respect these invariants.
+- **Caching subtleties (do not regress):** the `CheckGrain` activation memo stores the
+  *pre-context* `Branch` (membership + caveat expression), never the collapsed verdict — caveat
+  context is applied per-request at the caller. The grain key excludes the traversal bloom,
+  depth, and caveat context. Cycle-cut results are served but not retained. Revisions are
+  quantized so grain keys are shared within a window; `schemaHash` is in the key so a schema
+  change yields a fresh keyspace.
 - **Consistency.** Reads honor a `ConsistencyRequirement`; `RevisionMode` (Optimized vs Exact)
   threads into the cache key so fresh/at-exact/fully-consistent reads never serve stale data.
 

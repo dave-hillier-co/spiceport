@@ -16,35 +16,32 @@ namespace Spiceport.Grains;
 /// On <see cref="DispatchCheck"/> the grain decodes its identity from its string key (resource,
 /// subject, revision, schema hash), resolves a snapshot reader at that revision from the injected
 /// <see cref="IDatastore"/> singleton, and runs a <see cref="LocalDispatcher"/> whose onward
-/// <see cref="LocalDispatcher.Dispatcher"/> is the silo-wide onward dispatcher
-/// (<see cref="ISiloDispatcher"/> = Caching over Orleans). The local dispatcher performs the one step;
-/// children flow through Orleans as further grain calls.
+/// <see cref="LocalDispatcher.Dispatcher"/> is the silo-wide <see cref="OrleansDispatcher"/> singleton.
+/// The local dispatcher performs the one step; children flow through Orleans as further grain calls.
 /// <para>
 /// CACHING (stage (a) of "Activation-as-cache", <c>docs/future-work.md</c> item 1.3): the grain holds a
 /// single memoized reply in <see cref="_memo"/> — the PRE-CONTEXT branch (membership + caveat wire),
-/// never the collapsed verdict, mirroring exactly what <see cref="CachingDispatcher"/> caches one layer
-/// up. On entry, when <see cref="ActivationMemoOptions.Enabled"/> and a memo exists whose
+/// never the collapsed verdict. This activation memo is the ONE cache in the mesh (the caller-side
+/// branch cache that used to sit above it was retired; see <c>docs/future-work.md</c> item 1.3 stage
+/// (c)). On entry, when <see cref="ActivationMemoOptions.Enabled"/> and a memo exists whose
 /// <see cref="DispatchCheckReply.DepthRequired"/> is at most the caller's remaining depth budget, it is
-/// returned directly with no re-expansion of the relation graph (the same depth guard
-/// <c>CachingDispatcher</c> uses: <c>DepthRemaining &gt;= DepthRequired</c>, else fall through and
-/// recompute under the tighter budget). A freshly computed reply is stored ONLY when it is not
-/// <see cref="DispatchCheckReply.CycleCut"/> (a cycle-cut result depends on the in-flight visited-set,
-/// which is not part of this grain's identity, so caching it would be unsound on another path) and only
-/// when it is at least as servable as any existing memo (a strictly lower <c>DepthRequired</c> replaces
-/// it, so the activation keeps the most-reusable entry it has ever computed). The grain identity already
-/// embeds the quantized revision and schema hash, so the keyspace rotates on its own every quantization
-/// window; the activation's own idle-collection age (<see cref="ActivationMemoOptions.CollectionAge"/>,
-/// applied via <see cref="SiloBuilderExtensions.AddActivationMemoCollectionAge"/>) IS the memo's eviction
-/// policy, so no separate TTL bookkeeping is needed. This is therefore a bounded-staleness cache in the
-/// same sense the branch cache's revision quantization already is: a memo entry can serve requests for up
-/// to one collection-age window within one quantized-revision keyspace.
+/// returned directly with no re-expansion of the relation graph (a depth guard:
+/// <c>DepthRemaining &gt;= DepthRequired</c>, else fall through and recompute under the tighter budget).
+/// A freshly computed reply is stored ONLY when it is not <see cref="DispatchCheckReply.CycleCut"/> (a
+/// cycle-cut result depends on the in-flight visited-set, which is not part of this grain's identity, so
+/// caching it would be unsound on another path) and only when it is at least as servable as any existing
+/// memo (a strictly lower <c>DepthRequired</c> replaces it, so the activation keeps the most-reusable
+/// entry it has ever computed). The grain identity already embeds the quantized revision and schema
+/// hash, so the keyspace rotates on its own every quantization window; the activation's own
+/// idle-collection age (<see cref="ActivationMemoOptions.CollectionAge"/>, applied via
+/// <see cref="SiloBuilderExtensions.AddActivationMemoCollectionAge"/>) IS the memo's eviction policy, so
+/// no separate TTL bookkeeping is needed. This is therefore a bounded-staleness cache: a memo entry can
+/// serve requests for up to one collection-age window within one quantized-revision keyspace.
 /// </para>
 /// <para>
-/// This memo is purely additive: the silo-wide <see cref="CachingDispatcher"/> remains the first-line
-/// cache (consulted before a call ever reaches this grain, on the caller's silo), and every other seam —
-/// the hybrid local-recurse shortcut, the Orleans dispatcher, the traversal-bloom cycle guard — is
-/// unchanged. Disabling <see cref="ActivationMemoOptions.Enabled"/> reverts this grain to exactly its
-/// pre-memo behaviour.
+/// Every other seam — the Orleans dispatcher, the traversal-bloom cycle guard — is unchanged. Disabling
+/// <see cref="ActivationMemoOptions.Enabled"/> reverts this grain to a stateless expansion step with no
+/// memo at all.
 /// </para>
 /// <para>
 /// NOT a singleflight cache: concurrent calls never await one another's in-flight <see cref="Task"/>.
@@ -52,11 +49,9 @@ namespace Spiceport.Grains;
 /// is accepted rather than blocked; if a re-entrant call instead awaited a shared in-flight Task for the
 /// same key, a same-key cyclic re-entry would deadlock against itself. Letting concurrent duplicate calls
 /// recompute independently is benign — both read the same pinned snapshot and schema, so they produce the
-/// identical result — and is exactly the miss behaviour <see cref="CachingDispatcher"/> already accepts
-/// one layer up.
+/// identical result.
 /// </para>
 /// </remarks>
-[ConsistentHashPlacement]
 [Reentrant] // Accepts a same-key re-entry (a genuine cycle) rather than blocking it. The memo field below
             // is per-activation mutable state, but it is read-then-written with plain (non-atomic)
             // assignments deliberately: Orleans single-threads turn-based execution even for a reentrant
@@ -66,8 +61,7 @@ namespace Spiceport.Grains;
 public sealed class CheckGrain(
     IDatastore datastore,
     ISchemaProvider schemaProvider,
-    ISiloDispatcher onward,
-    Orleans.Runtime.ILocalSiloDetails localSiloDetails,
+    IDispatcher onward,
     ActivationMemoOptions? memoOptions = null,
     IDispatchMetrics? metrics = null) : Grain, ICheckGrain
 {
@@ -78,10 +72,6 @@ public sealed class CheckGrain(
     /// compute, or if the memo is disabled). See the CACHING remarks on this class.
     /// </summary>
     private DispatchCheckReply? _memo;
-
-    /// <inheritdoc />
-    public Task<string> GetHostSilo() =>
-        Task.FromResult(localSiloDetails.SiloAddress.ToParsableString());
 
     /// <inheritdoc />
     public async Task<DispatchCheckReply> DispatchCheck(
@@ -119,7 +109,7 @@ public sealed class CheckGrain(
             now,
             state)
         {
-            Dispatcher = onward.Dispatcher,
+            Dispatcher = onward,
         };
 
         var meta = new ResolverMeta(

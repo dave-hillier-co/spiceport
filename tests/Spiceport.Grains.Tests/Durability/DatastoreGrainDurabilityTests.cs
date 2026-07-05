@@ -70,7 +70,6 @@ public sealed class DatastoreGrainDurabilityTests
     {
         public void Configure(ISiloBuilder siloBuilder)
         {
-            siloBuilder.AddConsistentHashPlacement();
             // Durable AdoNet Postgres storage under the "datastore" provider (matches the grain's
             // [PersistentState("state","datastore")]), wired through the production helper so the test
             // exercises the SAME serializer choice (forced binary, not the AdoNet JSON default).
@@ -129,7 +128,6 @@ public sealed class DatastoreGrainDurabilityTests
     {
         public void Configure(ISiloBuilder siloBuilder)
         {
-            siloBuilder.AddConsistentHashPlacement();
             var config = new ConfigurationBuilder()
                 .AddInMemoryCollection(new Dictionary<string, string?>
                 {

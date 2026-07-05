@@ -4,19 +4,18 @@ using Spiceport.Engine;
 namespace Spiceport.Grains;
 
 /// <summary>
-/// Silo-singleton dispatch counters, aggregated across every grain/dispatch on a silo. Lets a
-/// benchmark observe the real hop behaviour of the hybrid: how many sub-problems became cross-silo
-/// grain calls (<see cref="RemoteGrainHop"/>) vs were served in-process on their owner silo
-/// (<see cref="LocalRecurse"/>), plus branch-cache hit/miss. Summing the snapshot from every silo's
-/// container yields cluster-wide totals.
+/// Silo-singleton dispatch counters, aggregated across every grain/dispatch on a silo: how often the
+/// traversal-bloom loop bypass fired (<see cref="RecordLoopBypass"/>), plus the <see cref="CheckGrain"/>
+/// activation memo hit/miss. Summing the snapshot from every silo's container yields cluster-wide totals.
 /// </summary>
-public interface IDispatchMetrics : ICacheMetrics
+public interface IDispatchMetrics
 {
-    /// <summary>A sub-problem whose owner was the local silo, served in-process (no cross-silo message).</summary>
-    void RecordLocalRecurse();
-
-    /// <summary>A sub-problem whose owner was a remote silo, sent as a (cross-silo) grain call.</summary>
-    void RecordRemoteGrainHop();
+    /// <summary>
+    /// A sub-problem whose (resource, subject) key was already on the traversal bloom (a likely same-key
+    /// loop): the grain call still happens as normal (the grain is reentrant), but the caller forces
+    /// <see cref="Engine.DispatchCheckResult.CycleCut"/> on the returned result so it is never memoized.
+    /// </summary>
+    void RecordLoopBypass();
 
     /// <summary>
     /// A <see cref="CheckGrain"/> per-activation reply memo hit (stage (a) of "Activation-as-cache"):
@@ -39,48 +38,28 @@ public interface IDispatchMetrics : ICacheMetrics
 }
 
 /// <summary>An immutable snapshot of <see cref="IDispatchMetrics"/> counters.</summary>
-/// <param name="LocalRecurse">In-process locally-owned dispatches.</param>
-/// <param name="RemoteGrainHop">Cross-silo grain-call dispatches.</param>
-/// <param name="CacheHit">Branch-cache hits.</param>
-/// <param name="CacheMiss">Branch-cache misses.</param>
+/// <param name="LoopBypass">Traversal-bloom loop-bypass hits (grain call still made, result force-cut).</param>
 /// <param name="MemoHit">CheckGrain per-activation reply-memo hits.</param>
 /// <param name="MemoMiss">CheckGrain per-activation reply-memo misses.</param>
 public readonly record struct DispatchMetricsSnapshot(
-    long LocalRecurse,
-    long RemoteGrainHop,
-    long CacheHit,
-    long CacheMiss,
+    long LoopBypass,
     long MemoHit = 0,
     long MemoMiss = 0)
 {
     /// <summary>Component-wise sum, for aggregating snapshots across silos.</summary>
     public static DispatchMetricsSnapshot operator +(DispatchMetricsSnapshot a, DispatchMetricsSnapshot b) =>
-        new(a.LocalRecurse + b.LocalRecurse, a.RemoteGrainHop + b.RemoteGrainHop,
-            a.CacheHit + b.CacheHit, a.CacheMiss + b.CacheMiss,
-            a.MemoHit + b.MemoHit, a.MemoMiss + b.MemoMiss);
+        new(a.LoopBypass + b.LoopBypass, a.MemoHit + b.MemoHit, a.MemoMiss + b.MemoMiss);
 }
 
 /// <summary>Thread-safe atomic-counter <see cref="IDispatchMetrics"/>.</summary>
 public sealed class DispatchMetrics : IDispatchMetrics
 {
-    private long _localRecurse;
-    private long _remoteGrainHop;
-    private long _cacheHit;
-    private long _cacheMiss;
+    private long _loopBypass;
     private long _memoHit;
     private long _memoMiss;
 
     /// <inheritdoc />
-    public void RecordLocalRecurse() => Interlocked.Increment(ref _localRecurse);
-
-    /// <inheritdoc />
-    public void RecordRemoteGrainHop() => Interlocked.Increment(ref _remoteGrainHop);
-
-    /// <inheritdoc />
-    public void RecordCacheHit() => Interlocked.Increment(ref _cacheHit);
-
-    /// <inheritdoc />
-    public void RecordCacheMiss() => Interlocked.Increment(ref _cacheMiss);
+    public void RecordLoopBypass() => Interlocked.Increment(ref _loopBypass);
 
     /// <inheritdoc />
     public void RecordMemoHit() => Interlocked.Increment(ref _memoHit);
@@ -90,20 +69,14 @@ public sealed class DispatchMetrics : IDispatchMetrics
 
     /// <inheritdoc />
     public DispatchMetricsSnapshot Snapshot() => new(
-        Interlocked.Read(ref _localRecurse),
-        Interlocked.Read(ref _remoteGrainHop),
-        Interlocked.Read(ref _cacheHit),
-        Interlocked.Read(ref _cacheMiss),
+        Interlocked.Read(ref _loopBypass),
         Interlocked.Read(ref _memoHit),
         Interlocked.Read(ref _memoMiss));
 
     /// <inheritdoc />
     public void Reset()
     {
-        Interlocked.Exchange(ref _localRecurse, 0);
-        Interlocked.Exchange(ref _remoteGrainHop, 0);
-        Interlocked.Exchange(ref _cacheHit, 0);
-        Interlocked.Exchange(ref _cacheMiss, 0);
+        Interlocked.Exchange(ref _loopBypass, 0);
         Interlocked.Exchange(ref _memoHit, 0);
         Interlocked.Exchange(ref _memoMiss, 0);
     }
