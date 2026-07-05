@@ -34,8 +34,7 @@ public class CancellationAndImmutabilityTests
     {
         await using var cluster = await MeshTestCluster.CreateMultiSiloAsync(
             CyclicSchema,
-            siloCount: 1,
-            localRecurseEnabled: false);
+            siloCount: 1);
         await cluster.Datastore.ReadWriteTx(tx => tx.WriteRelationships([
             new RelationshipUpdate(
                 Relationship.Create(
@@ -44,7 +43,7 @@ public class CancellationAndImmutabilityTests
                 UpdateOperation.Create),
         ]));
         var head = await cluster.Datastore.HeadRevision();
-        var dispatcher = cluster.Services.GetRequiredService<ISiloDispatcher>().Dispatcher;
+        var dispatcher = cluster.Services.GetRequiredService<IDispatcher>();
         var request = new DispatchCheckRequest(
             new ObjectAndRelation("group", "loop", "member"),
             new ObjectAndRelation("user", "alice", CoreConstants.Ellipsis),

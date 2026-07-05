@@ -35,26 +35,6 @@ public sealed class CheckEngine
     private readonly int _maxDepth;
     private readonly CaveatEvaluator _caveatEvaluator;
 
-    // Optional caching layer. Null by default => behaviour is identical to the uncached path.
-    private readonly CachingConfig? _caching;
-
-    /// <summary>
-    /// Optional caching configuration for a <see cref="CheckEngine"/>: the shared branch cache, the
-    /// revision quantizer and the schema hash used to scope cached entries.
-    /// </summary>
-    /// <remarks>
-    /// Caching stores only the pre-context branch (membership + caveat expression). The request-time
-    /// caveat context is still applied per-request in <see cref="Collapse"/>, so enabling caching does
-    /// not change any verdict, including for context-varying caveat checks.
-    /// </remarks>
-    /// <param name="Cache">The shared, thread-safe branch cache.</param>
-    /// <param name="Quantizer">Maps a request revision to a stable cache bucket.</param>
-    /// <param name="SchemaHash">A stable hash of the schema scoping cache entries.</param>
-    public sealed record CachingConfig(
-        IDispatchCache Cache,
-        IRevisionQuantizer Quantizer,
-        string SchemaHash);
-
     /// <summary>
     /// Creates a check engine over the given schema definitions.
     /// </summary>
@@ -80,46 +60,6 @@ public sealed class CheckEngine
         _namespaces = namespaces.ToImmutableDictionary(ns => ns.Name);
         _caveatEvaluator = new CaveatEvaluator(caveats ?? []);
         _maxDepth = maxDepth;
-        _caching = null;
-    }
-
-    private CheckEngine(
-        ImmutableDictionary<string, NamespaceDefinition> namespaces,
-        CaveatEvaluator caveatEvaluator,
-        int maxDepth,
-        CachingConfig? caching)
-    {
-        _namespaces = namespaces;
-        _caveatEvaluator = caveatEvaluator;
-        _maxDepth = maxDepth;
-        _caching = caching;
-    }
-
-    /// <summary>
-    /// Builds a cache-enabled <see cref="CheckEngine"/> over the given schema. Behaviour is identical
-    /// to the uncached engine except that pre-context branches are reused across sub-problems and
-    /// across checks (correctly, because caveat context is applied per-request after dispatch).
-    /// </summary>
-    /// <param name="namespaces">The compiled namespace definitions.</param>
-    /// <param name="caveats">The compiled caveat definitions, or null.</param>
-    /// <param name="cache">The shared branch cache (created if null).</param>
-    /// <param name="quantizer">The revision quantizer (defaults to a 5s timestamp quantizer).</param>
-    /// <param name="maxDepth">The maximum recursion depth before a check fails.</param>
-    public static CheckEngine WithCaching(
-        IEnumerable<NamespaceDefinition> namespaces,
-        IEnumerable<CaveatDefinition>? caveats = null,
-        IDispatchCache? cache = null,
-        IRevisionQuantizer? quantizer = null,
-        int maxDepth = DefaultMaxDepth)
-    {
-        ArgumentNullException.ThrowIfNull(namespaces);
-        var caveatList = caveats?.ToList();
-        var ns = namespaces.ToImmutableDictionary(n => n.Name);
-        var config = new CachingConfig(
-            cache ?? new InMemoryDispatchCache(),
-            quantizer ?? new TimestampRevisionQuantizer(),
-            SchemaHash.Compute(ns, caveatList));
-        return new CheckEngine(ns, new CaveatEvaluator(caveatList ?? []), maxDepth, config);
     }
 
     /// <summary>
@@ -191,22 +131,14 @@ public sealed class CheckEngine
             now,
             state);
 
-        // Compose Caching over Local when configured: the caching dispatcher becomes the seam every
-        // sub-problem flows through (local.Dispatcher), and is also the top-level entry point.
+        // The local dispatcher is both the top-level entry point and its own onward seam: with the
+        // caller-side branch cache retired (the CheckGrain activation memo is the one cache now, see
+        // docs/future-work.md item 1.3), a bare in-process Check simply runs the recursive walk once.
         IDispatcher dispatcher = local;
-        if (_caching is { } caching)
-        {
-            var cachingDispatcher = new CachingDispatcher(
-                local, caching.Cache, caching.Quantizer, new FixedSchemaHashSource(caching.SchemaHash));
-            local.Dispatcher = cachingDispatcher;
-            dispatcher = cachingDispatcher;
-        }
 
-        // Key the cache by the caller-supplied real read revision when available, so a reused caching
-        // engine (which holds the shared cache) yields a distinct keyspace per datastore revision rather
-        // than collapsing every Check onto the single "in-process" token. A supplied revision is keyed
-        // EXACTLY (RevisionMode.Exact) so it can never read an entry quantized down to an older bucket.
-        // When no revision is supplied, fall back to the placeholder identity (single-revision callers).
+        // Carry the caller-supplied real read revision when available (informational identity only —
+        // `_readerFor` above already closes over the pinned reader); fall back to the in-process
+        // placeholder identity when none is supplied.
         var (revision, mode) = atRevision is null
             ? ((IRevision)InProcessRevision.Instance, RevisionMode.Optimized)
             : (atRevision, RevisionMode.Exact);

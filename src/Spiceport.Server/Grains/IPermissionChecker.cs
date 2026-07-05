@@ -121,7 +121,7 @@ public interface IPermissionChecker
 /// </remarks>
 public sealed class PermissionChecker(
     IDatastore datastore,
-    ISiloDispatcher root,
+    IDispatcher root,
     ISchemaProvider schemaProvider,
     int maxDepth = CheckEngine.DefaultMaxDepth,
     int maxConcurrency = PermissionChecker.DefaultBatchConcurrency) : IPermissionChecker
@@ -161,7 +161,7 @@ public sealed class PermissionChecker(
             resolved.Revision, maxDepth, TraversalBloom.ForDepth(maxDepth), resolved.Mode);
         var request = new DispatchCheckRequest(resource, subject, meta);
 
-        var branch = await root.Dispatcher.DispatchCheck(request, ct).ConfigureAwait(false);
+        var branch = await root.DispatchCheck(request, ct).ConfigureAwait(false);
 
         var collapsed = engine.Collapse(branch, caveatContext);
         var datastoreId = await datastore.GetUniqueId(ct).ConfigureAwait(false);
@@ -223,7 +223,7 @@ public sealed class PermissionChecker(
                 var sample = items[indices[0]];
                 var resource = new ObjectAndRelation(sample.ResourceType, sample.ResourceId, sample.Permission);
                 var request = new DispatchCheckRequest(resource, sample.Subject, meta);
-                branches[slot] = await root.Dispatcher.DispatchCheck(request, ct).ConfigureAwait(false);
+                branches[slot] = await root.DispatchCheck(request, ct).ConfigureAwait(false);
             }
             finally
             {

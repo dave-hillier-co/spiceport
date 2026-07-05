@@ -1,6 +1,7 @@
 using Spiceport.Core;
 using Spiceport.Datastore;
 using Spiceport.Engine;
+using Spiceport.Schema;
 
 namespace Spiceport.Grains.Tests;
 
@@ -92,5 +93,57 @@ public class SameKeyCycleMeshTests
             new ObjectAndRelation("user", "x", CoreConstants.Ellipsis), null);
 
         Assert.Equal(Membership.Member, result.Verdict);
+    }
+
+    /// <summary>
+    /// Step 2 mesh gate for the local-recurse deletion: a genuine same-key grain re-entry (the SAME
+    /// group:a &lt;-&gt; group:b cycle as above) must terminate through the multi-silo mesh with EXACTLY the
+    /// verdict the <see cref="ReferenceDatastore"/> oracle's in-process <see cref="CheckEngine"/> produces
+    /// for the identical schema/relationships/request — an error (<see cref="MaxDepthExceededException"/>),
+    /// never a confident (wrong) verdict on either side. Now that <see cref="OrleansDispatcher"/> has no
+    /// in-process local-recurse shortcut, every hop of the cycle — including the one that re-addresses the
+    /// SAME grain key it started from — is a real grain call; termination rests solely on the depth
+    /// budget, and the grain's <c>[Reentrant]</c> attribute (not a bloom-based in-process bypass) is what
+    /// keeps a same-key re-entry from deadlocking.
+    /// </summary>
+    [Fact]
+    public async Task SameKeyCycle_mesh_verdict_matches_the_ReferenceDatastore_oracle()
+    {
+        var relationships = new List<RelationshipUpdate>
+        {
+            new(
+                Relationship.Create(
+                    new ObjectAndRelation("group", "a", "member"),
+                    new ObjectAndRelation("group", "b", "member")),
+                UpdateOperation.Create),
+            new(
+                Relationship.Create(
+                    new ObjectAndRelation("group", "b", "member"),
+                    new ObjectAndRelation("group", "a", "member")),
+                UpdateOperation.Create),
+        };
+        var subject = new ObjectAndRelation("user", "x", CoreConstants.Ellipsis);
+
+        // The oracle: a plain in-process CheckEngine over a ReferenceDatastore, no grains, no bloom.
+        var compiled = SchemaCompiler.CompileSchema(CycleSchema);
+        var oracleStore = new ReferenceDatastore();
+        var oracleRevision = await oracleStore.ReadWriteTx(tx => tx.WriteRelationships(relationships));
+        var oracleReader = oracleStore.SnapshotReader(oracleRevision);
+        var oracleEngine = new CheckEngine(compiled.Namespaces, compiled.Caveats);
+
+        await Assert.ThrowsAsync<MaxDepthExceededException>(
+            () => oracleEngine.Check(oracleReader, "group", "a", "member", subject, caveatContext: null));
+
+        // The mesh: the same schema/relationships/request across a real 3-silo Orleans cluster, where the
+        // cycle's second hop re-addresses the SAME grain key the check started from.
+        await using var cluster = await MeshTestCluster.CreateMultiSiloAsync(CycleSchema, siloCount: 3);
+        await cluster.Datastore.ReadWriteTx(tx => tx.WriteRelationships(relationships));
+
+        var meshCheck = cluster.Checker.Check("group", "a", "member", subject, null);
+        var completed = await Task.WhenAny(meshCheck, Task.Delay(TimeSpan.FromSeconds(20)));
+        Assert.True(ReferenceEquals(completed, meshCheck),
+            "The same-key cycle did not terminate within the timeout — the grain mesh deadlocked.");
+
+        await Assert.ThrowsAsync<MaxDepthExceededException>(() => meshCheck);
     }
 }

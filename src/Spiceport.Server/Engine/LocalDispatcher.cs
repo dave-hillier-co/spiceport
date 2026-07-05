@@ -91,9 +91,10 @@ public sealed class LocalDispatcher : IDispatcher
 
         // Record this (resource, subject) into the traversal bloom — RECORD ONLY, never Contains->Cut.
         // Correctness no longer rests on the bloom; it is kept solely so the dispatcher (OrleansDispatcher)
-        // can detect a LIKELY loop on the next hop and bypass a re-entry into the same (busy) grain key,
-        // mirroring SpiceDB's singleflight loop guard. A bloom false-positive can therefore only force a
-        // (correct) local step — it can never change a verdict.
+        // can detect a LIKELY loop on the next hop and mark that hop's result CycleCut so it is never
+        // memoized, mirroring SpiceDB's singleflight loop guard. The grain call itself still happens
+        // normally either way (CheckGrain is reentrant) — a bloom false-positive can therefore only force
+        // a (correct) uncached hop; it can never change a verdict.
         var key = VisitKey.Of(resource, subject);
         meta = meta with { Bloom = meta.Bloom.Add(key) };
 

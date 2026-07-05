@@ -103,11 +103,11 @@ hand-rolled mechanisms above:
 
 | SpiceDB mechanism | Orleans equivalent |
 |---|---|
-| Consistent-hash dispatch routing (`authzed/consistent`) | **Grain placement / directory** — grain keyed by cache key lands on a deterministic silo |
+| Consistent-hash dispatch routing (`authzed/consistent`) | **Grain directory** — routes to the activation for a given sub-problem key |
 | Singleflight (in-flight dedup) | **Single activation per grain key** — concurrent callers coalesce onto one activation |
 | Hashring membership/rebalancing | **Orleans cluster membership** (silos) |
 | Remote dispatch gRPC (`internal/dispatch/remote`) | **Inter-silo grain calls** — the whole `remote` + `cluster` package disappears |
-| Ristretto per-node cache | A silo-wide **caching dispatcher** keyed by sub-problem, plus grain-per-key activation locality |
+| Ristretto per-node cache | **CheckGrain activation state** — memoizes the pre-context `Branch` with idle-collection eviction |
 
 The elegant result: **`internal/dispatch/remote`, `cluster`, the consistent-hash balancer,
 and the singleflight machinery collapse into the Orleans runtime.** We port the *graph
@@ -117,14 +117,13 @@ engine* (the interesting part) and delete the *distribution plumbing* (the tedio
 
 The core mechanism that makes the domain *actor-addressable* is the **dispatcher seam**, not
 the grain class. The engine never recurses into itself directly; every sub-problem flows
-through a single `IDispatcher.DispatchCheck(request)` interface, mirroring SpiceDB's
-`combined(caching → remote → local)` chain. Because recursion is mediated by an interface, the
-same engine runs unchanged whether a sub-problem resolves in-process or hops to another silo —
-the seam is the only thing that decides. The grain is simply one implementation behind that
-seam, and **its identity is the sub-problem**: the domain concept that has identity, is
-cacheable, and is the unit of distribution.
+through a single `IDispatcher.DispatchCheck(request)` interface. Because recursion is mediated
+by an interface, the same engine runs unchanged whether a sub-problem resolves in-process or
+hops to another silo — the seam is the only thing that decides. The grain is simply one
+implementation behind that seam, and **its identity is the sub-problem**: the domain concept
+that has identity, is cacheable, and is the unit of distribution.
 
-The seam composes three implementations:
+The seam composes two implementations:
 
 - `LocalDispatcher` — runs exactly one expansion step, then calls *back through the seam* for
   each child sub-problem.
@@ -132,45 +131,31 @@ The seam composes three implementations:
   (`resourceType, resourceId, relation, subject, revision, schemaHash`, escaped and joined).
   A sub-problem becomes a grain call by resolving the grain for that key; the grain's own onward
   dispatch goes *back through the seam*, so recursion crosses grain boundaries. The traversal
-  state that is *not* part of the identity (`depthRemaining`, the visited set) rides in the
+  state that is *not* part of the identity (`depthRemaining`, the traversal bloom) rides in the
   request so a remote grain reads the same snapshot revision and continues the same cycle guard.
-- `CachingDispatcher` — wraps the chain and serves/stores by sub-problem key. It **caches the
-  pre-context branch (membership + caveat *expression*), never the collapsed verdict** — caveat
-  context is applied per-request outside the cache; cycle-cut results are not cached. Because the
-  cache and the grain are keyed by the same sub-problem, one shared caching dispatcher in front
-  of Orleans gives a mesh-wide branch cache. `CheckGrain` activation state adds a delegate-side
-  memo layer, memoizing the pre-context `Branch` with idle-activation collection as eviction.
+  `CheckGrain` activation state memoizes the pre-context `Branch` (membership + caveat
+  *expression*), never the collapsed verdict — caveat context is applied per-request at the
+  caller. Cycle-cut results are served but not retained.
 
 The grain identity being the sub-problem is verified by an Orleans `TestCluster` running the
 conformance corpus (set-ops, arrow, wildcard, nested-group, recursive, caveats) **through the
 grain mesh**, with results identical to the in-process engine.
 
-**Implemented performance mechanisms (the seam already makes the domain distributable):**
-- **Local-recurse vs grain-hop hybrid** — a custom consistent-hash placement director
-  (`ConsistentHashPlacementDirector`, mirroring `authzed/consistent`) places `CheckGrain` on the
-  silo its canonical sub-problem key hashes to. The dispatcher computes the same owner off the
-  same membership view (`ISiloOwnership`, a pure `HashRing.Owner`) without activating the grain:
-  when a sub-problem hashes to the local silo it recurses in-process through the same silo-wide
-  caching dispatcher (no cache bypass, dedup preserved); only a shard miss grain-hops across
-  silos — mirroring how SpiceDB only RPCs across nodes. Grain-per-sub-problem is kept (the
-  activation remains the cache entry for remote keys). Placement skew is benign: during membership
-  churn the dispatcher's ownership prediction and the director's actual placement may disagree, so
-  the same sub-problem may be computed in two places; both populate the shared cache identically
-  against the same schema/datastore snapshot, so verdicts agree and the only cost is duplicated
-  work. Toggleable via `OrleansDispatcherOptions.LocalRecurseEnabled` (on by default).
+**Cycle/termination control:**
+
 - **Traversal bloom** — a bounded loop hint that crosses grain boundaries as a bounded bloom filter
   (`TraversalBloom`, ≤1KB, as SpiceDB) rather than an exact set: 1024 bits / 10 hashes by default,
   FNV-1a with Kirsch–Mitzenmacher double hashing (process-stable). It is NOT on the correctness path:
   termination rests solely on `depthRemaining`, and a genuine cycle consumes depth until
   `MaxDepthExceededException` (gRPC `FailedPrecondition`), exactly as SpiceDB does. The bloom's only
-  job is SpiceDB's singleflight-style loop bypass — a hit makes the dispatcher recurse in-process
-  rather than re-enter a busy same-key grain (a deadlock guard), so a false positive can only force a
-  correct local step, never change a verdict, and loop/depth-affected results are never cached.
+  job is cycle detection — a hit at the grain boundary forces the normal (reentrant) grain call with
+  the result tagged `CycleCut` at the caller, avoiding re-entry into a same-key grain during the same
+  traversal. A false positive can only force a correct local step, never change a verdict.
 
 **Remaining tuning (not correctness):**
-- **Revision quantization** — every write mints a fresh revision, so an un-quantized cache key
+- **Revision quantization** — every write mints a fresh revision, so an un-quantized grain key
   never hits. A quantizer snaps the revision to a coarse bucket so concurrent requests share
-  cache entries; the bucket boundary is the cache-staleness knob.
+  activation state; the bucket boundary is the cache-staleness knob.
 
 ### 3.4 Other components, by actor role
 

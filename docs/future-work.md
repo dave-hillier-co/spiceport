@@ -49,59 +49,35 @@ floor throw `RevisionNotFoundException`, so consumers re-bootstrap; stale zookie
 `InvalidArgument`. The floor defaults to a 24-hour window, bounding state growth and aligning with
 Zanzibar/Spanner's use of zookie staleness as a retention boundary.
 
-### 1.3 Activation-as-cache (the dispatch cache dissolves into the runtime)
+### 1.3 Activation-as-cache (the dispatch cache dissolves into the runtime) (implemented)
 
-**Current state.** Caching is a separate layer (`CachingDispatcher`) beside the actor runtime,
-with its own keying, TTL, and the most intricate wiring in the codebase (the silo-wide root /
-`ISiloDispatcher` holder cycle).
+In the paper, subproblem results are cached at the *delegate* — the server that owns the
+subproblem on the hash ring — and a lock table dedupes concurrent misses. Orleans expresses both
+natively: the `CheckGrain` key is the cache key, single-activation is the lock table. The
+activation holds the computed pre-context `Branch`; eviction is activation collection age tuned
+near the revision-quantization window.
 
-**Direction.** In the paper, subproblem results are cached at the *delegate* — the server that
-owns the subproblem on the hash ring — and a lock table dedupes concurrent misses. Orleans
-expresses both natively: the `CheckGrain` key already **is** the cache key, single-activation
-**is** the lock table. Let the activation hold the computed pre-context `Branch`; express eviction
-as activation collection age tuned near the revision-quantization window (the quantized revision +
-schema hash in the key make the keyspace rotate every window, so idle-collection is the TTL).
+The invariants transfer structurally:
+- The activation memoizes the pre-context `Branch`; `Collapse` stays per-request.
+- Cycle-cut results are served but not retained.
+- Exact-revision requests mint a different (unquantized) grain key — a naturally separate
+  keyspace.
 
-The invariants transfer structurally rather than by convention:
+**Stages (a)/(b)/(c) all implemented.** Stage (a) established the activation memoization layer.
+Stages (b) and (c) — deletion of the caller-side `CachingDispatcher` and the elimination of the
+locally-owned subproblem bypass — were resolved by **MAINTAINER DECISION for simplicity over
+performance** (the benchmark gate was deliberately skipped). Every sub-problem now flows through
+a grain call, and a traversal-bloom hit forces the normal (reentrant) grain call with the result
+force-tagged `CycleCut` at the caller.
 
-- *Branch, not verdict*: the activation memoizes the pre-context `Branch`; `Collapse` stays
-  per-request.
-- *Cycle-cut results not cached*: a `Branch` computed under a traversal-bloom cut is served but
-  not retained.
-- *Exact vs optimized reads*: exact-revision requests mint a different (unquantized) grain key —
-  a naturally separate keyspace, replacing the `RevisionMode`-in-cache-key convention.
+### 1.4 Directory-owned location: delete the hash ring (implemented)
 
-**Known tensions.**
-1. *Hot-key serial turns*: a memoized activation processes turns serially; serving a memoized
-   `Branch` is pure, so the serve path wants `[AlwaysInterleave]` (compute once under the implicit
-   lock table, serve concurrently).
-2. *Remote re-hop*: callers stop caching remote results locally and re-hop to the warm owner —
-   the paper's exact trade. Empirical question, not architectural.
-3. *The local-recurse hole*: locally-owned subproblems bypass grains, so they would bypass the
-   activation cache. The pure answer — stop bypassing — is the step most likely to cost latency
-   and must be benchmark-gated (see 1.4 and 1.9).
-
-**Staging.** Stage (a) is implemented: `CheckGrain` memoizes the pre-context `Branch` in
-activation state, with idle-activation collection tuned via `ActivationMemoOptions.CollectionAge`
-as eviction. The grain key is the cache key; the depth guard and cycle-cut invariants transfer
-structurally. The silo-wide `CachingDispatcher` and local-recurse hybrid remain in place. Stages
-(b) and (c) — mesh benchmarking and the decision to delete or keep the caller-side cache and
-local-recurse hole — remain open.
-
-### 1.4 Directory-owned location: delete the hash ring
-
-**Current state.** `ConsistentHashPlacement` + `HashRing` + `ISiloOwnership` exist for one reason:
-the local-recurse shortcut must compute a subproblem's owner silo *without activating the grain*.
-
-**Direction.** Single-activation dedupe is enforced by the Orleans **grain directory**, not by
-placement — placement only chooses where the *first* activation lands. If every subproblem is a
-grain call (the endpoint of 1.3), ownership never needs to be computed: just call, and the
-directory finds or creates the activation. The hand-rolled ring becomes deletable and placement
-becomes a pluggable policy — including `ResourceOptimizedPlacement` and Orleans activation
-rebalancing, which self-balances hot silos in a way a static ring cannot.
-
-**Wins.** Deletes an entire subsystem; unlocks runtime-managed load balancing.
-**Dependency.** Only coherent as the completion of 1.3(c).
+Single-activation dedupe is enforced by the Orleans **grain directory**, not by placement —
+placement only chooses where the *first* activation lands. With every subproblem now a grain
+call, ownership never needs pre-computation: just call, and the directory finds or creates the
+activation. The hand-rolled `ConsistentHashPlacement`, `HashRing`, and `ISiloOwnership`
+subsystems have been deleted. Placement becomes a pluggable policy, including potential future
+use of `ResourceOptimizedPlacement` and Orleans activation rebalancing.
 
 ### 1.5 Native cancellation propagation (implemented)
 
@@ -139,8 +115,8 @@ traffic) and addressable from grains. Moderate win; the DI versions are workable
 
 The check request (`DispatchCheckArgs`), pre-context branch reply (`DispatchCheckReply`), and
 folded `LogEvent` are marked `[Immutable]`, eliminating their defensive deep copy on same-silo
-grain calls. This is a small win alone, but helps make 1.3(c)/1.4's "always call the grain, even
-locally" path cheap enough to benchmark fairly.
+grain calls. This supports the "always call the grain, even locally" pattern (1.3(c)/1.4) by
+reducing the cost of intra-silo grain calls.
 
 ### 1.10 Native `IAsyncEnumerable` grain streaming (internal paths)
 
@@ -263,7 +239,6 @@ Recorded so they are not relitigated by accident:
 
 ## Suggested ordering, if taken as a program
 
-1. **1.3 activation-as-cache** — stage (a) implemented, stages (b)/(c) benchmark-gated; only
-   if stage (c) wins, **1.4**.
+1. **1.3 activation-as-cache** and **1.4 directory-owned location** — both completed.
 2. **2.3 / 2.4 / 2.5** — cheap, immediately differentiating product capabilities.
 3. **2.1 per-tenant** and **2.2 materialized reachability** — each behind its own design document.

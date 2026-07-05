@@ -10,8 +10,6 @@ var builder = Host.CreateApplicationBuilder(args);
 builder.UseOrleans(silo =>
 {
     silo.UseLocalhostClustering();
-    // Place CheckGrain activations by consistent hash of the sub-problem key.
-    silo.AddConsistentHashPlacement();
     // CheckGrain's per-activation reply memo (default ON) needs a matching idle-collection age so a
     // warm activation survives long enough between calls for the memo to pay off.
     silo.AddActivationMemoCollectionAge();

@@ -47,7 +47,13 @@ public sealed record DispatchCheckArgs(
 /// <param name="Caveat">
 /// The serialized gating caveat expression, or null for unconditional membership / non-membership.
 /// </param>
-/// <param name="CycleCut">True if a visited-set cutoff was hit anywhere in this subtree.</param>
+/// <param name="CycleCut">
+/// True if this subtree was depth- or loop-affected and must not be cached. There is no visited-set
+/// verdict cut anymore (see the remarks on <see cref="DispatchCheckArgs"/>): this flag is force-set on
+/// the RETURNED reply by the Orleans dispatcher when the bounded traversal Bloom reports a likely
+/// repeat on this path, purely so the result is excluded from the grain's activation memo, not because
+/// the verdict itself was altered.
+/// </param>
 /// <param name="DepthRequired">
 /// The recursion depth this sub-problem actually consumed below itself (leaf = 1). Travels back across
 /// the grain boundary so the silo-wide caching dispatcher can gate reuse on
@@ -80,11 +86,4 @@ public interface ICheckGrain : IGrainWithStringKey
     Task<DispatchCheckReply> DispatchCheck(
         DispatchCheckArgs args,
         GrainCancellationToken cancellationToken);
-
-    /// <summary>
-    /// Returns the <c>ToParsableString()</c> of the silo this activation is hosted on. Used to prove
-    /// that consistent-hash placement put the grain on the silo the hash ring predicts; it activates
-    /// the grain (an empty step) and reports where it landed.
-    /// </summary>
-    Task<string> GetHostSilo();
 }
