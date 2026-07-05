@@ -345,3 +345,6 @@ single-activation, and cluster membership. So we port the *graph evaluation engi
 *schema compiler* (the genuinely hard, actor-agnostic code), keep the v1 gRPC API byte-
 compatible, reuse SpiceDB's YAML conformance corpus as a TDD oracle, and let the Orleans
 runtime replace the entire `remote`/`cluster`/hashring distribution layer.
+
+Candidate directions beyond this design — further Orleans-native consolidation and deliberate
+relaxations of Google-contingent Zanzibar details — are analyzed in [`future-work.md`](future-work.md).
