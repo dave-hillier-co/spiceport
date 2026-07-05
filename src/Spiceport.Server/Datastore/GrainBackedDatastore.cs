@@ -10,10 +10,11 @@ namespace Spiceport.Grains;
 /// An <see cref="IDatastore"/> that delegates all state to the cluster-singleton
 /// <see cref="IDatastoreGrain"/> (the single source of truth) and reuses the in-memory MVCC mechanics
 /// (<see cref="InMemoryReadWriteTransaction"/>, <see cref="InMemoryDatastoreReader"/>, the
-/// <c>DatastoreState</c> fold) by converting the grain wire state to/from the in-memory state. It holds
-/// NO persistent local state cache: every read reads the current grain state (correct multi-silo reads
-/// with zero replica lag). Writes use an optimistic compare-and-swap retry loop. This is a DI service,
-/// not a grain, so <c>ConfigureAwait(false)</c> is correct here.
+/// <c>DatastoreState</c> fold) by converting the grain wire state to/from the in-memory state. Reads
+/// serve from the per-silo <see cref="SiloProjection"/> (incremental log-tail fold), gated by the
+/// closed-timestamp watermark so pinned reads are never stale. Writes use an optimistic
+/// compare-and-swap retry loop. This is a DI service, not a grain, so <c>ConfigureAwait(false)</c> is
+/// correct here.
 /// </summary>
 public sealed class GrainBackedDatastore : IDatastore, IAsyncDisposable
 {
@@ -34,11 +35,10 @@ public sealed class GrainBackedDatastore : IDatastore, IAsyncDisposable
     private readonly long _quantizationNanos;
     private readonly long _gcWindowNanos;
 
-    // Per-silo materialized read projection (add-before-remove behind a flag). When non-null, reads serve
-    // from the incrementally-folded local projection (one ReadState bootstrap + log-tail catch-up) instead
-    // of a per-Check full-state fetch; when null, the legacy LazyGrainReader fetches the whole state per
-    // Check. This GrainBackedDatastore is itself the per-silo singleton, so the owned projection is per-silo.
-    private readonly SiloProjection? _projection;
+    // Per-silo materialized read projection: reads serve from the incrementally-folded local projection
+    // (one ReadState bootstrap + log-tail catch-up), never a per-Check full-state fetch. This
+    // GrainBackedDatastore is itself the per-silo singleton, so the owned projection is per-silo.
+    private readonly SiloProjection _projection;
 
     // Per-silo Watch notifier (created lazily on the first Watch). The local write path pulses it on commit
     // for instant same-silo Watch latency; its background loop covers cross-silo commits. Guarded by _hubLock.
@@ -61,20 +61,13 @@ public sealed class GrainBackedDatastore : IDatastore, IAsyncDisposable
     /// <param name="grainFactory">The Orleans grain factory used to reach the singleton datastore grain.</param>
     /// <param name="quantization">Quantization window for <see cref="OptimizedRevision"/> (default 5s).</param>
     /// <param name="gcWindow">How long old revisions remain valid (default 24h).</param>
-    /// <param name="useProjection">
-    /// When true, reads serve from a per-silo <see cref="SiloProjection"/> (incremental log-tail fold) instead
-    /// of fetching the whole grain state per Check. Defaults to false (the legacy full-fetch reader) so the
-    /// projection can soak behind a flag before becoming the default.
-    /// </param>
     public GrainBackedDatastore(
-        IGrainFactory grainFactory, TimeSpan? quantization = null, TimeSpan? gcWindow = null, bool useProjection = false)
+        IGrainFactory grainFactory, TimeSpan? quantization = null, TimeSpan? gcWindow = null)
     {
         _grainFactory = grainFactory;
         _quantizationNanos = (long)((quantization ?? TimeSpan.FromSeconds(5)).TotalMilliseconds) * 1_000_000L;
         _gcWindowNanos = (long)((gcWindow ?? TimeSpan.FromHours(24)).TotalMilliseconds) * 1_000_000L;
-        _projection = useProjection
-            ? new SiloProjection(grainFactory.GetGrain<IDatastoreGrain>(IDatastoreGrain.Key))
-            : null;
+        _projection = new SiloProjection(grainFactory.GetGrain<IDatastoreGrain>(IDatastoreGrain.Key));
     }
 
     private IDatastoreGrain Grain => _grainFactory.GetGrain<IDatastoreGrain>(IDatastoreGrain.Key);
@@ -82,15 +75,11 @@ public sealed class GrainBackedDatastore : IDatastore, IAsyncDisposable
     public IDatastoreReader SnapshotReader(IRevision revision)
     {
         var rev = ToNanos(revision);
-        // Both paths defer the (async) state acquisition to the first read and then serve every subsequent
-        // query in-process via one InMemoryDatastoreReader. The projection path catches up on demand (and
-        // blocks until watermark >= rev, the closed-timestamp gate); the legacy path fetches the whole state.
-        return _projection is { } projection
-            ? new DeferredReader(async ct =>
-                new InMemoryDatastoreReader(await projection.StateAtLeast(rev, ct).ConfigureAwait(false), rev, _ => true))
-            : new DeferredReader(async ct =>
-                new InMemoryDatastoreReader(
-                    DatastoreStateConverters.ToMemory(await Grain.ReadState().ConfigureAwait(false)), rev, _ => true));
+        // The (async) state acquisition defers to the first read; every subsequent query is served
+        // in-process via one InMemoryDatastoreReader. The projection catches up on demand (and blocks
+        // until watermark >= rev, the closed-timestamp gate).
+        return new DeferredReader(async ct =>
+            new InMemoryDatastoreReader(await _projection.StateAtLeast(rev, ct).ConfigureAwait(false), rev, _ => true));
     }
 
     public async Task<RevisionWithSchemaHash> HeadRevision(CancellationToken cancellationToken = default)
@@ -324,10 +313,10 @@ public sealed class GrainBackedDatastore : IDatastore, IAsyncDisposable
     /// lazily on the first query (via <paramref name="acquire"/>), then serves all subsequent reads in-process.
     /// Because <see cref="IDatastore.SnapshotReader"/> is synchronous but acquiring the state is async, the
     /// acquisition is deferred to the first (async) read. The local dispatcher pins one reader per Check and
-    /// queries it many times, so the acquisition happens exactly once per Check. The acquire delegate either
-    /// fetches the whole grain state (legacy) or catches up the per-silo projection — the grain never GCs
-    /// rows, so the MVCC fold via <c>IsVisibleAt</c> is exact at any revision and a permissive validator is
-    /// sound (validity is enforced upstream by <see cref="CheckRevision"/>).
+    /// queries it many times, so the acquisition happens exactly once per Check. The acquire delegate
+    /// catches up the per-silo projection — the grain never GCs rows, so the MVCC fold via
+    /// <c>IsVisibleAt</c> is exact at any revision and a permissive validator is sound (validity is
+    /// enforced upstream by <see cref="CheckRevision"/>).
     /// </summary>
     private sealed class DeferredReader(Func<CancellationToken, ValueTask<InMemoryDatastoreReader>> acquire)
         : IDatastoreReader

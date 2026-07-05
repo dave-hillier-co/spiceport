@@ -25,7 +25,7 @@ builder.Services.AddSpiceportGrainServices(SiloSchema.SchemaText);
 // The datastore delegates to the cluster-singleton datastore grain. Reads serve from the per-silo
 // materialized projection (folded incrementally from the event log) instead of a per-Check full fetch.
 builder.Services.AddSingleton<IDatastore>(sp =>
-    new GrainBackedDatastore(sp.GetRequiredService<IGrainFactory>(), useProjection: true));
+    new GrainBackedDatastore(sp.GetRequiredService<IGrainFactory>()));
 
 var host = builder.Build();
 host.Run();

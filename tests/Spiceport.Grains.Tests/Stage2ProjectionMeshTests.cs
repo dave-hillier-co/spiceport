@@ -19,14 +19,13 @@ using ZedToken = Spiceport.Protos.ZedToken;
 namespace Spiceport.Grains.Tests;
 
 /// <summary>
-/// Stage-2 gates for the per-silo materialized projection (<see cref="SiloProjection"/>) wired behind the
-/// <c>useProjection</c> flag on <see cref="GrainBackedDatastore"/>. Proves (a) ORACLE EQUIVALENCE: the same
-/// conformance corpus subset that the in-process engine asserts stays green when every read serves from the
-/// projection instead of the per-Check full fetch; (b) READER FIDELITY: at every committed revision the
-/// projection reader returns exactly the rows the legacy full-fetch reader and an independent
-/// <see cref="InMemoryDatastore"/> oracle return; (c) the CLOSED-TIMESTAMP gate: a cross-silo exact /
-/// at-least-as-fresh read observes a write immediately (the projection blocks for catch-up), never serving a
-/// stale prefix.
+/// Stage-2 gates for the per-silo materialized projection (<see cref="SiloProjection"/>), the only read
+/// path of <see cref="GrainBackedDatastore"/>. Proves (a) ORACLE EQUIVALENCE: the same conformance corpus
+/// subset that the in-process engine asserts stays green when every read serves from the projection;
+/// (b) READER FIDELITY: at every committed revision the projection reader returns exactly the rows an
+/// independent <see cref="InMemoryDatastore"/> oracle returns; (c) the CLOSED-TIMESTAMP gate: a cross-silo
+/// exact / at-least-as-fresh read observes a write immediately (the projection blocks for catch-up), never
+/// serving a stale prefix.
 /// </summary>
 [Collection(MeshClusterCollection.Name)]
 public class Stage2ProjectionMeshTests
@@ -54,7 +53,7 @@ public class Stage2ProjectionMeshTests
 
         var file = ValidationFileLoader.LoadFromFile(path);
 
-        await using var cluster = await MeshTestCluster.CreateAsync(file.SchemaText, useProjection: true);
+        await using var cluster = await MeshTestCluster.CreateAsync(file.SchemaText);
 
         if (file.Relationships.Count > 0)
             await cluster.Datastore.ReadWriteTx(tx => tx.WriteRelationships(
@@ -80,17 +79,17 @@ public class Stage2ProjectionMeshTests
     }
 
     /// <summary>
-    /// Gate (b): at every committed revision, the projection reader, the legacy full-fetch reader, and an
-    /// independent in-memory oracle all expose the same live relationship set. Both grain-backed readers go
-    /// through the ONE singleton grain; the oracle replays the same ops independently.
+    /// Gate (b): at every committed revision, a projection reader on a SEPARATE datastore instance (so the
+    /// rows can only have arrived by folding the singleton grain's log, never by local write echo) exposes
+    /// the same live relationship set as an independent in-memory oracle replaying the same ops.
     /// </summary>
     [Fact]
-    public async Task ProjectionReader_MatchesFullFetchAndOracle_AtEveryRevision()
+    public async Task ProjectionReader_MatchesOracle_AtEveryRevision()
     {
         await using var scope = new Scope(await NewDatastoreClusterAsync());
         var gf = scope.Cluster.GrainFactory;
         IDatastore writer = new GrainBackedDatastore(gf);
-        IDatastore projected = new GrainBackedDatastore(gf, useProjection: true);
+        IDatastore projected = new GrainBackedDatastore(gf);
         var oracle = new InMemoryDatastore();
 
         // Drive the SAME ordered workload through the grain (writer) and the oracle, capturing each backend's
@@ -105,11 +104,9 @@ public class Stage2ProjectionMeshTests
 
         for (var i = 0; i < grainRevs.Count; i++)
         {
-            var viaFetch = await LiveIds(writer.SnapshotReader(grainRevs[i]));
             var viaProjection = await LiveIds(projected.SnapshotReader(grainRevs[i]));
             var viaOracle = await LiveIds(oracle.SnapshotReader(oracleRevs[i]));
 
-            Assert.Equal(viaFetch, viaProjection);
             Assert.Equal(viaOracle, viaProjection);
         }
     }
@@ -123,8 +120,7 @@ public class Stage2ProjectionMeshTests
     [Fact]
     public async Task ExactReads_SeeWritesImmediately_AcrossSilos()
     {
-        await using var cluster = await MeshTestCluster.CreateMultiSiloAsync(
-            ViewerSchema, siloCount: 2, useProjection: true);
+        await using var cluster = await MeshTestCluster.CreateMultiSiloAsync(ViewerSchema, siloCount: 2);
         var service = new PermissionsGrpcService(
             cluster.Services.GetRequiredService<IPermissionChecker>(), cluster.GrainFactory);
 
