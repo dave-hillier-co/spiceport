@@ -15,7 +15,7 @@ namespace Spiceport.Api;
 /// <summary>
 /// gRPC front door for the <c>authzed.api.v1.PermissionsService</c>. A pure translation layer over the
 /// SAME grain mesh the internal <see cref="PermissionsGrpcService"/> uses: unary check/expand/write/delete
-/// dispatch through <see cref="IPermissionChecker"/> / <see cref="IReverseOpsGrain"/> /
+/// dispatch through <see cref="IPermissionChecker"/> / <see cref="IReverseOpsStreamGrain"/> /
 /// <see cref="IRelationshipsGrain"/>; the read + lookup RPCs are server-streaming and page the grain's
 /// opaque cursor internally over a single pinned snapshot (mirroring <see cref="BulkGrpcService"/>).
 /// </summary>
@@ -23,7 +23,9 @@ public sealed class AuthzedPermissionsV1Service(
     IPermissionChecker checker, IGrainFactory grains, ISchemaProvider schema)
     : V1::PermissionsService.PermissionsServiceBase
 {
-    private IReverseOpsGrain ReverseOps => grains.GetGrain<IReverseOpsGrain>(IReverseOpsGrain.Key);
+    // ExpandPermissionTree is unary with no follow-up MoveNext, so it reuses the one well-known
+    // activation instead of minting a fresh Guid per call (see IReverseOpsStreamGrain remarks).
+    private IReverseOpsStreamGrain ReverseOps => grains.GetGrain<IReverseOpsStreamGrain>(IReverseOpsStreamGrain.ExpandKey);
     private IRelationshipsGrain Relationships => grains.GetGrain<IRelationshipsGrain>(IRelationshipsGrain.Key);
 
     // Each read mints a FRESH Guid so every streaming RPC gets its OWN grain identity/activation — native

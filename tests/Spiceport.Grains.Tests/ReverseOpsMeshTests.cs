@@ -7,8 +7,8 @@ using Spiceport.Grains.Abstractions;
 namespace Spiceport.Grains.Tests;
 
 /// <summary>
-/// Exercises the three reverse / tree ops through the REAL Orleans grain mesh: the stateless-worker
-/// <see cref="IReverseOpsGrain"/> resolved from the in-process <see cref="TestCluster"/>'s grain
+/// Exercises the three reverse / tree ops through the REAL Orleans grain mesh: the
+/// <see cref="IReverseOpsStreamGrain"/> resolved from the in-process <see cref="TestCluster"/>'s grain
 /// factory, running ExpandPermissionTree, LookupSubjects and LookupResources against the silo's
 /// datastore snapshot.
 /// </summary>
@@ -37,8 +37,9 @@ public class ReverseOpsMeshTests
         await datastore.ReadWriteTx(tx => tx.WriteRelationships(updates));
     }
 
-    private static IReverseOpsGrain Grain(MeshTestCluster cluster) =>
-        cluster.GrainFactory.GetGrain<IReverseOpsGrain>(IReverseOpsGrain.Key);
+    // ExpandPermissionTree is unary with no follow-up MoveNext, so it reuses the well-known Expand key.
+    private static IReverseOpsStreamGrain Grain(MeshTestCluster cluster) =>
+        cluster.GrainFactory.GetGrain<IReverseOpsStreamGrain>(IReverseOpsStreamGrain.ExpandKey);
 
     // A FRESH Guid per enumeration: native IAsyncEnumerable streaming pins the enumerator to one activation,
     // so every stream (and every resume) must resolve its own brand-new grain key.

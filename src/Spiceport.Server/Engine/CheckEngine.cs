@@ -119,7 +119,6 @@ public sealed class CheckEngine
         ArgumentNullException.ThrowIfNull(subject);
 
         var now = evaluationTime ?? SystemClock.Instance.UtcNow;
-        var state = new CheckState();
 
         // In-process drive: build a LocalDispatcher that resolves any revision back to the single
         // reader we were handed, then dispatch the top-level sub-problem through it. The request
@@ -128,8 +127,7 @@ public sealed class CheckEngine
         var local = new LocalDispatcher(
             _namespaces,
             _ => reader,
-            now,
-            state);
+            now);
 
         // The local dispatcher is both the top-level entry point and its own onward seam: with the
         // caller-side branch cache retired (the CheckGrain activation memo is the one cache now, see
@@ -148,7 +146,7 @@ public sealed class CheckEngine
 
         // Collapse stays the per-request, post-dispatch step: evaluate the accumulated caveat with
         // the request-time context. (CycleCut is computed/propagated but does not affect the verdict.)
-        return Collapse(result, caveatContext, state.DispatchCount);
+        return Collapse(result, caveatContext);
     }
 
     /// <summary>
@@ -163,24 +161,22 @@ public sealed class CheckEngine
     /// </remarks>
     /// <param name="result">The pre-context dispatch branch (membership + caveat expression).</param>
     /// <param name="caveatContext">The request-time caveat context, or null.</param>
-    /// <param name="dispatchCount">The dispatch count to report on the result.</param>
     public CheckResult Collapse(
         DispatchCheckResult result,
-        IReadOnlyDictionary<string, object?>? caveatContext,
-        int dispatchCount = 0)
+        IReadOnlyDictionary<string, object?>? caveatContext)
     {
         if (!result.Member)
-            return new CheckResult(Membership.NotMember, dispatchCount);
+            return new CheckResult(Membership.NotMember);
 
         if (result.Caveat is null)
-            return new CheckResult(Membership.Member, dispatchCount);
+            return new CheckResult(Membership.Member);
 
         var evaluated = _caveatEvaluator.EvaluateExpression(result.Caveat, caveatContext);
         return evaluated.Outcome switch
         {
-            CaveatOutcome.DefinitelyTrue => new CheckResult(Membership.Member, dispatchCount),
-            CaveatOutcome.DefinitelyFalse => new CheckResult(Membership.NotMember, dispatchCount),
-            _ => new CheckResult(Membership.Caveated, dispatchCount, evaluated.MissingFields),
+            CaveatOutcome.DefinitelyTrue => new CheckResult(Membership.Member),
+            CaveatOutcome.DefinitelyFalse => new CheckResult(Membership.NotMember),
+            _ => new CheckResult(Membership.Caveated, evaluated.MissingFields),
         };
     }
 }

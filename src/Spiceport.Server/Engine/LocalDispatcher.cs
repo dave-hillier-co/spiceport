@@ -35,7 +35,6 @@ public sealed class LocalDispatcher : IDispatcher
     private readonly ImmutableDictionary<string, NamespaceDefinition> _namespaces;
     private readonly Func<IRevision, IDatastoreReader> _readerFor;
     private readonly DateTimeOffset _now;
-    private readonly CheckState _state;
 
     /// <summary>
     /// Creates a local dispatcher over the given schema, reader resolver and evaluation clock.
@@ -43,20 +42,16 @@ public sealed class LocalDispatcher : IDispatcher
     /// <param name="namespaces">The compiled namespace definitions keyed by name.</param>
     /// <param name="readerFor">Resolves a snapshot reader for a request's revision identity.</param>
     /// <param name="now">The pinned evaluation "now" used to filter expired relationships.</param>
-    /// <param name="state">Shared per-check state (dispatch counter, cycle-cut accounting).</param>
     public LocalDispatcher(
         ImmutableDictionary<string, NamespaceDefinition> namespaces,
         Func<IRevision, IDatastoreReader> readerFor,
-        DateTimeOffset now,
-        CheckState state)
+        DateTimeOffset now)
     {
         ArgumentNullException.ThrowIfNull(namespaces);
         ArgumentNullException.ThrowIfNull(readerFor);
-        ArgumentNullException.ThrowIfNull(state);
         _namespaces = namespaces;
         _readerFor = readerFor;
         _now = now;
-        _state = state;
         Dispatcher = this;
     }
 
@@ -71,7 +66,6 @@ public sealed class LocalDispatcher : IDispatcher
     {
         ArgumentNullException.ThrowIfNull(request);
         ct.ThrowIfCancellationRequested();
-        _state.DispatchCount++;
 
         var resource = request.Resource;
         var subject = request.Subject;

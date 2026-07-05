@@ -8,7 +8,7 @@ namespace Spiceport.Grains.Tests;
 
 /// <summary>
 /// Stage-4 gates for the Leopard <see cref="MembershipIndex"/> wired into the mesh behind the
-/// <c>useMembershipIndex</c> flag. Drives <see cref="IReverseOpsGrain.LookupResources"/> with the index ON and
+/// <c>useMembershipIndex</c> flag. Drives <see cref="IReverseOpsStreamGrain.StreamLookupResources"/> with the index ON and
 /// proves the result set is IDENTICAL to the index-OFF engine over the same snapshot (oracle equivalence
 /// end-to-end), that every returned resource is Check-confirmed, and that a runtime schema swap invalidates the
 /// old-hash index (the rebuilt index keeps verdicts correct).

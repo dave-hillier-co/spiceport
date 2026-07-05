@@ -48,7 +48,7 @@ public enum SetOpWire
     Exclusion = 2,
 }
 
-/// <summary>Arguments for <see cref="IReverseOpsGrain.ExpandPermissionTree"/>.</summary>
+/// <summary>Arguments for <see cref="IReverseOpsStreamGrain.ExpandPermissionTree"/>.</summary>
 /// <param name="ResourceType">The resource namespace.</param>
 /// <param name="ResourceId">The resource object id.</param>
 /// <param name="Permission">The relation or permission to expand.</param>
@@ -62,7 +62,7 @@ public sealed record ExpandTreeArgs(
     [property: Id(3)] ExpandModeWire Mode,
     [property: Id(4)] ConsistencyWire? Consistency = null);
 
-/// <summary>The reply from <see cref="IReverseOpsGrain.ExpandPermissionTree"/>: the whole tree root.</summary>
+/// <summary>The reply from <see cref="IReverseOpsStreamGrain.ExpandPermissionTree"/>: the whole tree root.</summary>
 /// <param name="Root">The expanded tree root.</param>
 /// <param name="ExpandedAtToken">The ZedToken for the revision actually evaluated.</param>
 [GenerateSerializer]

@@ -9,8 +9,8 @@ namespace Spiceport.Grains.Tests;
 
 /// <summary>
 /// Exercises the three reverse / tree ops (ExpandPermissionTree, LookupSubjects, LookupResources)
-/// THROUGH the in-process Orleans <see cref="MeshTestCluster"/> grain surface — the stateless-worker
-/// <see cref="IReverseOpsGrain"/> resolved from the cluster's grain factory — against representative
+/// THROUGH the in-process Orleans <see cref="MeshTestCluster"/> grain surface — the
+/// <see cref="IReverseOpsStreamGrain"/> resolved from the cluster's grain factory — against representative
 /// SpiceDB corpus schemas (a nested-group / exclusion file and a caveat file), NOT against the
 /// in-process engine directly.
 /// </summary>
@@ -48,8 +48,9 @@ public class ReverseOpsCorpusMeshTests
         await datastore.ReadWriteTx(tx => tx.WriteRelationships(updates));
     }
 
-    private static IReverseOpsGrain Grain(MeshTestCluster cluster) =>
-        cluster.GrainFactory.GetGrain<IReverseOpsGrain>(IReverseOpsGrain.Key);
+    // ExpandPermissionTree is unary with no follow-up MoveNext, so it reuses the well-known Expand key.
+    private static IReverseOpsStreamGrain Grain(MeshTestCluster cluster) =>
+        cluster.GrainFactory.GetGrain<IReverseOpsStreamGrain>(IReverseOpsStreamGrain.ExpandKey);
 
     // The reverse LOOKUP ops now stream from the Guid-keyed IReverseOpsStreamGrain (a fresh key per
     // enumeration); collect the whole stream so the corpus assertions read the same shape as before.
