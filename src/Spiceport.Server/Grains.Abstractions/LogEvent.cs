@@ -22,7 +22,7 @@ public sealed record CounterDeltaWire(
 /// <see cref="CounterChanges"/> carry name + filter (null filter = tombstone). A consumer can fold the
 /// ordered event sequence from empty without any side state.
 /// </remarks>
-[GenerateSerializer]
+[GenerateSerializer, Immutable]
 public sealed record LogEvent(
     [property: Id(0)] long Revision,
     [property: Id(1)] IReadOnlyList<RelationshipUpdateWire> RelationshipChanges,

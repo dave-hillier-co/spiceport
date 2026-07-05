@@ -40,7 +40,9 @@ public sealed class CheckGrain(
         Task.FromResult(localSiloDetails.SiloAddress.ToParsableString());
 
     /// <inheritdoc />
-    public async Task<DispatchCheckReply> DispatchCheck(DispatchCheckArgs args)
+    public async Task<DispatchCheckReply> DispatchCheck(
+        DispatchCheckArgs args,
+        GrainCancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(args);
 
@@ -68,7 +70,7 @@ public sealed class CheckGrain(
             parts.Mode);
         var request = new DispatchCheckRequest(parts.Resource, parts.Subject, meta);
 
-        var result = await local.DispatchCheck(request, CancellationToken.None).ConfigureAwait(false);
+        var result = await local.DispatchCheck(request, cancellationToken.CancellationToken);
 
         return new DispatchCheckReply(
             result.Member, CaveatWire.ToWire(result.Caveat), result.CycleCut, result.DepthRequired);

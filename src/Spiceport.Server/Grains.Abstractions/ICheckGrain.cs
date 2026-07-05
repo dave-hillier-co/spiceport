@@ -27,7 +27,7 @@ namespace Spiceport.Grains.Abstractions;
 /// exact revision that must be keyed exactly in the branch cache (never quantized). Defaults to
 /// <see cref="RevisionMode.Optimized"/> so existing callers are unchanged.
 /// </param>
-[GenerateSerializer]
+[GenerateSerializer, Immutable]
 public sealed record DispatchCheckArgs(
     [property: Id(0)] int DepthRemaining,
     [property: Id(1)] byte[] BloomBits,
@@ -53,7 +53,7 @@ public sealed record DispatchCheckArgs(
 /// the grain boundary so the silo-wide caching dispatcher can gate reuse on
 /// <c>DepthRemaining &gt;= DepthRequired</c> — mirroring SpiceDB's <c>ResponseMeta.DepthRequired</c>.
 /// </param>
-[GenerateSerializer]
+[GenerateSerializer, Immutable]
 public sealed record DispatchCheckReply(
     [property: Id(0)] bool Member,
     [property: Id(1)] SerializedCaveat? Caveat,
@@ -72,8 +72,14 @@ public sealed record DispatchCheckReply(
 /// </remarks>
 public interface ICheckGrain : IGrainWithStringKey
 {
-    /// <summary>Evaluates the one sub-problem this grain is keyed to, dispatching children onward.</summary>
-    Task<DispatchCheckReply> DispatchCheck(DispatchCheckArgs args);
+    /// <summary>
+    /// Evaluates the one sub-problem this grain is keyed to, dispatching children onward. The Orleans
+    /// cancellation token propagates caller cancellation across the grain boundary and through every
+    /// recursive child dispatch.
+    /// </summary>
+    Task<DispatchCheckReply> DispatchCheck(
+        DispatchCheckArgs args,
+        GrainCancellationToken cancellationToken);
 
     /// <summary>
     /// Returns the <c>ToParsableString()</c> of the silo this activation is hosted on. Used to prove

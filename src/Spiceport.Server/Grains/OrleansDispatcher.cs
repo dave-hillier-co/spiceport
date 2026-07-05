@@ -157,9 +157,31 @@ public sealed class OrleansDispatcher : IDispatcher
             request.Meta.Mode);
 
         DispatchCheckReply reply;
+        using var grainCancellation = new GrainCancellationTokenSource();
         try
         {
-            reply = await grain.DispatchCheck(args).ConfigureAwait(false);
+            var grainCall = grain.DispatchCheck(args, grainCancellation.Token);
+            try
+            {
+                reply = await grainCall.WaitAsync(ct).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                // GrainCancellationTokenSource.Cancel is asynchronous: await delivery so cancellation
+                // has reached the remote activation before unwinding this hop. The receiver converts
+                // the Orleans token back to the engine's System.Threading.CancellationToken.
+                try
+                {
+                    await grainCancellation.Cancel().ConfigureAwait(false);
+                }
+                catch
+                {
+                    // Cancellation is already the primary outcome. A silo disappearing while the
+                    // cancellation notification is in flight must not replace it with a transport error.
+                }
+
+                throw;
+            }
         }
         catch (Exception ex)
         {

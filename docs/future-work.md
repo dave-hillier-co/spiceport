@@ -118,18 +118,13 @@ rebalancing, which self-balances hot silos in a way a static ring cannot.
 **Wins.** Deletes an entire subsystem; unlocks runtime-managed load balancing.
 **Dependency.** Only coherent as the completion of 1.3(c).
 
-### 1.5 Native cancellation propagation (the paper's pruning)
+### 1.5 Native cancellation propagation (implemented)
 
-**Current state.** `IDispatcher.DispatchCheck` accepts a `CancellationToken`, but `CheckGrain`
-passes `CancellationToken.None` into its local dispatch — cancellation dies at every grain
-boundary, so a remote subtree keeps computing after its parent has already short-circuited.
-
-**Direction.** Orleans flows `CancellationToken` through grain calls natively. Thread the token
-through dispatcher → grain call → engine so that union short-circuits and gRPC deadline expiry
-prune in-flight work mesh-wide.
-
-**Wins.** Zanzibar's early-termination behavior with no bespoke machinery; strictly less wasted
-work. Small, grounded, independently shippable — a good warm-up regardless of 1.3.
+`OrleansDispatcher` now bridges each engine `CancellationToken` to an Orleans
+`GrainCancellationToken`, and `CheckGrain` passes its underlying token into the local engine.
+Cancellation therefore continues through every recursive child dispatch instead of stopping at
+the first grain boundary. Delivery to a remote activation is awaited before the cancelled hop
+unwinds, so gRPC deadline expiry prunes the mesh-wide computation.
 
 ### 1.6 Grain call filters for the cross-cutting layer
 
@@ -155,11 +150,12 @@ hand-built as DI singletons with manual lifecycle. The native primitive for that
 **GrainService**: silo-lifecycle-managed (the projection could bootstrap *before* the silo accepts
 traffic) and addressable from grains. Moderate win; the DI versions are workable.
 
-### 1.9 `[Immutable]` wire types
+### 1.9 `[Immutable]` wire types (implemented)
 
-Requests, branches, and log events are records that never mutate; `[Immutable]` eliminates the
-deep copy on same-silo grain calls. Small alone — but it is the enabler that makes 1.3(c)/1.4's
-"always call the grain, even locally" cheap enough to win its benchmark.
+The check request (`DispatchCheckArgs`), pre-context branch reply (`DispatchCheckReply`), and
+folded `LogEvent` are marked `[Immutable]`, eliminating their defensive deep copy on same-silo
+grain calls. This is a small win alone, but helps make 1.3(c)/1.4's "always call the grain, even
+locally" path cheap enough to benchmark fairly.
 
 ### 1.10 Native `IAsyncEnumerable` grain streaming (internal paths)
 
