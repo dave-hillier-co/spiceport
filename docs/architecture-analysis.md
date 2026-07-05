@@ -232,11 +232,13 @@ feed, and Leopard index below are all pure folds of that one log.
 
 **Two consumers ride the same log feed:**
 
-- **Watch (the changefeed)** consumes the `LogEvent` feed directly. A per-silo notifier samples the
-  head and pulses a shared async signal (and a local commit pulses it immediately); each Watch stream
-  tails `ReadFrom` from its own cursor, maps each event to a `RevisionChange`, and parks on the signal
-  rather than polling. One poller per silo, not one per stream; checkpoints ride the revision the feed
-  has progressed through, so a consumer filtering to a content subset still observes liveness.
+- **Watch (the changefeed)** consumes the `LogEvent` feed directly. A per-silo notifier registers a
+  grain observer on the datastore grain, so a commit anywhere pushes the new head to it (and a local
+  commit pulses it immediately, zero-hop); each Watch stream tails `ReadFrom` from its own cursor,
+  maps each event to a `RevisionChange`, and parks on the shared signal. Observer delivery is
+  best-effort, so a slow per-silo heartbeat doubles as registration refresh and missed-push backstop —
+  one heartbeat per silo, not a poller per stream; checkpoints ride the revision the feed has
+  progressed through, so a consumer filtering to a content subset still observes liveness.
 
 - **A Leopard-style membership index** (on by default, opt-out) is a projection over the same feed
   that flattens nested-group / userset chains into reverse adjacency, so `LookupResources` can

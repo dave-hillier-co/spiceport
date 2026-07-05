@@ -4,43 +4,66 @@ namespace Spiceport.Grains;
 
 /// <summary>
 /// A per-silo notifier that lets every <see cref="GrainBackedDatastore.Watch"/> stream on the silo learn when
-/// the datastore head advances WITHOUT each stream polling the grain on its own timer. ONE background loop per
-/// silo samples the head (a cheap <see cref="IDatastoreGrain.GetHead"/>, not a whole-state fetch) and pulses a
-/// shared async signal; in addition the local write path pulses it directly on commit, so a write committed on
-/// this silo is observed by a local watcher immediately (the poll only covers writes committed via other
-/// silos). Streams await the signal and then pull their own diffs from the log
-/// (<see cref="IDatastoreLog.ReadFrom"/>) from their own cursor — so the per-stream cost is one log-tail read
-/// per change, never a full-state fetch and never a private timer.
+/// the datastore head advances WITHOUT each stream polling the grain on its own timer. The primary signal is
+/// PUSH: the hub registers itself as an <see cref="IDatastoreWatcher"/> grain observer, so a commit on any
+/// silo notifies it directly; in addition the local write path pulses it on commit (zero-hop same-silo
+/// latency). Because observer delivery is best-effort (non-durable references, dropped on grain
+/// reactivation), ONE slow background loop per silo calls <see cref="IDatastoreGrain.SubscribeWatch"/> as a
+/// combined heartbeat: it refreshes the registration, resubscribes after grain reactivation, and pulses the
+/// returned head — so a missed push costs at most one heartbeat of latency, never a lost event. Streams await
+/// the signal and then pull their own diffs from the log (<see cref="IDatastoreLog.ReadFrom"/>) from their own
+/// cursor — so the per-stream cost is one log-tail read per change, never a full-state fetch and never a
+/// private timer.
 /// </summary>
-internal sealed class LogWatchHub : IAsyncDisposable
+internal sealed class LogWatchHub : IDatastoreWatcher, IAsyncDisposable
 {
-    /// <summary>Head-sampling cadence (covers cross-silo writes; same-silo writes pulse directly on commit).</summary>
-    private static readonly TimeSpan PollInterval = TimeSpan.FromMilliseconds(25);
+    /// <summary>
+    /// Default heartbeat cadence: a liveness backstop for missed pushes and the observer-registration
+    /// refresh (the grain expires registrations not refreshed within several heartbeats).
+    /// </summary>
+    private static readonly TimeSpan DefaultHeartbeatInterval = TimeSpan.FromSeconds(1);
 
     private readonly IDatastoreGrain _grain;
+    private readonly IGrainFactory _grainFactory;
+    private readonly TimeSpan _heartbeatInterval;
     private readonly CancellationTokenSource _cts = new();
     private readonly object _lock = new();
 
     private TaskCompletionSource _signal = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private long _observedHead;
     private Task? _loop;
+    private IDatastoreWatcher? _selfRef;
 
-    public LogWatchHub(IDatastoreGrain grain) => _grain = grain;
+    public LogWatchHub(IDatastoreGrain grain, IGrainFactory grainFactory, TimeSpan? heartbeatInterval = null)
+    {
+        _grain = grain;
+        _grainFactory = grainFactory;
+        _heartbeatInterval = heartbeatInterval ?? DefaultHeartbeatInterval;
+    }
 
-    /// <summary>Starts the per-silo head-sampling loop on first use (idempotent).</summary>
+    /// <summary>Push delivery from the datastore grain: a commit advanced the head.</summary>
+    public Task HeadAdvanced(long head)
+    {
+        Pulse(head);
+        return Task.CompletedTask;
+    }
+
+    /// <summary>Registers the observer reference and starts the heartbeat loop on first use (idempotent).</summary>
     public void EnsureStarted()
     {
         if (_loop is not null)
             return;
         lock (_lock)
         {
-            _loop ??= Task.Run(() => PollLoop(_cts.Token));
+            _selfRef ??= _grainFactory.CreateObjectReference<IDatastoreWatcher>(this);
+            _loop ??= Task.Run(() => HeartbeatLoop(_selfRef, _cts.Token));
         }
     }
 
     /// <summary>
     /// Records that the head advanced to <paramref name="head"/> and wakes every waiter. Called by the local
-    /// write path on commit (instant same-silo latency) and by the poll loop (cross-silo writes).
+    /// write path on commit (instant same-silo latency), by the observer push (cross-silo commits), and by
+    /// the heartbeat (missed-push backstop). Monotonic, so racing sources are harmless.
     /// </summary>
     public void Pulse(long head)
     {
@@ -75,16 +98,19 @@ internal sealed class LogWatchHub : IAsyncDisposable
         }
     }
 
-    private async Task PollLoop(CancellationToken ct)
+    private async Task HeartbeatLoop(IDatastoreWatcher selfRef, CancellationToken ct)
     {
         while (!ct.IsCancellationRequested)
         {
             try
             {
-                // WaitAsync(ct) makes cancellation unblock the await IMMEDIATELY even if the grain call is
-                // in-flight (e.g. the silo is shutting down) — so disposal never waits on a hung hop.
-                Pulse((await _grain.GetHead().WaitAsync(ct).ConfigureAwait(false)).Head);
-                await Task.Delay(PollInterval, ct).ConfigureAwait(false);
+                // One hop doing three jobs: refresh the observer registration (so it never expires while
+                // this hub lives), resubscribe after a grain reactivation dropped it, and read the head as
+                // the missed-push backstop. WaitAsync(ct) makes cancellation unblock the await IMMEDIATELY
+                // even if the grain call is in-flight (e.g. the silo is shutting down) — so disposal never
+                // waits on a hung hop.
+                Pulse((await _grain.SubscribeWatch(selfRef).WaitAsync(ct).ConfigureAwait(false)).Head);
+                await Task.Delay(_heartbeatInterval, ct).ConfigureAwait(false);
             }
             catch (OperationCanceledException)
             {
@@ -94,7 +120,7 @@ internal sealed class LogWatchHub : IAsyncDisposable
             {
                 // The grain may be momentarily unavailable (membership change, deactivation). Back off and
                 // retry; a transient failure must not tear down every Watch stream on the silo.
-                try { await Task.Delay(PollInterval, ct).ConfigureAwait(false); }
+                try { await Task.Delay(_heartbeatInterval, ct).ConfigureAwait(false); }
                 catch (OperationCanceledException) { return; }
             }
         }
@@ -109,6 +135,21 @@ internal sealed class LogWatchHub : IAsyncDisposable
             // a pathological in-flight hop can never deadlock silo teardown.
             await Task.WhenAny(loop, Task.Delay(TimeSpan.FromSeconds(5))).ConfigureAwait(false);
         }
+
+        // Best-effort deregistration (expiry would drop it anyway) + release the client-side reference.
+        if (_selfRef is { } selfRef)
+        {
+            try
+            {
+                await _grain.UnsubscribeWatch(selfRef).WaitAsync(TimeSpan.FromSeconds(2)).ConfigureAwait(false);
+            }
+            catch
+            {
+                // The registration expires on its own; never let teardown fail on it.
+            }
+            _grainFactory.DeleteObjectReference<IDatastoreWatcher>(selfRef);
+        }
+
         // Release any stragglers so their WaitAsync observes cancellation via their own token.
         lock (_lock)
             _signal.TrySetResult();

@@ -41,8 +41,10 @@ public sealed class GrainBackedDatastore : IDatastore, IAsyncDisposable
     private readonly SiloProjection _projection;
 
     // Per-silo Watch notifier (created lazily on the first Watch). The local write path pulses it on commit
-    // for instant same-silo Watch latency; its background loop covers cross-silo commits. Guarded by _hubLock.
+    // for instant same-silo Watch latency; cross-silo commits arrive by observer push from the datastore
+    // grain, with the hub's slow heartbeat as the missed-push backstop. Guarded by _hubLock.
     private readonly object _hubLock = new();
+    private readonly TimeSpan? _watchFallbackInterval;
     private LogWatchHub? _hub;
 
     // Cached optimized-revision candidate (mirrors InMemoryDatastore's CachedOptimizedRevisions): a real
@@ -61,12 +63,18 @@ public sealed class GrainBackedDatastore : IDatastore, IAsyncDisposable
     /// <param name="grainFactory">The Orleans grain factory used to reach the singleton datastore grain.</param>
     /// <param name="quantization">Quantization window for <see cref="OptimizedRevision"/> (default 5s).</param>
     /// <param name="gcWindow">How long old revisions remain valid (default 24h).</param>
+    /// <param name="watchFallbackInterval">
+    /// The Watch hub's heartbeat cadence (observer-registration refresh + missed-push backstop). Test seam;
+    /// leave null for the production default.
+    /// </param>
     public GrainBackedDatastore(
-        IGrainFactory grainFactory, TimeSpan? quantization = null, TimeSpan? gcWindow = null)
+        IGrainFactory grainFactory, TimeSpan? quantization = null, TimeSpan? gcWindow = null,
+        TimeSpan? watchFallbackInterval = null)
     {
         _grainFactory = grainFactory;
         _quantizationNanos = (long)((quantization ?? TimeSpan.FromSeconds(5)).TotalMilliseconds) * 1_000_000L;
         _gcWindowNanos = (long)((gcWindow ?? TimeSpan.FromHours(24)).TotalMilliseconds) * 1_000_000L;
+        _watchFallbackInterval = watchFallbackInterval;
         _projection = new SiloProjection(grainFactory.GetGrain<IDatastoreGrain>(IDatastoreGrain.Key));
     }
 
@@ -221,7 +229,8 @@ public sealed class GrainBackedDatastore : IDatastore, IAsyncDisposable
             }
 
             // Caught up: park until a commit advances the head past the cursor (a local commit pulses the hub
-            // directly; cross-silo commits are picked up by the hub's poll). No per-stream timer.
+            // directly; cross-silo commits arrive by observer push, backstopped by the hub's heartbeat). No
+            // per-stream timer.
             try
             {
                 await hub.WaitForChangeAfter(cursor, cancellationToken).ConfigureAwait(false);
@@ -239,7 +248,7 @@ public sealed class GrainBackedDatastore : IDatastore, IAsyncDisposable
             return existing;
         lock (_hubLock)
         {
-            return _hub ??= new LogWatchHub(Grain);
+            return _hub ??= new LogWatchHub(Grain, _grainFactory, _watchFallbackInterval);
         }
     }
 

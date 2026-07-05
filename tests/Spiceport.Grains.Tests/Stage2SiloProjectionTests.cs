@@ -143,5 +143,7 @@ public sealed class Stage2SiloProjectionTests
 
         public Task<DatastoreHeadWire> GetHead() => throw new NotSupportedException();
         public Task<long?> AppendCommit(long expectedHead, ProposedWrite write) => throw new NotSupportedException();
+        public Task<DatastoreHeadWire> SubscribeWatch(IDatastoreWatcher watcher) => throw new NotSupportedException();
+        public Task UnsubscribeWatch(IDatastoreWatcher watcher) => throw new NotSupportedException();
     }
 }
