@@ -148,54 +148,6 @@ public sealed class RelationshipsGrain(
     }
 
     /// <inheritdoc />
-    public async Task<ReadRelationshipsReply> ReadRelationships(ReadRelationshipsArgs args)
-    {
-        ArgumentNullException.ThrowIfNull(args);
-
-        // Honour the request consistency; null (the default) is MinimizeLatency → the optimized
-        // revision, identical to the prior behaviour. The read-at token is minted from the revision
-        // actually evaluated, not unconditionally the optimized one.
-        var requirement = (args.Consistency ?? ConsistencyWire.MinimizeLatency).ToRequirement();
-        var resolved = await RevisionResolver
-            .Resolve(datastore, requirement, cancellationToken: CancellationToken.None)
-            .ConfigureAwait(ContinueOnCapturedContext);
-        var reader = datastore.SnapshotReader(resolved.Revision);
-        var filter = ToFilter(args.Filter);
-        var after = args.Cursor;
-        var limit = args.Limit is { } l && l > 0 ? l : (int?)null;
-
-        // Materialize and order deterministically by canonical tuple string so paging is stable.
-        var matched = new List<(string Tuple, Relationship Rel)>();
-        await foreach (var rel in reader.QueryRelationships(filter))
-        {
-            var tuple = TupleStrings.FormatRelationship(rel);
-            if (after is { } a && string.CompareOrdinal(tuple, a) <= 0)
-                continue;
-            matched.Add((tuple, rel));
-        }
-
-        matched.Sort((x, y) => string.CompareOrdinal(x.Tuple, y.Tuple));
-
-        var page = new List<RelationshipWire>();
-        string? cursor = null;
-        for (var i = 0; i < matched.Count; i++)
-        {
-            if (limit is { } cap && page.Count >= cap)
-            {
-                // More rows remain past the page: resume strictly after the last emitted tuple.
-                cursor = matched[i - 1].Tuple;
-                break;
-            }
-
-            page.Add(ToWire(matched[i].Rel));
-        }
-
-        var token = await MintToken(resolved.Revision, resolved.SchemaHash ?? schemaProvider.Current.SchemaHash)
-            .ConfigureAwait(ContinueOnCapturedContext);
-        return new ReadRelationshipsReply(page, cursor, token);
-    }
-
-    /// <inheritdoc />
     public async Task<BulkImportRelationshipsReply> BulkImportRelationships(BulkImportRelationshipsArgs args)
     {
         ArgumentNullException.ThrowIfNull(args);
@@ -233,66 +185,6 @@ public sealed class RelationshipsGrain(
                 yield return rel;
             await Task.CompletedTask;
         }
-    }
-
-    /// <inheritdoc />
-    public async Task<BulkExportRelationshipsReply> BulkExportRelationships(BulkExportRelationshipsArgs args)
-    {
-        ArgumentNullException.ThrowIfNull(args);
-
-        // Pin the snapshot ONCE: with no cursor resolve from the request consistency; with a cursor read
-        // the exact revision the cursor encodes. The pinned revision is carried in every returned cursor,
-        // so resuming reads the same snapshot and never sees writes committed after the export began.
-        IRevision pinned;
-        string? after;
-        if (BulkExportCursor.TryDecode(args.Cursor, out var decoded))
-        {
-            pinned = decoded.Revision;
-            after = decoded.AfterTuple;
-        }
-        else
-        {
-            var requirement = (args.Consistency ?? ConsistencyWire.MinimizeLatency).ToRequirement();
-            var resolved = await RevisionResolver
-                .Resolve(datastore, requirement, cancellationToken: CancellationToken.None)
-                .ConfigureAwait(ContinueOnCapturedContext);
-            pinned = resolved.Revision;
-            after = null;
-        }
-
-        var reader = datastore.SnapshotReader(pinned);
-        var filter = ToFilter(args.Filter);
-        var limit = args.Limit > 0 ? args.Limit : DefaultExportPageSize;
-
-        // Materialize matching tuples ordered by canonical string (same deterministic paging convention
-        // as ReadRelationships), skip past the cursor, and take one page.
-        var matched = new List<(string Tuple, Relationship Rel)>();
-        await foreach (var rel in reader.QueryRelationships(filter))
-        {
-            var tuple = TupleStrings.FormatRelationship(rel);
-            if (after is { } a && string.CompareOrdinal(tuple, a) <= 0)
-                continue;
-            matched.Add((tuple, rel));
-        }
-
-        matched.Sort((x, y) => string.CompareOrdinal(x.Tuple, y.Tuple));
-
-        var page = new List<RelationshipWire>(Math.Min(limit, matched.Count));
-        string? lastTuple = null;
-        for (var i = 0; i < matched.Count && page.Count < limit; i++)
-        {
-            page.Add(ToWire(matched[i].Rel));
-            lastTuple = matched[i].Tuple;
-        }
-
-        // A full page that exactly drains the remaining rows still emits a cursor; the next call returns
-        // an empty page with a null cursor, signalling exhaustion. This mirrors the export's "keep going
-        // while pages are full" contract.
-        var cursor = page.Count == limit && lastTuple is not null
-            ? BulkExportCursor.Encode(pinned, lastTuple)
-            : null;
-
-        return new BulkExportRelationshipsReply(page, cursor);
     }
 
     /// <inheritdoc />
@@ -360,9 +252,6 @@ public sealed class RelationshipsGrain(
             .ConfigureAwait(ContinueOnCapturedContext);
         return new CountRelationshipsReply(count, token);
     }
-
-    /// <summary>The default bulk-export page size when the request leaves the limit unset.</summary>
-    private const int DefaultExportPageSize = 1000;
 
     /// <summary>
     /// Evaluates each precondition against the transaction reader (the snapshot the writes will commit
@@ -439,8 +328,6 @@ public sealed class RelationshipsGrain(
     }
 
     private static Relationship ToRelationship(RelationshipWire wire) => WireConvert.ToRelationship(wire);
-
-    private static RelationshipWire ToWire(Relationship rel) => WireConvert.ToWire(rel);
 
     private static RelationshipsFilter ToFilter(RelationshipsFilterWire wire)
     {

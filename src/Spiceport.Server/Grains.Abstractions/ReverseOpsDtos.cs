@@ -1,3 +1,5 @@
+using Orleans.Concurrency;
+
 namespace Spiceport.Grains.Abstractions;
 
 /// <summary>
@@ -108,7 +110,7 @@ public sealed record ExpandSubjectWire(
 
 // ---- LookupSubjects ----
 
-/// <summary>Arguments for <see cref="IReverseOpsGrain.LookupSubjects"/>.</summary>
+/// <summary>Arguments for <see cref="IReverseOpsStreamGrain.StreamLookupSubjects"/>. <c>Limit</c> is advisory.</summary>
 /// <param name="ResourceType">The resource namespace.</param>
 /// <param name="ResourceId">The resource object id.</param>
 /// <param name="Permission">The relation or permission.</param>
@@ -130,16 +132,6 @@ public sealed record LookupSubjectsArgs(
     [property: Id(7)] string? Cursor,
     [property: Id(8)] ConsistencyWire? Consistency = null);
 
-/// <summary>A bounded page of found subjects with an optional continuation cursor.</summary>
-/// <param name="Subjects">The subjects found in this page.</param>
-/// <param name="Cursor">A continuation token, or null/empty when the enumeration is exhausted.</param>
-/// <param name="LookedUpAtToken">The ZedToken for the revision actually evaluated.</param>
-[GenerateSerializer]
-public sealed record LookupSubjectsReply(
-    [property: Id(0)] IReadOnlyList<FoundSubjectWire> Subjects,
-    [property: Id(1)] string? Cursor,
-    [property: Id(2)] string LookedUpAtToken = "");
-
 /// <summary>A subject found by a lookup, with its collapsed permissionship.</summary>
 /// <param name="SubjectId">The subject object id ("*" for a wildcard).</param>
 /// <param name="IsWildcard">True when the subject is the public wildcard.</param>
@@ -150,9 +142,25 @@ public sealed record FoundSubjectWire(
     [property: Id(1)] bool IsWildcard,
     [property: Id(2)] Permissionship Permissionship);
 
+/// <summary>
+/// One item of the <see cref="IReverseOpsStreamGrain.StreamLookupSubjects"/> native
+/// <see cref="IAsyncEnumerable{T}"/>: a found subject plus the opaque resume cursor positioned
+/// immediately after it. The cursor lets a client-facing limited stream resume from a fresh grain
+/// activation with byte-identical token semantics — the internal page-loop is gone, the client contract
+/// is not.
+/// </summary>
+/// <param name="Subject">The found subject with its collapsed permissionship.</param>
+/// <param name="ResumeCursor">The opaque resume cursor positioned immediately after this subject.</param>
+/// <param name="LookedUpAtToken">The ZedToken for the revision actually evaluated (constant across the stream).</param>
+[GenerateSerializer, Immutable]
+public sealed record FoundSubjectStreamItem(
+    [property: Id(0)] FoundSubjectWire Subject,
+    [property: Id(1)] string ResumeCursor,
+    [property: Id(2)] string LookedUpAtToken = "");
+
 // ---- LookupResources ----
 
-/// <summary>Arguments for <see cref="IReverseOpsGrain.LookupResources"/>.</summary>
+/// <summary>Arguments for <see cref="IReverseOpsStreamGrain.StreamLookupResources"/>.</summary>
 /// <param name="ResourceType">The resource namespace to enumerate.</param>
 /// <param name="Permission">The relation or permission.</param>
 /// <param name="SubjectType">The subject namespace.</param>
@@ -174,16 +182,6 @@ public sealed record LookupResourcesArgs(
     [property: Id(7)] string? Cursor,
     [property: Id(8)] ConsistencyWire? Consistency = null);
 
-/// <summary>A bounded page of found resources with an optional continuation cursor.</summary>
-/// <param name="Resources">The resources found in this page.</param>
-/// <param name="Cursor">A continuation token, or null/empty when the enumeration is exhausted.</param>
-/// <param name="LookedUpAtToken">The ZedToken for the revision actually evaluated.</param>
-[GenerateSerializer]
-public sealed record LookupResourcesReply(
-    [property: Id(0)] IReadOnlyList<FoundResourceWire> Resources,
-    [property: Id(1)] string? Cursor,
-    [property: Id(2)] string LookedUpAtToken = "");
-
 /// <summary>A resource found by a lookup, with its collapsed permissionship.</summary>
 /// <param name="ResourceId">The reachable resource object id.</param>
 /// <param name="Permissionship">Member or caveated (with missing context params).</param>
@@ -191,8 +189,15 @@ public sealed record LookupResourcesReply(
 /// The opaque resume cursor positioned immediately after this resource, so a client can resume the
 /// stream right after it (mirrors v1 <c>after_result_cursor</c>). Null when no cursor is available.
 /// </param>
-[GenerateSerializer]
+/// <param name="LookedUpAtToken">The ZedToken for the revision actually evaluated (constant across the stream).</param>
+/// <remarks>
+/// This record doubles as its own stream item for <see cref="IReverseOpsStreamGrain.StreamLookupResources"/>:
+/// it already carries the per-item resume cursor, so no wrapper is needed. It is <c>[Immutable]</c> so the
+/// native <see cref="IAsyncEnumerable{T}"/> grain stream avoids a defensive copy per item on same-silo calls.
+/// </remarks>
+[GenerateSerializer, Immutable]
 public sealed record FoundResourceWire(
     [property: Id(0)] string ResourceId,
     [property: Id(1)] Permissionship Permissionship,
-    [property: Id(2)] string? AfterResultCursor = null);
+    [property: Id(2)] string? AfterResultCursor = null,
+    [property: Id(3)] string LookedUpAtToken = "");

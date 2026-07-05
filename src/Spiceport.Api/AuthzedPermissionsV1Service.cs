@@ -26,6 +26,13 @@ public sealed class AuthzedPermissionsV1Service(
     private IReverseOpsGrain ReverseOps => grains.GetGrain<IReverseOpsGrain>(IReverseOpsGrain.Key);
     private IRelationshipsGrain Relationships => grains.GetGrain<IRelationshipsGrain>(IRelationshipsGrain.Key);
 
+    // Each read mints a FRESH Guid so every streaming RPC gets its OWN grain identity/activation — native
+    // IAsyncEnumerable streaming pins the enumerator to one activation, so StartEnumeration and every
+    // MoveNext for a stream must target the same (brand-new, never-shared) key. Read ONCE per RPC into a
+    // local; a second read is a different grain. Per-stream activations are reclaimed by idle collection.
+    private IReverseOpsStreamGrain ReverseOpsStream => grains.GetGrain<IReverseOpsStreamGrain>(Guid.NewGuid());
+    private IRelationshipsStreamGrain RelationshipsStream => grains.GetGrain<IRelationshipsStreamGrain>(Guid.NewGuid());
+
     /// <summary>
     /// Maps a caveat-evaluation failure onto a gRPC status: a context value that does not match a
     /// declared parameter type is <c>InvalidArgument</c> (SpiceDB <c>ParameterTypeError</c>); a
@@ -186,42 +193,31 @@ public sealed class AuthzedPermissionsV1Service(
     {
         var filter = ToWire(request.RelationshipFilter);
         var consistency = ToWire(request.Consistency);
-        string? cursor = null;
 
-        // Page the grain over one pinned snapshot: the first page resolves and pins a revision and returns
-        // a cursor encoding it; subsequent pages pass it back so every page reads the SAME snapshot.
-        while (!context.CancellationToken.IsCancellationRequested)
+        // One native grain stream over one pinned snapshot (the internal page loop is gone). Each item
+        // carries the per-message read-at token, exactly as every page-message did before.
+        var stream = RelationshipsStream;
+        try
         {
-            ReadRelationshipsReply reply;
-            try
-            {
-                reply = await Relationships.ReadRelationships(
-                    new ReadRelationshipsArgs(filter, null, cursor, consistency));
-            }
-            catch (InvalidConsistencyTokenException ex)
-            {
-                throw new RpcException(new Status(StatusCode.InvalidArgument, ex.Message));
-            }
-            catch (RevisionNotFoundException ex)
-            {
-                // The pinned revision has been garbage-collected (or never existed): same client-facing
-                // contract as an invalid consistency token.
-                throw new RpcException(new Status(StatusCode.InvalidArgument, ex.Message));
-            }
-
-            foreach (var rel in reply.Relationships)
+            await foreach (var item in stream.StreamReadRelationships(
+                new ReadRelationshipsArgs(filter, null, null, consistency), context.CancellationToken))
             {
                 await responseStream.WriteAsync(new V1::ReadRelationshipsResponse
                 {
-                    ReadAt = new V1::ZedToken { Token = reply.ReadAtToken },
-                    Relationship = ToProto(rel),
+                    ReadAt = new V1::ZedToken { Token = item.ReadAtToken },
+                    Relationship = ToProto(item.Relationship),
                 });
             }
-
-            if (reply.Relationships.Count == 0 || string.IsNullOrEmpty(reply.Cursor))
-                break;
-
-            cursor = reply.Cursor;
+        }
+        catch (InvalidConsistencyTokenException ex)
+        {
+            throw new RpcException(new Status(StatusCode.InvalidArgument, ex.Message));
+        }
+        catch (RevisionNotFoundException ex)
+        {
+            // The pinned revision has been garbage-collected (or never existed): same client-facing
+            // contract as an invalid consistency token.
+            throw new RpcException(new Status(StatusCode.InvalidArgument, ex.Message));
         }
     }
 
@@ -315,47 +311,30 @@ public sealed class AuthzedPermissionsV1Service(
             new SchemaValidation.TypeAndRelation(request.ResourceObjectType, request.Permission, AllowEllipsis: false),
             new SchemaValidation.TypeAndRelation(request.Subject.Object.ObjectType, subjectRelation, AllowEllipsis: true));
 
-        var remaining = limit;
-        while (!context.CancellationToken.IsCancellationRequested)
+        // One native grain stream. A limited request takes at most `limit` items then stops (the RPC stream
+        // terminates; the client resumes via the last item's cursor). An unlimited request drains the whole
+        // reachable set. `limit` also drives the grain's engine path: a limited walk is cursor-bearing (so
+        // every item has a resume cursor), an unlimited/cursorless walk may take the Leopard fast path.
+        var stream = ReverseOpsStream;
+        var emitted = 0;
+        try
         {
-            LookupResourcesReply reply;
-            try
-            {
-                reply = await ReverseOps.LookupResources(new LookupResourcesArgs(
+            await foreach (var r in stream.StreamLookupResources(
+                new LookupResourcesArgs(
                     request.ResourceObjectType,
                     request.Permission,
                     request.Subject.Object.ObjectType,
                     request.Subject.Object.ObjectId,
                     subjectRelation,
                     context5,
-                    remaining,
+                    limit,
                     cursor,
-                    consistency));
-            }
-            catch (InvalidConsistencyTokenException ex)
-            {
-                throw new RpcException(new Status(StatusCode.InvalidArgument, ex.Message));
-            }
-            catch (RevisionNotFoundException ex)
-            {
-                // The pinned revision has been garbage-collected (or never existed): same client-facing
-                // contract as an invalid consistency token.
-                throw new RpcException(new Status(StatusCode.InvalidArgument, ex.Message));
-            }
-            catch (CaveatEvaluationException ex)
-            {
-                throw ToRpc(ex);
-            }
-            catch (DispatchFailedException ex)
-            {
-                throw ToRpc(ex);
-            }
-
-            foreach (var r in reply.Resources)
+                    consistency),
+                context.CancellationToken))
             {
                 var resp = new V1::LookupResourcesResponse
                 {
-                    LookedUpAt = new V1::ZedToken { Token = reply.LookedUpAtToken },
+                    LookedUpAt = new V1::ZedToken { Token = r.LookedUpAtToken },
                     ResourceObjectId = r.ResourceId,
                     Permissionship = ToLookupPermissionship(r.Permissionship),
                 };
@@ -368,20 +347,29 @@ public sealed class AuthzedPermissionsV1Service(
                 if (emitCursors && !string.IsNullOrEmpty(r.AfterResultCursor))
                     resp.AfterResultCursor = new V1::Cursor { Token = r.AfterResultCursor };
                 await responseStream.WriteAsync(resp);
+
+                emitted++;
+                if (limit is { } cap && emitted >= cap)
+                    break;
             }
-
-            if (remaining is { } rem)
-            {
-                remaining = rem - reply.Resources.Count;
-                // A limited request is satisfied by a single page (the grain returns up to `remaining`
-                // results plus a continuation cursor the client uses to fetch the next page itself).
-                break;
-            }
-
-            if (reply.Resources.Count == 0 || string.IsNullOrEmpty(reply.Cursor))
-                break;
-
-            cursor = reply.Cursor;
+        }
+        catch (InvalidConsistencyTokenException ex)
+        {
+            throw new RpcException(new Status(StatusCode.InvalidArgument, ex.Message));
+        }
+        catch (RevisionNotFoundException ex)
+        {
+            // The pinned revision has been garbage-collected (or never existed): same client-facing
+            // contract as an invalid consistency token.
+            throw new RpcException(new Status(StatusCode.InvalidArgument, ex.Message));
+        }
+        catch (CaveatEvaluationException ex)
+        {
+            throw ToRpc(ex);
+        }
+        catch (DispatchFailedException ex)
+        {
+            throw ToRpc(ex);
         }
     }
 
@@ -397,7 +385,6 @@ public sealed class AuthzedPermissionsV1Service(
         // Reject an oversized request caveat context (SpiceDB: GetCaveatContext) -> InvalidArgument.
         var context6 = StructToDict(RequestLimits.ValidateCaveatContextSize(request.Context));
         var consistency = ToWire(request.Consistency);
-        string? cursor = null;
 
         // v1 contract: optional_concrete_limit (field 7) caps the *concrete* (non-wildcard) subjects
         // returned. optional_cursor is not supported for LookupSubjects (the proto documents it as
@@ -411,49 +398,25 @@ public sealed class AuthzedPermissionsV1Service(
             new SchemaValidation.TypeAndRelation(request.Resource.ObjectType, request.Permission, AllowEllipsis: false),
             new SchemaValidation.TypeAndRelation(request.SubjectObjectType, subjectRelation, AllowEllipsis: true));
 
+        // One native grain stream: count non-wildcard emissions and stop once the concrete limit is met.
+        var stream = ReverseOpsStream;
         var emitted = 0;
-        while (!context.CancellationToken.IsCancellationRequested)
+        try
         {
-            // The grain caps each page; once we have served `limit` subjects we stop entirely.
-            var remaining = limit is { } l ? l - emitted : (int?)null;
-            if (remaining is <= 0)
-                break;
-
-            LookupSubjectsReply reply;
-            try
-            {
-                reply = await ReverseOps.LookupSubjects(new LookupSubjectsArgs(
+            await foreach (var item in stream.StreamLookupSubjects(
+                new LookupSubjectsArgs(
                     request.Resource.ObjectType,
                     request.Resource.ObjectId,
                     request.Permission,
                     request.SubjectObjectType,
                     subjectRelation,
                     context6,
-                    remaining,
-                    cursor,
-                    consistency));
-            }
-            catch (InvalidConsistencyTokenException ex)
+                    limit,
+                    null,
+                    consistency),
+                context.CancellationToken))
             {
-                throw new RpcException(new Status(StatusCode.InvalidArgument, ex.Message));
-            }
-            catch (RevisionNotFoundException ex)
-            {
-                // The pinned revision has been garbage-collected (or never existed): same client-facing
-                // contract as an invalid consistency token.
-                throw new RpcException(new Status(StatusCode.InvalidArgument, ex.Message));
-            }
-            catch (CaveatEvaluationException ex)
-            {
-                throw ToRpc(ex);
-            }
-            catch (DispatchFailedException ex)
-            {
-                throw ToRpc(ex);
-            }
-
-            foreach (var s in reply.Subjects)
-            {
+                var s = item.Subject;
                 var ship = ToLookupPermissionship(s.Permissionship);
                 V1::PartialCaveatInfo? partial = null;
                 if (s.Permissionship.IsCaveated && s.Permissionship.MissingContextParams.Count > 0)
@@ -464,7 +427,7 @@ public sealed class AuthzedPermissionsV1Service(
 
                 var resp = new V1::LookupSubjectsResponse
                 {
-                    LookedUpAt = new V1::ZedToken { Token = reply.LookedUpAtToken },
+                    LookedUpAt = new V1::ZedToken { Token = item.LookedUpAtToken },
                     // Modern field.
                     Subject = new V1::ResolvedSubject
                     {
@@ -481,15 +444,29 @@ public sealed class AuthzedPermissionsV1Service(
                     resp.PartialCaveatInfo = partial.Clone();
                 }
                 await responseStream.WriteAsync(resp);
+
                 // The cap is a *concrete* limit: wildcards do not count against it.
-                if (!s.IsWildcard)
-                    emitted++;
+                if (!s.IsWildcard && ++emitted == limit)
+                    break;
             }
-
-            if (reply.Subjects.Count == 0 || string.IsNullOrEmpty(reply.Cursor))
-                break;
-
-            cursor = reply.Cursor;
+        }
+        catch (InvalidConsistencyTokenException ex)
+        {
+            throw new RpcException(new Status(StatusCode.InvalidArgument, ex.Message));
+        }
+        catch (RevisionNotFoundException ex)
+        {
+            // The pinned revision has been garbage-collected (or never existed): same client-facing
+            // contract as an invalid consistency token.
+            throw new RpcException(new Status(StatusCode.InvalidArgument, ex.Message));
+        }
+        catch (CaveatEvaluationException ex)
+        {
+            throw ToRpc(ex);
+        }
+        catch (DispatchFailedException ex)
+        {
+            throw ToRpc(ex);
         }
     }
 
@@ -662,46 +639,57 @@ public sealed class AuthzedPermissionsV1Service(
         var consistency = ToWire(request.Consistency);
         var cursor = request.OptionalCursor is { Token.Length: > 0 } c ? c.Token : null;
 
-        // Page the grain over a single pinned snapshot. The first page resolves and pins the revision and
-        // returns a cursor encoding it; subsequent pages pass that cursor back so every page reads the SAME
-        // snapshot. Keep going while the grain hands back a continuation cursor.
-        while (!context.CancellationToken.IsCancellationRequested)
+        // One native grain stream over a single pinned snapshot (the grain pins once from the cursor or the
+        // request consistency). Batch up to `limit` relationships per response message — mirroring the prior
+        // per-page reply shape — carrying the last item's cursor as that batch's continuation cursor.
+        var batchSize = limit > 0 ? limit : DefaultExportBatchSize;
+        var batch = new List<RelationshipStreamItem>(Math.Min(batchSize, 1024));
+        var stream = RelationshipsStream;
+        try
         {
-            BulkExportRelationshipsReply reply;
-            try
+            await foreach (var item in stream.StreamBulkExportRelationships(
+                new BulkExportRelationshipsArgs(filter, limit, cursor, consistency), context.CancellationToken))
             {
-                reply = await Relationships.BulkExportRelationships(
-                    new BulkExportRelationshipsArgs(filter, limit, cursor, consistency));
+                batch.Add(item);
+                if (batch.Count >= batchSize)
+                {
+                    await WriteExportBatch(responseStream, batch);
+                    batch.Clear();
+                }
             }
-            catch (InvalidConsistencyTokenException ex)
-            {
-                throw new RpcException(new Status(StatusCode.InvalidArgument, ex.Message));
-            }
-            catch (RevisionNotFoundException ex)
-            {
-                // The pinned revision has been garbage-collected (or never existed): same client-facing
-                // contract as an invalid consistency token.
-                throw new RpcException(new Status(StatusCode.InvalidArgument, ex.Message));
-            }
-            catch (FormatException ex)
-            {
-                throw new RpcException(new Status(StatusCode.InvalidArgument, ex.Message));
-            }
-
-            if (reply.Relationships.Count == 0)
-                break;
-
-            var response = new V1::ExportBulkRelationshipsResponse
-            {
-                AfterResultCursor = new V1::Cursor { Token = reply.Cursor ?? string.Empty },
-            };
-            response.Relationships.AddRange(reply.Relationships.Select(ToProto));
-            await responseStream.WriteAsync(response);
-
-            if (reply.Cursor is null)
-                break;
-            cursor = reply.Cursor;
         }
+        catch (InvalidConsistencyTokenException ex)
+        {
+            throw new RpcException(new Status(StatusCode.InvalidArgument, ex.Message));
+        }
+        catch (RevisionNotFoundException ex)
+        {
+            // The pinned revision has been garbage-collected (or never existed): same client-facing
+            // contract as an invalid consistency token.
+            throw new RpcException(new Status(StatusCode.InvalidArgument, ex.Message));
+        }
+        catch (FormatException ex)
+        {
+            throw new RpcException(new Status(StatusCode.InvalidArgument, ex.Message));
+        }
+
+        if (batch.Count > 0)
+            await WriteExportBatch(responseStream, batch);
+    }
+
+    /// <summary>The default per-message bulk-export batch size when the request leaves the limit unset.</summary>
+    private const int DefaultExportBatchSize = 1000;
+
+    private static async Task WriteExportBatch(
+        IServerStreamWriter<V1::ExportBulkRelationshipsResponse> responseStream,
+        IReadOnlyList<RelationshipStreamItem> batch)
+    {
+        var response = new V1::ExportBulkRelationshipsResponse
+        {
+            AfterResultCursor = new V1::Cursor { Token = batch[^1].ResumeCursor },
+        };
+        response.Relationships.AddRange(batch.Select(i => ToProto(i.Relationship)));
+        await responseStream.WriteAsync(response);
     }
 
     private static readonly RelationshipsFilterWire EmptyFilter =

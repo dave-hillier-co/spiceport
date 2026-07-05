@@ -27,6 +27,10 @@ public sealed class BulkGrpcService(IGrainFactory grains)
 {
     private IRelationshipsGrain Relationships => grains.GetGrain<IRelationshipsGrain>(IRelationshipsGrain.Key);
 
+    // A fresh Guid per export RPC so the native IAsyncEnumerable stream stays pinned to one activation
+    // (see IRelationshipsStreamGrain). Read ONCE per RPC into a local.
+    private IRelationshipsStreamGrain RelationshipsStream => grains.GetGrain<IRelationshipsStreamGrain>(Guid.NewGuid());
+
     public override async Task<ImportBulkRelationshipsResponse> ImportBulkRelationships(
         IAsyncStreamReader<ImportBulkRelationshipsRequest> requestStream,
         ServerCallContext context)
@@ -71,46 +75,54 @@ public sealed class BulkGrpcService(IGrainFactory grains)
         var consistency = ToWire(request.Consistency);
         var cursor = string.IsNullOrEmpty(request.OptionalCursor) ? null : request.OptionalCursor;
 
-        // Page the grain over a single pinned snapshot. The first page resolves and pins the revision and
-        // returns a cursor encoding it; subsequent pages pass that cursor back so every page reads the
-        // SAME snapshot. Keep going while the grain hands back a continuation cursor.
-        while (!context.CancellationToken.IsCancellationRequested)
+        // One native grain stream over a single pinned snapshot (the grain pins once from the cursor or the
+        // request consistency). Batch up to `limit` relationships per response message, carrying the last
+        // item's cursor as that batch's continuation cursor.
+        var batchSize = limit > 0 ? limit : DefaultExportBatchSize;
+        var batch = new List<RelationshipStreamItem>(Math.Min(batchSize, 1024));
+        var stream = RelationshipsStream;
+        try
         {
-            BulkExportRelationshipsReply reply;
-            try
+            await foreach (var item in stream.StreamBulkExportRelationships(
+                new BulkExportRelationshipsArgs(filter, limit, cursor, consistency), context.CancellationToken))
             {
-                reply = await Relationships.BulkExportRelationships(
-                    new BulkExportRelationshipsArgs(filter, limit, cursor, consistency));
+                batch.Add(item);
+                if (batch.Count >= batchSize)
+                {
+                    await WriteExportBatch(responseStream, batch);
+                    batch.Clear();
+                }
             }
-            catch (InvalidConsistencyTokenException ex)
-            {
-                throw new RpcException(new Status(StatusCode.InvalidArgument, ex.Message));
-            }
-            catch (RevisionNotFoundException ex)
-            {
-                // The pinned revision has been garbage-collected (or never existed): same client-facing
-                // contract as an invalid consistency token.
-                throw new RpcException(new Status(StatusCode.InvalidArgument, ex.Message));
-            }
-            catch (FormatException ex)
-            {
-                throw new RpcException(new Status(StatusCode.InvalidArgument, ex.Message));
-            }
-
-            if (reply.Relationships.Count == 0)
-                break;
-
-            var response = new ExportBulkRelationshipsResponse
-            {
-                AfterCursor = reply.Cursor ?? string.Empty,
-            };
-            response.Relationships.AddRange(reply.Relationships.Select(ToProto));
-            await responseStream.WriteAsync(response);
-
-            if (reply.Cursor is null)
-                break;
-            cursor = reply.Cursor;
         }
+        catch (InvalidConsistencyTokenException ex)
+        {
+            throw new RpcException(new Status(StatusCode.InvalidArgument, ex.Message));
+        }
+        catch (RevisionNotFoundException ex)
+        {
+            // The pinned revision has been garbage-collected (or never existed): same client-facing
+            // contract as an invalid consistency token.
+            throw new RpcException(new Status(StatusCode.InvalidArgument, ex.Message));
+        }
+        catch (FormatException ex)
+        {
+            throw new RpcException(new Status(StatusCode.InvalidArgument, ex.Message));
+        }
+
+        if (batch.Count > 0)
+            await WriteExportBatch(responseStream, batch);
+    }
+
+    /// <summary>The default per-message bulk-export batch size when the request leaves the limit unset.</summary>
+    private const int DefaultExportBatchSize = 1000;
+
+    private static async Task WriteExportBatch(
+        IServerStreamWriter<ExportBulkRelationshipsResponse> responseStream,
+        IReadOnlyList<RelationshipStreamItem> batch)
+    {
+        var response = new ExportBulkRelationshipsResponse { AfterCursor = batch[^1].ResumeCursor };
+        response.Relationships.AddRange(batch.Select(i => ToProto(i.Relationship)));
+        await responseStream.WriteAsync(response);
     }
 
     private static readonly RelationshipsFilterWire EmptyFilter =

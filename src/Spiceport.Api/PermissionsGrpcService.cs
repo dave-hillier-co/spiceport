@@ -38,6 +38,35 @@ public sealed class PermissionsGrpcService(IPermissionChecker checker, IGrainFac
 {
     private IReverseOpsGrain ReverseOps => grains.GetGrain<IReverseOpsGrain>(IReverseOpsGrain.Key);
     private IRelationshipsGrain Relationships => grains.GetGrain<IRelationshipsGrain>(IRelationshipsGrain.Key);
+
+    // Each read mints a FRESH Guid so every enumeration gets its OWN grain identity/activation — native
+    // IAsyncEnumerable streaming pins the enumerator to one activation. These three RPCs stay unary: they
+    // drain the stream up to the request limit and echo the last item's resume cursor, so the client cursor
+    // contract is byte-identical while the internal per-page grain hop is deleted.
+    private IReverseOpsStreamGrain ReverseOpsStream => grains.GetGrain<IReverseOpsStreamGrain>(Guid.NewGuid());
+    private IRelationshipsStreamGrain RelationshipsStream => grains.GetGrain<IRelationshipsStreamGrain>(Guid.NewGuid());
+
+    /// <summary>
+    /// Drains a native grain stream up to <paramref name="limit"/> items. When a further item exists beyond
+    /// the limit, the last kept item's cursor is returned as the continuation cursor (mirroring the prior
+    /// grain's "one extra row detects more" paging); an unlimited (null) drain returns no cursor.
+    /// </summary>
+    private static async Task<(List<T> Items, string? Cursor)> Drain<T>(
+        IAsyncEnumerable<T> stream, int? limit, Func<T, string?> cursorOf, CancellationToken ct)
+    {
+        var items = new List<T>();
+        string? cursor = null;
+        await foreach (var item in stream.WithCancellation(ct))
+        {
+            if (limit is { } cap && items.Count >= cap)
+            {
+                cursor = cursorOf(items[^1]);
+                break;
+            }
+            items.Add(item);
+        }
+        return (items, cursor);
+    }
     /// <summary>
     /// Maps a cross-silo dispatch failure surfaced by <c>OrleansDispatcher</c> onto its deliberately
     /// chosen gRPC status (cf. SpiceDB <c>rewriteError</c>): transient transport/silo-availability is
@@ -233,18 +262,23 @@ public sealed class PermissionsGrpcService(IPermissionChecker checker, IGrainFac
     public override async Task<ReadRelationshipsResponse> ReadRelationships(
         ReadRelationshipsRequest request, ServerCallContext context)
     {
-        var reply = await Relationships.ReadRelationships(new ReadRelationshipsArgs(
-            ToWire(request.Filter),
-            request.OptionalLimit == 0 ? null : (int)request.OptionalLimit,
-            NullIfEmpty(request.OptionalCursor),
-            ToWire(request.Consistency)));
+        var limit = request.OptionalLimit == 0 ? (int?)null : (int)request.OptionalLimit;
+        var (items, cursor) = await Drain(
+            RelationshipsStream.StreamReadRelationships(
+                new ReadRelationshipsArgs(
+                    ToWire(request.Filter),
+                    limit,
+                    NullIfEmpty(request.OptionalCursor),
+                    ToWire(request.Consistency)),
+                context.CancellationToken),
+            limit, i => i.ResumeCursor, context.CancellationToken);
 
         var resp = new ReadRelationshipsResponse
         {
-            AfterResultCursor = reply.Cursor ?? string.Empty,
-            ReadAt = new ZedToken { Token = reply.ReadAtToken },
+            AfterResultCursor = cursor ?? string.Empty,
+            ReadAt = new ZedToken { Token = items.Count > 0 ? items[0].ReadAtToken : string.Empty },
         };
-        resp.Relationships.AddRange(reply.Relationships.Select(ToProto));
+        resp.Relationships.AddRange(items.Select(i => ToProto(i.Relationship)));
         return resp;
     }
 
@@ -373,23 +407,28 @@ public sealed class PermissionsGrpcService(IPermissionChecker checker, IGrainFac
             ? CoreConstants.Ellipsis
             : request.OptionalSubjectRelation;
 
-        var reply = await ReverseOps.LookupSubjects(new LookupSubjectsArgs(
-            request.Resource.ObjectType,
-            request.Resource.ObjectId,
-            request.Permission,
-            request.SubjectObjectType,
-            subjectRelation,
-            StructToDict(request.Context),
-            (int)request.OptionalLimit,
-            NullIfEmpty(request.OptionalCursor),
-            ToWire(request.Consistency)));
+        var limit = request.OptionalLimit == 0 ? (int?)null : (int)request.OptionalLimit;
+        var (items, cursor) = await Drain(
+            ReverseOpsStream.StreamLookupSubjects(
+                new LookupSubjectsArgs(
+                    request.Resource.ObjectType,
+                    request.Resource.ObjectId,
+                    request.Permission,
+                    request.SubjectObjectType,
+                    subjectRelation,
+                    StructToDict(request.Context),
+                    limit,
+                    NullIfEmpty(request.OptionalCursor),
+                    ToWire(request.Consistency)),
+                context.CancellationToken),
+            limit, i => i.ResumeCursor, context.CancellationToken);
 
         var resp = new LookupSubjectsResponse
         {
-            AfterResultCursor = reply.Cursor ?? string.Empty,
-            LookedUpAt = new ZedToken { Token = reply.LookedUpAtToken },
+            AfterResultCursor = cursor ?? string.Empty,
+            LookedUpAt = new ZedToken { Token = items.Count > 0 ? items[0].LookedUpAtToken : string.Empty },
         };
-        resp.Subjects.AddRange(reply.Subjects.Select(ToProto));
+        resp.Subjects.AddRange(items.Select(i => ToProto(i.Subject)));
         return resp;
     }
 
@@ -400,23 +439,28 @@ public sealed class PermissionsGrpcService(IPermissionChecker checker, IGrainFac
             ? CoreConstants.Ellipsis
             : request.Subject.OptionalRelation;
 
-        var reply = await ReverseOps.LookupResources(new LookupResourcesArgs(
-            request.ResourceObjectType,
-            request.Permission,
-            request.Subject.Object.ObjectType,
-            request.Subject.Object.ObjectId,
-            subjectRelation,
-            StructToDict(request.Context),
-            (int)request.OptionalLimit,
-            NullIfEmpty(request.OptionalCursor),
-            ToWire(request.Consistency)));
+        var limit = request.OptionalLimit == 0 ? (int?)null : (int)request.OptionalLimit;
+        var (items, cursor) = await Drain(
+            ReverseOpsStream.StreamLookupResources(
+                new LookupResourcesArgs(
+                    request.ResourceObjectType,
+                    request.Permission,
+                    request.Subject.Object.ObjectType,
+                    request.Subject.Object.ObjectId,
+                    subjectRelation,
+                    StructToDict(request.Context),
+                    limit,
+                    NullIfEmpty(request.OptionalCursor),
+                    ToWire(request.Consistency)),
+                context.CancellationToken),
+            limit, r => r.AfterResultCursor, context.CancellationToken);
 
         var resp = new LookupResourcesResponse
         {
-            AfterResultCursor = reply.Cursor ?? string.Empty,
-            LookedUpAt = new ZedToken { Token = reply.LookedUpAtToken },
+            AfterResultCursor = cursor ?? string.Empty,
+            LookedUpAt = new ZedToken { Token = items.Count > 0 ? items[0].LookedUpAtToken : string.Empty },
         };
-        resp.Resources.AddRange(reply.Resources.Select(ToProto));
+        resp.Resources.AddRange(items.Select(ToProto));
         return resp;
     }
 

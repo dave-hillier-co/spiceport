@@ -126,12 +126,41 @@ was deleted in 1.7; the wire contract is now just the grain key + cancellation t
 the "always call the grain, even locally" pattern (1.3(c)/1.4) by reducing the cost of intra-silo
 grain calls.
 
-### 1.10 Native `IAsyncEnumerable` grain streaming (internal paths)
+### 1.10 Native `IAsyncEnumerable` grain streaming (internal paths) (implemented)
 
-Client-facing cursors are API contract and must stay (they survive reconnects). The *internal*
-page-loop plumbing between service, grain, and engine for reverse ops / bulk export can become
-plain `IAsyncEnumerable` grain calls with native backpressure, deleting cursor round-trips where
-nothing needs resumability.
+The internal page-loop plumbing between the gRPC services and the reverse-ops / data-plane grains is
+now native Orleans `IAsyncEnumerable` grain streaming. `LookupSubjects`, `LookupResources`,
+`ReadRelationships`, and `BulkExportRelationships` are single grain calls whose results stream back one
+item at a time with runtime backpressure — the per-page service→grain round-trip is deleted. Each gRPC
+front door drives one `await foreach` and stops enumerating when it has enough; stopping the client-side
+loop stops the upstream engine walk, because the engine ops are themselves `IAsyncEnumerable`.
+
+Client-facing cursors are unchanged API contract. Every streamed item still carries its own opaque resume
+cursor (the byte-identical token from the existing codecs — the subject-id cursor, the multi-section
+lookup-resources keyset cursor, the revision-pinned bulk-export cursor), so a client-supplied cursor still
+resumes mid-stream and the token formats are unchanged. The limited RPCs take at most the requested items
+and echo the last item's cursor exactly as before.
+
+**The `[StatelessWorker]` incompatibility and the Guid-keyed adaptation.** Native `IAsyncEnumerable`
+streaming is not safe on a stateless-worker grain: the grain-side extension that backs it holds the live
+enumerator in memory on one specific activation keyed by a client-minted request id, and a stateless
+worker's activations are not individually addressable — a follow-up `MoveNext` can land on an activation
+that never started the stream. The reverse-ops and data-plane grains that page today are stateless workers,
+so the streaming ops moved to NEW `IGrainWithGuidKey` grains (`IReverseOpsStreamGrain`,
+`IRelationshipsStreamGrain`) under default placement. Each service mints a fresh `Guid` per RPC, so
+`StartEnumeration` and every `MoveNext` for that stream target the same brand-new, never-shared activation.
+These per-stream activations are reclaimed by ordinary idle collection, like any other grain — a real but
+minor cost against the deleted per-page hops. The shared pinning / index / caveat-collapse logic lives in
+one place (`ReverseOpsSupport`) so the unary and streaming paths cannot drift.
+
+`Expand` stays unary on the stateless-worker `IReverseOpsGrain`: it returns a whole tree, has no cursor, and
+needs no streaming. The Leopard membership index still accelerates an unlimited, cursorless
+`LookupResources` (its fast path yields a complete candidate set confirmed by Check); a *limited* walk runs
+the cursor-bearing live traversal so every item carries a resume cursor. Native streaming also gives
+per-item cancellation for free — the trailing `CancellationToken` threads into the engine walk, which the
+prior unary methods ignored. `Orleans.Runtime.AsyncEnumerableExtensions.WithBatchSize(n)` is available on
+the caller side as the native backpressure/batching knob that replaces the deleted manual page-size
+plumbing.
 
 ### 1.11 Broadcast channel for the log fan-out (deliberately deferred)
 
@@ -250,7 +279,7 @@ Recorded so they are not relitigated by accident:
 1. **1.1–1.7** — all completed. Cross-cutting infrastructure (filters, RequestContext) is now
    in place and the dispatcher seam is clean: error mapping and depth enforcement are native,
    and the wire contract is minimal (sub-problem + cancellation).
-2. **1.8–1.11** — optional Orleans-native refinements (GrainService, native `IAsyncEnumerable`,
-   broadcast channel) — low leverage, deferred.
+2. **1.8 / 1.11** — the remaining optional Orleans-native refinements (GrainService, broadcast channel)
+   — low leverage, deferred. (1.9 and 1.10 are done.)
 3. **2.3 / 2.4 / 2.5** — cheap, immediately differentiating product capabilities.
 4. **2.1 per-tenant** and **2.2 materialized reachability** — each behind its own design document.

@@ -42,6 +42,31 @@ public class DataPlaneMeshTests
 
     private static ObjectAndRelation User(string id) => new("user", id, CoreConstants.Ellipsis);
 
+    // ReadRelationships now streams from the Guid-keyed IRelationshipsStreamGrain (a fresh key per
+    // enumeration). Collect the whole stream, or take a bounded prefix, so the assertions read as before.
+    private static async Task<List<RelationshipStreamItem>> ReadAll(MeshTestCluster cluster, ReadRelationshipsArgs args)
+    {
+        var list = new List<RelationshipStreamItem>();
+        await foreach (var item in cluster.GrainFactory
+            .GetGrain<IRelationshipsStreamGrain>(Guid.NewGuid()).StreamReadRelationships(args))
+            list.Add(item);
+        return list;
+    }
+
+    private static async Task<List<RelationshipStreamItem>> ReadTake(
+        MeshTestCluster cluster, ReadRelationshipsArgs args, int n)
+    {
+        var list = new List<RelationshipStreamItem>();
+        await foreach (var item in cluster.GrainFactory
+            .GetGrain<IRelationshipsStreamGrain>(Guid.NewGuid()).StreamReadRelationships(args))
+        {
+            list.Add(item);
+            if (list.Count >= n)
+                break;
+        }
+        return list;
+    }
+
     [Fact]
     public async Task WriteSchema_then_WriteRelationships_then_Check_reflects_write()
     {
@@ -86,15 +111,15 @@ public class DataPlaneMeshTests
 
         var filter = new RelationshipsFilterWire("document", null, null, "viewer", null, null, null);
 
-        var first = await cluster.Relationships.ReadRelationships(new ReadRelationshipsArgs(filter, 2, null));
-        Assert.Equal(2, first.Relationships.Count);
-        Assert.False(string.IsNullOrEmpty(first.Cursor));
+        // Take 2 from a fresh stream, then resume from the 2nd item's cursor on a FRESH grain activation.
+        var first = await ReadTake(cluster, new ReadRelationshipsArgs(filter, 2, null), 2);
+        Assert.Equal(2, first.Count);
+        Assert.False(string.IsNullOrEmpty(first[^1].ResumeCursor));
 
-        var second = await cluster.Relationships.ReadRelationships(new ReadRelationshipsArgs(filter, 2, first.Cursor));
-        Assert.Single(second.Relationships);
-        Assert.Null(second.Cursor);
+        var second = await ReadAll(cluster, new ReadRelationshipsArgs(filter, 2, first[^1].ResumeCursor));
+        Assert.Single(second);
 
-        var all = first.Relationships.Concat(second.Relationships).Select(r => r.ResourceId).ToHashSet();
+        var all = first.Concat(second).Select(r => r.Relationship.ResourceId).ToHashSet();
         Assert.Equal(new HashSet<string> { "a", "b", "c" }, all);
     }
 
@@ -110,8 +135,8 @@ public class DataPlaneMeshTests
             }));
 
         var readFilter = new RelationshipsFilterWire("document", null, null, "viewer", null, null, null);
-        var beforeRead = await cluster.Relationships.ReadRelationships(new ReadRelationshipsArgs(readFilter, null, null));
-        Assert.Equal(2, beforeRead.Relationships.Count);
+        var beforeRead = await ReadAll(cluster, new ReadRelationshipsArgs(readFilter, null, null));
+        Assert.Equal(2, beforeRead.Count);
 
         var delFilter = new RelationshipsFilterWire(
             "document", null, new List<string> { "readme" }, "viewer", null, null, null);
@@ -123,9 +148,9 @@ public class DataPlaneMeshTests
         // window (matching SpiceDB's CachedOptimizedRevisions / memdb floored bucket), so a write that
         // lands mid-window is not yet reflected. To see one's own just-committed mutation deterministically
         // a caller asks for full consistency (or reads at the mutation's returned token).
-        var afterRead = await cluster.Relationships.ReadRelationships(
+        var afterRead = await ReadAll(cluster,
             new ReadRelationshipsArgs(readFilter, null, null, ConsistencyWire.FullyConsistent));
-        Assert.Empty(afterRead.Relationships);
+        Assert.Empty(afterRead);
     }
 
     [Fact]

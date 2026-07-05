@@ -30,8 +30,8 @@ public class Stage4LeopardMeshTests
         }
         """;
 
-    private static IReverseOpsGrain Grain(MeshTestCluster cluster) =>
-        cluster.GrainFactory.GetGrain<IReverseOpsGrain>(IReverseOpsGrain.Key);
+    private static IReverseOpsStreamGrain StreamGrain(MeshTestCluster cluster) =>
+        cluster.GrainFactory.GetGrain<IReverseOpsStreamGrain>(Guid.NewGuid());
 
     private static Relationship Rel(string rt, string rid, string rel, ObjectAndRelation subject) =>
         Relationship.Create(new ObjectAndRelation(rt, rid, rel), subject);
@@ -64,9 +64,11 @@ public class Stage4LeopardMeshTests
         MeshTestCluster cluster, string subjectType, string subjectId, string subjectRelation,
         string resourceType, string permission)
     {
-        var reply = await Grain(cluster).LookupResources(new LookupResourcesArgs(
-            resourceType, permission, subjectType, subjectId, subjectRelation, null, null, null));
-        return new SortedSet<string>(reply.Resources.Select(r => r.ResourceId), StringComparer.Ordinal);
+        var ids = new SortedSet<string>(StringComparer.Ordinal);
+        await foreach (var r in StreamGrain(cluster).StreamLookupResources(new LookupResourcesArgs(
+            resourceType, permission, subjectType, subjectId, subjectRelation, null, null, null)))
+            ids.Add(r.ResourceId);
+        return ids;
     }
 
     private static async Task AssertGrainEqualsEngine(
