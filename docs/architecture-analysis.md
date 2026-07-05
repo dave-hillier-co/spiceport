@@ -138,7 +138,8 @@ The seam composes three implementations:
   pre-context branch (membership + caveat *expression*), never the collapsed verdict** — caveat
   context is applied per-request outside the cache; cycle-cut results are not cached. Because the
   cache and the grain are keyed by the same sub-problem, one shared caching dispatcher in front
-  of Orleans gives a mesh-wide branch cache.
+  of Orleans gives a mesh-wide branch cache. `CheckGrain` activation state adds a delegate-side
+  memo layer, memoizing the pre-context `Branch` with idle-activation collection as eviction.
 
 The grain identity being the sub-problem is verified by an Orleans `TestCluster` running the
 conformance corpus (set-ops, arrow, wildcard, nested-group, recursive, caveats) **through the

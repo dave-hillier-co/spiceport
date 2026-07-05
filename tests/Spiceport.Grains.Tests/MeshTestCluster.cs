@@ -81,12 +81,14 @@ public sealed class MeshTestCluster : IAsyncDisposable
     public static async Task<MeshTestCluster> CreateAsync(
         string schemaText,
         int batchConcurrency = PermissionChecker.DefaultBatchConcurrency,
-        bool useMembershipIndex = true)
+        bool useMembershipIndex = true,
+        bool useActivationMemo = true)
     {
         SchemaHolder.SchemaText = schemaText;
         SchemaHolder.BatchConcurrency = batchConcurrency;
         SchemaHolder.LocalRecurseEnabled = true;
         SchemaHolder.UseMembershipIndex = useMembershipIndex;
+        SchemaHolder.UseActivationMemo = useActivationMemo;
 
         var builder = new TestClusterBuilder(initialSilosCount: 1);
         builder.AddSiloBuilderConfigurator<SiloConfigurator>();
@@ -111,7 +113,8 @@ public sealed class MeshTestCluster : IAsyncDisposable
         int siloCount = 3,
         int batchConcurrency = PermissionChecker.DefaultBatchConcurrency,
         bool localRecurseEnabled = true,
-        bool useMembershipIndex = true)
+        bool useMembershipIndex = true,
+        bool useActivationMemo = true)
     {
         if (siloCount < 1)
             throw new ArgumentOutOfRangeException(nameof(siloCount), "Need at least one silo.");
@@ -120,6 +123,7 @@ public sealed class MeshTestCluster : IAsyncDisposable
         SchemaHolder.BatchConcurrency = batchConcurrency;
         SchemaHolder.LocalRecurseEnabled = localRecurseEnabled;
         SchemaHolder.UseMembershipIndex = useMembershipIndex;
+        SchemaHolder.UseActivationMemo = useActivationMemo;
 
         var builder = new TestClusterBuilder(initialSilosCount: (short)siloCount);
         builder.AddSiloBuilderConfigurator<MultiSiloConfigurator>();
@@ -144,6 +148,7 @@ public sealed class MeshTestCluster : IAsyncDisposable
         public static int BatchConcurrency = PermissionChecker.DefaultBatchConcurrency;
         public static bool LocalRecurseEnabled = true;
         public static bool UseMembershipIndex;
+        public static bool UseActivationMemo = true;
     }
 
     private sealed class SiloConfigurator : ISiloConfigurator
@@ -155,6 +160,7 @@ public sealed class MeshTestCluster : IAsyncDisposable
             // director must be registered on every cluster (with one silo the ring trivially resolves
             // every key to that silo).
             siloBuilder.AddConsistentHashPlacement();
+            siloBuilder.AddActivationMemoCollectionAge();
             siloBuilder.AddMemoryGrainStorage("datastore");
             siloBuilder.AddCustomStorageBasedLogConsistencyProvider("CustomStorage");
             siloBuilder.ConfigureServices(services =>
@@ -164,6 +170,7 @@ public sealed class MeshTestCluster : IAsyncDisposable
                 services.AddSingleton<IDatastore>(sp =>
                     new GrainBackedDatastore(sp.GetRequiredService<IGrainFactory>()));
                 services.AddSingleton(new MembershipIndexOptions { Enabled = SchemaHolder.UseMembershipIndex });
+                services.AddSingleton(new ActivationMemoOptions { Enabled = SchemaHolder.UseActivationMemo });
                 services.AddSingleton(new OrleansDispatcherOptions
                 {
                     LocalRecurseEnabled = SchemaHolder.LocalRecurseEnabled,
@@ -181,6 +188,7 @@ public sealed class MeshTestCluster : IAsyncDisposable
             // persistent state lives on whichever silo holds its single activation; all silos route to it
             // via the grain directory, so it is shared by construction (no process-static instance).
             siloBuilder.AddConsistentHashPlacement();
+            siloBuilder.AddActivationMemoCollectionAge();
             siloBuilder.AddMemoryGrainStorage("datastore");
             siloBuilder.AddCustomStorageBasedLogConsistencyProvider("CustomStorage");
             siloBuilder.ConfigureServices(services =>
@@ -190,6 +198,7 @@ public sealed class MeshTestCluster : IAsyncDisposable
                 services.AddSingleton<IDatastore>(sp =>
                     new GrainBackedDatastore(sp.GetRequiredService<IGrainFactory>()));
                 services.AddSingleton(new MembershipIndexOptions { Enabled = SchemaHolder.UseMembershipIndex });
+                services.AddSingleton(new ActivationMemoOptions { Enabled = SchemaHolder.UseActivationMemo });
                 // Hybrid toggle for this cluster (last AddSingleton wins in the silo container), so a
                 // benchmark can deploy OFF (always grain-hop) vs ON (local-recurse shortcut) clusters.
                 services.AddSingleton(new OrleansDispatcherOptions

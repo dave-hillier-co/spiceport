@@ -105,12 +105,14 @@ public class HybridDispatchBenchmark(ITestOutputHelper output)
 
         output.WriteLine($"Workload: chain depth {ChainDepth}, {Families} distinct root checks/cell " +
             $"(set BENCH_FAMILIES to scale N).");
-        output.WriteLine("cell           | remoteHop | localRec | cacheHit | cacheMiss | p50 ms | p99 ms | checks/s");
+        output.WriteLine(
+            "cell           | remoteHop | localRec | cacheHit | cacheMiss | memoHit | memoMiss | p50 ms | p99 ms | checks/s");
         foreach (var c in new[] { single_off, single_on, multi_off, multi_on })
         {
             output.WriteLine(
                 $"{c.Name} | {c.Metrics.RemoteGrainHop,9} | {c.Metrics.LocalRecurse,8} | " +
-                $"{c.Metrics.CacheHit,8} | {c.Metrics.CacheMiss,9} | {c.P50Ms,6:F3} | {c.P99Ms,6:F3} | {c.Throughput,8:F0}");
+                $"{c.Metrics.CacheHit,8} | {c.Metrics.CacheMiss,9} | {c.Metrics.MemoHit,7} | {c.Metrics.MemoMiss,8} | " +
+                $"{c.P50Ms,6:F3} | {c.P99Ms,6:F3} | {c.Throughput,8:F0}");
         }
 
         // Headline claims, asserted (not just printed):
