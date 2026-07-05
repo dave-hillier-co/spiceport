@@ -69,12 +69,10 @@ public class DispatcherSeamTests
 
         var namespaces = SchemaCompiler.Compile(Schema)
             .ToImmutableDictionary(ns => ns.Name);
-        var state = new CheckState();
         var local = new LocalDispatcher(
             namespaces,
             _ => reader,
-            DateTimeOffset.UtcNow,
-            state);
+            DateTimeOffset.UtcNow);
 
         var counting = new CountingDispatcher(local);
         // Route every sub-problem the local dispatcher generates back through the decorator.
@@ -96,9 +94,10 @@ public class DispatcherSeamTests
         Assert.False(result.CycleCut);
 
         // The top-level call plus every recursive sub-problem went through the decorator. The walk
-        // visits more than just the root, proving recursion is delegated rather than self-called.
+        // visits more than just the root, proving recursion is delegated rather than self-called — this
+        // is the seam property this test pins: the local dispatcher never recurses into itself directly,
+        // every sub-problem flows out through the injected Dispatcher (here, the counting decorator).
         Assert.True(counting.Count >= 4, $"expected multiple dispatched sub-problems, got {counting.Count}");
-        Assert.Equal(state.DispatchCount, counting.Count);
 
         // Some specific sub-problems we expect to see routed through the seam.
         Assert.Contains(("document:readme#view", "user:alice"), counting.Calls);

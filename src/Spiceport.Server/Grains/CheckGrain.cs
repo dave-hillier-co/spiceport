@@ -106,12 +106,10 @@ public sealed class CheckGrain(
         // A LocalDispatcher does ONE expansion step; its onward Dispatcher (the silo-wide
         // Caching-over-Orleans dispatcher) turns each child sub-problem into a further grain call.
         var namespaces = schemaProvider.Current.Namespaces.ToImmutableDictionary(ns => ns.Name);
-        var state = new CheckState();
         var local = new LocalDispatcher(
             namespaces,
             datastore.SnapshotReader,
-            now,
-            state)
+            now)
         {
             Dispatcher = onward,
         };

@@ -5,7 +5,7 @@ namespace Spiceport.Grains.Abstractions;
 /// side of the system (the check / reverse-ops grains are the read side).
 /// </summary>
 /// <remarks>
-/// Like <see cref="IReverseOpsGrain"/>, every method here is a whole operation against the datastore
+/// Like the unary <see cref="IReverseOpsStreamGrain.ExpandPermissionTree"/>, every method here is a whole operation against the datastore
 /// (or the live schema provider) rather than a per-key dispatch, so it is exposed on ONE grain keyed by
 /// the constant integer <see cref="Key"/> and the implementation is <c>[StatelessWorker]</c> so the
 /// silo scales activations with load without fragmenting any keyspace. Writes persist through the

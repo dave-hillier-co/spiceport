@@ -153,8 +153,12 @@ These per-stream activations are reclaimed by ordinary idle collection, like any
 minor cost against the deleted per-page hops. The shared pinning / index / caveat-collapse logic lives in
 one place (`ReverseOpsSupport`) so the unary and streaming paths cannot drift.
 
-`Expand` stays unary on the stateless-worker `IReverseOpsGrain`: it returns a whole tree, has no cursor, and
-needs no streaming. The Leopard membership index still accelerates an unlimited, cursorless
+`Expand` stays unary — folded onto `IReverseOpsStreamGrain` alongside the streaming lookups, since it was
+the sole remaining member of the now-deleted stateless-worker `IReverseOpsGrain`. Callers target it via a
+stable well-known Guid (`IReverseOpsStreamGrain.ExpandKey`, `Guid.Empty`) rather than minting a fresh one
+per call, since Expand has no follow-up `MoveNext` and needs no per-stream activation affinity — it returns
+a whole tree, has no cursor, and needs no streaming. The Leopard membership index still accelerates an
+unlimited, cursorless
 `LookupResources` (its fast path yields a complete candidate set confirmed by Check); a *limited* walk runs
 the cursor-bearing live traversal so every item carries a resume cursor. Native streaming also gives
 per-item cancellation for free — the trailing `CancellationToken` threads into the engine walk, which the

@@ -30,13 +30,15 @@ namespace Spiceport.Api;
 /// gRPC front door: translates the proto <see cref="CheckPermissionRequest"/> into a top-level
 /// permission check, dispatches it through the silo-wide Caching-over-Orleans root dispatcher (so the
 /// recursion runs across the grain mesh), and maps the verdict back to the proto permissionship.
-/// The three reverse / tree ops are routed to the stateless-worker <see cref="IReverseOpsGrain"/>
-/// (keyed by the constant <see cref="IReverseOpsGrain.Key"/>) and its replies mapped back to proto.
+/// The three reverse / tree ops are routed to <see cref="IReverseOpsStreamGrain"/> and its replies
+/// mapped back to proto.
 /// </summary>
 public sealed class PermissionsGrpcService(IPermissionChecker checker, IGrainFactory grains)
     : PermissionsService.PermissionsServiceBase
 {
-    private IReverseOpsGrain ReverseOps => grains.GetGrain<IReverseOpsGrain>(IReverseOpsGrain.Key);
+    // ExpandPermissionTree is unary with no follow-up MoveNext, so it reuses the one well-known
+    // activation instead of minting a fresh Guid per call (see IReverseOpsStreamGrain remarks).
+    private IReverseOpsStreamGrain ReverseOps => grains.GetGrain<IReverseOpsStreamGrain>(IReverseOpsStreamGrain.ExpandKey);
     private IRelationshipsGrain Relationships => grains.GetGrain<IRelationshipsGrain>(IRelationshipsGrain.Key);
 
     // Each read mints a FRESH Guid so every enumeration gets its OWN grain identity/activation — native
