@@ -240,13 +240,15 @@ feed, and Leopard index below are all pure folds of that one log.
   one heartbeat per silo, not a poller per stream; checkpoints ride the revision the feed has
   progressed through, so a consumer filtering to a content subset still observes liveness.
 
-- **A Leopard-style membership index** (on by default, opt-out) is a projection over the same feed
-  that flattens nested-group / userset chains into reverse adjacency, so `LookupResources` can
-  enumerate candidate resources in-memory instead of by repeated reverse queries. It is **never an
-  oracle**: it produces a *complete candidate superset* that the trusted `CheckEngine` confirms, so a
-  stale or over-broad index can only cost an extra Check, never change a verdict. It engages only for
-  shapes it can fully flatten (no tuple-to-userset arrows) and only for fresh, unpaged enumerations,
-  leaving the cursored live traversal untouched.
+- **A Leopard-style membership index** (on by default, opt-out) bootstraps once from a snapshot
+  and folds incrementally from the log tail (following the `SiloProjection` pattern), flattening
+  nested-group / userset chains into reverse adjacency so `LookupResources` can enumerate candidate
+  resources in-memory instead of by repeated reverse queries; a full rebuild occurs only on schema
+  change or when log compaction advances past the cache watermark. It is **never an oracle**: it
+  produces a *complete candidate superset* that the trusted `CheckEngine` confirms, so a stale or
+  over-broad index can only cost an extra Check, never change a verdict. It engages only for shapes
+  it can fully flatten (no tuple-to-userset arrows) and only for fresh, unpaged enumerations, leaving
+  the cursored live traversal untouched.
 
 ---
 
