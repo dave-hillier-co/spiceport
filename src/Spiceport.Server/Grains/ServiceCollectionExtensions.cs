@@ -59,7 +59,7 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<OrleansDispatcherOptions>();
         services.AddSingleton<IDispatchMetrics, DispatchMetrics>();
 
-        // Per-silo Leopard membership-index accelerator (default OFF; flip via a registered options override).
+        // Per-silo Leopard membership-index accelerator (default ON; opt out via a registered options override).
         services.AddSingleton<MembershipIndexOptions>();
         services.AddSingleton<MembershipIndexCache>();
 

@@ -1,9 +1,11 @@
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 using Orleans.EventSourcing;
 using Orleans.EventSourcing.CustomStorage;
 using Orleans.Providers;
 using Orleans.Runtime;
 using Orleans.Storage;
+using Orleans.Utilities;
 using Spiceport.Core;
 using Spiceport.Datastore;
 using Spiceport.Grains.Abstractions;
@@ -53,7 +55,20 @@ public sealed class DatastoreGrain :
     /// </summary>
     private static readonly long GcWindowNanos = (long)TimeSpan.FromHours(24).TotalMilliseconds * 1_000_000L;
 
+    /// <summary>
+    /// How long a watcher registration lives without a <see cref="SubscribeWatch"/> refresh. 10x the hubs'
+    /// heartbeat interval, so a silo must miss many heartbeats before its watcher is dropped.
+    /// </summary>
+    private static readonly TimeSpan WatcherExpiry = TimeSpan.FromSeconds(10);
+
     private readonly IGrainStorage _storage;
+
+    /// <summary>
+    /// The registered head-advance observers (one per silo hub). Deliberately in-memory only — observer
+    /// references are not durable, so the set empties on reactivation; the hubs' heartbeat resubscribe (which
+    /// also returns the head) makes that safe.
+    /// </summary>
+    private readonly ObserverManager<IDatastoreWatcher> _watchers;
 
     /// <summary>The contiguous append-only log version (= number of confirmed events) currently in storage.</summary>
     private int _logVersion;
@@ -91,7 +106,11 @@ public sealed class DatastoreGrain :
     /// </summary>
     private long _recentFloorRevision;
 
-    public DatastoreGrain([FromKeyedServices("datastore")] IGrainStorage storage) => _storage = storage;
+    public DatastoreGrain([FromKeyedServices("datastore")] IGrainStorage storage, ILogger<DatastoreGrain> logger)
+    {
+        _storage = storage;
+        _watchers = new ObserverManager<IDatastoreWatcher>(WatcherExpiry, logger);
+    }
 
     // --- Fold (JournaledGrain) ---
 
@@ -134,7 +153,36 @@ public sealed class DatastoreGrain :
         if (!raised)
             return null;
         await ConfirmEvents().ConfigureAwait(ContinueOnCapturedContext);
+
+        // Push the new head to the per-silo watch hubs. Best-effort and isolated: HeadAdvanced is [OneWay]
+        // (the await completes at send, no round-trip) and any failure is swallowed — the commit result must
+        // never depend on the notify; a missed push is recovered by the hubs' heartbeat.
+        try
+        {
+            await _watchers.Notify(w => w.HeadAdvanced(newRevision)).ConfigureAwait(ContinueOnCapturedContext);
+        }
+        catch
+        {
+            // Defunct observers are pruned by ObserverManager; nothing else to do.
+        }
+
         return newRevision;
+    }
+
+    /// <inheritdoc />
+    public Task<DatastoreHeadWire> SubscribeWatch(IDatastoreWatcher watcher)
+    {
+        ArgumentNullException.ThrowIfNull(watcher);
+        _watchers.Subscribe(watcher, watcher);
+        return GetHead();
+    }
+
+    /// <inheritdoc />
+    public Task UnsubscribeWatch(IDatastoreWatcher watcher)
+    {
+        ArgumentNullException.ThrowIfNull(watcher);
+        _watchers.Unsubscribe(watcher);
+        return Task.CompletedTask;
     }
 
     // --- IDatastoreLog ---

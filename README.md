@@ -43,9 +43,8 @@ The full design rationale is in [`docs/architecture-analysis.md`](docs/architect
 - **Storage**: the datastore is an **event-sourced cluster-singleton Orleans grain** — an
   append-only log of changes is the source of truth, each silo reads from a projection folded from
   that log, and the same feed drives Watch. Durable via Orleans grain storage (in-memory for dev,
-  **PostgreSQL** via AdoNet) with no application SQL schema. A standalone PostgreSQL MVCC datastore
-  backend (xid8 / `pg_snapshot`) also exists; SpiceDB's consistency conformance corpus passes against
-  the in-memory fold, the grain mesh, and that backend.
+  **PostgreSQL** via AdoNet) with no application SQL schema. SpiceDB's consistency conformance
+  corpus passes against the in-memory fold and the grain mesh.
 - **Relationship counters** (ExperimentalService): register/unregister a named counter over a
   filter and count matching relationships at a revision (computed on demand).
 - **`authzed.api.v1`** gRPC surface — verified end to end with the real `zed` CLI (schema,
@@ -59,7 +58,6 @@ src/
                               Revision/ZedToken, tuple string parsing
   Spiceport.Datastore         datastore abstraction (MVCC snapshot reads, Watch, revisions)
   Spiceport.Datastore.Memory  in-memory MVCC datastore
-  Spiceport.Datastore.Postgres PostgreSQL backend (Npgsql, xid8/pg_snapshot)
   Spiceport.Server            the engine and the mesh, in one project:
                               Schema/  schema DSL compiler (lexer -> parser -> compiler) + reachability graph
                               Engine/  Check/Expand/Lookup engine + the IDispatcher seam + caching dispatcher
@@ -76,11 +74,12 @@ docs/                         architecture analysis + the Zanzibar paper
 
 ## Build & test
 
-Requires the .NET 10 SDK. Docker is required only for the PostgreSQL tests (Testcontainers).
+Requires the .NET 10 SDK. Docker is required only for the grain-storage durability tests
+(Testcontainers PostgreSQL).
 
 ```bash
 dotnet build                 # build the solution
-dotnet test                  # run all tests (Postgres tests spin up a container via Testcontainers)
+dotnet test                  # run all tests (durability tests spin up a Postgres container)
 ```
 
 ## Run

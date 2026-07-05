@@ -232,13 +232,15 @@ feed, and Leopard index below are all pure folds of that one log.
 
 **Two consumers ride the same log feed:**
 
-- **Watch (the changefeed)** consumes the `LogEvent` feed directly. A per-silo notifier samples the
-  head and pulses a shared async signal (and a local commit pulses it immediately); each Watch stream
-  tails `ReadFrom` from its own cursor, maps each event to a `RevisionChange`, and parks on the signal
-  rather than polling. One poller per silo, not one per stream; checkpoints ride the revision the feed
-  has progressed through, so a consumer filtering to a content subset still observes liveness.
+- **Watch (the changefeed)** consumes the `LogEvent` feed directly. A per-silo notifier registers a
+  grain observer on the datastore grain, so a commit anywhere pushes the new head to it (and a local
+  commit pulses it immediately, zero-hop); each Watch stream tails `ReadFrom` from its own cursor,
+  maps each event to a `RevisionChange`, and parks on the shared signal. Observer delivery is
+  best-effort, so a slow per-silo heartbeat doubles as registration refresh and missed-push backstop —
+  one heartbeat per silo, not a poller per stream; checkpoints ride the revision the feed has
+  progressed through, so a consumer filtering to a content subset still observes liveness.
 
-- **A Leopard-style membership index** (optional, off by default) is a projection over the same feed
+- **A Leopard-style membership index** (on by default, opt-out) is a projection over the same feed
   that flattens nested-group / userset chains into reverse adjacency, so `LookupResources` can
   enumerate candidate resources in-memory instead of by repeated reverse queries. It is **never an
   oracle**: it produces a *complete candidate superset* that the trusted `CheckEngine` confirms, so a
@@ -320,9 +322,9 @@ Caveats (CEL decision per §4), expiration, Watch/changefeed via Orleans Streams
 Exit: `caveat*` and `relexpiration*` corpus files green.
 
 **Phase 5 — Storage & scale.**
-Postgres datastore (Npgsql, `xid8` revisions, Watch via replication); consistency/perf
-benchmarks; tune placement (A→B) and concurrency limits. Exit: Postgres-backed conformance +
-load test.
+Durable persistence for the event-sourced datastore grain via the AdoNet (Postgres)
+grain-storage provider — no application SQL; consistency/perf benchmarks; tune placement
+(A→B) and concurrency limits. Exit: durable-storage tests + load test.
 
 ---
 

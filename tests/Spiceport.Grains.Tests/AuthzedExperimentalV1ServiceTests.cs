@@ -10,7 +10,7 @@ namespace Spiceport.Grains.Tests;
 /// cluster's grain mesh (in-memory datastore). Verifies the on-demand relationship-counter RPCs: register +
 /// count returns the matching count with a non-empty read-at token; the count tracks subsequent matching /
 /// non-matching writes; unregister then count is FAILED_PRECONDITION; re-registering an existing name is
-/// FAILED_PRECONDITION. (Postgres MVCC/count behaviour is covered by the datastore Testcontainers suite.)
+/// FAILED_PRECONDITION.
 /// </summary>
 [Collection(MeshClusterCollection.Name)]
 public class AuthzedExperimentalV1ServiceTests

@@ -28,4 +28,15 @@ public interface IDatastoreGrain : IGrainWithIntegerKey, IDatastoreLog
     /// head-compare and the append atomic with respect to all other writes.
     /// </summary>
     Task<long?> AppendCommit(long expectedHead, ProposedWrite write);
+
+    /// <summary>
+    /// Registers (or refreshes) a head-advance observer and returns the current head, so one call serves as
+    /// the subscription heartbeat AND the fallback head read: a subscriber that missed a push still observes
+    /// the head it missed, and a subscriber dropped by grain reactivation is re-registered. Registration
+    /// expires if not refreshed (observers are best-effort, non-durable client references).
+    /// </summary>
+    Task<DatastoreHeadWire> SubscribeWatch(IDatastoreWatcher watcher);
+
+    /// <summary>Removes a head-advance observer (best-effort; expiry would remove it anyway).</summary>
+    Task UnsubscribeWatch(IDatastoreWatcher watcher);
 }

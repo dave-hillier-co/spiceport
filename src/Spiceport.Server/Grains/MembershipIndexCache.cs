@@ -5,11 +5,11 @@ using Spiceport.Engine;
 
 namespace Spiceport.Grains;
 
-/// <summary>Toggle for the Leopard <see cref="MembershipIndex"/> accelerator. Default OFF (add-before-remove).</summary>
+/// <summary>Toggle for the Leopard <see cref="MembershipIndex"/> accelerator. Default ON (opt-out).</summary>
 public sealed class MembershipIndexOptions
 {
-    /// <summary>When false (the default) the index is never built or consulted; lookups run the live traversal.</summary>
-    public bool Enabled { get; init; }
+    /// <summary>When false the index is never built or consulted; lookups run the live traversal.</summary>
+    public bool Enabled { get; init; } = true;
 }
 
 /// <summary>

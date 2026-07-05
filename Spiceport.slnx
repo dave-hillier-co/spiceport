@@ -3,7 +3,6 @@
     <Project Path="src/Spiceport.Api/Spiceport.Api.csproj" />
     <Project Path="src/Spiceport.Core/Spiceport.Core.csproj" />
     <Project Path="src/Spiceport.Datastore.Memory/Spiceport.Datastore.Memory.csproj" />
-    <Project Path="src/Spiceport.Datastore.Postgres/Spiceport.Datastore.Postgres.csproj" />
     <Project Path="src/Spiceport.Datastore/Spiceport.Datastore.csproj" />
     <Project Path="src/Spiceport.Protos/Spiceport.Protos.csproj" />
     <Project Path="src/Spiceport.Server/Spiceport.Server.csproj" />
@@ -13,7 +12,6 @@
     <Project Path="tests/Spiceport.Conformance.Tests/Spiceport.Conformance.Tests.csproj" />
     <Project Path="tests/Spiceport.Core.Tests/Spiceport.Core.Tests.csproj" />
     <Project Path="tests/Spiceport.Datastore.Memory.Tests/Spiceport.Datastore.Memory.Tests.csproj" />
-    <Project Path="tests/Spiceport.Datastore.Postgres.Tests/Spiceport.Datastore.Postgres.Tests.csproj" />
     <Project Path="tests/Spiceport.Engine.Tests/Spiceport.Engine.Tests.csproj" />
     <Project Path="tests/Spiceport.Grains.Tests/Spiceport.Grains.Tests.csproj" />
     <Project Path="tests/Spiceport.Schema.Tests/Spiceport.Schema.Tests.csproj" />
