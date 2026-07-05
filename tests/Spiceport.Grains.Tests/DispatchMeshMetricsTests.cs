@@ -76,7 +76,16 @@ public class DispatchMeshMetricsTests
     [Fact]
     public async Task Multi_silo_cluster_genuinely_spreads_activations_across_more_than_one_silo()
     {
-        await using var cluster = await MeshTestCluster.CreateMultiSiloAsync(ChainSchema, siloCount: 3);
+        // Random placement (an explicit opt-in for THIS assertion): Orleans 10's default placement is
+        // ResourceOptimizedPlacement, a load-statistics heuristic whose local-silo preference margin may
+        // legitimately keep a whole chain on the calling silo when silo load scores are close (observed
+        // deterministically after heavy in-process cluster churn) — it makes no spread guarantee, so a
+        // spread ASSERTION under it would be asserting behavior the runtime does not promise. Random
+        // placement does guarantee spread (statistically overwhelming for 30 keys over 3 silos), keeping
+        // this test's real claim — recursion crosses genuine process boundaries with no custom router —
+        // sound and deterministic.
+        await using var cluster = await MeshTestCluster.CreateMultiSiloAsync(
+            ChainSchema, siloCount: 3, useRandomPlacement: true);
         await SeedChain(cluster.Datastore, depth: 30);
 
         cluster.ResetMetrics();
@@ -84,10 +93,10 @@ public class DispatchMeshMetricsTests
             "group", "g0", "member", new ObjectAndRelation("user", "u", CoreConstants.Ellipsis), null);
         Assert.Equal(Membership.Member, result.Verdict);
 
-        // With no custom placement director, Orleans' own default placement + the grain directory decide
-        // where each of the chain's many distinct grain keys activates. Anti-hollow: on a real 3-silo
-        // cluster that routing must genuinely land activations on more than one silo's own process, not
-        // collapse the whole chain onto a single silo.
+        // With no custom placement director, Orleans' own placement + the grain directory decide where
+        // each of the chain's many distinct grain keys activates. Anti-hollow: on a real 3-silo cluster
+        // that routing must genuinely land activations on more than one silo's own process, not collapse
+        // the whole chain onto a single silo.
         var perSiloDispatches = cluster.AllSiloServices
             .Select(sp => sp.GetRequiredService<IDispatchMetrics>().Snapshot().Dispatch)
             .ToArray();

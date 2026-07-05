@@ -47,6 +47,11 @@ public sealed class GrainBackedDatastore : IDatastore, IAsyncDisposable
     private readonly TimeSpan? _watchFallbackInterval;
     private LogWatchHub? _hub;
 
+    // True for the private-instance (test-seam) constructor, which owns the hub it lazily creates and must
+    // dispose it; false for the shared-host constructor, whose hub's lifecycle is owned by
+    // DatastoreProjectionService (this instance must not dispose a hub it does not own).
+    private readonly bool _ownsHub;
+
     // Cached optimized-revision candidate (mirrors ReferenceDatastore's CachedOptimizedRevisions): a real
     // head sampled when a window opens, held stable until the bucket boundary so near-in-time
     // minimize-latency checks WITHIN THIS SILO share one revision (and therefore one dispatch cache key).
@@ -84,16 +89,61 @@ public sealed class GrainBackedDatastore : IDatastore, IAsyncDisposable
     /// <see cref="DatastoreGcOptions"/>'s own default), consistent with the grain's own optional-options
     /// pattern.
     /// </param>
+    /// <remarks>
+    /// TEST/ISOLATION SEAM: this constructor builds its OWN private <see cref="SiloProjection"/> and
+    /// <see cref="LogWatchHub"/> rather than reusing the per-silo shared ones. Production code should use the
+    /// <see cref="GrainBackedDatastore(IGrainFactory, IDatastoreProjectionHost, TimeSpan?, TimeSpan?, IOptions{DatastoreGcOptions}?)"/>
+    /// overload instead. This overload exists for tests that need a genuinely isolated hub — e.g. proving
+    /// PUSH-driven Watch is real (grain-observer-driven), not a shared in-process shortcut, by committing
+    /// through one <see cref="GrainBackedDatastore"/>'s hub while asserting on another's (see
+    /// <c>Stage3WatchPushMeshTests</c>) — or that need to override the hub's heartbeat cadence via
+    /// <paramref name="watchFallbackInterval"/>.
+    /// </remarks>
     public GrainBackedDatastore(
         IGrainFactory grainFactory, TimeSpan? quantization = null, TimeSpan? gcWindow = null,
         TimeSpan? watchFallbackInterval = null, IOptions<DatastoreGcOptions>? gcOptions = null)
     {
         _grainFactory = grainFactory;
-        _quantizationNanos = (long)((quantization ?? TimeSpan.FromSeconds(5)).TotalMilliseconds) * 1_000_000L;
-        var window = gcWindow ?? gcOptions?.Value.Window ?? TimeSpan.FromHours(24);
-        _gcWindowNanos = (long)(window.TotalMilliseconds) * 1_000_000L;
+        _quantizationNanos = ComputeQuantizationNanos(quantization);
+        _gcWindowNanos = ComputeGcWindowNanos(gcWindow, gcOptions);
         _watchFallbackInterval = watchFallbackInterval;
         _projection = new SiloProjection(grainFactory.GetGrain<IDatastoreGrain>(IDatastoreGrain.Key));
+        _ownsHub = true;
+    }
+
+    /// <summary>
+    /// Production constructor: reads and Watch use the per-silo SHARED <see cref="SiloProjection"/>/
+    /// <see cref="LogWatchHub"/> owned by <paramref name="projectionHost"/> — the same instances the
+    /// silo-lifecycle-managed <see cref="DatastoreProjectionService"/> bootstraps before the silo accepts
+    /// traffic and disposes on silo shutdown. This <see cref="GrainBackedDatastore"/> instance does not own
+    /// the hub's lifetime, so <see cref="DisposeAsync"/> leaves it running for other same-silo consumers.
+    /// </summary>
+    /// <param name="grainFactory">The Orleans grain factory used to reach the singleton datastore grain.</param>
+    /// <param name="projectionHost">The per-silo shared projection/hub pair (see <see cref="IDatastoreProjectionHost"/>).</param>
+    /// <param name="quantization">Quantization window for <see cref="OptimizedRevision"/> (default 5s).</param>
+    /// <param name="gcWindow">See the other constructor's parameter of the same name.</param>
+    /// <param name="gcOptions">See the other constructor's parameter of the same name.</param>
+    public GrainBackedDatastore(
+        IGrainFactory grainFactory, IDatastoreProjectionHost projectionHost, TimeSpan? quantization = null,
+        TimeSpan? gcWindow = null, IOptions<DatastoreGcOptions>? gcOptions = null)
+    {
+        ArgumentNullException.ThrowIfNull(projectionHost);
+        _grainFactory = grainFactory;
+        _quantizationNanos = ComputeQuantizationNanos(quantization);
+        _gcWindowNanos = ComputeGcWindowNanos(gcWindow, gcOptions);
+        _watchFallbackInterval = null;
+        _projection = projectionHost.Projection;
+        _hub = projectionHost.Hub;
+        _ownsHub = false;
+    }
+
+    private static long ComputeQuantizationNanos(TimeSpan? quantization) =>
+        (long)((quantization ?? TimeSpan.FromSeconds(5)).TotalMilliseconds) * 1_000_000L;
+
+    private static long ComputeGcWindowNanos(TimeSpan? gcWindow, IOptions<DatastoreGcOptions>? gcOptions)
+    {
+        var window = gcWindow ?? gcOptions?.Value.Window ?? TimeSpan.FromHours(24);
+        return (long)(window.TotalMilliseconds) * 1_000_000L;
     }
 
     private IDatastoreGrain Grain => _grainFactory.GetGrain<IDatastoreGrain>(IDatastoreGrain.Key);
@@ -284,6 +334,11 @@ public sealed class GrainBackedDatastore : IDatastore, IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
+        // The shared hub's lifecycle belongs to DatastoreProjectionService (silo shutdown), not to any one
+        // GrainBackedDatastore instance that merely references it.
+        if (!_ownsHub)
+            return;
+
         LogWatchHub? hub;
         lock (_hubLock)
         {

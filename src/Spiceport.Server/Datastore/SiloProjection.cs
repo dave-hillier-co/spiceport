@@ -22,7 +22,7 @@ namespace Spiceport.Grains;
 /// (compaction GC'd past our watermark, e.g. after a long idle), <c>ReadFrom</c> throws
 /// <see cref="RevisionNotFoundException"/> and we re-bootstrap from a full snapshot and continue.
 /// </remarks>
-internal sealed class SiloProjection
+public sealed class SiloProjection
 {
     /// <summary>Log-tail page size for catch-up pulls.</summary>
     private const int BatchSize = 256;
@@ -49,13 +49,28 @@ internal sealed class SiloProjection
     public long AppliedWatermark => Interlocked.Read(ref _watermark);
 
     /// <summary>
+    /// True once the first full-snapshot bootstrap has completed. Used to observe (honestly, not via a mock)
+    /// that <see cref="DatastoreProjectionService"/> warmed the projection up before the silo accepted
+    /// traffic, rather than the first real request paying the bootstrap latency.
+    /// </summary>
+    public bool IsBootstrapped => _bootstrapped;
+
+    /// <summary>
+    /// Triggers the projection's first bootstrap without pinning to a specific revision. Used by
+    /// <see cref="DatastoreProjectionService"/> to warm the projection up during the silo's
+    /// <c>RuntimeGrainServices</c> lifecycle stage — strictly before the silo accepts client traffic — so the
+    /// first real request never pays the bootstrap latency. A no-op fast path if already bootstrapped.
+    /// </summary>
+    public Task WarmUpAsync(CancellationToken cancellationToken = default) => StateAtLeast(0, cancellationToken);
+
+    /// <summary>
     /// Ensures every commit with revision &lt;= <paramref name="rev"/> is folded into the projection, then
     /// returns the immutable memory snapshot to read against. Blocks (pulling the log tail) until the
     /// watermark reaches <paramref name="rev"/>. The returned state may be FRESHER than <paramref name="rev"/>
     /// (a concurrent catch-up advanced it); the caller's <see cref="MvccSnapshotReader"/> filters by
     /// <c>IsVisibleAt(rev)</c>, so the over-shoot is invisible to the read.
     /// </summary>
-    public async Task<DatastoreState> StateAtLeast(long rev, CancellationToken cancellationToken = default)
+    internal async Task<DatastoreState> StateAtLeast(long rev, CancellationToken cancellationToken = default)
     {
         // Fast path: already caught up. _memoryState is published before _watermark advances, so observing
         // watermark >= rev implies a snapshot at least as fresh as rev is visible.

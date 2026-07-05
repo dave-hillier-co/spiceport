@@ -15,7 +15,7 @@ namespace Spiceport.Grains;
 /// cursor — so the per-stream cost is one log-tail read per change, never a full-state fetch and never a
 /// private timer.
 /// </summary>
-internal sealed class LogWatchHub : IDatastoreWatcher, IAsyncDisposable
+public sealed class LogWatchHub : IDatastoreWatcher, IAsyncDisposable
 {
     /// <summary>
     /// Default heartbeat cadence: a liveness backstop for missed pushes and the observer-registration

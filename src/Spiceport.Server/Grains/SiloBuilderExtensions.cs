@@ -46,4 +46,19 @@ public static class SiloBuilderExtensions
             });
         return siloBuilder;
     }
+
+    /// <summary>
+    /// Registers the per-silo shared <see cref="IDatastoreProjectionHost"/> singleton and the
+    /// silo-lifecycle-managed <see cref="DatastoreProjectionService"/> that bootstraps its projection before
+    /// the silo accepts traffic and tears down its hub on silo shutdown (see <c>docs/future-work.md</c>
+    /// §1.8). Call this once per silo; construct <see cref="GrainBackedDatastore"/> via its
+    /// <see cref="IDatastoreProjectionHost"/> overload afterward so it shares the same projection/hub pair.
+    /// </summary>
+    public static ISiloBuilder AddDatastoreProjectionService(this ISiloBuilder siloBuilder)
+    {
+        ArgumentNullException.ThrowIfNull(siloBuilder);
+        siloBuilder.Services.AddSingleton<IDatastoreProjectionHost, DatastoreProjectionHost>();
+        siloBuilder.AddGrainService<DatastoreProjectionService>();
+        return siloBuilder;
+    }
 }

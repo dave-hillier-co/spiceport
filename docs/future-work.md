@@ -105,12 +105,18 @@ is now exactly the canonical sub-problem (the grain key) plus the cancellation t
 repo accepts this with an explicit test helper (`SetDispatchContext`) to inject context for
 unit verification.
 
-### 1.8 `GrainService` for the per-silo components
+### 1.8 `GrainService` for the per-silo components (implemented)
 
-`SiloProjection`, `LogWatchHub`, and `MembershipIndexCache` are the "one per silo" pattern
-hand-built as DI singletons with manual lifecycle. The native primitive for that shape is the
-**GrainService**: silo-lifecycle-managed (the projection could bootstrap *before* the silo accepts
-traffic) and addressable from grains. Moderate win; the DI versions are workable.
+`DatastoreProjectionService` (a `GrainService`) owns the lifecycle of the per-silo
+`SiloProjection`/`LogWatchHub` pair: it bootstraps the projection and starts the hub at the
+`RuntimeGrainServices` lifecycle stage — strictly before the silo accepts traffic, so the first
+request never pays the bootstrap — and disposes the hub (bounded observer unsubscribe) on silo
+shutdown. Identity lives in the `IDatastoreProjectionHost` DI singleton rather than the
+`GrainService` itself: the only supported DI-reachable client of a live `GrainService` is the
+message-passing `GrainServiceClient<T>`, which would put a hop back on the per-Check read path the
+projection exists to eliminate. `MembershipIndexCache` stays a plain DI singleton — its build is
+request-schema-driven, so lifecycle management adds nothing. The private-instance
+`GrainBackedDatastore` constructor survives as the test seam the push-Watch proofs need.
 
 ### 1.9 `[Immutable]` wire types (implemented)
 
