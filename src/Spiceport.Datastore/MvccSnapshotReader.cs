@@ -12,6 +12,12 @@ internal sealed class MvccSnapshotReader : IDatastoreReader
 
     public MvccSnapshotReader(DatastoreState state, long revision, Func<long, bool> isValid)
     {
+        // A revision below the collected floor cannot be read exactly: DatastoreState.CollectBelow may
+        // already have dropped rows that would have been visible at it (rows dead-below-floor, or
+        // expired-at-or-before-floor). Reject outright rather than silently serving a partial view.
+        if (revision < state.GcFloor)
+            throw new RevisionNotFoundException(new TimestampRevision(revision));
+
         _state = state;
         _revision = revision;
         _isValid = isValid;

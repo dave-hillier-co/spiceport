@@ -39,4 +39,13 @@ public interface IDatastoreGrain : IGrainWithIntegerKey, IDatastoreLog
 
     /// <summary>Removes a head-advance observer (best-effort; expiry would remove it anyway).</summary>
     Task UnsubscribeWatch(IDatastoreWatcher watcher);
+
+    /// <summary>
+    /// Runs one round of MVCC garbage collection: computes a floor (bounded by the configured GC window,
+    /// never above the current head), and — if it advances the floor already recorded — appends a GC
+    /// <see cref="LogEvent"/> that collects history below it. This is both the reminder's periodic body
+    /// and a directly callable test seam. Returns the new floor, or null if no collection was needed
+    /// (the computed floor did not advance the current one).
+    /// </summary>
+    Task<long?> RunGc();
 }

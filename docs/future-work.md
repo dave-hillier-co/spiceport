@@ -39,23 +39,15 @@ to the reverse-adjacency sets incrementally, with full rebuild only on schema ch
 compaction advances past the cache watermark. The index remains a complete candidate superset
 confirmed by `CheckEngine`, never an oracle — it cannot change a verdict.
 
-### 1.2 Reminder-driven MVCC garbage collection
+### 1.2 Reminder-driven MVCC garbage collection (implemented)
 
-**Current state.** The datastore grain never GCs MVCC rows — `GrainBackedDatastore`'s reader
-soundness argument rests on that, and state grows without bound. Relationship expiration is
-filtered at read, never swept.
-
-**Direction.** Use an Orleans **Reminder** (durable, survives deactivation — the native scheduling
-primitive this design gained by adopting Orleans) on the datastore grain to periodically append a
-`GcApplied(floor)` event to the log. Because GC is *itself a log event*, every fold — grain state,
-silo projections, the membership index — applies it identically and stays consistent. Reads below
-the floor already fail correctly (`RevisionNotFoundException` → consumer re-bootstraps from a
-snapshot). An expiration sweep can ride the same janitor.
-
-**Wins.** Bounds state growth (correctness at scale, not just tidiness); paper alignment (Spanner
-version GC bounded by zookie staleness).
-**Risk.** Low-moderate: the GC floor interacts with the Watch cursor window and the projection
-re-bootstrap path; tests must cover a consumer parked across a GC event.
+An Orleans **Reminder** on the singleton `DatastoreGrain` periodically appends a `GcApplied(floor)`
+event to the log. Because GC is itself a log event, every fold — grain state, silo projections, the
+membership index — applies it identically. The collect drops relationship rows fully dead below the
+floor, sweeps expired tuples, and compacts old schema and counter versions. Reads pinned below the
+floor throw `RevisionNotFoundException`, so consumers re-bootstrap; stale zookies map to
+`InvalidArgument`. The floor defaults to a 24-hour window, bounding state growth and aligning with
+Zanzibar/Spanner's use of zookie staleness as a retention boundary.
 
 ### 1.3 Activation-as-cache (the dispatch cache dissolves into the runtime)
 
@@ -270,8 +262,7 @@ Recorded so they are not relitigated by accident:
 
 ## Suggested ordering, if taken as a program
 
-1. **1.2 reminder GC** — the only place the current architecture is quietly unbounded.
-2. **1.3 activation-as-cache**, staged and benchmark-gated, and — only if stage (c) wins its
+1. **1.3 activation-as-cache**, staged and benchmark-gated, and — only if stage (c) wins its
    benchmark — **1.4**.
-3. **2.3 / 2.4 / 2.5** — cheap, immediately differentiating product capabilities.
-4. **2.1 per-tenant** and **2.2 materialized reachability** — each behind its own design document.
+2. **2.3 / 2.4 / 2.5** — cheap, immediately differentiating product capabilities.
+3. **2.1 per-tenant** and **2.2 materialized reachability** — each behind its own design document.

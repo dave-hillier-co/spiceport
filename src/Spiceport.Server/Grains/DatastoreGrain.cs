@@ -1,5 +1,6 @@
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
 using Orleans.EventSourcing;
 using Orleans.EventSourcing.CustomStorage;
 using Orleans.Providers;
@@ -32,8 +33,12 @@ namespace Spiceport.Grains;
 public sealed class DatastoreGrain :
     JournaledGrain<DatastoreStateHolder, LogEvent>,
     IDatastoreGrain,
-    ICustomStorageInterface<DatastoreStateHolder, LogEvent>
+    ICustomStorageInterface<DatastoreStateHolder, LogEvent>,
+    IRemindable
 {
+    /// <summary>The name of the periodic MVCC-GC reminder registered in <see cref="OnActivateAsync"/>.</summary>
+    private const string GcReminderName = "mvcc-gc";
+
     // Orleans grain code must not ConfigureAwait(false); keep the captured context.
     private const ConfigureAwaitOptions ContinueOnCapturedContext = ConfigureAwaitOptions.ContinueOnCapturedContext;
 
@@ -50,18 +55,21 @@ public sealed class DatastoreGrain :
     private const int SnapshotInterval = 64;
 
     /// <summary>
-    /// How long old revisions stay served by <see cref="ReadFrom"/> / retained in the in-memory window
-    /// (mirrors the datastore GC window default). Older cursors throw <c>RevisionNotFoundException</c>.
-    /// </summary>
-    private static readonly long GcWindowNanos = (long)TimeSpan.FromHours(24).TotalMilliseconds * 1_000_000L;
-
-    /// <summary>
     /// How long a watcher registration lives without a <see cref="SubscribeWatch"/> refresh. 10x the hubs'
     /// heartbeat interval, so a silo must miss many heartbeats before its watcher is dropped.
     /// </summary>
     private static readonly TimeSpan WatcherExpiry = TimeSpan.FromSeconds(10);
 
     private readonly IGrainStorage _storage;
+    private readonly ILogger<DatastoreGrain> _logger;
+    private readonly DatastoreGcOptions _gcOptions;
+
+    /// <summary>
+    /// How long old revisions stay served by <see cref="ReadFrom"/> / retained in the in-memory window,
+    /// and the retention window <see cref="RunGc"/> collects MVCC history beyond. Older cursors throw
+    /// <c>RevisionNotFoundException</c>. Derived from <see cref="DatastoreGcOptions.Window"/>.
+    /// </summary>
+    private readonly long _gcWindowNanos;
 
     /// <summary>
     /// The registered head-advance observers (one per silo hub). Deliberately in-memory only — observer
@@ -106,11 +114,51 @@ public sealed class DatastoreGrain :
     /// </summary>
     private long _recentFloorRevision;
 
-    public DatastoreGrain([FromKeyedServices("datastore")] IGrainStorage storage, ILogger<DatastoreGrain> logger)
+    public DatastoreGrain(
+        [FromKeyedServices("datastore")] IGrainStorage storage,
+        ILogger<DatastoreGrain> logger,
+        IOptions<DatastoreGcOptions>? gcOptions = null)
     {
         _storage = storage;
+        _logger = logger;
         _watchers = new ObserverManager<IDatastoreWatcher>(WatcherExpiry, logger);
+        // Optional so a host/test that never registers DatastoreGcOptions in DI still activates the grain
+        // with sane defaults (24h window, 1h reminder, enabled) — only a host that wants non-default GC
+        // behaviour needs to configure the options.
+        _gcOptions = gcOptions?.Value ?? new DatastoreGcOptions();
+        _gcWindowNanos = (long)_gcOptions.Window.TotalMilliseconds * 1_000_000L;
     }
+
+    /// <inheritdoc />
+    public override async Task OnActivateAsync(CancellationToken cancellationToken)
+    {
+        await base.OnActivateAsync(cancellationToken).ConfigureAwait(ContinueOnCapturedContext);
+
+        if (!_gcOptions.ReminderEnabled)
+            return;
+
+        try
+        {
+            var period = _gcOptions.ReminderPeriod < DatastoreGcOptions.MinimumReminderPeriod
+                ? DatastoreGcOptions.MinimumReminderPeriod
+                : _gcOptions.ReminderPeriod;
+            await this.RegisterOrUpdateReminder(GcReminderName, period, period).ConfigureAwait(ContinueOnCapturedContext);
+        }
+        catch (Exception ex)
+        {
+            // A host with no reminder service configured (many tests, some dev hosts) must still activate;
+            // losing the periodic reminder is safe because the singleton re-registers it on every future
+            // activation, and RunGc remains directly callable regardless (the test seam).
+            _logger.LogWarning(
+                ex,
+                "datastore grain: failed to register the '{ReminderName}' reminder; MVCC GC will not run periodically on this activation",
+                GcReminderName);
+        }
+    }
+
+    /// <inheritdoc />
+    public Task ReceiveReminder(string reminderName, TickStatus status) =>
+        reminderName == GcReminderName ? RunGc() : Task.CompletedTask;
 
     // --- Fold (JournaledGrain) ---
 
@@ -127,7 +175,7 @@ public sealed class DatastoreGrain :
     public Task<DatastoreHeadWire> GetHead()
     {
         var s = State.Value;
-        return Task.FromResult(new DatastoreHeadWire(s.HeadRevision, s.SchemaHashAt(s.HeadRevision)));
+        return Task.FromResult(new DatastoreHeadWire(s.HeadRevision, s.SchemaHashAt(s.HeadRevision), s.GcFloor));
     }
 
     /// <inheritdoc />
@@ -167,6 +215,51 @@ public sealed class DatastoreGrain :
         }
 
         return newRevision;
+    }
+
+    /// <inheritdoc />
+    public async Task<long?> RunGc()
+    {
+        var head = State.Value.HeadRevision;
+        var currentFloor = State.Value.GcFloor;
+        var now = NowNanos();
+        // Never above head (a floor beyond the head would be meaningless) and never inside the retained
+        // window — mirrors AppendCommit's own revision-minting arithmetic style.
+        var floor = Math.Min(head, now - _gcWindowNanos);
+
+        if (floor <= currentFloor)
+            return null; // GC only ever moves forward; nothing new to collect yet.
+
+        // Mint the new revision exactly like AppendCommit (monotonic over the observed head) — a GC event
+        // is minted by the grain itself, not by a caller-supplied expectedHead CAS.
+        var newRevision = now > head ? now : head + 1;
+        var ev = new LogEvent(
+            newRevision, Array.Empty<RelationshipUpdateWire>(), SchemaChange: null,
+            Array.Empty<CounterDeltaWire>(), GcFloor: floor);
+
+        var raised = await RaiseConditionalEvent(ev).ConfigureAwait(ContinueOnCapturedContext);
+        if (!raised)
+            return null; // lost a race with a concurrent turn; the next reminder tick (or caller) retries.
+        await ConfirmEvents().ConfigureAwait(ContinueOnCapturedContext);
+
+        // Keep the in-memory log-tail retention (ReadFrom) in lockstep with the collected state floor: a
+        // cursor below the floor is no longer a meaningful re-bootstrap point either.
+        _recentFloorRevision = Math.Max(_recentFloorRevision, floor);
+        _recent.RemoveAll(e => e.Revision <= _recentFloorRevision);
+
+        // Same best-effort notify pattern as AppendCommit: the GC result never depends on this succeeding,
+        // and the GC event itself carries no relationship/schema content so a Watch consumer parked before
+        // it just observes the head advancing with nothing to emit.
+        try
+        {
+            await _watchers.Notify(w => w.HeadAdvanced(newRevision)).ConfigureAwait(ContinueOnCapturedContext);
+        }
+        catch
+        {
+            // Defunct observers are pruned by ObserverManager; nothing else to do.
+        }
+
+        return floor;
     }
 
     /// <inheritdoc />
@@ -376,7 +469,7 @@ public sealed class DatastoreGrain :
     // higher), and drop the now-unretained events. _recent always holds exactly the events above the floor.
     private void TrimRecent(long head)
     {
-        var floor = Math.Max(_recentFloorRevision, head - GcWindowNanos);
+        var floor = Math.Max(_recentFloorRevision, head - _gcWindowNanos);
         if (floor <= _recentFloorRevision)
             return;
         _recentFloorRevision = floor;

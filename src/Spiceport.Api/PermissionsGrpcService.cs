@@ -1,6 +1,7 @@
 using Google.Protobuf.WellKnownTypes;
 using Grpc.Core;
 using Spiceport.Core;
+using Spiceport.Datastore;
 using Spiceport.Engine;
 using Spiceport.Grains;
 using Spiceport.Grains.Abstractions;
@@ -82,6 +83,12 @@ public sealed class PermissionsGrpcService(IPermissionChecker checker, IGrainFac
         {
             throw new RpcException(new Status(StatusCode.InvalidArgument, ex.Message));
         }
+        catch (RevisionNotFoundException ex)
+        {
+            // The pinned revision has been garbage-collected (or never existed): same client-facing
+            // contract as an invalid consistency token.
+            throw new RpcException(new Status(StatusCode.InvalidArgument, ex.Message));
+        }
         catch (MaxDepthExceededException ex)
         {
             throw new RpcException(new Status(StatusCode.FailedPrecondition, ex.Message));
@@ -141,6 +148,12 @@ public sealed class PermissionsGrpcService(IPermissionChecker checker, IGrainFac
         }
         catch (InvalidConsistencyTokenException ex)
         {
+            throw new RpcException(new Status(StatusCode.InvalidArgument, ex.Message));
+        }
+        catch (RevisionNotFoundException ex)
+        {
+            // The pinned revision has been garbage-collected (or never existed): same client-facing
+            // contract as an invalid consistency token.
             throw new RpcException(new Status(StatusCode.InvalidArgument, ex.Message));
         }
         catch (DispatchFailedException ex)

@@ -22,12 +22,19 @@ public sealed record CounterDeltaWire(
 /// <see cref="CounterChanges"/> carry name + filter (null filter = tombstone). A consumer can fold the
 /// ordered event sequence from empty without any side state.
 /// </remarks>
+/// <param name="GcFloor">
+/// Non-null marks this a GC event (minted by the datastore grain's own janitor, never by a client
+/// proposal): folding it applies <c>DatastoreState.CollectBelow(GcFloor)</c> to the memory-space state
+/// INSTEAD of replaying <see cref="RelationshipChanges"/>/<see cref="SchemaChange"/>/<see cref="CounterChanges"/>
+/// (which are always empty/null on a GC event), then advances the head to <see cref="Revision"/> as usual.
+/// </param>
 [GenerateSerializer, Immutable]
 public sealed record LogEvent(
     [property: Id(0)] long Revision,
     [property: Id(1)] IReadOnlyList<RelationshipUpdateWire> RelationshipChanges,
     [property: Id(2)] SchemaVersionWire? SchemaChange,
-    [property: Id(3)] IReadOnlyList<CounterDeltaWire> CounterChanges);
+    [property: Id(3)] IReadOnlyList<CounterDeltaWire> CounterChanges,
+    [property: Id(4)] long? GcFloor);
 
 /// <summary>A bounded page of the event log, plus the head revision observed at read time.</summary>
 [GenerateSerializer]

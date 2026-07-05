@@ -18,7 +18,8 @@ internal static class DatastoreStateConverters
             g.HeadRevision,
             g.Relationships.Select(ToMemoryRow).ToImmutableList(),
             g.Schemas.Select(ToMemorySchema).ToImmutableList(),
-            g.Counters.Select(ToMemoryCounter).ToImmutableList());
+            g.Counters.Select(ToMemoryCounter).ToImmutableList(),
+            g.GcFloor);
 
     /// <summary>In-memory MVCC state to grain wire state (for the CAS payload).</summary>
     public static DatastoreGrainState ToGrain(DatastoreState s) =>
@@ -28,6 +29,7 @@ internal static class DatastoreStateConverters
             Relationships = s.Relationships.Select(ToWireRow).ToImmutableList(),
             Schemas = s.Schemas.Select(ToWireSchema).ToImmutableList(),
             Counters = s.Counters.Select(ToWireCounter).ToImmutableList(),
+            GcFloor = s.GcFloor,
         };
 
     private static StoredRelationship ToMemoryRow(StoredRelationshipWire w) =>

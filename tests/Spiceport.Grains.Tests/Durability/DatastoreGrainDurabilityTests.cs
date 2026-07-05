@@ -10,6 +10,7 @@ using Orleans.TestingHost;
 using Spiceport.Core;
 using Spiceport.Datastore;
 using Spiceport.Grains;
+using Spiceport.Grains.Abstractions;
 using Spiceport.Server.Hosting;
 
 namespace Spiceport.Grains.Tests.Durability;
@@ -108,6 +109,63 @@ public sealed class DatastoreGrainDurabilityTests
 
     private static IDatastore Datastore(TestCluster cluster) =>
         ((InProcessSiloHandle)cluster.Primary!).SiloHost.Services.GetRequiredService<IDatastore>();
+
+    private static IDatastoreGrain GcGrain(TestCluster cluster) =>
+        cluster.GrainFactory.GetGrain<IDatastoreGrain>(IDatastoreGrain.Key);
+
+    /// <summary>Carries the AdoNet connection string to the GC-enabled silo configurator.</summary>
+    private static class GcConnHolder
+    {
+        public static string ConnectionString = string.Empty;
+    }
+
+    /// <summary>
+    /// Same as <see cref="AdoNetSiloConfigurator"/> but with an aggressive (<see cref="TimeSpan.Zero"/>)
+    /// GC window, so a single <see cref="IDatastoreGrain.RunGc"/> call deterministically collects
+    /// everything dead as of the current head (see <c>DatastoreGcMeshTests</c> for the same pattern
+    /// against in-memory storage).
+    /// </summary>
+    private sealed class GcAdoNetSiloConfigurator : ISiloConfigurator
+    {
+        public void Configure(ISiloBuilder siloBuilder)
+        {
+            siloBuilder.AddConsistentHashPlacement();
+            var config = new ConfigurationBuilder()
+                .AddInMemoryCollection(new Dictionary<string, string?>
+                {
+                    [DatastoreStorageConfig.ConnectionStringKey] = GcConnHolder.ConnectionString,
+                })
+                .Build();
+            siloBuilder.AddDatastoreGrainStorage(config);
+            siloBuilder.AddCustomStorageBasedLogConsistencyProvider("CustomStorage");
+            siloBuilder.ConfigureServices(services =>
+            {
+                services.AddSpiceportGrainServices(SchemaText);
+                // No reminder service is registered on this cluster (RunGc is invoked directly in the
+                // test, never via the reminder), which also doubles as proof that a durable AdoNet-backed
+                // host with no reminder service still activates (the try/catch gate).
+                services.AddSingleton<IOptions<DatastoreGcOptions>>(
+                    Options.Create(new DatastoreGcOptions { Window = TimeSpan.Zero, ReminderEnabled = false }));
+                // Mirrors production wiring: GrainBackedDatastore's own nominal GC window must track the
+                // SAME DatastoreGcOptions the grain is configured with (see GrainBackedDatastore's ctor doc).
+                services.AddSingleton<IDatastore>(sp =>
+                    new GrainBackedDatastore(
+                        sp.GetRequiredService<IGrainFactory>(),
+                        gcOptions: sp.GetRequiredService<IOptions<DatastoreGcOptions>>()));
+            });
+        }
+    }
+
+    private static async Task<TestCluster> BuildGcAdoNetClusterAsync(string connectionString, string serviceId)
+    {
+        GcConnHolder.ConnectionString = connectionString;
+        var builder = new TestClusterBuilder(initialSilosCount: 1);
+        builder.Options.ServiceId = serviceId;
+        builder.AddSiloBuilderConfigurator<GcAdoNetSiloConfigurator>();
+        var cluster = builder.Build();
+        await cluster.DeployAsync();
+        return cluster;
+    }
 
     private static readonly DateTimeOffset Expiry = new(2030, 1, 1, 0, 0, 0, TimeSpan.Zero);
 
@@ -316,6 +374,109 @@ public sealed class DatastoreGrainDurabilityTests
             Assert.Equal("is_active", early.OptionalCaveat!.CaveatName);
             Assert.Equal("\"eu\"", ((JsonElement)early.OptionalCaveat.Context!["region"]!).GetRawText());
             Assert.Equal("7", ((JsonElement)early.OptionalCaveat.Context!["level"]!).GetRawText());
+        }
+        finally
+        {
+            await clusterB.DisposeAsync();
+        }
+    }
+
+    /// <summary>
+    /// The GC-specific durability gate: commits rows, deletes some, runs <see cref="IDatastoreGrain.RunGc"/>
+    /// (collecting the dead rows and stamping a GC floor), then proves BOTH survive a TRUE reactivation
+    /// (brand-new cluster over the same Postgres) — the collected relationship set AND the floor itself,
+    /// which is only durable if it round-trips through the snapshot/log exactly like any other event.
+    /// </summary>
+    /// <remarks>
+    /// Negative control (mirrors the other tests in this file): if durable state were lost, cluster B's
+    /// activation would re-seed <c>Empty(NowNanos)</c> — a DIFFERENT, larger head, GcFloor back at 0, and
+    /// zero relationships — so the head-equality, GcFloor-equality, and live-row assertions below are
+    /// exactly what makes this test FAIL LOUDLY on real data loss rather than silently pass.
+    /// </remarks>
+    [SkippableFact]
+    public async Task GcFloor_And_CollectedState_Survive_TrueReactivation_FromPostgres()
+    {
+        Skip.IfNot(_fixture.Available, _fixture.SkipReason ?? "Postgres fixture unavailable");
+
+        long writtenHead;
+        long writtenFloor;
+
+        var clusterA = await BuildGcAdoNetClusterAsync(_fixture.ConnectionString, "spiceport-durability-gc");
+        try
+        {
+            var dsA = Datastore(clusterA);
+            var grainA = GcGrain(clusterA);
+
+            await dsA.ReadWriteTx(tx => tx.WriteRelationships(new[]
+            {
+                new RelationshipUpdate(
+                    Relationship.Create(
+                        new ObjectAndRelation("doc", "dead", "viewer"),
+                        new ObjectAndRelation("user", "alice", CoreConstants.Ellipsis)),
+                    UpdateOperation.Create),
+                new RelationshipUpdate(
+                    Relationship.Create(
+                        new ObjectAndRelation("doc", "alive", "viewer"),
+                        new ObjectAndRelation("user", "bob", CoreConstants.Ellipsis)),
+                    UpdateOperation.Create),
+            }));
+
+            await dsA.ReadWriteTx(tx => tx.WriteRelationships(new[]
+            {
+                new RelationshipUpdate(
+                    Relationship.Create(
+                        new ObjectAndRelation("doc", "dead", "viewer"),
+                        new ObjectAndRelation("user", "alice", CoreConstants.Ellipsis)),
+                    UpdateOperation.Delete),
+            }));
+
+            var floor = await grainA.RunGc();
+            Assert.NotNull(floor);
+            writtenFloor = floor!.Value;
+
+            var head = await dsA.HeadRevision();
+            writtenHead = ((TimestampRevision)head.Revision).TimestampNanosSinceEpoch;
+
+            // Collected in cluster A itself, before any reactivation.
+            var stateA = await grainA.ReadState();
+            Assert.Equal(writtenFloor, stateA.GcFloor);
+            Assert.DoesNotContain(stateA.Relationships, r => r.Relationship.ResourceId == "dead");
+            Assert.Contains(stateA.Relationships, r => r.Relationship.ResourceId == "alive");
+        }
+        finally
+        {
+            await clusterA.DisposeAsync();
+        }
+
+        // --- TRUE reactivation: a brand-new cluster over the same Postgres. ---
+        var clusterB = await BuildGcAdoNetClusterAsync(_fixture.ConnectionString, "spiceport-durability-gc");
+        try
+        {
+            var dsB = Datastore(clusterB);
+            var grainB = GcGrain(clusterB);
+
+            var head = await dsB.HeadRevision();
+            Assert.Equal(writtenHead, ((TimestampRevision)head.Revision).TimestampNanosSinceEpoch);
+
+            var stateB = await grainB.ReadState();
+            Assert.Equal(writtenFloor, stateB.GcFloor); // the floor itself is durable
+
+            var reader = dsB.SnapshotReader(head.Revision);
+            var rels = new List<Relationship>();
+            await foreach (var rel in reader.QueryRelationships(new RelationshipsFilter { OptionalResourceType = "doc" }))
+                rels.Add(rel);
+
+            Assert.Single(rels); // "dead" stayed collected across reactivation; only "alive" survives
+            Assert.Equal("alive", rels[0].Resource.ObjectId);
+
+            // A read pinned below the (durable) floor is rejected exactly as it would be pre-reactivation.
+            await Assert.ThrowsAsync<RevisionNotFoundException>(async () =>
+            {
+                var stale = dsB.SnapshotReader(new TimestampRevision(writtenFloor - 1));
+                await foreach (var _ in stale.QueryRelationships(new RelationshipsFilter()))
+                {
+                }
+            });
         }
         finally
         {

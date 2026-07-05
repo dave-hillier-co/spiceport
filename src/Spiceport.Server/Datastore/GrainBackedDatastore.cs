@@ -1,4 +1,5 @@
 using System.Runtime.CompilerServices;
+using Microsoft.Extensions.Options;
 using Spiceport.Core;
 using Spiceport.Datastore;
 using Spiceport.Grains.Abstractions;
@@ -61,18 +62,36 @@ public sealed class GrainBackedDatastore : IDatastore, IAsyncDisposable
     /// <summary>Creates a grain-backed datastore.</summary>
     /// <param name="grainFactory">The Orleans grain factory used to reach the singleton datastore grain.</param>
     /// <param name="quantization">Quantization window for <see cref="OptimizedRevision"/> (default 5s).</param>
-    /// <param name="gcWindow">How long old revisions remain valid (default 24h).</param>
+    /// <param name="gcWindow">
+    /// How long old revisions remain valid. Takes priority over <paramref name="gcOptions"/> when supplied
+    /// (a test seam for pinning an exact value); otherwise falls back to <c>gcOptions.Value.Window</c>, and
+    /// only defaults to 24h when neither is given. This MUST track the same
+    /// <see cref="DatastoreGcOptions.Window"/> the singleton <see cref="DatastoreGrain"/> was configured
+    /// with — that value is what actually drives the grain's real <c>GcFloor</c> (see
+    /// <see cref="DatastoreGrain.RunGc"/>), so a caller that configures a non-default window for the grain
+    /// must pass the SAME <see cref="IOptions{TOptions}"/> here (see the production wiring in
+    /// <c>Spiceport.Api</c>/<c>Spiceport.Silo</c>'s <c>Program.cs</c>). A mismatched, independently-hardcoded
+    /// window here would wrongly reject (or wrongly accept) a still-valid revision relative to the real
+    /// per-host retention policy.
+    /// </param>
     /// <param name="watchFallbackInterval">
     /// The Watch hub's heartbeat cadence (observer-registration refresh + missed-push backstop). Test seam;
     /// leave null for the production default.
     /// </param>
+    /// <param name="gcOptions">
+    /// The same <see cref="DatastoreGcOptions"/> the singleton <see cref="DatastoreGrain"/> is configured
+    /// with. Optional so a host/test that never registers it still gets the 24h default (matching
+    /// <see cref="DatastoreGcOptions"/>'s own default), consistent with the grain's own optional-options
+    /// pattern.
+    /// </param>
     public GrainBackedDatastore(
         IGrainFactory grainFactory, TimeSpan? quantization = null, TimeSpan? gcWindow = null,
-        TimeSpan? watchFallbackInterval = null)
+        TimeSpan? watchFallbackInterval = null, IOptions<DatastoreGcOptions>? gcOptions = null)
     {
         _grainFactory = grainFactory;
         _quantizationNanos = (long)((quantization ?? TimeSpan.FromSeconds(5)).TotalMilliseconds) * 1_000_000L;
-        _gcWindowNanos = (long)((gcWindow ?? TimeSpan.FromHours(24)).TotalMilliseconds) * 1_000_000L;
+        var window = gcWindow ?? gcOptions?.Value.Window ?? TimeSpan.FromHours(24);
+        _gcWindowNanos = (long)(window.TotalMilliseconds) * 1_000_000L;
         _watchFallbackInterval = watchFallbackInterval;
         _projection = new SiloProjection(grainFactory.GetGrain<IDatastoreGrain>(IDatastoreGrain.Key));
     }
@@ -180,7 +199,10 @@ public sealed class GrainBackedDatastore : IDatastore, IAsyncDisposable
     {
         var head = await Grain.GetHead().ConfigureAwait(false);
         var rev = ToNanos(revision);
-        return rev <= head.Head && rev >= head.Head - _gcWindowNanos;
+        // The REAL GC floor is the hard bound (below it, MVCC rows are actually gone); the nominal window
+        // is kept as an additional, stricter-or-equal bound for API-parity with ReferenceDatastore/SpiceDB
+        // even before GC has caught up to it (e.g. right after activation, when head.GcFloor is still 0).
+        return rev <= head.Head && rev >= head.Head - _gcWindowNanos && rev >= head.GcFloor;
     }
 
     public async IAsyncEnumerable<RevisionChange> Watch(
@@ -193,9 +215,11 @@ public sealed class GrainBackedDatastore : IDatastore, IAsyncDisposable
 
         var cursor = ToNanos(afterRevision);
 
-        // Validate the cursor is within the GC window (mirror ReferenceDatastore: RevisionNotFoundException).
+        // Validate the cursor against the REAL GC floor (mirror ReferenceDatastore: RevisionNotFoundException).
+        // The nominal window is kept alongside it as a stricter-or-equal bound for API-parity even before
+        // GC has caught up (head0.GcFloor starts at 0 on a fresh datastore).
         var head0 = await Grain.GetHead().ConfigureAwait(false);
-        if (!(cursor <= head0.Head && cursor >= head0.Head - _gcWindowNanos))
+        if (!(cursor <= head0.Head && cursor >= head0.Head - _gcWindowNanos && cursor >= head0.GcFloor))
             throw new RevisionNotFoundException(afterRevision);
 
         var hub = Hub();
@@ -322,9 +346,10 @@ public sealed class GrainBackedDatastore : IDatastore, IAsyncDisposable
     /// Because <see cref="IDatastore.SnapshotReader"/> is synchronous but acquiring the state is async, the
     /// acquisition is deferred to the first (async) read. The local dispatcher pins one reader per Check and
     /// queries it many times, so the acquisition happens exactly once per Check. The acquire delegate
-    /// catches up the per-silo projection — the grain never GCs rows, so the MVCC fold via
-    /// <c>IsVisibleAt</c> is exact at any revision and a permissive validator is sound (validity is
-    /// enforced upstream by <see cref="CheckRevision"/>).
+    /// catches up the per-silo projection; the MVCC fold via <c>IsVisibleAt</c> is exact for any revision
+    /// AT OR ABOVE the projection's collected floor, and <c>MvccSnapshotReader</c>'s own constructor guard
+    /// rejects (<see cref="RevisionNotFoundException"/>) a revision below it, so a permissive <c>isValid</c>
+    /// delegate here is sound — the hard floor check lives in the reader itself, not this wrapper.
     /// </summary>
     private sealed class DeferredReader(Func<CancellationToken, ValueTask<MvccSnapshotReader>> acquire)
         : IDatastoreReader

@@ -34,6 +34,6 @@ internal static class LogEventFactory
             .Select(s => new SchemaVersionWire(s.Revision, s.Bytes, s.Hash))
             .FirstOrDefault();
 
-        return new LogEvent(revision, relationshipChanges, schemaChange, counterChanges);
+        return new LogEvent(revision, relationshipChanges, schemaChange, counterChanges, GcFloor: null);
     }
 }
