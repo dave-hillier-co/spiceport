@@ -87,22 +87,23 @@ Cancellation therefore continues through every recursive child dispatch instead 
 the first grain boundary. Delivery to a remote activation is awaited before the cancelled hop
 unwinds, so gRPC deadline expiry prunes the mesh-wide computation.
 
-### 1.6 Grain call filters for the cross-cutting layer
+### 1.6 Grain call filters for the cross-cutting layer (implemented)
 
-**Current state.** `DispatchErrorMapper`, `IDispatchMetrics`, and depth-budget enforcement are
-hand-threaded through the dispatch path.
+`CheckDispatchOutgoingCallFilter` maps cross-silo `DispatchCheck` exceptions into the
+dispatch-error taxonomy (transient → `Unavailable`, cancellation → `Cancelled`, domain
+exceptions pass through unchanged). `CheckDispatchIncomingCallFilter` increments the hop
+counter and enforces the boundary-depth ceiling via the `DepthRemaining` RequestContext value.
+The dispatchers now carry only dispatch logic (key building, cancellation bridging, the bloom
+loop-bypass tag), with error mapping and hop counting delegated to the native interceptor seam.
 
-**Direction.** `IIncomingGrainCallFilter` / `IOutgoingGrainCallFilter` are the native interceptor
-seam: exception mapping, hop counters, and depth enforcement become one filter each, and the
-dispatchers stop carrying plumbing that is not dispatch logic.
+### 1.7 `RequestContext` for traversal state (implemented)
 
-### 1.7 `RequestContext` for traversal state
-
-`depthRemaining` and the traversal bloom are call-chain context, not part of the subproblem
-identity, yet they ride in the request DTOs. Orleans `RequestContext` flows implicitly across
-grain calls; moving them there makes the wire contract exactly the canonical subproblem.
-**Trade, stated honestly:** implicit context is harder to see in tests and debuggers — this is
-taste as much as simplification, and the lowest-priority item here.
+`DepthRemaining` and the traversal bloom now ride in the Orleans `RequestContext` via the
+scoped `DispatchContext` helper, not in the request DTOs. The wire contract for `DispatchCheck`
+is now exactly the canonical sub-problem (the grain key) plus the cancellation token.
+**Trade, stated honestly:** implicit context is harder to see in tests and debuggers — the
+repo accepts this with an explicit test helper (`SetDispatchContext`) to inject context for
+unit verification.
 
 ### 1.8 `GrainService` for the per-silo components
 
@@ -113,10 +114,11 @@ traffic) and addressable from grains. Moderate win; the DI versions are workable
 
 ### 1.9 `[Immutable]` wire types (implemented)
 
-The check request (`DispatchCheckArgs`), pre-context branch reply (`DispatchCheckReply`), and
-folded `LogEvent` are marked `[Immutable]`, eliminating their defensive deep copy on same-silo
-grain calls. This supports the "always call the grain, even locally" pattern (1.3(c)/1.4) by
-reducing the cost of intra-silo grain calls.
+The pre-context branch reply (`DispatchCheckReply`) and folded `LogEvent` are marked `[Immutable]`,
+eliminating their defensive deep copy on same-silo grain calls. (The check request `DispatchCheckArgs`
+was deleted in 1.7; the wire contract is now just the grain key + cancellation token.) This supports
+the "always call the grain, even locally" pattern (1.3(c)/1.4) by reducing the cost of intra-silo
+grain calls.
 
 ### 1.10 Native `IAsyncEnumerable` grain streaming (internal paths)
 
@@ -239,6 +241,10 @@ Recorded so they are not relitigated by accident:
 
 ## Suggested ordering, if taken as a program
 
-1. **1.3 activation-as-cache** and **1.4 directory-owned location** — both completed.
-2. **2.3 / 2.4 / 2.5** — cheap, immediately differentiating product capabilities.
-3. **2.1 per-tenant** and **2.2 materialized reachability** — each behind its own design document.
+1. **1.1–1.7** — all completed. Cross-cutting infrastructure (filters, RequestContext) is now
+   in place and the dispatcher seam is clean: error mapping and depth enforcement are native,
+   and the wire contract is minimal (sub-problem + cancellation).
+2. **1.8–1.11** — optional Orleans-native refinements (GrainService, native `IAsyncEnumerable`,
+   broadcast channel) — low leverage, deferred.
+3. **2.3 / 2.4 / 2.5** — cheap, immediately differentiating product capabilities.
+4. **2.1 per-tenant** and **2.2 materialized reachability** — each behind its own design document.

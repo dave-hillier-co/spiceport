@@ -97,4 +97,37 @@ public static class DispatchErrorMapper
             OrleansException => true,
             _ => false,
         };
+
+    /// <summary>
+    /// Translates an exception surfaced from (or at) a cross-silo <c>ICheckGrain.DispatchCheck</c> hop
+    /// into the exception the caller should see: a known domain exception (and an already-classified
+    /// <see cref="DispatchFailedException"/>) is re-thrown unchanged; everything else is collapsed to a
+    /// <see cref="DispatchFailedException"/> carrying its deliberately-mapped <see cref="DispatchErrorCode"/>.
+    /// Pure, given <see cref="Classify"/>.
+    /// </summary>
+    /// <remarks>
+    /// Shared by <see cref="CheckDispatchOutgoingCallFilter"/> (the normal path: every exception the
+    /// grain call itself produces) and <see cref="OrleansDispatcher"/>'s own cancellation-bridging catch
+    /// (the one case — the caller's own <c>CancellationToken</c> firing first inside
+    /// <c>Task.WaitAsync</c> — that never reaches the filter at all, because it is raised locally against
+    /// an abandoned await rather than surfaced from the grain call's own fault).
+    /// </remarks>
+    public static Exception Translate(Exception exception)
+    {
+        var classification = Classify(exception);
+        if (classification.PassThrough)
+            return exception;
+
+        var reason = classification.Code switch
+        {
+            DispatchErrorCode.Unavailable =>
+                "the permission check could not reach the silo that owns this sub-problem; the failure " +
+                "is transient and the request may be retried",
+            DispatchErrorCode.Cancelled => "the permission check was cancelled",
+            DispatchErrorCode.DeadlineExceeded => "the permission check exceeded its deadline",
+            _ => "the permission check failed with an unexpected dispatch error",
+        };
+
+        return new DispatchFailedException(classification.Code, reason, exception);
+    }
 }

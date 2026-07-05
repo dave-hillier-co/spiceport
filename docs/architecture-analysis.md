@@ -128,12 +128,12 @@ The seam composes two implementations:
 - `LocalDispatcher` — runs exactly one expansion step, then calls *back through the seam* for
   each child sub-problem.
 - `OrleansDispatcher` + `CheckGrain` — the grain key *is* the canonical sub-problem
-  (`resourceType, resourceId, relation, subject, revision, schemaHash`, escaped and joined).
+  (`resourceType, resourceId, relation, subject, quantizedRevision, schemaHash`, escaped and joined).
   A sub-problem becomes a grain call by resolving the grain for that key; the grain's own onward
   dispatch goes *back through the seam*, so recursion crosses grain boundaries. The traversal
-  state that is *not* part of the identity (`depthRemaining`, the traversal bloom) rides in the
-  request so a remote grain reads the same snapshot revision and continues the same cycle guard.
-  `CheckGrain` activation state memoizes the pre-context `Branch` (membership + caveat
+  state that is *not* part of the identity (`depthRemaining`, the traversal bloom) rides ambient
+  in the Orleans `RequestContext` via `DispatchContext`, so a remote grain continues the same
+  cycle guard. `CheckGrain` activation state memoizes the pre-context `Branch` (membership + caveat
   *expression*), never the collapsed verdict — caveat context is applied per-request at the
   caller. Cycle-cut results are served but not retained.
 
@@ -174,7 +174,7 @@ grain mesh**, with results identical to the in-process engine.
   semaphore that mirrors SpiceDB's `ConcurrencyLimits`. Orleans turn-based single-threading is
   fine here because dispatch grains are stateless workers and scale out.
 - **Cycle/depth control** → termination rests on `depthRemaining` (a genuine cycle errors at the
-  depth limit), with the bloom carried in the request only as a singleflight-style loop-bypass hint,
+  depth limit), with the bloom carried in `RequestContext` only as a singleflight-style loop-bypass hint,
   exactly as SpiceDB does. No actor state required.
 
 ### 3.5 Storage as an event-sourced grain (the log is the storage/compute seam)

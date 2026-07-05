@@ -18,7 +18,8 @@ namespace Spiceport.Grains;
 /// that child's identity. There is no in-process local-recurse shortcut — every sub-problem, local or
 /// remote, is a grain call; Orleans' own placement director and grain directory are the only router. The
 /// dispatcher maps the engine's <see cref="DispatchCheckRequest"/> / <see cref="DispatchCheckResult"/> to
-/// and from the serializable grain <see cref="DispatchCheckArgs"/> / <see cref="DispatchCheckReply"/>.
+/// and from the serializable grain <see cref="DispatchCheckReply"/>, threading the depth budget and
+/// traversal-bloom cycle guard ambiently via <see cref="DispatchContext"/> rather than a method argument.
 /// </remarks>
 public sealed class OrleansDispatcher : IDispatcher
 {
@@ -77,48 +78,49 @@ public sealed class OrleansDispatcher : IDispatcher
 
         var grain = _grains.GetGrain<ICheckGrain>(key);
 
-        var args = new DispatchCheckArgs(
-            request.Meta.DepthRemaining,
-            request.Meta.Bloom.ToBytes(),
-            request.Meta.Bloom.Hashes,
-            request.Meta.Mode);
+        // The depth budget and traversal-bloom cycle guard are call-chain context, not sub-problem
+        // identity (already pinned by `key` above), so they ride ambiently via DispatchContext /
+        // Orleans RequestContext rather than as a method argument — see the scoping guarantee documented
+        // on DispatchContext. Set immediately before the grain call so it is exactly what flows down into
+        // THIS hop (never a stale value from a previous sibling dispatch).
+        DispatchContext.Set(request.Meta.DepthRemaining, request.Meta.Bloom.ToBytes(), request.Meta.Bloom.Hashes);
 
+        // Deliberate cross-silo error mapping (cf. SpiceDB rewriteError / remote cluster boundary) now
+        // happens INSIDE the grain call itself, via CheckDispatchOutgoingCallFilter: known typed domain
+        // exceptions keep their own semantics and pass through; transport/availability failures become a
+        // RETRIABLE Unavailable; anything else collapses to Internal. The mapped failure travels back as
+        // a [GenerateSerializer] DispatchFailedException so its code survives any further grain hops up
+        // the recursion. This dispatcher therefore no longer wraps the call in its own catch(Exception) —
+        // only the cancellation bridging below remains, because that ONE case (the caller's own `ct`
+        // firing first inside Task.WaitAsync) never reaches the filter: WaitAsync raises its own
+        // OperationCanceledException locally, against an abandoned await, without observing whatever the
+        // still-running (filter-wrapped) grain call itself eventually faults with.
         DispatchCheckReply reply;
         using var grainCancellation = new GrainCancellationTokenSource();
+        var grainCall = grain.DispatchCheck(grainCancellation.Token);
         try
         {
-            var grainCall = grain.DispatchCheck(args, grainCancellation.Token);
+            reply = await grainCall.WaitAsync(ct).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException ex) when (ct.IsCancellationRequested)
+        {
+            // GrainCancellationTokenSource.Cancel is asynchronous: await delivery so cancellation
+            // has reached the remote activation before unwinding this hop. The receiver converts
+            // the Orleans token back to the engine's System.Threading.CancellationToken.
             try
             {
-                reply = await grainCall.WaitAsync(ct).ConfigureAwait(false);
+                await grainCancellation.Cancel().ConfigureAwait(false);
             }
-            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            catch
             {
-                // GrainCancellationTokenSource.Cancel is asynchronous: await delivery so cancellation
-                // has reached the remote activation before unwinding this hop. The receiver converts
-                // the Orleans token back to the engine's System.Threading.CancellationToken.
-                try
-                {
-                    await grainCancellation.Cancel().ConfigureAwait(false);
-                }
-                catch
-                {
-                    // Cancellation is already the primary outcome. A silo disappearing while the
-                    // cancellation notification is in flight must not replace it with a transport error.
-                }
-
-                throw;
+                // Cancellation is already the primary outcome. A silo disappearing while the
+                // cancellation notification is in flight must not replace it with a transport error.
             }
-        }
-        catch (Exception ex)
-        {
-            // Deliberate cross-silo error mapping (cf. SpiceDB rewriteError / remote cluster boundary):
-            // classify the failure and translate it to a stable, documented gRPC code. Known typed
-            // domain exceptions keep their own semantics and pass through; transport/availability
-            // failures become a RETRIABLE Unavailable; cancellation/deadline are preserved; anything
-            // else collapses to Internal. The mapped failure travels back as a [GenerateSerializer]
-            // DispatchFailedException so its code survives any further grain hops up the recursion.
-            throw Translate(ex);
+
+            // Mirror the SAME classification the outgoing filter applies to every other dispatch
+            // failure, so caller-cancellation still surfaces as the DispatchFailedException(Cancelled)
+            // callers have always seen — even though this exception never touched the filter.
+            throw DispatchErrorMapper.Translate(ex);
         }
 
         var result = new DispatchCheckResult(
@@ -127,31 +129,5 @@ public sealed class OrleansDispatcher : IDispatcher
         // Force the loop-bypassed subtree CycleCut so it is never memoized upstream, regardless of what
         // the (correctly computed) callee itself decided about its own memo.
         return loopBypass ? result with { CycleCut = true } : result;
-    }
-
-    /// <summary>
-    /// Translates an exception surfaced from a remote grain dispatch into the exception the caller should
-    /// see: a known domain exception (and an already-classified <see cref="DispatchFailedException"/>) is
-    /// re-thrown unchanged; everything else is collapsed to a <see cref="DispatchFailedException"/>
-    /// carrying its deliberately-mapped <see cref="DispatchErrorCode"/>. Pure given
-    /// <see cref="DispatchErrorMapper.Classify"/>.
-    /// </summary>
-    private static Exception Translate(Exception ex)
-    {
-        var classification = DispatchErrorMapper.Classify(ex);
-        if (classification.PassThrough)
-            return ex;
-
-        var reason = classification.Code switch
-        {
-            DispatchErrorCode.Unavailable =>
-                "the permission check could not reach the silo that owns this sub-problem; the failure " +
-                "is transient and the request may be retried",
-            DispatchErrorCode.Cancelled => "the permission check was cancelled",
-            DispatchErrorCode.DeadlineExceeded => "the permission check exceeded its deadline",
-            _ => "the permission check failed with an unexpected dispatch error",
-        };
-
-        return new DispatchFailedException(classification.Code, reason, ex);
     }
 }

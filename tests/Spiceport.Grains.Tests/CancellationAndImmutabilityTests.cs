@@ -4,6 +4,7 @@ using Spiceport.Core;
 using Spiceport.Datastore;
 using Spiceport.Engine;
 using Spiceport.Grains.Abstractions;
+using static Spiceport.Grains.Tests.DispatchContextTestHelper;
 
 namespace Spiceport.Grains.Tests;
 
@@ -75,14 +76,12 @@ public class CancellationAndImmutabilityTests
         using var cancellation = new GrainCancellationTokenSource();
         await cancellation.Cancel();
 
+        SetDispatchContext(50);
         await Assert.ThrowsAnyAsync<OperationCanceledException>(
-            () => grain.DispatchCheck(
-                new DispatchCheckArgs(50, TraversalBloom.Empty.ToBytes(), TraversalBloom.Empty.Hashes),
-                cancellation.Token));
+            () => grain.DispatchCheck(cancellation.Token));
     }
 
     [Theory]
-    [InlineData(typeof(DispatchCheckArgs))]
     [InlineData(typeof(DispatchCheckReply))]
     [InlineData(typeof(LogEvent))]
     public void Same_silo_wire_values_are_declared_immutable(Type wireType)

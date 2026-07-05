@@ -74,15 +74,19 @@ public sealed class CheckGrain(
     private DispatchCheckReply? _memo;
 
     /// <inheritdoc />
-    public async Task<DispatchCheckReply> DispatchCheck(
-        DispatchCheckArgs args,
-        GrainCancellationToken cancellationToken)
+    public async Task<DispatchCheckReply> DispatchCheck(GrainCancellationToken cancellationToken)
     {
-        ArgumentNullException.ThrowIfNull(args);
+        // The depth budget and traversal-bloom cycle guard are call-chain context, not part of this
+        // grain's identity, so they arrive ambiently via the Orleans RequestContext (imported before any
+        // incoming call filter runs) rather than as a method argument — see DispatchContext's remarks. A
+        // missing value here means some caller reached DispatchCheck without going through the
+        // OrleansDispatcher / test seam that sets it; that is a bug and must throw loudly, not default.
+        var depthRemaining = DispatchContext.RequireDepthRemaining();
+        var (bloomBits, bloomK) = DispatchContext.RequireBloom();
 
         if (_memoOptions.Enabled
             && _memo is { } cached
-            && args.DepthRemaining >= cached.DepthRequired)
+            && depthRemaining >= cached.DepthRequired)
         {
             metrics?.RecordMemoHit();
             return cached;
@@ -114,8 +118,8 @@ public sealed class CheckGrain(
 
         var meta = new ResolverMeta(
             revision,
-            args.DepthRemaining,
-            TraversalBloom.FromBytes(args.BloomBits, args.BloomK),
+            depthRemaining,
+            TraversalBloom.FromBytes(bloomBits, bloomK),
             parts.Mode);
         var request = new DispatchCheckRequest(parts.Resource, parts.Subject, meta);
 
