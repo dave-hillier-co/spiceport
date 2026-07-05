@@ -46,17 +46,30 @@ public sealed class MembershipIndex
     /// <summary>
     /// Reverse adjacency over the stored userset edges: a subject key (<c>type:id#relation</c>) maps to the
     /// resource nodes that name it as a subject. Walking it transitively yields every containing group/resource.
+    /// An <see cref="ImmutableDictionary{TKey,TValue}"/> of <see cref="ImmutableHashSet{T}"/> so
+    /// <see cref="Apply"/> can produce a new index by cheap structure-sharing updates instead of a full copy;
+    /// edges are unique per (resource, relation, subject), so a set loses no information a list would keep.
     /// </summary>
-    private readonly Dictionary<string, List<ResourceNode>> _parents;
+    private readonly ImmutableDictionary<string, ImmutableHashSet<ResourceNode>> _parents;
+
+    /// <summary>
+    /// The base relations (<c>(type, relation)</c>) this index scanned to build <see cref="_parents"/> — the
+    /// scan set computed by <see cref="TryResolveYields"/>'s closure walk. <see cref="Apply"/> consults it to
+    /// decide whether an incoming delta is relevant (its resource-side relation is one this index tracks) or
+    /// must be ignored (a relation outside the scan set can never appear in <see cref="_parents"/>).
+    /// </summary>
+    private readonly ImmutableHashSet<(string Type, string Relation)> _scanSet;
 
     private MembershipIndex(
         string schemaHash,
         Dictionary<(string, string), ImmutableHashSet<string>> coveredTargets,
-        Dictionary<string, List<ResourceNode>> parents)
+        ImmutableDictionary<string, ImmutableHashSet<ResourceNode>> parents,
+        ImmutableHashSet<(string Type, string Relation)> scanSet)
     {
         _schemaHash = schemaHash;
         _coveredTargets = coveredTargets;
         _parents = parents;
+        _scanSet = scanSet;
     }
 
     private readonly record struct ResourceNode(string Type, string Id, string Relation);
@@ -105,20 +118,88 @@ public sealed class MembershipIndex
             }
         }
 
-        var parents = new Dictionary<string, List<ResourceNode>>();
+        var parentsBuilder = new Dictionary<string, ImmutableHashSet<ResourceNode>.Builder>();
         foreach (var (type, rel) in scanSet)
         {
             var filter = new RelationshipsFilter { OptionalResourceType = type, OptionalResourceRelation = rel };
             await foreach (var r in reader.QueryRelationships(filter, cancellationToken).ConfigureAwait(false))
             {
                 var subjectKey = Key(r.Subject.ObjectType, r.Subject.ObjectId, r.Subject.Relation);
-                if (!parents.TryGetValue(subjectKey, out var list))
-                    parents[subjectKey] = list = [];
-                list.Add(new ResourceNode(r.Resource.ObjectType, r.Resource.ObjectId, r.Resource.Relation));
+                if (!parentsBuilder.TryGetValue(subjectKey, out var set))
+                    parentsBuilder[subjectKey] = set = ImmutableHashSet.CreateBuilder<ResourceNode>();
+                set.Add(new ResourceNode(r.Resource.ObjectType, r.Resource.ObjectId, r.Resource.Relation));
             }
         }
 
-        return new MembershipIndex(schemaHash, covered, parents);
+        var parents = parentsBuilder.ToImmutableDictionary(kv => kv.Key, kv => kv.Value.ToImmutable());
+        return new MembershipIndex(schemaHash, covered, parents, scanSet.ToImmutableHashSet());
+    }
+
+    /// <summary>
+    /// Folds a batch of committed relationship deltas into a NEW index (a persistent/structure-sharing
+    /// update — <c>this</c> instance is untouched), so a caller that already has an index built at revision
+    /// <c>R1</c> can advance it to <c>R2</c> without a full re-scan.
+    /// </summary>
+    /// <remarks>
+    /// FOLD-EQUIVALENCE INVARIANT: <c>Build(schema, reader@R1).Apply(deltas in (R1..R2])</c> is
+    /// candidate-equivalent to <c>Build(schema, reader@R2)</c> — i.e. <see cref="TryCoveredResources"/>
+    /// returns the same candidate sets from either. This holds because "rows live at R1" + "creates in
+    /// (R1..R2]" − "deletes in (R1..R2]" = "rows live at R2" for every base relation in the scan set, and the
+    /// index deliberately ignores caveats/expiration by design (see the class remarks) — a caveat-only Touch
+    /// changes neither side of that set equation, and a wildcard/userset edge is just another
+    /// (resource, relation, subject) row the same equation covers.
+    /// </remarks>
+    /// <param name="updates">
+    /// The relationship mutations committed strictly after this index's build revision, up to and including
+    /// the target revision, in any order (each is either a Touch/Create upsert or a Delete; order between
+    /// distinct rows does not matter because they are idempotent set operations).
+    /// </param>
+    /// <returns>
+    /// A new <see cref="MembershipIndex"/> with the same <see cref="SchemaHash"/> and coverage tables and the
+    /// deltas folded into the adjacency; if no update touched a scanned relation, returns <c>this</c>
+    /// unchanged.
+    /// </returns>
+    public MembershipIndex Apply(IReadOnlyList<RelationshipUpdate> updates)
+    {
+        ArgumentNullException.ThrowIfNull(updates);
+        if (updates.Count == 0)
+            return this;
+
+        var parents = _parents;
+        var changed = false;
+
+        foreach (var update in updates)
+        {
+            var resource = update.Relationship.Resource;
+            if (!_scanSet.Contains((resource.ObjectType, resource.Relation)))
+                continue; // outside the scanned base relations — cannot appear in _parents, so it's a no-op.
+
+            var subject = update.Relationship.Subject;
+            var subjectKey = Key(subject.ObjectType, subject.ObjectId, subject.Relation);
+            var node = new ResourceNode(resource.ObjectType, resource.ObjectId, resource.Relation);
+            var existing = parents.TryGetValue(subjectKey, out var set) ? set : ImmutableHashSet<ResourceNode>.Empty;
+
+            if (update.Operation == UpdateOperation.Delete)
+            {
+                if (!existing.Contains(node))
+                    continue; // deleting a nonexistent edge is a no-op.
+                var next = existing.Remove(node);
+                parents = next.IsEmpty ? parents.Remove(subjectKey) : parents.SetItem(subjectKey, next);
+                changed = true;
+            }
+            else
+            {
+                // Touch (upsert) or Create: idempotent set-add. A Touch that only changes a caveat/expiration
+                // targets the SAME (resource, relation, subject) triple already present — a no-op, because the
+                // index ignores caveats by design (see the class remarks).
+                if (existing.Contains(node))
+                    continue;
+                parents = parents.SetItem(subjectKey, existing.Add(node));
+                changed = true;
+            }
+        }
+
+        return changed ? new MembershipIndex(_schemaHash, _coveredTargets, parents, _scanSet) : this;
     }
 
     /// <summary>

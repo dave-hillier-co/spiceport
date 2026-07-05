@@ -31,22 +31,13 @@ Whatever is taken from this list, these do not move:
 
 ## Part 1 — Leaning further into Orleans
 
-### 1.1 Leopard as an incremental log projection
+### 1.1 Leopard as an incremental log projection (implemented)
 
-**Current state.** `MembershipIndexCache` rebuilds the flattened membership index by full scan
-whenever the schema changes or a request needs a fresher revision than the cached build.
-
-**Direction.** The Zanzibar paper's Leopard is explicitly two pieces: an offline base index plus
-an *incremental layer fed by the Watch stream*. The repo already owns that exact pattern:
-`SiloProjection` bootstraps once and folds the log tail. Rebuild the membership index the same
-way — snapshot the flattening at a revision, apply each `LogEvent`'s relationship deltas to the
-reverse-adjacency sets incrementally, invalidate only on schema change.
-
-**Wins.** Removes the recompute spike on hot lookup paths; completes "everything is a fold of the
-one log" for the last consumer that is not; direct paper alignment.
-**Risk.** Low — the index-on==off corpus equivalence gate is the unchanged safety net.
-**Sequencing.** Good first pick; proves the fold pattern that 2.2 (materialized reachability)
-would later depend on.
+`MembershipIndexCache` now bootstraps once from a snapshot and folds incrementally from the log
+tail, following the `SiloProjection` pattern. It applies each `LogEvent`'s relationship deltas
+to the reverse-adjacency sets incrementally, with full rebuild only on schema change or when log
+compaction advances past the cache watermark. The index remains a complete candidate superset
+confirmed by `CheckEngine`, never an oracle — it cannot change a verdict.
 
 ### 1.2 Reminder-driven MVCC garbage collection
 
@@ -279,10 +270,8 @@ Recorded so they are not relitigated by accident:
 
 ## Suggested ordering, if taken as a program
 
-1. **1.5 cancellation** and **1.6 call filters** — small, grounded, independently shippable.
-2. **1.1 Leopard-as-fold** — retires the last non-fold; proves the pattern for 2.2.
-3. **1.2 reminder GC** — the only place the current architecture is quietly unbounded.
-4. **1.3 activation-as-cache**, staged and benchmark-gated, folding in **1.9** and — only if
-   stage (c) wins its benchmark — **1.4**.
-5. **2.3 / 2.4 / 2.5** — cheap, immediately differentiating product capabilities.
-6. **2.1 per-tenant** and **2.2 materialized reachability** — each behind its own design document.
+1. **1.2 reminder GC** — the only place the current architecture is quietly unbounded.
+2. **1.3 activation-as-cache**, staged and benchmark-gated, and — only if stage (c) wins its
+   benchmark — **1.4**.
+3. **2.3 / 2.4 / 2.5** — cheap, immediately differentiating product capabilities.
+4. **2.1 per-tenant** and **2.2 materialized reachability** — each behind its own design document.
