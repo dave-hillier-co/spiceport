@@ -1,7 +1,6 @@
 using System.Collections.Immutable;
 using Spiceport.Core;
 using Spiceport.Datastore;
-using Spiceport.Datastore.Memory;
 using Spiceport.Engine;
 using Spiceport.Schema;
 
@@ -200,7 +199,7 @@ public class ValidationLoaderSuiteTests
 
     private static async Task<IRevision> WriteAll(ImmutableList<Relationship> relationships)
     {
-        var datastore = new InMemoryDatastore();
+        var datastore = new ReferenceDatastore();
         if (relationships.Count == 0)
         {
             return (await datastore.HeadRevision()).Revision;

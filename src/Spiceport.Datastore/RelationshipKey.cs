@@ -1,6 +1,6 @@
 using Spiceport.Core;
 
-namespace Spiceport.Datastore.Memory;
+namespace Spiceport.Datastore;
 
 /// <summary>
 /// The full identity of a relationship for storage purposes:

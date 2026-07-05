@@ -1,7 +1,6 @@
 using System.Text;
 using Spiceport.Core;
 using Spiceport.Datastore;
-using Spiceport.Datastore.Memory;
 using Spiceport.Engine;
 using Spiceport.Schema;
 
@@ -292,7 +291,7 @@ public class SteelThreadTests
     // full export and is not separately modelled here.)
     private static async Task RunBulkImportExport(string datafile, BulkImportExportOp o)
     {
-        var store = new InMemoryDatastore();
+        var store = new ReferenceDatastore();
 
         var seedFile = ValidationFileLoader.LoadFromFile(
             Path.Combine(AppContext.BaseDirectory, "SteelThread", "TestData", datafile));
@@ -514,7 +513,7 @@ public class SteelThreadTests
             var file = ValidationFileLoader.LoadFromFile(path);
             var compiled = SchemaCompiler.CompileSchema(file.SchemaText);
 
-            var store = new InMemoryDatastore();
+            var store = new ReferenceDatastore();
             IRevision rev;
             if (file.Relationships.Count == 0)
             {

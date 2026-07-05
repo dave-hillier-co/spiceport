@@ -3,13 +3,13 @@ using System.Runtime.CompilerServices;
 using System.Security.Cryptography;
 using Spiceport.Core;
 
-namespace Spiceport.Datastore.Memory;
+namespace Spiceport.Datastore;
 
 /// <summary>
 /// A read-write transaction. Reads see prior committed state plus this transaction's own staged
 /// mutations. On successful completion the datastore atomically commits the resulting state.
 /// </summary>
-internal sealed class InMemoryReadWriteTransaction : IReadWriteTransaction
+internal sealed class MvccReadWriteTransaction : IReadWriteTransaction
 {
     private readonly DatastoreState _baseState;
     private readonly long _newRevision;
@@ -27,7 +27,7 @@ internal sealed class InMemoryReadWriteTransaction : IReadWriteTransaction
     private readonly Dictionary<string, RelationshipsFilter> _pendingCounterWrites = new();
     private readonly HashSet<string> _pendingCounterDeletes = new();
 
-    public InMemoryReadWriteTransaction(DatastoreState baseState, long newRevision)
+    public MvccReadWriteTransaction(DatastoreState baseState, long newRevision)
     {
         _baseState = baseState;
         _newRevision = newRevision;

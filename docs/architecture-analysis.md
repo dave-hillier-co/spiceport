@@ -271,7 +271,8 @@ These are pure CPU and must be ported faithfully; they carry the real porting ri
   dependency risk; it is now retired.
 - **Datastore + revision model** — the in-memory MVCC mechanics (visibility at a revision, the
   per-revision diff, ZedToken encode/decode) are a straight port and stay the reusable core: the
-  same `InMemoryDatastoreReader` fold serves both the conformance oracle and the silo projections.
+  same `MvccSnapshotReader` fold serves both the `ReferenceDatastore` conformance oracle and the
+  silo projections.
   Durability is *not* a hand-rolled SQL datastore but the event-sourced grain's own storage (§3.5) —
   the log + snapshots persist via an Orleans grain-storage provider (AdoNet/Postgres), so there is no
   bespoke `xid8`/tuple SQL schema to maintain.

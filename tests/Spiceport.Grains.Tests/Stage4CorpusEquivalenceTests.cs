@@ -1,7 +1,6 @@
 using Spiceport.Conformance.Tests;
 using Spiceport.Core;
 using Spiceport.Datastore;
-using Spiceport.Datastore.Memory;
 using Spiceport.Engine;
 using Spiceport.Schema;
 
@@ -33,7 +32,7 @@ public class Stage4CorpusEquivalenceTests
         var compiled = SchemaCompiler.CompileSchema(file.SchemaText);
         var engine = new LookupResourcesEngine(compiled.Namespaces, compiled.Caveats);
 
-        var store = new InMemoryDatastore();
+        var store = new ReferenceDatastore();
         var rev = await store.ReadWriteTx(tx => tx.WriteRelationships(
             file.Relationships.Select(r => new RelationshipUpdate(r, UpdateOperation.Create)).ToList()));
         var reader = store.SnapshotReader(rev);

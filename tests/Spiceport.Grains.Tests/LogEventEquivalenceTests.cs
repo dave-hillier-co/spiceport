@@ -1,7 +1,7 @@
 using System.Collections.Immutable;
 using System.Text;
 using Spiceport.Core;
-using Spiceport.Datastore.Memory;
+using Spiceport.Datastore;
 using Spiceport.Grains;
 using Spiceport.Grains.Abstractions;
 

@@ -1,5 +1,4 @@
 using Spiceport.Datastore;
-using Spiceport.Datastore.Memory;
 using Spiceport.Grains.Abstractions;
 
 namespace Spiceport.Grains;
@@ -53,7 +52,7 @@ internal sealed class SiloProjection
     /// Ensures every commit with revision &lt;= <paramref name="rev"/> is folded into the projection, then
     /// returns the immutable memory snapshot to read against. Blocks (pulling the log tail) until the
     /// watermark reaches <paramref name="rev"/>. The returned state may be FRESHER than <paramref name="rev"/>
-    /// (a concurrent catch-up advanced it); the caller's <see cref="InMemoryDatastoreReader"/> filters by
+    /// (a concurrent catch-up advanced it); the caller's <see cref="MvccSnapshotReader"/> filters by
     /// <c>IsVisibleAt(rev)</c>, so the over-shoot is invisible to the read.
     /// </summary>
     public async Task<DatastoreState> StateAtLeast(long rev, CancellationToken cancellationToken = default)

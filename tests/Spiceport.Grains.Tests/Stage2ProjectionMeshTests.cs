@@ -7,7 +7,6 @@ using Spiceport.Api;
 using Spiceport.Conformance.Tests;
 using Spiceport.Core;
 using Spiceport.Datastore;
-using Spiceport.Datastore.Memory;
 using Spiceport.Grains.Abstractions;
 using Spiceport.Protos;
 using Relationship = Spiceport.Core.Relationship;
@@ -23,7 +22,7 @@ namespace Spiceport.Grains.Tests;
 /// path of <see cref="GrainBackedDatastore"/>. Proves (a) ORACLE EQUIVALENCE: the same conformance corpus
 /// subset that the in-process engine asserts stays green when every read serves from the projection;
 /// (b) READER FIDELITY: at every committed revision the projection reader returns exactly the rows an
-/// independent <see cref="InMemoryDatastore"/> oracle returns; (c) the CLOSED-TIMESTAMP gate: a cross-silo
+/// independent <see cref="ReferenceDatastore"/> oracle returns; (c) the CLOSED-TIMESTAMP gate: a cross-silo
 /// exact / at-least-as-fresh read observes a write immediately (the projection blocks for catch-up), never
 /// serving a stale prefix.
 /// </summary>
@@ -90,7 +89,7 @@ public class Stage2ProjectionMeshTests
         var gf = scope.Cluster.GrainFactory;
         IDatastore writer = new GrainBackedDatastore(gf);
         IDatastore projected = new GrainBackedDatastore(gf);
-        var oracle = new InMemoryDatastore();
+        var oracle = new ReferenceDatastore();
 
         // Drive the SAME ordered workload through the grain (writer) and the oracle, capturing each backend's
         // commit revision so we can compare the readers revision-by-revision.

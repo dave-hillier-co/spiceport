@@ -1,6 +1,6 @@
 using System.Security.Cryptography;
 using Spiceport.Core;
-using Spiceport.Datastore.Memory;
+using Spiceport.Datastore;
 using Spiceport.Grains.Abstractions;
 
 namespace Spiceport.Grains;
@@ -10,7 +10,7 @@ namespace Spiceport.Grains;
 /// committed <see cref="LogEvent"/> to the datastore state", used by the event-sourced
 /// <c>DatastoreGrain</c>'s <c>TransitionState</c> (replay + live append) and by the storage replay on
 /// reactivation. It is deliberately implemented by REUSING the in-memory MVCC
-/// <see cref="InMemoryReadWriteTransaction"/> (the same mechanics the write path runs through), so the
+/// <see cref="MvccReadWriteTransaction"/> (the same mechanics the write path runs through), so the
 /// fold is provably equal to the in-memory <c>Commit()</c> rather than a divergent re-derivation of the
 /// MVCC visibility rules.
 /// </summary>
@@ -28,7 +28,7 @@ internal static class LogFold
 
         // Replay the resolved changes through a fresh in-memory transaction pinned at the event revision,
         // then commit — exactly the path the write produced this event from, so the fold equals that Commit.
-        var tx = new InMemoryReadWriteTransaction(baseState, ev.Revision);
+        var tx = new MvccReadWriteTransaction(baseState, ev.Revision);
 
         if (ev.RelationshipChanges.Count > 0)
         {
@@ -43,7 +43,7 @@ internal static class LogFold
         var committed = tx.Commit();
 
         // Counters are folded by appending the event's NET counter versions DIRECTLY, matching what
-        // InMemoryReadWriteTransaction.Commit appends (a raw CounterVersion for whatever net op survived) —
+        // MvccReadWriteTransaction.Commit appends (a raw CounterVersion for whatever net op survived) —
         // NOT by replaying through the guarded tx.WriteCounter/DeleteCounter, whose register/unregister
         // preconditions can be false in the fold base for a same-commit register+unregister (or the inverse),
         // which would throw and poison replay even though the original Commit succeeded.

@@ -140,7 +140,7 @@ public sealed class DatastoreGrain :
         if (State.Value.HeadRevision != expectedHead)
             return null;
 
-        // Mint the new revision monotonically over the observed head (mirrors InMemoryDatastore).
+        // Mint the new revision monotonically over the observed head (mirrors ReferenceDatastore).
         var now = NowNanos();
         var newRevision = now > expectedHead ? now : expectedHead + 1;
 
@@ -217,7 +217,7 @@ public sealed class DatastoreGrain :
 
         if (!_headState.RecordExists || _headState.State is null)
         {
-            // No durable head yet: seed an empty state at a monotonic timestamp (mirrors InMemoryDatastore's
+            // No durable head yet: seed an empty state at a monotonic timestamp (mirrors ReferenceDatastore's
             // initial Empty(NowNanos)) and PERSIST the seed, so the pre-first-write revision floor is stable
             // across reactivation (a re-seed with a fresh, larger NowNanos would silently move the head).
             var seeded = DatastoreGrainState.Empty(NowNanos());

@@ -4,7 +4,6 @@ using Orleans.Hosting;
 using Orleans.TestingHost;
 using Spiceport.Core;
 using Spiceport.Datastore;
-using Spiceport.Datastore.Memory;
 using Spiceport.Grains.Abstractions;
 
 namespace Spiceport.Grains.Tests;
@@ -117,7 +116,7 @@ public sealed class Stage1JournaledWritePathTests
     /// <summary>
     /// Gate 2: folding the event list from EMPTY via the same ApplyEvent the grain uses reproduces the
     /// grain's materialized state (LiveAt head, schema, counters) AND matches an independent
-    /// InMemoryDatastore oracle run with the same ops.
+    /// ReferenceDatastore oracle run with the same ops.
     /// </summary>
     [Fact]
     public async Task Replay_FromEmpty_ReconstructsGrainStateAndMatchesOracle()
@@ -148,8 +147,8 @@ public sealed class Stage1JournaledWritePathTests
             CounterResource(grainState, "doc_viewers", grainState.HeadRevision),
             CounterResource(folded, "doc_viewers", grainState.HeadRevision));
 
-        // Independent oracle: the SAME ops through a fresh InMemoryDatastore yield the same live set.
-        var oracle = new InMemoryDatastore();
+        // Independent oracle: the SAME ops through a fresh ReferenceDatastore yield the same live set.
+        var oracle = new ReferenceDatastore();
         await RunWorkload(oracle);
         var oracleHead = await oracle.HeadRevision();
         var oracleReader = oracle.SnapshotReader(oracleHead.Revision);

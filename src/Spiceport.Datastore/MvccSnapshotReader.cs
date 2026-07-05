@@ -1,16 +1,16 @@
 using System.Runtime.CompilerServices;
 using Spiceport.Core;
 
-namespace Spiceport.Datastore.Memory;
+namespace Spiceport.Datastore;
 
 /// <summary>Read-only snapshot accessor over an immutable <see cref="DatastoreState"/> at a fixed revision.</summary>
-internal sealed class InMemoryDatastoreReader : IDatastoreReader
+internal sealed class MvccSnapshotReader : IDatastoreReader
 {
     private readonly DatastoreState _state;
     private readonly long _revision;
     private readonly Func<long, bool> _isValid;
 
-    public InMemoryDatastoreReader(DatastoreState state, long revision, Func<long, bool> isValid)
+    public MvccSnapshotReader(DatastoreState state, long revision, Func<long, bool> isValid)
     {
         _state = state;
         _revision = revision;

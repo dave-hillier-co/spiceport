@@ -31,7 +31,8 @@ dotnet test tests/Spiceport.Conformance.Tests  # the SpiceDB conformance corpus 
 - **Storage is not *dispatch*-grain state.** Evaluation is a pure function of
   `(schema@revision, tuples@revision, request)`; dispatch grains never hold relationship data.
   The MVCC mechanics (visibility at a revision, the per-revision diff) live in `Spiceport.Datastore`
-  + Memory and are reused everywhere — the conformance oracle and the silo projections share one fold.
+  and are reused everywhere — the `ReferenceDatastore` conformance oracle and the silo projections
+  share one fold.
 - **Storage is an event-sourced grain (the log is the storage/compute seam).** All
   relationship/schema/counter state lives behind a single cluster-singleton `DatastoreGrain`, a
   **journaled grain whose append-only `LogEvent` log is the source of truth**; the materialized state
@@ -77,8 +78,8 @@ dotnet test tests/Spiceport.Conformance.Tests  # the SpiceDB conformance corpus 
 
 - **The SpiceDB conformance corpus is the correctness oracle.** `tests/.../TestData/*.yaml`
   (schema + relationships + Check/Lookup assertions) must stay green; the same corpus runs
-  through the in-memory engine and the Orleans grain mesh, and both must agree. Never
-  weaken/skip a corpus case to make something pass.
+  through the engine over the `ReferenceDatastore` oracle and the Orleans grain mesh, and both
+  must agree. Never weaken/skip a corpus case to make something pass.
 - **Verify grains via the Orleans `TestingHost`** (in-process `TestCluster`), not by booting a
   host. For server/client-streaming gRPC, drive the service in-process with a fake
   `IServerStreamWriter`/`IAsyncStreamReader` + a fake `ServerCallContext`. Do **not** start a

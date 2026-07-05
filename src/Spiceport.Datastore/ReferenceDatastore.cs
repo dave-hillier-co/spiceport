@@ -2,15 +2,18 @@ using System.Collections.Immutable;
 using System.Runtime.CompilerServices;
 using Spiceport.Core;
 
-namespace Spiceport.Datastore.Memory;
+namespace Spiceport.Datastore;
 
 /// <summary>
-/// An in-memory MVCC datastore. Revisions are monotonically increasing nanosecond timestamps.
+/// The independent conformance-oracle and engine-test datastore: an in-memory MVCC implementation
+/// deliberately NOT built from the event-sourced <c>DatastoreGrain</c> path, so the two can disagree
+/// and catch bugs. It is not a deployable backend (durability is a grain-storage provider choice,
+/// see <c>DatastoreStorageConfig</c>). Revisions are monotonically increasing nanosecond timestamps.
 /// Each committed transaction produces a new immutable <see cref="DatastoreState"/>; snapshot
 /// readers capture a state reference and read correctly regardless of subsequent writes.
 /// Writes are serialized by a single write lock.
 /// </summary>
-public sealed class InMemoryDatastore : IDatastore
+public sealed class ReferenceDatastore : IDatastore
 {
     private readonly object _writeLock = new();
     private readonly string _uniqueId = Guid.NewGuid().ToString("n");
@@ -41,7 +44,7 @@ public sealed class InMemoryDatastore : IDatastore
     /// <summary>Creates an in-memory datastore.</summary>
     /// <param name="quantization">Quantization window for <see cref="OptimizedRevision"/> (default 5s).</param>
     /// <param name="gcWindow">How long old revisions remain valid (default 24h). Snapshots before this window are rejected.</param>
-    public InMemoryDatastore(TimeSpan? quantization = null, TimeSpan? gcWindow = null)
+    public ReferenceDatastore(TimeSpan? quantization = null, TimeSpan? gcWindow = null)
     {
         _quantizationNanos = (long)((quantization ?? TimeSpan.FromSeconds(5)).TotalMilliseconds) * 1_000_000L;
         _gcWindowNanos = (long)((gcWindow ?? TimeSpan.FromHours(24)).TotalMilliseconds) * 1_000_000L;
@@ -59,7 +62,7 @@ public sealed class InMemoryDatastore : IDatastore
                 throw new RevisionNotFoundException(revision);
             state = _current;
         }
-        return new InMemoryDatastoreReader(state, rev, IsRevisionValidSnapshot);
+        return new MvccSnapshotReader(state, rev, IsRevisionValidSnapshot);
     }
 
     public Task<RevisionWithSchemaHash> HeadRevision(CancellationToken cancellationToken = default)
@@ -114,7 +117,7 @@ public sealed class InMemoryDatastore : IDatastore
             newRevision = NextRevision();
         }
 
-        var tx = new InMemoryReadWriteTransaction(baseState, newRevision);
+        var tx = new MvccReadWriteTransaction(baseState, newRevision);
         await transaction(tx).ConfigureAwait(false);
 
         lock (_writeLock)
@@ -228,7 +231,7 @@ public sealed class InMemoryDatastore : IDatastore
     public Task<string> GetUniqueId(CancellationToken cancellationToken = default) => Task.FromResult(_uniqueId);
 
     public Task<IRevisionParser> GetRevisionParser(CancellationToken cancellationToken = default) =>
-        Task.FromResult<IRevisionParser>(new InMemoryRevisionParser(_uniqueId));
+        Task.FromResult<IRevisionParser>(new TimestampRevisionParser(_uniqueId));
 
     public Task Close() => Task.CompletedTask;
 

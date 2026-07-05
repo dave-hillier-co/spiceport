@@ -1,6 +1,5 @@
 using Spiceport.Core;
 using Spiceport.Datastore;
-using Spiceport.Datastore.Memory;
 using Spiceport.Grains.Abstractions;
 
 namespace Spiceport.Grains.Tests;
