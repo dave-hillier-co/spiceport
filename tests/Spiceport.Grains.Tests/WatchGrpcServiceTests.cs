@@ -1,10 +1,14 @@
 using System.Threading.Channels;
 using Grpc.Core;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Options;
+using Orleans.Hosting;
+using Orleans.TestingHost;
 using Spiceport.Api;
 using Spiceport.Core;
 using Spiceport.Datastore;
 using Spiceport.Grains;
+using Spiceport.Grains.Abstractions;
 using Spiceport.Protos;
 using RelationshipUpdate = Spiceport.Protos.RelationshipUpdate;
 using Relationship = Spiceport.Protos.Relationship;
@@ -118,6 +122,86 @@ public class WatchGrpcServiceTests
 
         Assert.True(watchTask.IsCompletedSuccessfully);
         Assert.Empty(writer.Collected);
+    }
+
+    /// <summary>
+    /// Regression test: once reminder-driven MVCC GC has actually collected past a client's cursor,
+    /// <see cref="GrainBackedDatastore.Watch"/> throws <see cref="RevisionNotFoundException"/> from inside
+    /// the async-iterator body — which only runs lazily on the FIRST <c>MoveNextAsync</c>, not on
+    /// <c>GetAsyncEnumerator</c>. The gRPC handler must map that into <c>FailedPrecondition</c> (mirroring
+    /// <c>AuthzedWatchV1Service</c>), not let it propagate unmapped.
+    /// </summary>
+    [Fact]
+    public async Task Watch_from_a_cursor_below_the_gc_floor_yields_FailedPrecondition()
+    {
+        await using var scope = new GcClusterScope(await BuildGcClusterAsync());
+        var gf = scope.Cluster.GrainFactory;
+        var services = ((InProcessSiloHandle)scope.Cluster.Primary!).SiloHost.Services;
+        var gcOptions = services.GetRequiredService<IOptions<DatastoreGcOptions>>();
+        var schemaProvider = services.GetRequiredService<ISchemaProvider>();
+        var grain = gf.GetGrain<IDatastoreGrain>(IDatastoreGrain.Key);
+
+        IDatastore datastore = new GrainBackedDatastore(gf, gcOptions: gcOptions);
+        var service = new WatchGrpcService(datastore, schemaProvider);
+
+        // Capture a cursor, then write past it and collect everything at/below that cursor via GC (Window
+        // = Zero makes the floor deterministically equal to head after one RunGc call).
+        var staleRevision = await datastore.HeadRevision(CancellationToken.None);
+        var datastoreId = await datastore.GetUniqueId(CancellationToken.None);
+        var staleToken = ZedTokens.FromRevision(staleRevision.Revision, staleRevision.SchemaHash, datastoreId);
+
+        await datastore.ReadWriteTx(tx => tx.WriteRelationships(new[]
+        {
+            new global::Spiceport.Core.RelationshipUpdate(
+                global::Spiceport.Core.Relationship.Create(
+                    new ObjectAndRelation("document", "doc1", "viewer"),
+                    new ObjectAndRelation("user", "alice", CoreConstants.Ellipsis)),
+                global::Spiceport.Core.UpdateOperation.Create),
+        }));
+
+        var floor = await grain.RunGc();
+        Assert.NotNull(floor);
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        var writer = new CollectingStreamWriter<WatchResponse>();
+        var ctx = new FakeServerCallContext(cts.Token);
+        var request = new WatchRequest { OptionalStartCursor = new Spiceport.Protos.ZedToken { Token = staleToken.Token } };
+
+        var ex = await Assert.ThrowsAsync<RpcException>(() => service.Watch(request, writer, ctx));
+        Assert.Equal(StatusCode.FailedPrecondition, ex.StatusCode);
+    }
+
+    /// <summary>An aggressive, deterministic GC window (mirrors <c>DatastoreGcMeshTests.GcSiloConfigurator</c>):
+    /// <c>Window = TimeSpan.Zero</c> makes a single <c>RunGc()</c> call collect everything dead as of the
+    /// current head, with no dependence on wall-clock timing.</summary>
+    private sealed class GcSiloConfigurator : ISiloConfigurator
+    {
+        public void Configure(ISiloBuilder b)
+        {
+            b.AddMemoryGrainStorage("datastore");
+            b.AddCustomStorageBasedLogConsistencyProvider("CustomStorage");
+            b.ConfigureServices(services =>
+            {
+                services.AddSpiceportGrainServices(Schema);
+                services.AddSingleton<IOptions<DatastoreGcOptions>>(
+                    Options.Create(new DatastoreGcOptions { Window = TimeSpan.Zero, ReminderEnabled = false }));
+            });
+        }
+    }
+
+    private static async Task<TestCluster> BuildGcClusterAsync()
+    {
+        var builder = new TestClusterBuilder(initialSilosCount: 1);
+        builder.AddSiloBuilderConfigurator<GcSiloConfigurator>();
+        var cluster = builder.Build();
+        await cluster.DeployAsync();
+        return cluster;
+    }
+
+    private sealed class GcClusterScope(TestCluster cluster) : IAsyncDisposable
+    {
+        public TestCluster Cluster { get; } = cluster;
+        public async ValueTask DisposeAsync() => await Cluster.DisposeAsync();
     }
 
     /// <summary>A fake server stream writer that records responses and signals each arrival.</summary>

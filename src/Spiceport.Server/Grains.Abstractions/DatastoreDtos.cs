@@ -62,11 +62,15 @@ public sealed record CaveatNameFilterWire(
     [property: Id(0)] int Option,
     [property: Id(1)] string? CaveatName);
 
-/// <summary>A lightweight head probe: head revision plus the schema hash effective at that head.</summary>
+/// <summary>
+/// A lightweight head probe: head revision, the schema hash effective at that head, and the current GC
+/// floor (the revision below which MVCC history has been collected — reads/cursors below it are invalid).
+/// </summary>
 [GenerateSerializer]
 public sealed record DatastoreHeadWire(
     [property: Id(0)] long Head,
-    [property: Id(1)] string? SchemaHash);
+    [property: Id(1)] string? SchemaHash,
+    [property: Id(2)] long GcFloor = 0);
 
 /// <summary>
 /// A proposed commit submitted to the event-sourced datastore grain WITHOUT a final revision: the

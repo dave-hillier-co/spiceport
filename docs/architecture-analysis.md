@@ -203,7 +203,13 @@ schema of its own:
   **append** (the compare-and-swap serialization point), never a whole-state rewrite. Persistence
   is the grain's own responsibility through a custom-storage interface over an Orleans grain-storage
   provider (in-memory in dev, AdoNet/Postgres in production) — **no application SQL**: each event is
-  a per-version entry, with periodic snapshots plus log compaction bounding replay on reactivation.
+  a per-version entry, with periodic snapshots plus log compaction. Garbage collection is driven by
+  an Orleans **Reminder** that periodically appends a `GcApplied(floor)` event to the log; because GC
+  is itself a log event, every fold applies it identically. The collect drops relationship rows fully
+  dead below the floor, sweeps expired tuples, and compacts old schema and counter versions. The GC
+  floor defaults to a 24-hour window, bounding state growth and aligning with Zanzibar's use of
+  zookie staleness as a retention boundary. Reads pinned below the floor throw
+  `RevisionNotFoundException`, so consumers re-bootstrap.
   The single non-reentrant activation makes the head-compare-and-append atomic, so the revision it
   mints is the **cluster-wide global order**. *This single ordered log is the total order that
   defeats Zanzibar's "new enemy" problem — the global-order point Spanner provides in the original.*

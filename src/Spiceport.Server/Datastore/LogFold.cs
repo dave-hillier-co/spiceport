@@ -24,6 +24,15 @@ internal static class LogFold
     /// </summary>
     public static DatastoreGrainState ApplyEvent(DatastoreGrainState state, LogEvent ev)
     {
+        if (ev.GcFloor is { } floor)
+        {
+            // A GC event carries no relationship/schema/counter changes: collect below the floor, then
+            // advance the head to the event's own revision exactly like any other event (CollectBelow
+            // itself never touches HeadRevision).
+            var collected = DatastoreStateConverters.ToMemory(state).CollectBelow(floor);
+            return DatastoreStateConverters.ToGrain(collected) with { HeadRevision = ev.Revision };
+        }
+
         var baseState = DatastoreStateConverters.ToMemory(state);
 
         // Replay the resolved changes through a fresh in-memory transaction pinned at the event revision,
@@ -69,7 +78,7 @@ internal static class LogFold
         var schemaChange = write.SchemaBytes is { } bytes
             ? new SchemaVersionWire(revision, bytes, ComputeHash(bytes))
             : null;
-        return new LogEvent(revision, write.RelationshipChanges, schemaChange, write.CounterChanges);
+        return new LogEvent(revision, write.RelationshipChanges, schemaChange, write.CounterChanges, GcFloor: null);
     }
 
     private static string ComputeHash(byte[] bytes) =>

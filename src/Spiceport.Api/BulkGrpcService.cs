@@ -1,6 +1,7 @@
 using Google.Protobuf.WellKnownTypes;
 using Grpc.Core;
 using Spiceport.Core;
+using Spiceport.Datastore;
 using Spiceport.Grains.Abstractions;
 using Spiceport.Protos;
 using ProtoRelationship = Spiceport.Protos.Relationship;
@@ -83,6 +84,12 @@ public sealed class BulkGrpcService(IGrainFactory grains)
             }
             catch (InvalidConsistencyTokenException ex)
             {
+                throw new RpcException(new Status(StatusCode.InvalidArgument, ex.Message));
+            }
+            catch (RevisionNotFoundException ex)
+            {
+                // The pinned revision has been garbage-collected (or never existed): same client-facing
+                // contract as an invalid consistency token.
                 throw new RpcException(new Status(StatusCode.InvalidArgument, ex.Message));
             }
             catch (FormatException ex)

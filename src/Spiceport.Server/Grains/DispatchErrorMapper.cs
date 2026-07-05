@@ -1,5 +1,6 @@
 using Orleans.Runtime;
 using Spiceport.Core;
+using Spiceport.Datastore;
 using Spiceport.Grains.Abstractions;
 
 namespace Spiceport.Grains;
@@ -76,6 +77,7 @@ public static class DispatchErrorMapper
             or PreconditionFailedException
             or WriteConflictException
             or SchemaWriteValidationException
+            or RevisionNotFoundException // pinned revision fell below the GC floor: caller-facing InvalidArgument.
             or DispatchFailedException; // already-classified failure from a deeper hop: keep its code.
 
     /// <summary>

@@ -1,6 +1,7 @@
 using Google.Protobuf.WellKnownTypes;
 using Grpc.Core;
 using Spiceport.Core;
+using Spiceport.Datastore;
 using Spiceport.Engine;
 using Spiceport.Grains;
 using Spiceport.Grains.Abstractions;
@@ -96,6 +97,12 @@ public sealed class AuthzedPermissionsV1Service(
         }
         catch (InvalidConsistencyTokenException ex)
         {
+            throw new RpcException(new Status(StatusCode.InvalidArgument, ex.Message));
+        }
+        catch (RevisionNotFoundException ex)
+        {
+            // The pinned revision has been garbage-collected (or never existed): same client-facing
+            // contract as an invalid consistency token.
             throw new RpcException(new Status(StatusCode.InvalidArgument, ex.Message));
         }
         catch (MaxDepthExceededException ex)
@@ -195,6 +202,12 @@ public sealed class AuthzedPermissionsV1Service(
             {
                 throw new RpcException(new Status(StatusCode.InvalidArgument, ex.Message));
             }
+            catch (RevisionNotFoundException ex)
+            {
+                // The pinned revision has been garbage-collected (or never existed): same client-facing
+                // contract as an invalid consistency token.
+                throw new RpcException(new Status(StatusCode.InvalidArgument, ex.Message));
+            }
 
             foreach (var rel in reply.Relationships)
             {
@@ -257,6 +270,12 @@ public sealed class AuthzedPermissionsV1Service(
         {
             throw new RpcException(new Status(StatusCode.InvalidArgument, ex.Message));
         }
+        catch (RevisionNotFoundException ex)
+        {
+            // The pinned revision has been garbage-collected (or never existed): same client-facing
+            // contract as an invalid consistency token.
+            throw new RpcException(new Status(StatusCode.InvalidArgument, ex.Message));
+        }
         catch (DispatchFailedException ex)
         {
             throw ToRpc(ex);
@@ -315,6 +334,12 @@ public sealed class AuthzedPermissionsV1Service(
             }
             catch (InvalidConsistencyTokenException ex)
             {
+                throw new RpcException(new Status(StatusCode.InvalidArgument, ex.Message));
+            }
+            catch (RevisionNotFoundException ex)
+            {
+                // The pinned revision has been garbage-collected (or never existed): same client-facing
+                // contract as an invalid consistency token.
                 throw new RpcException(new Status(StatusCode.InvalidArgument, ex.Message));
             }
             catch (CaveatEvaluationException ex)
@@ -410,6 +435,12 @@ public sealed class AuthzedPermissionsV1Service(
             }
             catch (InvalidConsistencyTokenException ex)
             {
+                throw new RpcException(new Status(StatusCode.InvalidArgument, ex.Message));
+            }
+            catch (RevisionNotFoundException ex)
+            {
+                // The pinned revision has been garbage-collected (or never existed): same client-facing
+                // contract as an invalid consistency token.
                 throw new RpcException(new Status(StatusCode.InvalidArgument, ex.Message));
             }
             catch (CaveatEvaluationException ex)
@@ -519,6 +550,12 @@ public sealed class AuthzedPermissionsV1Service(
             }
             catch (InvalidConsistencyTokenException ex)
             {
+                throw new RpcException(new Status(StatusCode.InvalidArgument, ex.Message));
+            }
+            catch (RevisionNotFoundException ex)
+            {
+                // The pinned revision has been garbage-collected (or never existed): same client-facing
+                // contract as an invalid consistency token.
                 throw new RpcException(new Status(StatusCode.InvalidArgument, ex.Message));
             }
             catch (CaveatEvaluationException ex)
@@ -638,6 +675,12 @@ public sealed class AuthzedPermissionsV1Service(
             }
             catch (InvalidConsistencyTokenException ex)
             {
+                throw new RpcException(new Status(StatusCode.InvalidArgument, ex.Message));
+            }
+            catch (RevisionNotFoundException ex)
+            {
+                // The pinned revision has been garbage-collected (or never existed): same client-facing
+                // contract as an invalid consistency token.
                 throw new RpcException(new Status(StatusCode.InvalidArgument, ex.Message));
             }
             catch (FormatException ex)

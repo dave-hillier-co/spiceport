@@ -58,16 +58,10 @@ public sealed class WatchGrpcService(IDatastore datastore, ISchemaProvider schem
         var datastoreId = await datastore.GetUniqueId(cancellationToken);
         var options = new WatchOptions(content);
 
-        IAsyncEnumerator<RevisionChange> enumerator;
-        try
-        {
-            enumerator = datastore.Watch(afterRevision, options, cancellationToken).GetAsyncEnumerator(cancellationToken);
-        }
-        catch (RevisionNotFoundException ex)
-        {
-            // The cursor is older than the retained GC window — cannot replay from it.
-            throw new RpcException(new Status(StatusCode.FailedPrecondition, ex.Message));
-        }
+        // The datastore Watch is a lazy iterator: cursor-validity and watch-enablement checks throw on the
+        // first MoveNextAsync, not at GetAsyncEnumerator (an async-iterator method body does not run until
+        // the first MoveNextAsync call), so the catch must wrap the iteration, not the enumerator creation.
+        var enumerator = datastore.Watch(afterRevision, options, cancellationToken).GetAsyncEnumerator(cancellationToken);
 
         try
         {
@@ -81,6 +75,16 @@ public sealed class WatchGrpcService(IDatastore datastore, ISchemaProvider schem
                 catch (OperationCanceledException)
                 {
                     break;
+                }
+                catch (RevisionNotFoundException ex)
+                {
+                    // The cursor is older than the retained GC window — cannot replay from it.
+                    throw new RpcException(new Status(StatusCode.FailedPrecondition, ex.Message));
+                }
+                catch (WatchDisabledException ex)
+                {
+                    // The backend cannot support Watch (e.g. Postgres without track_commit_timestamp=on).
+                    throw new RpcException(new Status(StatusCode.FailedPrecondition, ex.Message));
                 }
 
                 if (!moved)

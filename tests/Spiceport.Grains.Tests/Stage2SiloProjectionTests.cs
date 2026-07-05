@@ -23,7 +23,8 @@ public sealed class Stage2SiloProjectionTests
         new(revision,
             new[] { new RelationshipUpdateWire(RelationshipUpdateOpWire.Touch, WireConvert.ToWire(Rel(rid, sid))) },
             SchemaChange: null,
-            Array.Empty<CounterDeltaWire>());
+            Array.Empty<CounterDeltaWire>(),
+            GcFloor: null);
 
     /// <summary>The set of live relationship identities a projection snapshot exposes at its head.</summary>
     private static SortedSet<string> LiveIdentities(DatastoreState state)
@@ -144,5 +145,6 @@ public sealed class Stage2SiloProjectionTests
         public Task<long?> AppendCommit(long expectedHead, ProposedWrite write) => throw new NotSupportedException();
         public Task<DatastoreHeadWire> SubscribeWatch(IDatastoreWatcher watcher) => throw new NotSupportedException();
         public Task UnsubscribeWatch(IDatastoreWatcher watcher) => throw new NotSupportedException();
+        public Task<long?> RunGc() => throw new NotSupportedException();
     }
 }

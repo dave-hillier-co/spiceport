@@ -40,18 +40,21 @@ public sealed class LeopardIncrementalFoldTests
         new(revision,
             new[] { new RelationshipUpdateWire(RelationshipUpdateOpWire.Touch, WireConvert.ToWire(rel)) },
             SchemaChange: null,
-            Array.Empty<CounterDeltaWire>());
+            Array.Empty<CounterDeltaWire>(),
+            GcFloor: null);
 
     private static LogEvent DeleteEvent(long revision, Relationship rel) =>
         new(revision,
             new[] { new RelationshipUpdateWire(RelationshipUpdateOpWire.Delete, WireConvert.ToWire(rel)) },
             SchemaChange: null,
-            Array.Empty<CounterDeltaWire>());
+            Array.Empty<CounterDeltaWire>(),
+            GcFloor: null);
 
     private static LogEvent SchemaChangeEvent(long revision) =>
         new(revision, Array.Empty<RelationshipUpdateWire>(),
             new SchemaVersionWire(revision, Array.Empty<byte>(), $"schema-{revision}"),
-            Array.Empty<CounterDeltaWire>());
+            Array.Empty<CounterDeltaWire>(),
+            GcFloor: null);
 
     [Fact]
     public async Task Incremental_CatchUp_AdvancesWithoutASecondFullScan()
@@ -380,5 +383,6 @@ public sealed class LeopardIncrementalFoldTests
         public Task<long?> AppendCommit(long expectedHead, ProposedWrite write) => throw new NotSupportedException();
         public Task<DatastoreHeadWire> SubscribeWatch(IDatastoreWatcher watcher) => throw new NotSupportedException();
         public Task UnsubscribeWatch(IDatastoreWatcher watcher) => throw new NotSupportedException();
+        public Task<long?> RunGc() => throw new NotSupportedException();
     }
 }

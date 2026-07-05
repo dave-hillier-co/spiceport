@@ -1,5 +1,6 @@
 using Orleans.Runtime;
 using Spiceport.Core;
+using Spiceport.Datastore;
 using Spiceport.Grains;
 using Spiceport.Grains.Abstractions;
 
@@ -24,6 +25,7 @@ public class DispatchErrorMapperTests
         yield return [new PreconditionFailedException(PreconditionFailureKind.MustMatchFoundNone, 0, "p")];
         yield return [new WriteConflictException(WriteConflictKind.Serialization, "conflict")];
         yield return [new SchemaWriteValidationException("dangling")];
+        yield return [new RevisionNotFoundException(new TimestampRevision(1))];
     }
 
     [Theory]

@@ -277,7 +277,10 @@ internal sealed class MvccReadWriteTransaction : IReadWriteTransaction
         foreach (var name in _pendingCounterDeletes)
             counters = counters.Add(new CounterVersion(_newRevision, name, null));
 
-        return new DatastoreState(_newRevision, relationships, schemas, counters);
+        // Carry the base state's GC floor forward: a regular commit never collects anything (only a GC
+        // LogEvent does, via DatastoreState.CollectBelow), so the floor must survive unchanged here —
+        // otherwise every write would silently reset it to 0 and re-admit reads below the real floor.
+        return new DatastoreState(_newRevision, relationships, schemas, counters, _baseState.GcFloor);
     }
 
     private void Apply(RelationshipKey key, Relationship rel)

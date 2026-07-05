@@ -28,6 +28,14 @@ public sealed record DatastoreGrainState
     [Id(3)]
     public ImmutableList<CounterVersionWire> Counters { get; init; } = ImmutableList<CounterVersionWire>.Empty;
 
+    /// <summary>
+    /// The revision below which MVCC history has been garbage-collected (0 = nothing collected yet). Set
+    /// by folding a GC <see cref="LogEvent"/> (never decreases). Reads pinned strictly below this floor
+    /// are rejected.
+    /// </summary>
+    [Id(4)]
+    public long GcFloor { get; init; }
+
     /// <summary>An empty state seeded at the given initial revision.</summary>
     public static DatastoreGrainState Empty(long initialRevision) => new() { HeadRevision = initialRevision };
 
