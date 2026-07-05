@@ -90,6 +90,7 @@ public sealed class MeshTestCluster : IAsyncDisposable
         SchemaHolder.BatchConcurrency = batchConcurrency;
         SchemaHolder.UseMembershipIndex = useMembershipIndex;
         SchemaHolder.UseActivationMemo = useActivationMemo;
+        SchemaHolder.UseRandomPlacement = false;
 
         var builder = new TestClusterBuilder(initialSilosCount: 1);
         builder.AddSiloBuilderConfigurator<SiloConfigurator>();
@@ -110,12 +111,22 @@ public sealed class MeshTestCluster : IAsyncDisposable
     /// <param name="schemaText">The schema DSL to compile into every silo.</param>
     /// <param name="siloCount">The number of silos to deploy (must be >= 1).</param>
     /// <param name="batchConcurrency">Bounded fan-out width for batch checks.</param>
+    /// <param name="useRandomPlacement">
+    /// Overrides the cluster's DEFAULT placement strategy with <see cref="Orleans.Runtime.RandomPlacement"/>.
+    /// Orleans 10's out-of-the-box default is <c>ResourceOptimizedPlacement</c>, a load-statistics heuristic
+    /// with a local-silo preference margin that may legitimately place a whole workload on the calling silo
+    /// when the silos' load scores are close — it makes NO spread guarantee. A test whose ASSERTION is that
+    /// activations land on multiple silos (the anti-hollow spread proof) must opt into random placement,
+    /// which does guarantee spread statistically; leave false everywhere else to keep exactly the
+    /// production default.
+    /// </param>
     public static async Task<MeshTestCluster> CreateMultiSiloAsync(
         string schemaText,
         int siloCount = 3,
         int batchConcurrency = PermissionChecker.DefaultBatchConcurrency,
         bool useMembershipIndex = true,
-        bool useActivationMemo = true)
+        bool useActivationMemo = true,
+        bool useRandomPlacement = false)
     {
         if (siloCount < 1)
             throw new ArgumentOutOfRangeException(nameof(siloCount), "Need at least one silo.");
@@ -124,6 +135,7 @@ public sealed class MeshTestCluster : IAsyncDisposable
         SchemaHolder.BatchConcurrency = batchConcurrency;
         SchemaHolder.UseMembershipIndex = useMembershipIndex;
         SchemaHolder.UseActivationMemo = useActivationMemo;
+        SchemaHolder.UseRandomPlacement = useRandomPlacement;
 
         var builder = new TestClusterBuilder(initialSilosCount: (short)siloCount);
         builder.AddSiloBuilderConfigurator<MultiSiloConfigurator>();
@@ -148,6 +160,7 @@ public sealed class MeshTestCluster : IAsyncDisposable
         public static int BatchConcurrency = PermissionChecker.DefaultBatchConcurrency;
         public static bool UseMembershipIndex;
         public static bool UseActivationMemo = true;
+        public static bool UseRandomPlacement;
     }
 
     private sealed class SiloConfigurator : ISiloConfigurator
@@ -160,12 +173,16 @@ public sealed class MeshTestCluster : IAsyncDisposable
             siloBuilder.AddActivationMemoCollectionAge();
             siloBuilder.AddMemoryGrainStorage("datastore");
             siloBuilder.AddCustomStorageBasedLogConsistencyProvider("CustomStorage");
+            // Exactly the production silo-lifecycle wiring: the shared per-silo projection/hub, bootstrapped
+            // before the silo accepts traffic (see docs/future-work.md §1.8).
+            siloBuilder.AddDatastoreProjectionService();
             siloBuilder.ConfigureServices(services =>
             {
                 services.AddSpiceportGrainServices(
                     SchemaHolder.SchemaText, batchConcurrency: SchemaHolder.BatchConcurrency);
                 services.AddSingleton<IDatastore>(sp =>
-                    new GrainBackedDatastore(sp.GetRequiredService<IGrainFactory>()));
+                    new GrainBackedDatastore(
+                        sp.GetRequiredService<IGrainFactory>(), sp.GetRequiredService<IDatastoreProjectionHost>()));
                 services.AddSingleton(new MembershipIndexOptions { Enabled = SchemaHolder.UseMembershipIndex });
                 services.AddSingleton(new ActivationMemoOptions { Enabled = SchemaHolder.UseActivationMemo });
             });
@@ -184,14 +201,25 @@ public sealed class MeshTestCluster : IAsyncDisposable
             siloBuilder.AddActivationMemoCollectionAge();
             siloBuilder.AddMemoryGrainStorage("datastore");
             siloBuilder.AddCustomStorageBasedLogConsistencyProvider("CustomStorage");
+            // Exactly the production silo-lifecycle wiring: the shared per-silo projection/hub, bootstrapped
+            // before the silo accepts traffic (see docs/future-work.md §1.8).
+            siloBuilder.AddDatastoreProjectionService();
             siloBuilder.ConfigureServices(services =>
             {
                 services.AddSpiceportGrainServices(
                     SchemaHolder.SchemaText, batchConcurrency: SchemaHolder.BatchConcurrency);
                 services.AddSingleton<IDatastore>(sp =>
-                    new GrainBackedDatastore(sp.GetRequiredService<IGrainFactory>()));
+                    new GrainBackedDatastore(
+                        sp.GetRequiredService<IGrainFactory>(), sp.GetRequiredService<IDatastoreProjectionHost>()));
                 services.AddSingleton(new MembershipIndexOptions { Enabled = SchemaHolder.UseMembershipIndex });
                 services.AddSingleton(new ActivationMemoOptions { Enabled = SchemaHolder.UseActivationMemo });
+
+                // See CreateMultiSiloAsync's useRandomPlacement doc: an opt-in override of the cluster's
+                // DEFAULT placement (Orleans 10's ResourceOptimizedPlacement makes no spread guarantee) for
+                // tests that ASSERT activation spread. Registered last, so GetService<PlacementStrategy>
+                // (how Orleans resolves the default strategy) returns it.
+                if (SchemaHolder.UseRandomPlacement)
+                    services.AddSingleton<Orleans.Runtime.PlacementStrategy, Orleans.Runtime.RandomPlacement>();
             });
         }
     }

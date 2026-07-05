@@ -19,6 +19,9 @@ builder.UseOrleans(silo =>
     // The event-sourced datastore grain owns its persistence via ICustomStorageInterface over the
     // "datastore" grain-storage provider above.
     silo.AddCustomStorageBasedLogConsistencyProvider("CustomStorage");
+    // The per-silo SiloProjection + LogWatchHub pair, silo-lifecycle-managed: bootstraps before this silo
+    // accepts traffic and tears its hub down cleanly on shutdown (see docs/future-work.md §1.8).
+    silo.AddDatastoreProjectionService();
     // Backs the datastore grain's periodic MVCC-GC reminder ("mvcc-gc"). In-memory is fine even for a
     // durable deployment: losing a reminder registration is safe because the singleton grain re-registers
     // it on every activation (see DatastoreGrain.OnActivateAsync) — a production cluster that wants the
@@ -37,6 +40,7 @@ builder.Services.AddSpiceportGrainServices(SiloSchema.SchemaText);
 builder.Services.AddSingleton<IDatastore>(sp =>
     new GrainBackedDatastore(
         sp.GetRequiredService<IGrainFactory>(),
+        sp.GetRequiredService<IDatastoreProjectionHost>(),
         gcOptions: sp.GetService<IOptions<DatastoreGcOptions>>()));
 
 var host = builder.Build();
