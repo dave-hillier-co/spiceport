@@ -1,7 +1,8 @@
 # CLAUDE.md
 
-Guidance for working in this repository. See `README.md` for the project overview and
-`docs/architecture-analysis.md` for the design rationale.
+Guidance for working in this repository. See `README.md` for the project overview,
+`docs/architecture-analysis.md` for the design rationale, and `docs/future-work.md` for
+candidate directions that are analyzed but not committed.
 
 ## What this is
 
