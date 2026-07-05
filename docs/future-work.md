@@ -19,8 +19,9 @@ Whatever is taken from this list, these do not move:
 - **The conformance corpus stays green, unweakened.** Every direction below is additive
   (stronger defaults, more atomicity, more history, more scale) — never a semantic change to
   Check/Expand/Lookup verdicts.
-- **New-enemy protection can be strengthened, never weakened.** Zookies remain supported as API
-  contract even if they stop being the primary consistency mechanism.
+- **New-enemy protection can be strengthened, never weakened.** Zookies remain a first-class API
+  contract: they must not be removed, deprecated, or semantically weakened, even if they stop
+  being the primary consistency mechanism.
 - **The never-an-oracle discipline generalizes.** Any accelerating index or materialized view
   either has its candidates confirmed by `CheckEngine`, or earns oracle status only through a
   fold-correctness equivalence gate (the Leopard on==off pattern).
@@ -205,15 +206,19 @@ verifier for the view. The never-an-oracle discipline applies until a corpus equ
 (the Leopard on==off pattern) earns the view oracle status.
 **Sequencing.** The performance moonshot; wait until 1.1 proves the incremental-fold pattern.
 
-### 2.3 Read-your-writes by default; zookies optional
+### 2.3 Read-your-writes by default without weakening zookies
 
 **The contingent detail.** Zanzibar defaults to bounded staleness because cache shareability at
 ~10⁷ QPS demands quantization, pushing the freshness burden onto clients via zookie plumbing.
 
 **The relaxation.** The closed-timestamp gate makes freshness a cheap watermark wait on a local
 projection. Flip the default: every read is read-your-writes unless the caller opts into staleness
-for latency. Zookies remain supported (API contract) but stop being something integrators must
-understand to be safe. A strictly *stronger* consistency posture than the paper.
+for latency. This changes only the default for callers that do not supply a zookie.
+
+**Non-negotiable constraint.** Zookies remain fully supported and first-class for explicit
+revision chaining and new-enemy protection. This direction must not remove, deprecate, hide, or
+weaken them. "Optional" means a caller can obtain a safe default without supplying one; it does
+not make the zookie mechanism optional for the server to implement.
 
 ### 2.4 Transactional schema+data migrations
 
@@ -260,6 +265,9 @@ Recorded so they are not relitigated by accident:
 - **Per-object state grains.** Ruled out in `architecture-analysis.md` §3.1: too large/cold to
   activate economically; zookie point-in-time reads are incompatible with "the grain's latest
   value".
+- **Removing or weakening zookies.** They remain a first-class compatibility and consistency
+  contract. Any future read-your-writes default is additive and applies only when the caller does
+  not supply one.
 - **Per-revision state grains ("versions as actors").** Revisions are *identities* (dispatch keys,
   cache keys, watermarks), not state-bearing actors. Version-state grains would lose structural
   sharing across the grain boundary (each activation holds isolated memory, so consecutive
