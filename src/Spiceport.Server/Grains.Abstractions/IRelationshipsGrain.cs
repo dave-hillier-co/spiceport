@@ -10,8 +10,9 @@ namespace Spiceport.Grains.Abstractions;
 /// the constant integer <see cref="Key"/> and the implementation is <c>[StatelessWorker]</c> so the
 /// silo scales activations with load without fragmenting any keyspace. Writes persist through the
 /// host-owned <see cref="Spiceport.Datastore.IDatastore"/> and (for schema) swap the live schema
-/// snapshot; replies carry an opaque revision token. Reads pin the optimized revision and page with an
-/// opaque cursor, mirroring the reverse-ops convention.
+/// snapshot; replies carry an opaque revision token. The relationship READ ops (ReadRelationships,
+/// BulkExportRelationships) moved to the Guid-keyed <see cref="IRelationshipsStreamGrain"/>, which streams
+/// them natively; this grain keeps the write side and the on-demand counter/schema ops.
 /// </remarks>
 public interface IRelationshipsGrain : IGrainWithIntegerKey
 {
@@ -30,9 +31,6 @@ public interface IRelationshipsGrain : IGrainWithIntegerKey
     /// <summary>Deletes relationships matching the filter, optionally bounded by a limit.</summary>
     Task<DeleteRelationshipsReply> DeleteRelationships(DeleteRelationshipsArgs args);
 
-    /// <summary>Reads relationships matching the filter, as a bounded page with an optional cursor.</summary>
-    Task<ReadRelationshipsReply> ReadRelationships(ReadRelationshipsArgs args);
-
     /// <summary>
     /// Loads one batch of relationships as an efficient insert (create-or-overwrite, no per-row
     /// existence check) in a single, all-or-nothing write transaction. The bulk-import gRPC service
@@ -40,14 +38,6 @@ public interface IRelationshipsGrain : IGrainWithIntegerKey
     /// request/response.
     /// </summary>
     Task<BulkImportRelationshipsReply> BulkImportRelationships(BulkImportRelationshipsArgs args);
-
-    /// <summary>
-    /// Returns one page of a bulk export over a single pinned snapshot. With no cursor the grain
-    /// resolves and pins a revision from the request consistency and encodes it into the returned
-    /// cursor; with a cursor it reads the exact revision the cursor encodes, so every page (and any
-    /// resume) sees the same snapshot.
-    /// </summary>
-    Task<BulkExportRelationshipsReply> BulkExportRelationships(BulkExportRelationshipsArgs args);
 
     /// <summary>
     /// Registers an MVCC relationship counter under <c>args.Name</c> with the given filter. Throws

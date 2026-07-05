@@ -1,3 +1,5 @@
+using Orleans.Concurrency;
+
 namespace Spiceport.Grains.Abstractions;
 
 /// <summary>The kind of relationship mutation. Mirrors the core <c>UpdateOperation</c>.</summary>
@@ -25,6 +27,23 @@ public sealed record RelationshipWire(
     [property: Id(6)] string? CaveatName,
     [property: Id(7)] IReadOnlyDictionary<string, object?>? CaveatContext,
     [property: Id(8)] DateTimeOffset? Expiration);
+
+/// <summary>
+/// One item of a relationship stream (<see cref="IRelationshipsStreamGrain.StreamReadRelationships"/> /
+/// <see cref="IRelationshipsStreamGrain.StreamBulkExportRelationships"/>): a relationship plus the opaque
+/// resume cursor positioned immediately after it. For ReadRelationships the cursor is the canonical tuple
+/// string (resumption skips tuples at or before it) and <see cref="ReadAtToken"/> carries the per-message
+/// ZedToken; for BulkExport the cursor pins the export revision plus the last tuple (so a reconnect reads
+/// the exact same snapshot) and <see cref="ReadAtToken"/> is empty (that RPC carries no per-item token).
+/// </summary>
+/// <param name="Relationship">The relationship on the wire.</param>
+/// <param name="ResumeCursor">The opaque resume cursor positioned immediately after this relationship.</param>
+/// <param name="ReadAtToken">The read-at ZedToken for this item (ReadRelationships), or empty (BulkExport).</param>
+[GenerateSerializer, Immutable]
+public sealed record RelationshipStreamItem(
+    [property: Id(0)] RelationshipWire Relationship,
+    [property: Id(1)] string ResumeCursor,
+    [property: Id(2)] string ReadAtToken = "");
 
 /// <summary>A single relationship mutation on the wire.</summary>
 [GenerateSerializer]
@@ -90,20 +109,13 @@ public sealed record DeleteRelationshipsReply(
     [property: Id(1)] bool ReachedLimit,
     [property: Id(2)] string DeletedAtToken);
 
-/// <summary>Arguments for <see cref="IRelationshipsGrain.ReadRelationships"/>.</summary>
+/// <summary>Arguments for <see cref="IRelationshipsStreamGrain.StreamReadRelationships"/>. <c>Limit</c> is advisory.</summary>
 [GenerateSerializer]
 public sealed record ReadRelationshipsArgs(
     [property: Id(0)] RelationshipsFilterWire Filter,
     [property: Id(1)] int? Limit,
     [property: Id(2)] string? Cursor,
     [property: Id(3)] ConsistencyWire? Consistency = null);
-
-/// <summary>Reply for <see cref="IRelationshipsGrain.ReadRelationships"/>.</summary>
-[GenerateSerializer]
-public sealed record ReadRelationshipsReply(
-    [property: Id(0)] IReadOnlyList<RelationshipWire> Relationships,
-    [property: Id(1)] string? Cursor,
-    [property: Id(2)] string ReadAtToken);
 
 /// <summary>Arguments for <see cref="IRelationshipsGrain.WriteSchema"/>.</summary>
 [GenerateSerializer]
@@ -136,9 +148,10 @@ public sealed record BulkImportRelationshipsReply(
     [property: Id(1)] string LoadedAtToken);
 
 /// <summary>
-/// Arguments for <see cref="IRelationshipsGrain.BulkExportRelationships"/>: one page request at a
-/// pinned snapshot. With no cursor the grain resolves and pins a revision from <see cref="Consistency"/>;
+/// Arguments for <see cref="IRelationshipsStreamGrain.StreamBulkExportRelationships"/>: an export over a
+/// single pinned snapshot. With no cursor the grain resolves and pins a revision from <see cref="Consistency"/>;
 /// with a cursor it reads the exact revision the cursor encodes (the consistency is then ignored).
+/// <see cref="Limit"/> is advisory (the caller applies batching/limit by how it consumes the stream).
 /// </summary>
 [GenerateSerializer]
 public sealed record BulkExportRelationshipsArgs(
@@ -146,15 +159,6 @@ public sealed record BulkExportRelationshipsArgs(
     [property: Id(1)] int Limit,
     [property: Id(2)] string? Cursor,
     [property: Id(3)] ConsistencyWire? Consistency = null);
-
-/// <summary>
-/// Reply for <see cref="IRelationshipsGrain.BulkExportRelationships"/>: one page plus the cursor for the
-/// next page from the same snapshot. <see cref="Cursor"/> is null when the export is exhausted.
-/// </summary>
-[GenerateSerializer]
-public sealed record BulkExportRelationshipsReply(
-    [property: Id(0)] IReadOnlyList<RelationshipWire> Relationships,
-    [property: Id(1)] string? Cursor);
 
 /// <summary>
 /// Distinguishes the two on-demand counter failures so the gRPC front door can map them to the right

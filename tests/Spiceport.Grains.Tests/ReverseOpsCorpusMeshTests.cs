@@ -51,6 +51,28 @@ public class ReverseOpsCorpusMeshTests
     private static IReverseOpsGrain Grain(MeshTestCluster cluster) =>
         cluster.GrainFactory.GetGrain<IReverseOpsGrain>(IReverseOpsGrain.Key);
 
+    // The reverse LOOKUP ops now stream from the Guid-keyed IReverseOpsStreamGrain (a fresh key per
+    // enumeration); collect the whole stream so the corpus assertions read the same shape as before.
+    private static async Task<List<FoundSubjectWire>> LookupSubjectsViaMesh(
+        MeshTestCluster cluster, LookupSubjectsArgs args)
+    {
+        var list = new List<FoundSubjectWire>();
+        await foreach (var item in cluster.GrainFactory
+            .GetGrain<IReverseOpsStreamGrain>(Guid.NewGuid()).StreamLookupSubjects(args))
+            list.Add(item.Subject);
+        return list;
+    }
+
+    private static async Task<List<FoundResourceWire>> LookupResourcesViaMesh(
+        MeshTestCluster cluster, LookupResourcesArgs args)
+    {
+        var list = new List<FoundResourceWire>();
+        await foreach (var item in cluster.GrainFactory
+            .GetGrain<IReverseOpsStreamGrain>(Guid.NewGuid()).StreamLookupResources(args))
+            list.Add(item);
+        return list;
+    }
+
     /// <summary>
     /// Builds the engine-side LookupSubjects op over the SAME pinned snapshot the grain would use,
     /// so the mesh result can be compared against the engine's own answer.
@@ -107,11 +129,11 @@ public class ReverseOpsCorpusMeshTests
         await using var cluster = await MeshTestCluster.CreateAsync(file.SchemaText);
         await SeedAsync(cluster.Datastore, file);
 
-        var reply = await Grain(cluster).LookupSubjects(new LookupSubjectsArgs(
+        var subjects = await LookupSubjectsViaMesh(cluster, new LookupSubjectsArgs(
             "document", "firstdoc", "view", "user", CoreConstants.Ellipsis,
             Context: null, Limit: null, Cursor: null));
 
-        var meshIds = reply.Subjects.Select(s => s.SubjectId).ToHashSet();
+        var meshIds = subjects.Select(s => s.SubjectId).ToHashSet();
 
         // (1) Mesh grain agrees with the engine's own LookupSubjects over the same snapshot.
         var engineIds = await EngineLookupSubjects(cluster, "document", "firstdoc", "view", "user");
@@ -127,7 +149,7 @@ public class ReverseOpsCorpusMeshTests
         Assert.DoesNotContain("frank", meshIds);
 
         // (2) Consistency invariant: every returned subject is Member-or-Caveated under mesh Check.
-        foreach (var s in reply.Subjects)
+        foreach (var s in subjects)
         {
             var check = await cluster.Checker.Check(
                 "document", "firstdoc", "view",
@@ -147,11 +169,11 @@ public class ReverseOpsCorpusMeshTests
         await SeedAsync(cluster.Datastore, file);
 
         // tom is a direct viewer AND a non-intern member of engineering, so reachable on firstdoc.
-        var reply = await Grain(cluster).LookupResources(new LookupResourcesArgs(
+        var resources = await LookupResourcesViaMesh(cluster, new LookupResourcesArgs(
             "document", "view", "user", "tom", CoreConstants.Ellipsis,
             Context: null, Limit: null, Cursor: null));
 
-        var meshIds = reply.Resources.Select(r => r.ResourceId).ToHashSet();
+        var meshIds = resources.Select(r => r.ResourceId).ToHashSet();
 
         // (1) Mesh grain agrees with the engine's own LookupResources over the same snapshot.
         var engineIds = await EngineLookupResources(cluster, "document", "view", "user", "tom");
@@ -159,7 +181,7 @@ public class ReverseOpsCorpusMeshTests
         Assert.Contains("firstdoc", meshIds);
 
         // (2) Consistency invariant: every returned resource is Member-or-Caveated under mesh Check.
-        foreach (var r in reply.Resources)
+        foreach (var r in resources)
         {
             var check = await cluster.Checker.Check(
                 "document", r.ResourceId, "view",
@@ -215,11 +237,11 @@ public class ReverseOpsCorpusMeshTests
 
         // No request context: tracy is unconditional, sarah is caveated (missing somecondition),
         // tom's written context (42) satisfies the caveat, fred's written context (41) fails it.
-        var reply = await Grain(cluster).LookupSubjects(new LookupSubjectsArgs(
+        var subjects = await LookupSubjectsViaMesh(cluster, new LookupSubjectsArgs(
             "document", "firstdoc", "view", "user", CoreConstants.Ellipsis,
             Context: null, Limit: null, Cursor: null));
 
-        var byId = reply.Subjects.ToDictionary(s => s.SubjectId, s => s.Permissionship);
+        var byId = subjects.ToDictionary(s => s.SubjectId, s => s.Permissionship);
 
         // (1) Mesh grain agrees with the engine's own pre-collapse subject set over the same snapshot.
         // The engine yields the structural members (tracy, tom, sarah, fred carry caveats verbatim);
@@ -243,7 +265,7 @@ public class ReverseOpsCorpusMeshTests
 
         // (2) Consistency invariant: every returned subject is Member-or-Caveated under mesh Check
         // (using the same null request context).
-        foreach (var s in reply.Subjects)
+        foreach (var s in subjects)
         {
             var check = await cluster.Checker.Check(
                 "document", "firstdoc", "view",
@@ -267,11 +289,11 @@ public class ReverseOpsCorpusMeshTests
         // Provide somecondition=42 so the caveated subjects resolve to definite members.
         var context = new Dictionary<string, object?> { ["somecondition"] = 42L };
 
-        var reply = await Grain(cluster).LookupResources(new LookupResourcesArgs(
+        var resources = await LookupResourcesViaMesh(cluster, new LookupResourcesArgs(
             "document", "view", "user", "sarah", CoreConstants.Ellipsis,
             Context: context, Limit: null, Cursor: null));
 
-        var meshIds = reply.Resources.Select(r => r.ResourceId).ToHashSet();
+        var meshIds = resources.Select(r => r.ResourceId).ToHashSet();
 
         // (1) Mesh grain (with satisfying context) reaches firstdoc for sarah; engine (no caveat shear,
         // candidate set) also includes firstdoc.
@@ -283,7 +305,7 @@ public class ReverseOpsCorpusMeshTests
 
         // (2) Consistency invariant: every returned resource is Member-or-Caveated under mesh Check
         // with the same context.
-        foreach (var r in reply.Resources)
+        foreach (var r in resources)
         {
             var check = await cluster.Checker.Check(
                 "document", r.ResourceId, "view",
