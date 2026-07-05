@@ -13,7 +13,7 @@
   </ItemGroup>
 
   <ItemGroup>
-    <ProjectReference Include="..\Spiceport.Datastore.Memory\Spiceport.Datastore.Memory.csproj" />
     <ProjectReference Include="..\Spiceport.Server\Spiceport.Server.csproj" />
+    <ProjectReference Include="..\Spiceport.Datastore\Spiceport.Datastore.csproj" />
   </ItemGroup>
 </Project>

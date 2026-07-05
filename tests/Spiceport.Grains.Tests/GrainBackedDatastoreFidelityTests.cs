@@ -5,15 +5,14 @@ using Orleans.Hosting;
 using Orleans.TestingHost;
 using Spiceport.Core;
 using Spiceport.Datastore;
-using Spiceport.Datastore.Memory;
 using Spiceport.Grains;
 
 namespace Spiceport.Grains.Tests;
 
 /// <summary>
-/// Proves the LIVE grain-backed datastore is faithful to the <see cref="InMemoryDatastore"/> oracle through
+/// Proves the LIVE grain-backed datastore is faithful to the <see cref="ReferenceDatastore"/> oracle through
 /// the <see cref="IDatastore"/> contract: an identical ordered sequence of write transactions through (a) a
-/// plain <see cref="InMemoryDatastore"/> and (b) a <see cref="GrainBackedDatastore"/> over the singleton
+/// plain <see cref="ReferenceDatastore"/> and (b) a <see cref="GrainBackedDatastore"/> over the singleton
 /// <c>DatastoreGrain</c> yields equal live relationship sets at head, plus matching delete counts and
 /// schema/counter state. This exercises the seam the conformance corpus does not isolate: the optimistic
 /// compare-and-swap commit and the <c>DatastoreState</c> &lt;-&gt; <c>DatastoreGrainState</c> conversion
@@ -48,9 +47,9 @@ public sealed class GrainBackedDatastoreFidelityTests
     }
 
     [Fact]
-    public async Task GrainBackedDatastore_MatchesInMemoryDatastore_AtLiveSetLevel()
+    public async Task GrainBackedDatastore_MatchesReferenceDatastore_AtLiveSetLevel()
     {
-        var inMem = new InMemoryDatastore();
+        var inMem = new ReferenceDatastore();
         await using var scope = new ClusterScope(await NewClusterAsync());
         IDatastore grainDs = new GrainBackedDatastore(scope.Cluster.GrainFactory);
 

@@ -1,6 +1,5 @@
 using Spiceport.Core;
 using Spiceport.Datastore;
-using Spiceport.Datastore.Memory;
 using Spiceport.Schema;
 
 namespace Spiceport.Engine.Tests;
@@ -73,9 +72,9 @@ public class LookupSubjectsEngineTests
         return new CheckEngine(compiled.Namespaces, compiled.Caveats);
     }
 
-    private static async Task<(InMemoryDatastore Store, IRevision Rev)> Seed(params Relationship[] rels)
+    private static async Task<(ReferenceDatastore Store, IRevision Rev)> Seed(params Relationship[] rels)
     {
-        var store = new InMemoryDatastore();
+        var store = new ReferenceDatastore();
         var rev = await store.ReadWriteTx(async tx =>
         {
             var updates = rels.Select(r => new RelationshipUpdate(r, UpdateOperation.Create)).ToList();

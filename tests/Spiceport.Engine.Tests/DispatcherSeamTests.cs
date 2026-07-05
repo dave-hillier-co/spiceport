@@ -1,7 +1,6 @@
 using System.Collections.Immutable;
 using Spiceport.Core;
 using Spiceport.Datastore;
-using Spiceport.Datastore.Memory;
 using Spiceport.Engine;
 using Spiceport.Schema;
 
@@ -44,7 +43,7 @@ public class DispatcherSeamTests
 
     private static async Task<IDatastoreReader> Seed(params Relationship[] rels)
     {
-        var store = new InMemoryDatastore();
+        var store = new ReferenceDatastore();
         var rev = await store.ReadWriteTx(async tx =>
         {
             var updates = rels.Select(r => new RelationshipUpdate(r, UpdateOperation.Create)).ToList();
@@ -111,7 +110,7 @@ public class DispatcherSeamTests
     // IRevision works here for driving the dispatcher directly.
     private static IRevision InProcessRevisionForTest()
     {
-        var store = new InMemoryDatastore();
+        var store = new ReferenceDatastore();
         // HeadRevision gives a real, comparable revision identity.
         return store.HeadRevision().GetAwaiter().GetResult().Revision;
     }

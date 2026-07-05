@@ -1,10 +1,9 @@
 using Spiceport.Core;
 using Spiceport.Datastore;
-using Spiceport.Datastore.Memory;
 
-namespace Spiceport.Datastore.Memory.Tests;
+namespace Spiceport.Datastore.Tests;
 
-public class InMemoryDatastoreTests
+public class ReferenceDatastoreTests
 {
     private static Relationship Rel(string resType, string resId, string relation, string subType, string subId, string subRel = CoreConstants.Ellipsis) =>
         Relationship.Create(
@@ -22,7 +21,7 @@ public class InMemoryDatastoreTests
     [Fact]
     public async Task Watch_emits_change_committed_after_cursor()
     {
-        var ds = new InMemoryDatastore();
+        var ds = new ReferenceDatastore();
         var head = await ds.HeadRevision();
         var rel = Rel("document", "doc1", "viewer", "user", "alice");
 
@@ -53,7 +52,7 @@ public class InMemoryDatastoreTests
     [Fact]
     public async Task Watch_from_old_cursor_replays_committed_write()
     {
-        var ds = new InMemoryDatastore();
+        var ds = new ReferenceDatastore();
         var head = await ds.HeadRevision();
         var rel = Rel("document", "doc2", "viewer", "user", "bob");
 
@@ -76,7 +75,7 @@ public class InMemoryDatastoreTests
     [Fact]
     public async Task Watch_emits_checkpoint_after_change_when_requested()
     {
-        var ds = new InMemoryDatastore();
+        var ds = new ReferenceDatastore();
         var head = await ds.HeadRevision();
         var rel = Rel("document", "doc1", "viewer", "user", "alice");
 
@@ -112,7 +111,7 @@ public class InMemoryDatastoreTests
     [Fact]
     public async Task Watch_does_not_emit_checkpoint_when_not_requested()
     {
-        var ds = new InMemoryDatastore();
+        var ds = new ReferenceDatastore();
         var head = await ds.HeadRevision();
         var rel = Rel("document", "doc1", "viewer", "user", "alice");
 
@@ -143,7 +142,7 @@ public class InMemoryDatastoreTests
         // A tiny GC window means each new commit pushes prior commits out of the retained window. The
         // changefeed must not retain expired revisions, so a fresh Watch from head only ever sees the
         // changes still inside the window — never an unbounded backlog.
-        var ds = new InMemoryDatastore(quantization: TimeSpan.Zero, gcWindow: TimeSpan.FromMilliseconds(1));
+        var ds = new ReferenceDatastore(quantization: TimeSpan.Zero, gcWindow: TimeSpan.FromMilliseconds(1));
 
         for (var i = 0; i < 5; i++)
         {
@@ -171,7 +170,7 @@ public class InMemoryDatastoreTests
     [Fact]
     public async Task WriteThenReadBack_ReturnsRelationship()
     {
-        var ds = new InMemoryDatastore();
+        var ds = new ReferenceDatastore();
         var rel = Rel("document", "doc1", "viewer", "user", "alice");
 
         var rev = await ds.ReadWriteTx(async tx =>
@@ -187,7 +186,7 @@ public class InMemoryDatastoreTests
     [Fact]
     public async Task SnapshotIsolation_OldRevisionDoesNotSeeNewWrite()
     {
-        var ds = new InMemoryDatastore();
+        var ds = new ReferenceDatastore();
         var relA = Rel("document", "doc1", "viewer", "user", "alice");
         var relB = Rel("document", "doc2", "viewer", "user", "bob");
 
@@ -208,7 +207,7 @@ public class InMemoryDatastoreTests
     [Fact]
     public async Task SnapshotIsolation_DeleteNotVisibleAtOldRevision()
     {
-        var ds = new InMemoryDatastore();
+        var ds = new ReferenceDatastore();
         var rel = Rel("document", "doc1", "viewer", "user", "alice");
 
         var rev1 = await ds.ReadWriteTx(async tx =>
@@ -229,7 +228,7 @@ public class InMemoryDatastoreTests
     {
         // A CREATE on an already-existing relationship is a permanent conflict (AlreadyExists at the
         // gRPC boundary), NOT a transient write-write serialization failure (Aborted).
-        var ds = new InMemoryDatastore();
+        var ds = new ReferenceDatastore();
         var rel = Rel("document", "doc1", "viewer", "user", "alice");
 
         await ds.ReadWriteTx(async tx =>
@@ -243,7 +242,7 @@ public class InMemoryDatastoreTests
     [Fact]
     public async Task Touch_UpsertsWithoutThrowing()
     {
-        var ds = new InMemoryDatastore();
+        var ds = new ReferenceDatastore();
         var rel = Rel("document", "doc1", "viewer", "user", "alice");
         var withCaveat = rel.WithCaveat(new ContextualizedCaveat("only_office"));
 
@@ -260,7 +259,7 @@ public class InMemoryDatastoreTests
     [Fact]
     public async Task FilterByResourceId_Matches()
     {
-        var ds = new InMemoryDatastore();
+        var ds = new ReferenceDatastore();
         var rev = await ds.ReadWriteTx(async tx => await tx.WriteRelationships(
         [
             new RelationshipUpdate(Rel("document", "doc1", "viewer", "user", "alice"), UpdateOperation.Create),
@@ -277,7 +276,7 @@ public class InMemoryDatastoreTests
     [Fact]
     public async Task FilterByResourceIdPrefix_Matches()
     {
-        var ds = new InMemoryDatastore();
+        var ds = new ReferenceDatastore();
         var rev = await ds.ReadWriteTx(async tx => await tx.WriteRelationships(
         [
             new RelationshipUpdate(Rel("document", "report-1", "viewer", "user", "alice"), UpdateOperation.Create),
@@ -295,7 +294,7 @@ public class InMemoryDatastoreTests
     [Fact]
     public async Task ReverseQuery_FiltersBySubject()
     {
-        var ds = new InMemoryDatastore();
+        var ds = new ReferenceDatastore();
         var rev = await ds.ReadWriteTx(async tx => await tx.WriteRelationships(
         [
             new RelationshipUpdate(Rel("document", "doc1", "viewer", "user", "alice"), UpdateOperation.Create),
@@ -313,7 +312,7 @@ public class InMemoryDatastoreTests
     [Fact]
     public async Task ReverseQuery_BySubject_OrdersAndResumesAfterKeyset()
     {
-        var ds = new InMemoryDatastore();
+        var ds = new ReferenceDatastore();
         var rev = await ds.ReadWriteTx(async tx => await tx.WriteRelationships(
         [
             // Inserted out of order; BySubject must yield doc1, doc2, doc3.
@@ -337,7 +336,7 @@ public class InMemoryDatastoreTests
     [Fact]
     public async Task FilterByCaveat_Matches()
     {
-        var ds = new InMemoryDatastore();
+        var ds = new ReferenceDatastore();
         var plain = Rel("document", "doc1", "viewer", "user", "alice");
         var caveated = Rel("document", "doc2", "viewer", "user", "bob").WithCaveat(new ContextualizedCaveat("biz_hours"));
 
@@ -361,7 +360,7 @@ public class InMemoryDatastoreTests
     [Fact]
     public async Task ExpiredRelationship_IsExcluded()
     {
-        var ds = new InMemoryDatastore();
+        var ds = new ReferenceDatastore();
         var expired = Relationship.Create(
             new ObjectAndRelation("document", "doc1", "viewer"),
             new ObjectAndRelation("user", "alice", CoreConstants.Ellipsis),
@@ -385,7 +384,7 @@ public class InMemoryDatastoreTests
     [Fact]
     public async Task DeleteRelationships_RemovesMatchingAndReportsCount()
     {
-        var ds = new InMemoryDatastore();
+        var ds = new ReferenceDatastore();
         await ds.ReadWriteTx(async tx => await tx.WriteRelationships(
         [
             new RelationshipUpdate(Rel("document", "doc1", "viewer", "user", "alice"), UpdateOperation.Create),
@@ -404,7 +403,7 @@ public class InMemoryDatastoreTests
     [Fact]
     public async Task DeleteRelationships_RespectsLimit()
     {
-        var ds = new InMemoryDatastore();
+        var ds = new ReferenceDatastore();
         await ds.ReadWriteTx(async tx => await tx.WriteRelationships(
         [
             new RelationshipUpdate(Rel("document", "doc1", "viewer", "user", "alice"), UpdateOperation.Create),
@@ -425,7 +424,7 @@ public class InMemoryDatastoreTests
     [Fact]
     public async Task SchemaWriteAndReadBack()
     {
-        var ds = new InMemoryDatastore();
+        var ds = new ReferenceDatastore();
         var schema = "definition user {}"u8.ToArray();
 
         var rev = await ds.ReadWriteTx(async tx => await tx.WriteStoredSchema(schema));
@@ -441,7 +440,7 @@ public class InMemoryDatastoreTests
     [Fact]
     public async Task Schema_SnapshotIsolation()
     {
-        var ds = new InMemoryDatastore();
+        var ds = new ReferenceDatastore();
         var v1 = "definition user {}"u8.ToArray();
         var v2 = "definition user {}\ndefinition doc {}"u8.ToArray();
 
@@ -455,7 +454,7 @@ public class InMemoryDatastoreTests
     [Fact]
     public async Task BulkLoad_LoadsAll()
     {
-        var ds = new InMemoryDatastore();
+        var ds = new ReferenceDatastore();
 
         async IAsyncEnumerable<Relationship> Source()
         {
@@ -475,7 +474,7 @@ public class InMemoryDatastoreTests
     [Fact]
     public async Task HeadRevisionIncreasesAfterWrite()
     {
-        var ds = new InMemoryDatastore();
+        var ds = new ReferenceDatastore();
         var before = (await ds.HeadRevision()).Revision;
 
         var committed = await ds.ReadWriteTx(async tx =>
@@ -489,7 +488,7 @@ public class InMemoryDatastoreTests
     [Fact]
     public async Task GcWindow_OldRevisionRejected()
     {
-        var ds = new InMemoryDatastore(gcWindow: TimeSpan.Zero);
+        var ds = new ReferenceDatastore(gcWindow: TimeSpan.Zero);
 
         var rev1 = await ds.ReadWriteTx(async tx =>
             await tx.WriteRelationships([new RelationshipUpdate(Rel("document", "doc1", "viewer", "user", "alice"), UpdateOperation.Create)]));
@@ -505,7 +504,7 @@ public class InMemoryDatastoreTests
     [Fact]
     public async Task ConcurrentWrites_SecondCommitFailsSerialization()
     {
-        var ds = new InMemoryDatastore();
+        var ds = new ReferenceDatastore();
         var gate = new TaskCompletionSource();
 
         // First transaction begins and pauses inside its body, holding the base state.
@@ -531,7 +530,7 @@ public class InMemoryDatastoreTests
     [Fact]
     public async Task OptimizedRevision_IsAtOrAboveHead_AndSnapshotReadable()
     {
-        var ds = new InMemoryDatastore();
+        var ds = new ReferenceDatastore();
         var committed = await ds.ReadWriteTx(async tx =>
             await tx.WriteRelationships([new RelationshipUpdate(Rel("document", "doc1", "viewer", "user", "alice"), UpdateOperation.Create)]));
         var head = await ds.HeadRevision();
@@ -550,7 +549,7 @@ public class InMemoryDatastoreTests
     [Fact]
     public async Task OptimizedRevision_IsStableWithinTheQuantizationWindow()
     {
-        var ds = new InMemoryDatastore(quantization: TimeSpan.FromSeconds(5));
+        var ds = new ReferenceDatastore(quantization: TimeSpan.FromSeconds(5));
         await ds.ReadWriteTx(async tx =>
             await tx.WriteRelationships([new RelationshipUpdate(Rel("document", "doc1", "viewer", "user", "alice"), UpdateOperation.Create)]));
 

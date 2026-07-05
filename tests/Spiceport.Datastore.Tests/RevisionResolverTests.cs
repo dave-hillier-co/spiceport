@@ -1,8 +1,7 @@
 using Spiceport.Core;
 using Spiceport.Datastore;
-using Spiceport.Datastore.Memory;
 
-namespace Spiceport.Datastore.Memory.Tests;
+namespace Spiceport.Datastore.Tests;
 
 public class RevisionResolverTests
 {
@@ -11,14 +10,14 @@ public class RevisionResolverTests
             new ObjectAndRelation("document", id, "viewer"),
             new ObjectAndRelation("user", "alice", CoreConstants.Ellipsis));
 
-    private static async Task<IRevision> Write(InMemoryDatastore ds, string id) =>
+    private static async Task<IRevision> Write(ReferenceDatastore ds, string id) =>
         await ds.ReadWriteTx(async tx =>
             await tx.WriteRelationships([new RelationshipUpdate(Rel(id), UpdateOperation.Create)]));
 
     // No quantization: OptimizedRevision == HeadRevision, so revision comparisons are exact and deterministic.
-    private static InMemoryDatastore NewExactDatastore() => new(quantization: TimeSpan.Zero);
+    private static ReferenceDatastore NewExactDatastore() => new(quantization: TimeSpan.Zero);
 
-    private static async Task<ZedToken> TokenFor(InMemoryDatastore ds, IRevision rev)
+    private static async Task<ZedToken> TokenFor(ReferenceDatastore ds, IRevision rev)
     {
         var id = await ds.GetUniqueId();
         return ZedTokens.FromRevision(rev, schemaHash: null, datastoreUniqueId: id);
@@ -29,7 +28,7 @@ public class RevisionResolverTests
     [Fact]
     public async Task TokenRoundTrip_MintedTokenDecodesToCommittedRevision_AndSnapshotReads()
     {
-        var ds = new InMemoryDatastore();
+        var ds = new ReferenceDatastore();
         var committed = await Write(ds, "doc1");
         var token = await TokenFor(ds, committed);
 
@@ -46,7 +45,7 @@ public class RevisionResolverTests
     [Fact]
     public async Task TokenRoundTrip_DifferentDatastoreId_DecodesAsMismatched()
     {
-        var ds = new InMemoryDatastore();
+        var ds = new ReferenceDatastore();
         var committed = await Write(ds, "doc1");
         var foreign = ZedTokens.FromRevision(committed, schemaHash: null, datastoreUniqueId: "some-other-id");
 
@@ -76,7 +75,7 @@ public class RevisionResolverTests
     [Fact]
     public async Task FullyConsistent_ResolvesToHeadRevision_ModeExact()
     {
-        var ds = new InMemoryDatastore();
+        var ds = new ReferenceDatastore();
         var head = await Write(ds, "doc1");
 
         var resolved = await RevisionResolver.Resolve(ds, ConsistencyRequirement.FullyConsistent);
@@ -138,7 +137,7 @@ public class RevisionResolverTests
     [Fact]
     public async Task AtLeastAsFresh_MismatchedDatastore_FallsToFullConsistency()
     {
-        var ds = new InMemoryDatastore();
+        var ds = new ReferenceDatastore();
         var rev = await Write(ds, "doc1");
         var foreign = ZedTokens.FromRevision(rev, schemaHash: null, datastoreUniqueId: "other-instance");
 
@@ -152,7 +151,7 @@ public class RevisionResolverTests
     [Fact]
     public async Task AtLeastAsFresh_MismatchedDatastore_AsError_Throws()
     {
-        var ds = new InMemoryDatastore();
+        var ds = new ReferenceDatastore();
         var rev = await Write(ds, "doc1");
         var foreign = ZedTokens.FromRevision(rev, schemaHash: null, datastoreUniqueId: "other-instance");
 
@@ -164,7 +163,7 @@ public class RevisionResolverTests
     [Fact]
     public async Task AtLeastAsFresh_MalformedToken_Throws()
     {
-        var ds = new InMemoryDatastore();
+        var ds = new ReferenceDatastore();
         await Write(ds, "doc1");
         var garbage = new ZedToken("!!!not-base64!!!");
 
@@ -191,7 +190,7 @@ public class RevisionResolverTests
     [Fact]
     public async Task AtExactSnapshot_MismatchedDatastore_Throws()
     {
-        var ds = new InMemoryDatastore();
+        var ds = new ReferenceDatastore();
         var rev = await Write(ds, "doc1");
         var foreign = ZedTokens.FromRevision(rev, schemaHash: null, datastoreUniqueId: "other-instance");
 
@@ -203,7 +202,7 @@ public class RevisionResolverTests
     public async Task AtExactSnapshot_RevisionOutsideGcWindow_Throws()
     {
         // Very tight GC window so an old revision is no longer available.
-        var ds = new InMemoryDatastore(gcWindow: TimeSpan.FromMilliseconds(1));
+        var ds = new ReferenceDatastore(gcWindow: TimeSpan.FromMilliseconds(1));
         var staleRev = new TimestampRevision(1); // far in the past, before the GC floor
         var token = await TokenFor(ds, staleRev);
 
@@ -214,7 +213,7 @@ public class RevisionResolverTests
     [Fact]
     public async Task AtExactSnapshot_MalformedToken_Throws()
     {
-        var ds = new InMemoryDatastore();
+        var ds = new ReferenceDatastore();
         await Write(ds, "doc1");
         var garbage = new ZedToken("###");
 

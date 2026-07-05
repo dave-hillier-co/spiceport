@@ -1,7 +1,6 @@
 using System.Collections.Immutable;
 using Spiceport.Core;
 using Spiceport.Datastore;
-using Spiceport.Datastore.Memory;
 using Spiceport.Engine;
 using Spiceport.Schema;
 
@@ -385,7 +384,7 @@ public class ReverseConsistencyCrossCheckTests
 
         var compiled = SchemaCompiler.CompileSchema(file.SchemaText);
 
-        var store = new InMemoryDatastore();
+        var store = new ReferenceDatastore();
         var rev = await LoadRelationships(store, file.Relationships);
         var reader = store.SnapshotReader(rev);
 
@@ -452,7 +451,7 @@ public class ReverseConsistencyCrossCheckTests
     }
 
     private static async Task<IRevision> LoadRelationships(
-        InMemoryDatastore datastore,
+        ReferenceDatastore datastore,
         ImmutableList<Relationship> relationships)
     {
         if (relationships.Count == 0)

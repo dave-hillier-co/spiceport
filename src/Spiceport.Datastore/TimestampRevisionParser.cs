@@ -1,13 +1,14 @@
 using Spiceport.Core;
 
-namespace Spiceport.Datastore.Memory;
+namespace Spiceport.Datastore;
 
 /// <summary>
-/// Decodes the in-memory datastore's revision string form (integer nanos) back into a
-/// <see cref="TimestampRevision"/>. Co-located with the datastore that mints the strings.
+/// Decodes the timestamp revision string form (integer nanos) back into a
+/// <see cref="TimestampRevision"/>. Used by both <see cref="ReferenceDatastore"/> and
+/// GrainBackedDatastore, which mint the same string form.
 /// </summary>
 /// <param name="datastoreUniqueId">The owning datastore's <see cref="IDatastore.GetUniqueId"/>.</param>
-public sealed class InMemoryRevisionParser(string datastoreUniqueId) : IRevisionParser
+public sealed class TimestampRevisionParser(string datastoreUniqueId) : IRevisionParser
 {
     /// <inheritdoc />
     public string DatastoreUniqueId { get; } = datastoreUniqueId;

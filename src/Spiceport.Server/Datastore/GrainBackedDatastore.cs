@@ -1,7 +1,6 @@
 using System.Runtime.CompilerServices;
 using Spiceport.Core;
 using Spiceport.Datastore;
-using Spiceport.Datastore.Memory;
 using Spiceport.Grains.Abstractions;
 
 namespace Spiceport.Grains;
@@ -9,7 +8,7 @@ namespace Spiceport.Grains;
 /// <summary>
 /// An <see cref="IDatastore"/> that delegates all state to the cluster-singleton
 /// <see cref="IDatastoreGrain"/> (the single source of truth) and reuses the in-memory MVCC mechanics
-/// (<see cref="InMemoryReadWriteTransaction"/>, <see cref="InMemoryDatastoreReader"/>, the
+/// (<see cref="MvccReadWriteTransaction"/>, <see cref="MvccSnapshotReader"/>, the
 /// <c>DatastoreState</c> fold) by converting the grain wire state to/from the in-memory state. Reads
 /// serve from the per-silo <see cref="SiloProjection"/> (incremental log-tail fold), gated by the
 /// closed-timestamp watermark so pinned reads are never stale. Writes use an optimistic
@@ -47,7 +46,7 @@ public sealed class GrainBackedDatastore : IDatastore, IAsyncDisposable
     private readonly TimeSpan? _watchFallbackInterval;
     private LogWatchHub? _hub;
 
-    // Cached optimized-revision candidate (mirrors InMemoryDatastore's CachedOptimizedRevisions): a real
+    // Cached optimized-revision candidate (mirrors ReferenceDatastore's CachedOptimizedRevisions): a real
     // head sampled when a window opens, held stable until the bucket boundary so near-in-time
     // minimize-latency checks WITHIN THIS SILO share one revision (and therefore one dispatch cache key).
     // NOTE: this cache is per-silo (one GrainBackedDatastore per DI container), so two silos can sample the
@@ -84,10 +83,10 @@ public sealed class GrainBackedDatastore : IDatastore, IAsyncDisposable
     {
         var rev = ToNanos(revision);
         // The (async) state acquisition defers to the first read; every subsequent query is served
-        // in-process via one InMemoryDatastoreReader. The projection catches up on demand (and blocks
+        // in-process via one MvccSnapshotReader. The projection catches up on demand (and blocks
         // until watermark >= rev, the closed-timestamp gate).
         return new DeferredReader(async ct =>
-            new InMemoryDatastoreReader(await _projection.StateAtLeast(rev, ct).ConfigureAwait(false), rev, _ => true));
+            new MvccSnapshotReader(await _projection.StateAtLeast(rev, ct).ConfigureAwait(false), rev, _ => true));
     }
 
     public async Task<RevisionWithSchemaHash> HeadRevision(CancellationToken cancellationToken = default)
@@ -109,7 +108,7 @@ public sealed class GrainBackedDatastore : IDatastore, IAsyncDisposable
         var head = await Grain.GetHead().ConfigureAwait(false);
         var sampled = new RevisionWithSchemaHash(new TimestampRevision(head.Head), head.SchemaHash);
         // Recompute now AFTER the grain hop so the window boundary is not skewed past its bucket by hop
-        // latency (InMemoryDatastore samples under its lock with no intervening await).
+        // latency (ReferenceDatastore samples under its lock with no intervening await).
         var nowAfter = NowNanos();
 
         lock (_optLock)
@@ -140,7 +139,7 @@ public sealed class GrainBackedDatastore : IDatastore, IAsyncDisposable
             var baseState = DatastoreStateConverters.ToMemory(grainState);
             var expectedHead = baseState.HeadRevision;
 
-            // 2. Mint a provisional revision monotonically over the observed head (mirrors InMemoryDatastore).
+            // 2. Mint a provisional revision monotonically over the observed head (mirrors ReferenceDatastore).
             //    This revision pins the local tx so the staged view and preconditions are evaluated at a
             //    fixed point; the grain mints the AUTHORITATIVE revision when it appends the event.
             var now = NowNanos();
@@ -150,7 +149,7 @@ public sealed class GrainBackedDatastore : IDatastore, IAsyncDisposable
             //    SchemaChangeValidator read the tx reader (the staged-view over the snapshot). Any
             //    exception thrown by the lambda (create-conflict, precondition, schema-validation, counter
             //    conflict) propagates AS-IS and aborts the whole call — it is NOT a retry.
-            var tx = new InMemoryReadWriteTransaction(baseState, newRevision);
+            var tx = new MvccReadWriteTransaction(baseState, newRevision);
             await transaction(tx).ConfigureAwait(false);
 
             // 4. Derive the proposed change from the committed state: the net relationship/schema/counter
@@ -171,7 +170,7 @@ public sealed class GrainBackedDatastore : IDatastore, IAsyncDisposable
 
             // 6. Head moved under us. Reload and re-run the WHOLE lambda (so preconditions and validation
             //    re-evaluate against the new base — race-free). Bounded retries; on exhaustion surface the
-            //    same exception type InMemoryDatastore throws on a concurrent write.
+            //    same exception type ReferenceDatastore throws on a concurrent write.
             if (attempt + 1 >= MaxCasAttempts)
                 throw new SerializationException();
         }
@@ -194,7 +193,7 @@ public sealed class GrainBackedDatastore : IDatastore, IAsyncDisposable
 
         var cursor = ToNanos(afterRevision);
 
-        // Validate the cursor is within the GC window (mirror InMemoryDatastore: RevisionNotFoundException).
+        // Validate the cursor is within the GC window (mirror ReferenceDatastore: RevisionNotFoundException).
         var head0 = await Grain.GetHead().ConfigureAwait(false);
         if (!(cursor <= head0.Head && cursor >= head0.Head - _gcWindowNanos))
             throw new RevisionNotFoundException(afterRevision);
@@ -255,7 +254,7 @@ public sealed class GrainBackedDatastore : IDatastore, IAsyncDisposable
     public Task<string> GetUniqueId(CancellationToken cancellationToken = default) => Task.FromResult(UniqueId);
 
     public Task<IRevisionParser> GetRevisionParser(CancellationToken cancellationToken = default) =>
-        Task.FromResult<IRevisionParser>(new InMemoryRevisionParser(UniqueId));
+        Task.FromResult<IRevisionParser>(new TimestampRevisionParser(UniqueId));
 
     public Task Close() => DisposeAsync().AsTask();
 
@@ -318,7 +317,7 @@ public sealed class GrainBackedDatastore : IDatastore, IAsyncDisposable
     private static long NowNanos() => (DateTimeOffset.UtcNow - DateTimeOffset.UnixEpoch).Ticks * 100L;
 
     /// <summary>
-    /// An <see cref="IDatastoreReader"/> that acquires its inner <see cref="InMemoryDatastoreReader"/> ONCE,
+    /// An <see cref="IDatastoreReader"/> that acquires its inner <see cref="MvccSnapshotReader"/> ONCE,
     /// lazily on the first query (via <paramref name="acquire"/>), then serves all subsequent reads in-process.
     /// Because <see cref="IDatastore.SnapshotReader"/> is synchronous but acquiring the state is async, the
     /// acquisition is deferred to the first (async) read. The local dispatcher pins one reader per Check and
@@ -327,13 +326,13 @@ public sealed class GrainBackedDatastore : IDatastore, IAsyncDisposable
     /// <c>IsVisibleAt</c> is exact at any revision and a permissive validator is sound (validity is
     /// enforced upstream by <see cref="CheckRevision"/>).
     /// </summary>
-    private sealed class DeferredReader(Func<CancellationToken, ValueTask<InMemoryDatastoreReader>> acquire)
+    private sealed class DeferredReader(Func<CancellationToken, ValueTask<MvccSnapshotReader>> acquire)
         : IDatastoreReader
     {
         private readonly SemaphoreSlim _gate = new(1, 1);
-        private InMemoryDatastoreReader? _inner;
+        private MvccSnapshotReader? _inner;
 
-        private async ValueTask<InMemoryDatastoreReader> Inner(CancellationToken ct)
+        private async ValueTask<MvccSnapshotReader> Inner(CancellationToken ct)
         {
             if (_inner is { } r)
                 return r;

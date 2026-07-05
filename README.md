@@ -44,7 +44,7 @@ The full design rationale is in [`docs/architecture-analysis.md`](docs/architect
   append-only log of changes is the source of truth, each silo reads from a projection folded from
   that log, and the same feed drives Watch. Durable via Orleans grain storage (in-memory for dev,
   **PostgreSQL** via AdoNet) with no application SQL schema. SpiceDB's consistency conformance
-  corpus passes against the in-memory fold and the grain mesh.
+  corpus passes against both the reference datastore oracle and the grain mesh.
 - **Relationship counters** (ExperimentalService): register/unregister a named counter over a
   filter and count matching relationships at a revision (computed on demand).
 - **`authzed.api.v1`** gRPC surface — verified end to end with the real `zed` CLI (schema,
@@ -56,8 +56,8 @@ The full design rationale is in [`docs/architecture-analysis.md`](docs/architect
 src/
   Spiceport.Core              core model: ObjectAndRelation, Relationship, schema model,
                               Revision/ZedToken, tuple string parsing
-  Spiceport.Datastore         datastore abstraction (MVCC snapshot reads, Watch, revisions)
-  Spiceport.Datastore.Memory  in-memory MVCC datastore
+  Spiceport.Datastore         datastore abstraction + the MVCC state model (fold, snapshot reader,
+                              transaction) + the ReferenceDatastore conformance oracle
   Spiceport.Server            the engine and the mesh, in one project:
                               Schema/  schema DSL compiler (lexer -> parser -> compiler) + reachability graph
                               Engine/  Check/Expand/Lookup engine + the IDispatcher seam + caching dispatcher

@@ -1,6 +1,5 @@
 using Spiceport.Core;
 using Spiceport.Datastore;
-using Spiceport.Datastore.Memory;
 using Spiceport.Schema;
 
 namespace Spiceport.Engine.Tests;
@@ -45,7 +44,7 @@ public class CaveatCheckTests
 
     private static async Task<IDatastoreReader> Seed(params Relationship[] rels)
     {
-        var store = new InMemoryDatastore();
+        var store = new ReferenceDatastore();
         var rev = await store.ReadWriteTx(async tx =>
         {
             var updates = rels.Select(r => new RelationshipUpdate(r, UpdateOperation.Create)).ToList();
@@ -160,7 +159,7 @@ public class CaveatCheckTests
         Assert.Equal(Membership.NotMember, result.Verdict);
     }
 
-    // The in-memory datastore reader pre-filters expiry against real UtcNow. To exercise the
+    // The MvccSnapshotReader pre-filters expiry against real UtcNow. To exercise the
     // engine's own pinned-clock filtering (rather than the datastore's), these tests use an expiry
     // far in the future so the datastore keeps the tuple, then pin the engine clock on either side.
     private static readonly DateTimeOffset FarFutureExpiry =

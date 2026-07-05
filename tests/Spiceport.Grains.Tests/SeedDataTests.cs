@@ -1,13 +1,12 @@
 using Spiceport.Api;
 using Spiceport.Datastore;
-using Spiceport.Datastore.Memory;
 
 namespace Spiceport.Grains.Tests;
 
 /// <summary>
 /// <see cref="SeedData.SeedAsync"/> must be idempotent: it seeds an empty datastore but leaves a populated
 /// one untouched, so a host restart over durable storage resumes cleanly instead of re-stamping the
-/// fixture relationship (which would churn MVCC history every boot). Plain <see cref="InMemoryDatastore"/>
+/// fixture relationship (which would churn MVCC history every boot). Plain <see cref="ReferenceDatastore"/>
 /// (no cluster) — the seed only depends on the <see cref="IDatastore"/> contract.
 /// </summary>
 public sealed class SeedDataTests
@@ -15,7 +14,7 @@ public sealed class SeedDataTests
     [Fact]
     public async Task SeedAsync_OnEmptyDatastore_WritesTheFixtureOnce()
     {
-        var datastore = new InMemoryDatastore();
+        var datastore = new ReferenceDatastore();
 
         var seeded = await SeedData.SeedAsync(datastore);
 
@@ -26,7 +25,7 @@ public sealed class SeedDataTests
     [Fact]
     public async Task SeedAsync_OnPopulatedDatastore_SkipsAndDoesNotChurn()
     {
-        var datastore = new InMemoryDatastore();
+        var datastore = new ReferenceDatastore();
         Assert.True(await SeedData.SeedAsync(datastore));
         var headAfterFirst = (await datastore.HeadRevision()).Revision;
 

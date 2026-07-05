@@ -1,7 +1,6 @@
 using System.Collections.Immutable;
 using Spiceport.Core;
 using Spiceport.Datastore;
-using Spiceport.Datastore.Memory;
 using Spiceport.Engine;
 using Spiceport.Schema;
 
@@ -46,7 +45,7 @@ public class CachingDispatcherTests
 
     private static async Task<IDatastoreReader> Seed(params Relationship[] rels)
     {
-        var store = new InMemoryDatastore();
+        var store = new ReferenceDatastore();
         var rev = await store.ReadWriteTx(async tx =>
         {
             var updates = rels.Select(r => new RelationshipUpdate(r, UpdateOperation.Create)).ToList();
@@ -296,7 +295,7 @@ public class CachingDispatcherTests
     [Fact]
     public async Task CachingEngine_KeyedByRealRevision_DoesNotServeStaleResultAcrossRevisions()
     {
-        var store = new InMemoryDatastore();
+        var store = new ReferenceDatastore();
         // Revision 1: no relationships -> alice is NOT a viewer.
         var rev1 = await store.ReadWriteTx(_ => Task.CompletedTask);
         // Revision 2: grant alice viewer on the document.

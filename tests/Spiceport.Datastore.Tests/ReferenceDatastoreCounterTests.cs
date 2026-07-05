@@ -1,14 +1,14 @@
 using Spiceport.Core;
 using Spiceport.Datastore;
 
-namespace Spiceport.Datastore.Memory.Tests;
+namespace Spiceport.Datastore.Tests;
 
 /// <summary>
-/// Datastore-level conformance for the relationship-counter primitive on the in-memory backend:
+/// Datastore-level conformance for the relationship-counter primitive on the reference datastore:
 /// register / read-filter / count / overwrite-conflict / delete, MVCC snapshot isolation, and that the
 /// count tracks live matches across writes and deletes.
 /// </summary>
-public class InMemoryCounterTests
+public class ReferenceDatastoreCounterTests
 {
     private static Relationship Rel(string resType, string resId, string relation, string subType, string subId, string subRel = CoreConstants.Ellipsis) =>
         Relationship.Create(
@@ -21,7 +21,7 @@ public class InMemoryCounterTests
     [Fact]
     public async Task WriteCounter_ThenReadFilter_RoundTrips()
     {
-        var ds = new InMemoryDatastore();
+        var ds = new ReferenceDatastore();
         var filter = new RelationshipsFilter
         {
             OptionalResourceType = "document",
@@ -43,7 +43,7 @@ public class InMemoryCounterTests
     [Fact]
     public async Task ReadCounterFilter_UnknownName_ReturnsNull()
     {
-        var ds = new InMemoryDatastore();
+        var ds = new ReferenceDatastore();
         var head = await ds.HeadRevision();
         Assert.Null(await ds.SnapshotReader(head.Revision).ReadCounterFilter("nope"));
     }
@@ -51,7 +51,7 @@ public class InMemoryCounterTests
     [Fact]
     public async Task CountRelationships_MatchesFilter()
     {
-        var ds = new InMemoryDatastore();
+        var ds = new ReferenceDatastore();
         await ds.ReadWriteTx(tx => tx.WriteRelationships(
         [
             new RelationshipUpdate(Rel("document", "doc1", "viewer", "user", "alice"), UpdateOperation.Create),
@@ -66,7 +66,7 @@ public class InMemoryCounterTests
     [Fact]
     public async Task CountRelationships_UnknownName_Throws()
     {
-        var ds = new InMemoryDatastore();
+        var ds = new ReferenceDatastore();
         var head = await ds.HeadRevision();
         await Assert.ThrowsAsync<CounterNotRegisteredException>(
             () => ds.SnapshotReader(head.Revision).CountRelationships("nope"));
@@ -75,7 +75,7 @@ public class InMemoryCounterTests
     [Fact]
     public async Task WriteCounter_Twice_Throws()
     {
-        var ds = new InMemoryDatastore();
+        var ds = new ReferenceDatastore();
         await ds.ReadWriteTx(tx => tx.WriteCounter("c", DocViewerFilter()));
 
         var ex = await Assert.ThrowsAsync<CounterAlreadyRegisteredException>(
@@ -86,7 +86,7 @@ public class InMemoryCounterTests
     [Fact]
     public async Task WriteCounter_TwiceWithinSameTx_Throws()
     {
-        var ds = new InMemoryDatastore();
+        var ds = new ReferenceDatastore();
         await Assert.ThrowsAsync<CounterAlreadyRegisteredException>(() => ds.ReadWriteTx(async tx =>
         {
             await tx.WriteCounter("c", DocViewerFilter());
@@ -97,7 +97,7 @@ public class InMemoryCounterTests
     [Fact]
     public async Task DeleteCounter_ThenCount_Throws()
     {
-        var ds = new InMemoryDatastore();
+        var ds = new ReferenceDatastore();
         await ds.ReadWriteTx(tx => tx.WriteCounter("c", DocViewerFilter()));
         var rev = await ds.ReadWriteTx(tx => tx.DeleteCounter("c"));
 
@@ -109,7 +109,7 @@ public class InMemoryCounterTests
     [Fact]
     public async Task DeleteCounter_UnknownName_Throws()
     {
-        var ds = new InMemoryDatastore();
+        var ds = new ReferenceDatastore();
         var ex = await Assert.ThrowsAsync<CounterNotRegisteredException>(
             () => ds.ReadWriteTx(tx => tx.DeleteCounter("nope")));
         Assert.Equal("nope", ex.CounterName);
@@ -118,7 +118,7 @@ public class InMemoryCounterTests
     [Fact]
     public async Task DeleteThenReRegister_Succeeds()
     {
-        var ds = new InMemoryDatastore();
+        var ds = new ReferenceDatastore();
         await ds.ReadWriteTx(tx => tx.WriteCounter("c", DocViewerFilter()));
         await ds.ReadWriteTx(tx => tx.DeleteCounter("c"));
         var rev = await ds.ReadWriteTx(tx => tx.WriteCounter("c", DocViewerFilter()));
@@ -129,7 +129,7 @@ public class InMemoryCounterTests
     [Fact]
     public async Task Count_IsSnapshotIsolated_AcrossWritesAndDeletes()
     {
-        var ds = new InMemoryDatastore();
+        var ds = new ReferenceDatastore();
 
         await ds.ReadWriteTx(tx => tx.WriteRelationships(
             [new RelationshipUpdate(Rel("document", "doc1", "viewer", "user", "alice"), UpdateOperation.Create)]));
@@ -159,7 +159,7 @@ public class InMemoryCounterTests
     [Fact]
     public async Task Counter_VisiblePerSnapshot_TombstonedAfterUnregister()
     {
-        var ds = new InMemoryDatastore();
+        var ds = new ReferenceDatastore();
         var revBefore = (await ds.HeadRevision()).Revision;
         var revRegistered = await ds.ReadWriteTx(tx => tx.WriteCounter("c", DocViewerFilter()));
         var revUnregistered = await ds.ReadWriteTx(tx => tx.DeleteCounter("c"));
@@ -175,7 +175,7 @@ public class InMemoryCounterTests
     [Fact]
     public async Task LookupCounters_ReturnsLiveCounters()
     {
-        var ds = new InMemoryDatastore();
+        var ds = new ReferenceDatastore();
         await ds.ReadWriteTx(async tx =>
         {
             await tx.WriteCounter("a", DocViewerFilter());

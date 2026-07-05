@@ -1,5 +1,5 @@
 using System.Collections.Immutable;
-using Spiceport.Datastore.Memory;
+using Spiceport.Datastore;
 using Spiceport.Grains.Abstractions;
 
 namespace Spiceport.Grains;

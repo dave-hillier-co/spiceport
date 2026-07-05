@@ -1,7 +1,7 @@
 using System.Collections.Immutable;
 using Spiceport.Core;
 
-namespace Spiceport.Datastore.Memory;
+namespace Spiceport.Datastore;
 
 /// <summary>A relationship row with the revision range over which it is live.</summary>
 /// <param name="Relationship">The stored relationship (payload + identity).</param>

@@ -1,6 +1,5 @@
 using Spiceport.Core;
 using Spiceport.Datastore;
-using Spiceport.Datastore.Memory;
 using Spiceport.Schema;
 
 namespace Spiceport.Engine.Tests;
@@ -9,7 +8,7 @@ namespace Spiceport.Engine.Tests;
 /// Stage-4 gates for the Leopard <see cref="MembershipIndex"/>: the flattened nested-group accelerator must
 /// produce verdicts IDENTICAL to the live traversal for the shapes it covers (oracle equivalence), and must
 /// decline coverage (so the caller falls back to live) for shapes it cannot flatten (arrows). Driven directly
-/// against an <see cref="InMemoryDatastore"/> (no Orleans) so the matrix runs fast.
+/// against an <see cref="ReferenceDatastore"/> (no Orleans) so the matrix runs fast.
 /// </summary>
 public class Stage4MembershipIndexTests
 {
@@ -77,7 +76,7 @@ public class Stage4MembershipIndexTests
         var compiled = SchemaCompiler.CompileSchema(schemaText);
         var engine = new LookupResourcesEngine(compiled.Namespaces, compiled.Caveats);
 
-        var store = new InMemoryDatastore();
+        var store = new ReferenceDatastore();
         var rev = await store.ReadWriteTx(tx => tx.WriteRelationships(
             rels.Select(r => new RelationshipUpdate(r, UpdateOperation.Create)).ToList()));
         var reader = store.SnapshotReader(rev);

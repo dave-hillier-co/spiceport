@@ -19,7 +19,6 @@
   </ItemGroup>
 
   <ItemGroup>
-    <ProjectReference Include="..\..\src\Spiceport.Datastore.Memory\Spiceport.Datastore.Memory.csproj" />
     <ProjectReference Include="..\..\src\Spiceport.Datastore\Spiceport.Datastore.csproj" />
     <ProjectReference Include="..\..\src\Spiceport.Core\Spiceport.Core.csproj" />
   </ItemGroup>

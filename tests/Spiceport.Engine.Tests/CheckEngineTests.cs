@@ -1,6 +1,5 @@
 using Spiceport.Core;
 using Spiceport.Datastore;
-using Spiceport.Datastore.Memory;
 using Spiceport.Engine;
 using Spiceport.Schema;
 
@@ -43,9 +42,9 @@ public class CheckEngineTests
     private static CheckEngine BuildEngine(string schemaText, int maxDepth) =>
         new(SchemaCompiler.Compile(schemaText), maxDepth);
 
-    private static async Task<(InMemoryDatastore Store, IRevision Rev)> Seed(params Relationship[] rels)
+    private static async Task<(ReferenceDatastore Store, IRevision Rev)> Seed(params Relationship[] rels)
     {
-        var store = new InMemoryDatastore();
+        var store = new ReferenceDatastore();
         var rev = await store.ReadWriteTx(async tx =>
         {
             var updates = rels.Select(r => new RelationshipUpdate(r, UpdateOperation.Create)).ToList();
