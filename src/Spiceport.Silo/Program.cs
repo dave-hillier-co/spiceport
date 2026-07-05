@@ -12,6 +12,9 @@ builder.UseOrleans(silo =>
     silo.UseLocalhostClustering();
     // Place CheckGrain activations by consistent hash of the sub-problem key.
     silo.AddConsistentHashPlacement();
+    // CheckGrain's per-activation reply memo (default ON) needs a matching idle-collection age so a
+    // warm activation survives long enough between calls for the memo to pay off.
+    silo.AddActivationMemoCollectionAge();
     // Storage for the singleton datastore grain (the single source of truth). Durable Postgres when
     // ConnectionStrings:OrleansStorage is configured; otherwise in-memory (default localhost dev = no Postgres).
     silo.AddDatastoreGrainStorage(builder.Configuration);

@@ -60,7 +60,8 @@ dotnet test tests/Spiceport.Conformance.Tests  # the SpiceDB conformance corpus 
   (membership + caveat expression), never the collapsed verdict — caveat context is applied
   per-request in `Collapse`. The cache key excludes the visited-set, depth, and caveat context.
   Cycle-cut results are not cached. Revisions are quantized so cache keys are shared within a
-  window; `schemaHash` is in the key so a schema change yields a fresh keyspace.
+  window; `schemaHash` is in the key so a schema change yields a fresh keyspace. Both the
+  silo-wide `CachingDispatcher` and the `CheckGrain` activation memo respect these invariants.
 - **Consistency.** Reads honor a `ConsistencyRequirement`; `RevisionMode` (Optimized vs Exact)
   threads into the cache key so fresh/at-exact/fully-consistent reads never serve stale data.
 

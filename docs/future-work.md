@@ -81,11 +81,12 @@ The invariants transfer structurally rather than by convention:
    activation cache. The pure answer — stop bypassing — is the step most likely to cost latency
    and must be benchmark-gated (see 1.4 and 1.9).
 
-**Staging.** (a) Move the `Branch` memo into `CheckGrain` activation state with `[AlwaysInterleave]`
-serving and tuned collection age, keeping everything else; (b) measure hit rates and latency
-against the mesh benchmarks; (c) only then decide whether the caller-side cache and the
-local-recurse hybrid earn their complexity or get deleted. Each step independently shippable and
-reversible; `CachingDispatcherTests` and the corpus gate every move.
+**Staging.** Stage (a) is implemented: `CheckGrain` memoizes the pre-context `Branch` in
+activation state, with idle-activation collection tuned via `ActivationMemoOptions.CollectionAge`
+as eviction. The grain key is the cache key; the depth guard and cycle-cut invariants transfer
+structurally. The silo-wide `CachingDispatcher` and local-recurse hybrid remain in place. Stages
+(b) and (c) — mesh benchmarking and the decision to delete or keep the caller-side cache and
+local-recurse hole — remain open.
 
 ### 1.4 Directory-owned location: delete the hash ring
 
@@ -262,7 +263,7 @@ Recorded so they are not relitigated by accident:
 
 ## Suggested ordering, if taken as a program
 
-1. **1.3 activation-as-cache**, staged and benchmark-gated, and — only if stage (c) wins its
-   benchmark — **1.4**.
+1. **1.3 activation-as-cache** — stage (a) implemented, stages (b)/(c) benchmark-gated; only
+   if stage (c) wins, **1.4**.
 2. **2.3 / 2.4 / 2.5** — cheap, immediately differentiating product capabilities.
 3. **2.1 per-tenant** and **2.2 materialized reachability** — each behind its own design document.
