@@ -66,9 +66,11 @@ public class DispatchMeshMetricsTests
         var m = cluster.MetricsSnapshot();
 
         // Every sub-problem is a real grain call (no in-process local-recurse shortcut left), so a
-        // 20-deep chain must cold-activate at least that many distinct CheckGrain keys.
-        Assert.True(m.MemoMiss >= 20,
-            $"Expected the chain to fan into at least 20 distinct grain activations; saw {m.MemoMiss} memo misses.");
+        // 20-deep chain must cross the CheckDispatchIncomingCallFilter's boundary at least that many
+        // times — one real dispatch hop per distinct CheckGrain key, counted at the filter itself rather
+        // than inferred from the grain's own (memo-dependent) hit/miss bookkeeping.
+        Assert.True(m.Dispatch >= 20,
+            $"Expected the chain to fan into at least 20 real dispatch hops; saw {m.Dispatch}.");
     }
 
     [Fact]
@@ -86,12 +88,12 @@ public class DispatchMeshMetricsTests
         // where each of the chain's many distinct grain keys activates. Anti-hollow: on a real 3-silo
         // cluster that routing must genuinely land activations on more than one silo's own process, not
         // collapse the whole chain onto a single silo.
-        var perSiloMisses = cluster.AllSiloServices
-            .Select(sp => sp.GetRequiredService<IDispatchMetrics>().Snapshot().MemoMiss)
+        var perSiloDispatches = cluster.AllSiloServices
+            .Select(sp => sp.GetRequiredService<IDispatchMetrics>().Snapshot().Dispatch)
             .ToArray();
 
-        Assert.True(perSiloMisses.Count(count => count > 0) > 1,
-            $"Expected activations to spread across more than one silo; per-silo memo misses were " +
-            $"[{string.Join(", ", perSiloMisses)}].");
+        Assert.True(perSiloDispatches.Count(count => count > 0) > 1,
+            $"Expected activations to spread across more than one silo; per-silo dispatch hops were " +
+            $"[{string.Join(", ", perSiloDispatches)}].");
     }
 }

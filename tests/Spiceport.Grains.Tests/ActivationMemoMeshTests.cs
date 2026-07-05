@@ -3,6 +3,7 @@ using Spiceport.Core;
 using Spiceport.Datastore;
 using Spiceport.Engine;
 using Spiceport.Grains.Abstractions;
+using static Spiceport.Grains.Tests.DispatchContextTestHelper;
 
 namespace Spiceport.Grains.Tests;
 
@@ -74,9 +75,6 @@ public class ActivationMemoMeshTests
         return (cluster.GrainFactory.GetGrain<ICheckGrain>(key), head.Revision.ToString());
     }
 
-    private static DispatchCheckArgs Args(int depthRemaining, TraversalBloom? bloom = null) =>
-        new(depthRemaining, (bloom ?? TraversalBloom.Empty).ToBytes(), (bloom ?? TraversalBloom.Empty).Hashes);
-
     [Fact]
     public async Task Warm_activation_serves_the_second_identical_call_from_the_memo()
     {
@@ -96,9 +94,11 @@ public class ActivationMemoMeshTests
         using var ct2 = new GrainCancellationTokenSource();
 
         var before = cluster.MetricsSnapshot();
-        var first = await grain.DispatchCheck(Args(50), ct1.Token);
+        SetDispatchContext(50);
+        var first = await grain.DispatchCheck(ct1.Token);
         var afterFirst = cluster.MetricsSnapshot();
-        var second = await grain.DispatchCheck(Args(50), ct2.Token);
+        SetDispatchContext(50);
+        var second = await grain.DispatchCheck(ct2.Token);
         var afterSecond = cluster.MetricsSnapshot();
 
         Assert.Equal(first, second);
@@ -153,10 +153,12 @@ public class ActivationMemoMeshTests
         using var ct2 = new GrainCancellationTokenSource();
 
         var before = cluster.MetricsSnapshot();
-        var first = await grain.DispatchCheck(Args(50), ct1.Token);
+        SetDispatchContext(50);
+        var first = await grain.DispatchCheck(ct1.Token);
         var afterFirst = cluster.MetricsSnapshot();
         // Second call to the SAME warm activation: served from the memo (a miss, then a hit).
-        var second = await grain.DispatchCheck(Args(50), ct2.Token);
+        SetDispatchContext(50);
+        var second = await grain.DispatchCheck(ct2.Token);
         var afterSecond = cluster.MetricsSnapshot();
 
         // (Not asserting first == second by record equality: the caveat's Context dictionary has no
@@ -217,7 +219,8 @@ public class ActivationMemoMeshTests
         // Prime the memo with a generous budget so it genuinely completes and records the sub-problem's
         // real DepthRequired (D).
         using var ctPrime = new GrainCancellationTokenSource();
-        var primed = await grain.DispatchCheck(Args(1_000), ctPrime.Token);
+        SetDispatchContext(1_000);
+        var primed = await grain.DispatchCheck(ctPrime.Token);
         Assert.True(primed.Member);
         var required = primed.DepthRequired;
         Assert.True(required > 1, "expected the chain to require more than one hop of depth.");
@@ -226,7 +229,8 @@ public class ActivationMemoMeshTests
         // DepthRequired), so the memo answers without touching the datastore/graph again.
         using var ctServed = new GrainCancellationTokenSource();
         var beforeServed = cluster.MetricsSnapshot();
-        var served = await grain.DispatchCheck(Args(required), ctServed.Token);
+        SetDispatchContext(required);
+        var served = await grain.DispatchCheck(ctServed.Token);
         var afterServed = cluster.MetricsSnapshot();
         Assert.Equal(primed, served);
         Assert.Equal(beforeServed.MemoHit + 1, afterServed.MemoHit);
@@ -237,8 +241,9 @@ public class ActivationMemoMeshTests
         // successfully instead).
         using var ctTight = new GrainCancellationTokenSource();
         var beforeTight = cluster.MetricsSnapshot();
+        SetDispatchContext(required - 1);
         await Assert.ThrowsAsync<MaxDepthExceededException>(
-            () => grain.DispatchCheck(Args(required - 1), ctTight.Token));
+            () => grain.DispatchCheck(ctTight.Token));
         var afterTight = cluster.MetricsSnapshot();
 
         // The root's own memo must NOT serve this call (its DepthRequired is one more than the offered
@@ -281,7 +286,8 @@ public class ActivationMemoMeshTests
 
         using var ct1 = new GrainCancellationTokenSource();
         var before = cluster.MetricsSnapshot();
-        var first = await grain.DispatchCheck(Args(50, seeded), ct1.Token);
+        SetDispatchContext(50, seeded);
+        var first = await grain.DispatchCheck(ct1.Token);
         var afterFirst = cluster.MetricsSnapshot();
 
         Assert.True(first.Member);
@@ -301,7 +307,8 @@ public class ActivationMemoMeshTests
         // to what OrleansDispatcher hands back to the CALLER, never to a callee's own memo decision), so
         // both are served from their own memos (two hits) without re-touching doc2/viewer at all.
         using var ct2 = new GrainCancellationTokenSource();
-        var second = await grain.DispatchCheck(Args(50), ct2.Token);
+        SetDispatchContext(50);
+        var second = await grain.DispatchCheck(ct2.Token);
         var afterSecond = cluster.MetricsSnapshot();
 
         Assert.True(second.Member);
@@ -328,8 +335,10 @@ public class ActivationMemoMeshTests
         cluster.ResetMetrics();
         using var ct1 = new GrainCancellationTokenSource();
         using var ct2 = new GrainCancellationTokenSource();
-        var first = await grain.DispatchCheck(Args(50), ct1.Token);
-        var second = await grain.DispatchCheck(Args(50), ct2.Token);
+        SetDispatchContext(50);
+        var first = await grain.DispatchCheck(ct1.Token);
+        SetDispatchContext(50);
+        var second = await grain.DispatchCheck(ct2.Token);
         var snapshot = cluster.MetricsSnapshot();
 
         Assert.True(first.Member);

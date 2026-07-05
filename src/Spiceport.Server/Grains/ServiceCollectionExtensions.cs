@@ -1,4 +1,5 @@
 using Microsoft.Extensions.DependencyInjection;
+using Orleans;
 using Spiceport.Datastore;
 using Spiceport.Engine;
 using Spiceport.Schema;
@@ -44,8 +45,17 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<ISchemaProvider>(provider);
         services.AddSingleton<ISchemaHashSource>(provider);
 
-        // The silo-wide loop-bypass / activation-memo counters.
+        // The silo-wide loop-bypass / activation-memo / dispatch counters.
         services.AddSingleton<IDispatchMetrics, DispatchMetrics>();
+
+        // The check-dispatch cross-cutting grain-call filters, registered as plain DI singletons: Orleans
+        // resolves every IIncomingGrainCallFilter/IOutgoingGrainCallFilter from the SAME container the
+        // silo runtime uses, so this one registration covers both co-hosted hosts (Api, Silo) and any
+        // TestingHost cluster built by calling this same extension — there is nothing host-specific to
+        // wire up separately. Both filters match ONLY ICheckGrain.DispatchCheck (see CheckDispatchFilter);
+        // every other grain call in the mesh passes through untouched.
+        services.AddSingleton<IOutgoingGrainCallFilter, CheckDispatchOutgoingCallFilter>();
+        services.AddSingleton<IIncomingGrainCallFilter, CheckDispatchIncomingCallFilter>();
 
         // Per-silo Leopard membership-index accelerator (default ON; opt out via a registered options override).
         services.AddSingleton<MembershipIndexOptions>();

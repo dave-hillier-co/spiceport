@@ -3,38 +3,6 @@ using Spiceport.Core;
 namespace Spiceport.Grains.Abstractions;
 
 /// <summary>
-/// The parts of a dispatched sub-problem that are NOT encoded in the grain's string key and so must
-/// travel in the call: the remaining recursion budget and the cycle-guard visited set.
-/// </summary>
-/// <remarks>
-/// The grain identity (its string key) already pins the canonical sub-problem coordinates
-/// (resource, subject, quantized revision, schema hash). Two callers asking the same sub-problem on
-/// different recursion paths address the SAME grain but may carry a different depth budget / cycle
-/// guard, so those cross-cutting fields ride in <see cref="DispatchCheckArgs"/> rather than the key.
-/// <para>
-/// The cycle guard is a bounded traversal Bloom filter (SpiceDB-style): <see cref="BloomBits"/> is the
-/// fixed-width bit array (≤1KB) and <see cref="BloomK"/> the number of hash functions, so the wire/CPU
-/// cost is constant regardless of recursion depth. It replaces the prior exact visited set. The guard
-/// is conservative — a Bloom false-positive can only cut a branch (never grant) and cut results are
-/// never cached, so it is sound.
-/// </para>
-/// </remarks>
-/// <param name="DepthRemaining">The remaining recursion depth budget for this sub-problem.</param>
-/// <param name="BloomBits">The serialized traversal-Bloom bit array (the cycle guard for this path).</param>
-/// <param name="BloomK">The number of hash functions the Bloom was built with.</param>
-/// <param name="Mode">
-/// Whether the revision pinned in the grain key is an optimized (quantizable) bucket revision or an
-/// exact revision that must be keyed exactly in the branch cache (never quantized). Defaults to
-/// <see cref="RevisionMode.Optimized"/> so existing callers are unchanged.
-/// </param>
-[GenerateSerializer, Immutable]
-public sealed record DispatchCheckArgs(
-    [property: Id(0)] int DepthRemaining,
-    [property: Id(1)] byte[] BloomBits,
-    [property: Id(2)] int BloomK,
-    [property: Id(3)] RevisionMode Mode = RevisionMode.Optimized);
-
-/// <summary>
 /// The serializable reply from a dispatched sub-problem: the engine's pre-context branch
 /// (tri-state membership plus an optional gating caveat) augmented with the cycle-cut flag.
 /// </summary>
@@ -49,10 +17,9 @@ public sealed record DispatchCheckArgs(
 /// </param>
 /// <param name="CycleCut">
 /// True if this subtree was depth- or loop-affected and must not be cached. There is no visited-set
-/// verdict cut anymore (see the remarks on <see cref="DispatchCheckArgs"/>): this flag is force-set on
-/// the RETURNED reply by the Orleans dispatcher when the bounded traversal Bloom reports a likely
-/// repeat on this path, purely so the result is excluded from the grain's activation memo, not because
-/// the verdict itself was altered.
+/// verdict cut anymore: this flag is force-set on the RETURNED reply by the Orleans dispatcher when the
+/// bounded traversal Bloom reports a likely repeat on this path, purely so the result is excluded from
+/// the grain's activation memo, not because the verdict itself was altered.
 /// </param>
 /// <param name="DepthRequired">
 /// The recursion depth this sub-problem actually consumed below itself (leaf = 1). Travels back across
@@ -73,17 +40,22 @@ public sealed record DispatchCheckReply(
 /// </summary>
 /// <remarks>
 /// Recursion crosses grain boundaries: computing one sub-problem dispatches its children back through
-/// the Orleans dispatcher, which addresses a different grain per child key. The cross-cutting depth /
-/// visited fields that are not part of the identity travel in <see cref="DispatchCheckArgs"/>.
+/// the Orleans dispatcher, which addresses a different grain per child key. The cross-cutting depth
+/// budget and traversal-bloom cycle guard are NOT part of that identity — they ride ambiently in the
+/// Orleans <see cref="Orleans.Runtime.RequestContext"/> via
+/// <see cref="Spiceport.Grains.Abstractions.DispatchContext"/> rather than as a method argument, so this
+/// method's wire contract is exactly the canonical sub-problem (the grain key) plus the cancellation
+/// token. See <see cref="Spiceport.Grains.Abstractions.DispatchContext"/> for the scoping guarantee this
+/// relies on.
 /// </remarks>
 public interface ICheckGrain : IGrainWithStringKey
 {
     /// <summary>
-    /// Evaluates the one sub-problem this grain is keyed to, dispatching children onward. The Orleans
-    /// cancellation token propagates caller cancellation across the grain boundary and through every
-    /// recursive child dispatch.
+    /// Evaluates the one sub-problem this grain is keyed to, dispatching children onward. The depth
+    /// budget and traversal-bloom cycle guard are read from the ambient
+    /// <see cref="Spiceport.Grains.Abstractions.DispatchContext"/>, which the caller must have set before
+    /// making this call. The Orleans cancellation token propagates caller cancellation across the grain
+    /// boundary and through every recursive child dispatch.
     /// </summary>
-    Task<DispatchCheckReply> DispatchCheck(
-        DispatchCheckArgs args,
-        GrainCancellationToken cancellationToken);
+    Task<DispatchCheckReply> DispatchCheck(GrainCancellationToken cancellationToken);
 }
