@@ -42,8 +42,8 @@ dotnet test tests/Spiceport.Conformance.Tests  # the SpiceDB conformance corpus 
   compaction). Each silo reads from a **`SiloProjection`** folded incrementally from the log
   (`ReadFrom` tail, bootstrap-once) — no per-Check full fetch; exact/at-least-as-fresh reads block
   until the projection watermark covers the pinned revision (closed-timestamp gate). The same log feed
-  drives **Watch** (one per-silo `LogWatchHub` notifier, no per-stream polling) and an optional default-off
-  **Leopard `MembershipIndex`** for `LookupResources` (a complete candidate superset confirmed by
+  drives **Watch** (one per-silo `LogWatchHub` notifier, no per-stream polling) and an on-by-default
+  (opt-out via `MembershipIndexOptions`) **Leopard `MembershipIndex`** for `LookupResources` (a complete candidate superset confirmed by
   `CheckEngine`, never an oracle — it cannot change a verdict). See `docs/architecture-analysis.md` §3.5.
 - **The dispatcher seam is the core mechanism.** `Spiceport.Engine`'s `CheckEngine` never
   recurses into itself directly — every sub-problem flows through `IDispatcher.DispatchCheck`.

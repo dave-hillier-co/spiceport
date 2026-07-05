@@ -81,7 +81,7 @@ public sealed class MeshTestCluster : IAsyncDisposable
     public static async Task<MeshTestCluster> CreateAsync(
         string schemaText,
         int batchConcurrency = PermissionChecker.DefaultBatchConcurrency,
-        bool useMembershipIndex = false)
+        bool useMembershipIndex = true)
     {
         SchemaHolder.SchemaText = schemaText;
         SchemaHolder.BatchConcurrency = batchConcurrency;
@@ -111,7 +111,7 @@ public sealed class MeshTestCluster : IAsyncDisposable
         int siloCount = 3,
         int batchConcurrency = PermissionChecker.DefaultBatchConcurrency,
         bool localRecurseEnabled = true,
-        bool useMembershipIndex = false)
+        bool useMembershipIndex = true)
     {
         if (siloCount < 1)
             throw new ArgumentOutOfRangeException(nameof(siloCount), "Need at least one silo.");
