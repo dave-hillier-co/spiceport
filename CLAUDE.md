@@ -21,8 +21,9 @@ dotnet test tests/Spiceport.Conformance.Tests  # the SpiceDB conformance corpus 
 - **Use the dotnet CLI for package/reference/project changes** (`dotnet add package`,
   `dotnet add reference`, `dotnet sln add`). Do not hand-edit `<PackageReference>`/
   `<ProjectReference>` items. Editing build items like `<Protobuf>` is fine.
-- The **PostgreSQL** tests use Testcontainers and require Docker running; they spin up and
-  dispose their own `postgres` container.
+- The grain-storage **durability tests** (`tests/Spiceport.Grains.Tests/Durability`) use
+  Testcontainers and require Docker running; they spin up and dispose their own `postgres`
+  container (and skip when Docker is unavailable).
 - The solution file is `Spiceport.slnx` (the .NET 10 XML solution format).
 
 ## Architecture (the load-bearing ideas)
@@ -76,8 +77,8 @@ dotnet test tests/Spiceport.Conformance.Tests  # the SpiceDB conformance corpus 
 
 - **The SpiceDB conformance corpus is the correctness oracle.** `tests/.../TestData/*.yaml`
   (schema + relationships + Check/Lookup assertions) must stay green; the same corpus runs
-  through the in-memory engine, the Orleans grain mesh, and the Postgres backend, and all must
-  agree. Never weaken/skip a corpus case to make something pass.
+  through the in-memory engine and the Orleans grain mesh, and both must agree. Never
+  weaken/skip a corpus case to make something pass.
 - **Verify grains via the Orleans `TestingHost`** (in-process `TestCluster`), not by booting a
   host. For server/client-streaming gRPC, drive the service in-process with a fake
   `IServerStreamWriter`/`IAsyncStreamReader` + a fake `ServerCallContext`. Do **not** start a

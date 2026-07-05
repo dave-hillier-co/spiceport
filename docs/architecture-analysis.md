@@ -320,9 +320,9 @@ Caveats (CEL decision per §4), expiration, Watch/changefeed via Orleans Streams
 Exit: `caveat*` and `relexpiration*` corpus files green.
 
 **Phase 5 — Storage & scale.**
-Postgres datastore (Npgsql, `xid8` revisions, Watch via replication); consistency/perf
-benchmarks; tune placement (A→B) and concurrency limits. Exit: Postgres-backed conformance +
-load test.
+Durable persistence for the event-sourced datastore grain via the AdoNet (Postgres)
+grain-storage provider — no application SQL; consistency/perf benchmarks; tune placement
+(A→B) and concurrency limits. Exit: durable-storage tests + load test.
 
 ---
 
