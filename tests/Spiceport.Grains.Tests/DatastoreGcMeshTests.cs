@@ -95,7 +95,8 @@ public class DatastoreGcMeshTests
     public async Task RunGc_appends_a_log_event_advances_head_and_collects_dead_rows()
     {
         await using var scope = new Scope(await NewClusterAsync<GcSiloConfigurator>());
-        IDatastore ds = new GrainBackedDatastore(scope.Cluster.GrainFactory);
+        await using var host = new PrivateProjectionHost(scope.Cluster.GrainFactory);
+        IDatastore ds = new GrainBackedDatastore(scope.Cluster.GrainFactory, host);
         var grain = Grain(scope.Cluster);
 
         await ds.ReadWriteTx(tx => tx.WriteRelationships(new[] { Create("a", "alice"), Create("b", "bob") }));
@@ -128,7 +129,8 @@ public class DatastoreGcMeshTests
     public async Task RunGc_is_a_no_op_when_the_window_exceeds_elapsed_epoch_time()
     {
         await using var scope = new Scope(await NewClusterAsync<HugeWindowSiloConfigurator>());
-        IDatastore ds = new GrainBackedDatastore(scope.Cluster.GrainFactory);
+        await using var host = new PrivateProjectionHost(scope.Cluster.GrainFactory);
+        IDatastore ds = new GrainBackedDatastore(scope.Cluster.GrainFactory, host);
         var grain = Grain(scope.Cluster);
 
         await ds.ReadWriteTx(tx => tx.WriteRelationships(new[] { Create("a", "alice") }));
@@ -175,8 +177,12 @@ public class DatastoreGcMeshTests
     {
         await using var scope = new Scope(await NewClusterAsync<GcSiloConfigurator>());
         var gf = scope.Cluster.GrainFactory;
-        IDatastore writer = new GrainBackedDatastore(gf);
-        IDatastore reader = new GrainBackedDatastore(gf); // a SEPARATE per-silo projection instance
+        // Two ISOLATED hosts: "reader" must fold the GC event from the log tail via its OWN SiloProjection,
+        // never by sharing "writer"'s in-memory state.
+        await using var writerHost = new PrivateProjectionHost(gf);
+        await using var readerHost = new PrivateProjectionHost(gf);
+        IDatastore writer = new GrainBackedDatastore(gf, writerHost);
+        IDatastore reader = new GrainBackedDatastore(gf, readerHost); // a SEPARATE per-silo projection instance
         var grain = Grain(scope.Cluster);
 
         var rev1 = await writer.ReadWriteTx(tx => tx.WriteRelationships(new[] { Create("a", "alice") }));
@@ -199,7 +205,8 @@ public class DatastoreGcMeshTests
     public async Task Reader_pinned_below_the_floor_throws_RevisionNotFoundException()
     {
         await using var scope = new Scope(await NewClusterAsync<GcSiloConfigurator>());
-        IDatastore ds = new GrainBackedDatastore(scope.Cluster.GrainFactory);
+        await using var host = new PrivateProjectionHost(scope.Cluster.GrainFactory);
+        IDatastore ds = new GrainBackedDatastore(scope.Cluster.GrainFactory, host);
         var grain = Grain(scope.Cluster);
 
         var oldHead = await ds.HeadRevision(); // strictly before the write below, so below the post-GC floor
@@ -226,8 +233,10 @@ public class DatastoreGcMeshTests
         // to test the floor-rejection behavior itself, below).
         await using var scope = new Scope(await NewClusterAsync<RealWindowSiloConfigurator>());
         var gf = scope.Cluster.GrainFactory;
-        await using var watcher = new GrainBackedDatastore(gf);
-        await using var committer = new GrainBackedDatastore(gf);
+        await using var watcherHost = new PrivateProjectionHost(gf);
+        await using var committerHost = new PrivateProjectionHost(gf);
+        var watcher = new GrainBackedDatastore(gf, watcherHost);
+        var committer = new GrainBackedDatastore(gf, committerHost);
         var grain = Grain(scope.Cluster);
 
         var head = (await watcher.HeadRevision()).Revision;
@@ -271,7 +280,8 @@ public class DatastoreGcMeshTests
     public async Task New_watch_from_a_cursor_below_the_floor_throws()
     {
         await using var scope = new Scope(await NewClusterAsync<GcSiloConfigurator>());
-        IDatastore ds = new GrainBackedDatastore(scope.Cluster.GrainFactory);
+        await using var host = new PrivateProjectionHost(scope.Cluster.GrainFactory);
+        IDatastore ds = new GrainBackedDatastore(scope.Cluster.GrainFactory, host);
         var grain = Grain(scope.Cluster);
 
         var oldHead = await ds.HeadRevision();
@@ -327,7 +337,8 @@ public class DatastoreGcMeshTests
         var gcOptions = services.GetRequiredService<IOptions<DatastoreGcOptions>>();
         var grain = Grain(scope.Cluster);
 
-        IDatastore ds = new GrainBackedDatastore(gf, gcOptions: gcOptions);
+        await using var host = new PrivateProjectionHost(gf);
+        IDatastore ds = new GrainBackedDatastore(gf, host, gcOptions: gcOptions);
 
         var revision = await ds.ReadWriteTx(tx => tx.WriteRelationships(new[] { Create("a", "alice") }));
 
@@ -379,7 +390,8 @@ public class DatastoreGcMeshTests
         // The try/catch gate in DatastoreGrain.OnActivateAsync: no reminder service is configured on this
         // cluster at all, yet the grain must still activate and serve calls normally.
         await using var scope = new Scope(await NewClusterAsync<GcWithoutReminderServiceSiloConfigurator>());
-        IDatastore ds = new GrainBackedDatastore(scope.Cluster.GrainFactory);
+        await using var host = new PrivateProjectionHost(scope.Cluster.GrainFactory);
+        IDatastore ds = new GrainBackedDatastore(scope.Cluster.GrainFactory, host);
         var grain = Grain(scope.Cluster);
 
         await ds.ReadWriteTx(tx => tx.WriteRelationships(new[] { Create("a", "alice") }));

@@ -93,8 +93,7 @@ public class CheckDispatchFiltersTests
             new ObjectAndRelation("document", "readme", "view"),
             new ObjectAndRelation("user", "alice", CoreConstants.Ellipsis),
             head.Revision.ToString(),
-            schemaHash,
-            RevisionMode.Optimized);
+            schemaHash);
         var grain = cluster.GrainFactory.GetGrain<ICheckGrain>(key);
 
         cluster.ResetMetrics();

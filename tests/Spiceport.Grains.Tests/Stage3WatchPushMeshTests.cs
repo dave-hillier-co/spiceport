@@ -30,8 +30,10 @@ public class Stage3WatchPushMeshTests
         await using var scope = new Scope(await NewDatastoreClusterAsync());
         var gf = scope.Cluster.GrainFactory;
 
-        await using var watcher = new GrainBackedDatastore(gf, watchFallbackInterval: TimeSpan.FromSeconds(30));
-        await using var committer = new GrainBackedDatastore(gf);
+        await using var watcherHost = new PrivateProjectionHost(gf, heartbeatInterval: TimeSpan.FromSeconds(30));
+        await using var committerHost = new PrivateProjectionHost(gf);
+        var watcher = new GrainBackedDatastore(gf, watcherHost);
+        var committer = new GrainBackedDatastore(gf, committerHost);
 
         var head = (await watcher.HeadRevision()).Revision;
 
@@ -75,8 +77,10 @@ public class Stage3WatchPushMeshTests
         await using var scope = new Scope(await NewDatastoreClusterAsync());
         var gf = scope.Cluster.GrainFactory;
 
-        await using var watcher = new GrainBackedDatastore(gf);
-        await using var committer = new GrainBackedDatastore(gf);
+        await using var watcherHost = new PrivateProjectionHost(gf);
+        await using var committerHost = new PrivateProjectionHost(gf);
+        var watcher = new GrainBackedDatastore(gf, watcherHost);
+        var committer = new GrainBackedDatastore(gf, committerHost);
 
         var head = (await watcher.HeadRevision()).Revision;
 

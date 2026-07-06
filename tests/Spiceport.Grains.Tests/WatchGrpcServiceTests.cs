@@ -141,7 +141,8 @@ public class WatchGrpcServiceTests
         var schemaProvider = services.GetRequiredService<ISchemaProvider>();
         var grain = gf.GetGrain<IDatastoreGrain>(IDatastoreGrain.Key);
 
-        IDatastore datastore = new GrainBackedDatastore(gf, gcOptions: gcOptions);
+        await using var host = new PrivateProjectionHost(gf);
+        IDatastore datastore = new GrainBackedDatastore(gf, host, gcOptions: gcOptions);
         var service = new WatchGrpcService(datastore, schemaProvider);
 
         // Capture a cursor, then write past it and collect everything at/below that cursor via GC (Window

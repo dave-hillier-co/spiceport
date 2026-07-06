@@ -93,7 +93,8 @@ public sealed class Stage1JournaledWritePathTests
     public async Task ReadFrom_IsPageSizeInvariant()
     {
         await using var scope = new Scope(await NewClusterAsync());
-        IDatastore ds = new GrainBackedDatastore(scope.Cluster.GrainFactory);
+        await using var host = new PrivateProjectionHost(scope.Cluster.GrainFactory);
+        IDatastore ds = new GrainBackedDatastore(scope.Cluster.GrainFactory, host);
         var grain = Grain(scope.Cluster);
         // The "from the beginning" cursor: the pre-first-write head. Revisions are timestamp-nanos, so 0 is
         // below the GC window; the seed head is the earliest valid cursor that precedes every event.
@@ -122,7 +123,8 @@ public sealed class Stage1JournaledWritePathTests
     public async Task Replay_FromEmpty_ReconstructsGrainStateAndMatchesOracle()
     {
         await using var scope = new Scope(await NewClusterAsync());
-        IDatastore ds = new GrainBackedDatastore(scope.Cluster.GrainFactory);
+        await using var host = new PrivateProjectionHost(scope.Cluster.GrainFactory);
+        IDatastore ds = new GrainBackedDatastore(scope.Cluster.GrainFactory, host);
         var grain = Grain(scope.Cluster);
         var from = (await grain.GetHead()).Head;
         await RunWorkload(ds);
@@ -166,7 +168,8 @@ public sealed class Stage1JournaledWritePathTests
     public async Task ReadFrom_BelowGcWindow_Throws()
     {
         await using var scope = new Scope(await NewClusterAsync());
-        IDatastore ds = new GrainBackedDatastore(scope.Cluster.GrainFactory);
+        await using var host = new PrivateProjectionHost(scope.Cluster.GrainFactory);
+        IDatastore ds = new GrainBackedDatastore(scope.Cluster.GrainFactory, host);
         await RunWorkload(ds);
         var grain = Grain(scope.Cluster);
 
@@ -188,7 +191,8 @@ public sealed class Stage1JournaledWritePathTests
     public async Task CounterNetDelta_FoldsWithoutThrowing()
     {
         await using var scope = new Scope(await NewClusterAsync());
-        IDatastore ds = new GrainBackedDatastore(scope.Cluster.GrainFactory);
+        await using var host = new PrivateProjectionHost(scope.Cluster.GrainFactory);
+        IDatastore ds = new GrainBackedDatastore(scope.Cluster.GrainFactory, host);
         var grain = Grain(scope.Cluster);
         var from = (await grain.GetHead()).Head;
 

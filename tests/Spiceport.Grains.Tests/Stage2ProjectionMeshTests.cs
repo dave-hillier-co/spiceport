@@ -87,8 +87,12 @@ public class Stage2ProjectionMeshTests
     {
         await using var scope = new Scope(await NewDatastoreClusterAsync());
         var gf = scope.Cluster.GrainFactory;
-        IDatastore writer = new GrainBackedDatastore(gf);
-        IDatastore projected = new GrainBackedDatastore(gf);
+        // Two ISOLATED hosts: "projected" must observe every row purely by folding the singleton grain's log
+        // (via its OWN SiloProjection), never by sharing "writer"'s in-memory state.
+        await using var writerHost = new PrivateProjectionHost(gf);
+        await using var projectedHost = new PrivateProjectionHost(gf);
+        IDatastore writer = new GrainBackedDatastore(gf, writerHost);
+        IDatastore projected = new GrainBackedDatastore(gf, projectedHost);
         var oracle = new ReferenceDatastore();
 
         // Drive the SAME ordered workload through the grain (writer) and the oracle, capturing each backend's

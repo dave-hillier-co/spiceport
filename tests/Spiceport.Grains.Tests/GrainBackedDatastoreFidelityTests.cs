@@ -51,7 +51,8 @@ public sealed class GrainBackedDatastoreFidelityTests
     {
         var inMem = new ReferenceDatastore();
         await using var scope = new ClusterScope(await NewClusterAsync());
-        IDatastore grainDs = new GrainBackedDatastore(scope.Cluster.GrainFactory);
+        await using var host = new PrivateProjectionHost(scope.Cluster.GrainFactory);
+        IDatastore grainDs = new GrainBackedDatastore(scope.Cluster.GrainFactory, host);
 
         // Step 1: distinct creates.
         var a = Rel("doc", "a", "viewer", "user", "alice");

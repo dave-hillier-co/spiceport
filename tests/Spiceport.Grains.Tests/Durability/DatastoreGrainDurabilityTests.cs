@@ -84,8 +84,10 @@ public sealed class DatastoreGrainDurabilityTests
             siloBuilder.ConfigureServices(services =>
             {
                 services.AddSpiceportGrainServices(SchemaText);
+                services.AddSingleton<IDatastoreProjectionHost, PrivateProjectionHost>();
                 services.AddSingleton<IDatastore>(sp =>
-                    new GrainBackedDatastore(sp.GetRequiredService<IGrainFactory>()));
+                    new GrainBackedDatastore(
+                        sp.GetRequiredService<IGrainFactory>(), sp.GetRequiredService<IDatastoreProjectionHost>()));
             });
         }
     }
@@ -144,11 +146,13 @@ public sealed class DatastoreGrainDurabilityTests
                 // host with no reminder service still activates (the try/catch gate).
                 services.AddSingleton<IOptions<DatastoreGcOptions>>(
                     Options.Create(new DatastoreGcOptions { Window = TimeSpan.Zero, ReminderEnabled = false }));
+                services.AddSingleton<IDatastoreProjectionHost, PrivateProjectionHost>();
                 // Mirrors production wiring: GrainBackedDatastore's own nominal GC window must track the
                 // SAME DatastoreGcOptions the grain is configured with (see GrainBackedDatastore's ctor doc).
                 services.AddSingleton<IDatastore>(sp =>
                     new GrainBackedDatastore(
                         sp.GetRequiredService<IGrainFactory>(),
+                        sp.GetRequiredService<IDatastoreProjectionHost>(),
                         gcOptions: sp.GetRequiredService<IOptions<DatastoreGcOptions>>()));
             });
         }
