@@ -115,8 +115,10 @@ shutdown. Identity lives in the `IDatastoreProjectionHost` DI singleton rather t
 `GrainService` itself: the only supported DI-reachable client of a live `GrainService` is the
 message-passing `GrainServiceClient<T>`, which would put a hop back on the per-Check read path the
 projection exists to eliminate. `MembershipIndexCache` stays a plain DI singleton — its build is
-request-schema-driven, so lifecycle management adds nothing. The private-instance
-`GrainBackedDatastore` constructor survives as the test seam the push-Watch proofs need.
+request-schema-driven, so lifecycle management adds nothing. `GrainBackedDatastore` has a single,
+host-fed constructor; the push-Watch proofs get a genuinely isolated hub via a test-only
+`IDatastoreProjectionHost` implementation (`PrivateProjectionHost` in `Spiceport.Grains.Tests`)
+rather than a dedicated constructor.
 
 ### 1.9 `[Immutable]` wire types (implemented)
 

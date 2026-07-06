@@ -137,10 +137,8 @@ public sealed class CheckEngine
         // Carry the caller-supplied real read revision when available (informational identity only —
         // `_readerFor` above already closes over the pinned reader); fall back to the in-process
         // placeholder identity when none is supplied.
-        var (revision, mode) = atRevision is null
-            ? ((IRevision)InProcessRevision.Instance, RevisionMode.Optimized)
-            : (atRevision, RevisionMode.Exact);
-        var meta = new ResolverMeta(revision, _maxDepth, TraversalBloom.ForDepth(_maxDepth), mode);
+        var revision = atRevision is null ? (IRevision)InProcessRevision.Instance : atRevision;
+        var meta = new ResolverMeta(revision, _maxDepth, TraversalBloom.ForDepth(_maxDepth));
         var request = new DispatchCheckRequest(resource, subject, meta);
         var result = await dispatcher.DispatchCheck(request, cancellationToken).ConfigureAwait(false);
 

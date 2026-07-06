@@ -117,8 +117,7 @@ public sealed class CheckGrain(
         var meta = new ResolverMeta(
             revision,
             depthRemaining,
-            TraversalBloom.FromBytes(bloomBits, bloomK),
-            parts.Mode);
+            TraversalBloom.FromBytes(bloomBits, bloomK));
         var request = new DispatchCheckRequest(parts.Resource, parts.Subject, meta);
 
         var result = await local.DispatchCheck(request, cancellationToken.CancellationToken);

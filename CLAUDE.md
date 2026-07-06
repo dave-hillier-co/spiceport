@@ -63,8 +63,11 @@ dotnet test tests/Spiceport.Conformance.Tests  # the SpiceDB conformance corpus 
   `DispatchContext`, not in the grain key. Cycle-cut results are served but not retained.
   Revisions are quantized so grain keys are shared within a window; `schemaHash` is in the key
   so a schema change yields a fresh keyspace.
-- **Consistency.** Reads honor a `ConsistencyRequirement`; `RevisionMode` (Optimized vs Exact)
-  threads into the cache key so fresh/at-exact/fully-consistent reads never serve stale data.
+- **Consistency.** Reads honor a `ConsistencyRequirement`; consistency is enforced entirely at
+  `RevisionResolver` time — which revision string gets pinned, plus the projection's
+  closed-timestamp gate — so fresh/at-exact/fully-consistent reads never serve stale data. The
+  pinned revision string is the grain key's whole identity: no separate cache-mode segment exists
+  downstream of resolution.
 
 ## Conventions
 

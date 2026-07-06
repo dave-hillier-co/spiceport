@@ -143,9 +143,9 @@ public sealed class PermissionChecker(
     {
         ArgumentNullException.ThrowIfNull(subject);
 
-        // Resolve the consistency requirement to a concrete revision + cache mode. Default (null) is
-        // MinimizeLatency → the optimized (quantized, head-pinned) revision, identical to the prior
-        // behaviour, so existing tests are unchanged.
+        // Resolve the consistency requirement to a concrete revision. Default (null) is MinimizeLatency
+        // → the optimized (quantized, head-pinned) revision, identical to the prior behaviour, so
+        // existing tests are unchanged.
         var resolved = await RevisionResolver
             .Resolve(datastore, consistency ?? ConsistencyRequirement.MinimizeLatency, cancellationToken: ct)
             .ConfigureAwait(false);
@@ -158,7 +158,7 @@ public sealed class PermissionChecker(
 
         var resource = new ObjectAndRelation(resourceType, resourceId, permission);
         var meta = new ResolverMeta(
-            resolved.Revision, maxDepth, TraversalBloom.ForDepth(maxDepth), resolved.Mode);
+            resolved.Revision, maxDepth, TraversalBloom.ForDepth(maxDepth));
         var request = new DispatchCheckRequest(resource, subject, meta);
 
         var branch = await root.DispatchCheck(request, ct).ConfigureAwait(false);
@@ -179,8 +179,8 @@ public sealed class PermissionChecker(
         ArgumentNullException.ThrowIfNull(items);
 
         // ONE revision for the whole batch (mirrors SpiceDB's single RevisionFromContext). Every item's
-        // ResolverMeta carries the same revision + mode, so structurally-identical sub-problems across
-        // items collide on the same shared cache key and the same grain activation.
+        // ResolverMeta carries the same revision, so structurally-identical sub-problems across items
+        // collide on the same shared cache key and the same grain activation.
         var resolved = await RevisionResolver
             .Resolve(datastore, consistency ?? ConsistencyRequirement.MinimizeLatency, cancellationToken: ct)
             .ConfigureAwait(false);
@@ -191,7 +191,7 @@ public sealed class PermissionChecker(
         var engine = new CheckEngine(schema.Namespaces, schema.Caveats, maxDepth);
 
         var meta = new ResolverMeta(
-            resolved.Revision, maxDepth, TraversalBloom.ForDepth(maxDepth), resolved.Mode);
+            resolved.Revision, maxDepth, TraversalBloom.ForDepth(maxDepth));
 
         // Dedup distinct sub-problems by their dispatch key (resource + subject; caveat context is
         // excluded from the dispatch key and applied per-item at collapse). Each distinct sub-problem is

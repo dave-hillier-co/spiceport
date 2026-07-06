@@ -33,9 +33,10 @@ public interface IDatastoreProjectionGrainService : IGrainService;
 /// GrainService lifecycle-stage progression, so no fire-and-forget fallback was needed.
 /// </description></item>
 /// <item><description>
-/// <see cref="Stop"/> disposes the hub — a bounded/timeout-guarded unsubscribe from the DatastoreGrain's
-/// observer set, the same shape <see cref="GrainBackedDatastore.DisposeAsync"/> already uses — so silo
-/// shutdown never hangs on a slow or failed unsubscribe call.
+/// <see cref="Stop"/> disposes the hub via <see cref="LogWatchHub.DisposeAsync"/> — a bounded/timeout-guarded
+/// unsubscribe from the DatastoreGrain's observer set — so silo shutdown never hangs on a slow or failed
+/// unsubscribe call. <see cref="GrainBackedDatastore"/> itself owns no lifetime of its own to dispose; the
+/// hub's lifecycle belongs entirely to this <see cref="IDatastoreProjectionHost"/>-owning service.
 /// </description></item>
 /// </list>
 /// </remarks>

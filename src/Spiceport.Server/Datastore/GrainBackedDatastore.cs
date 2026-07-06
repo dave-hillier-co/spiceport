@@ -16,7 +16,14 @@ namespace Spiceport.Grains;
 /// compare-and-swap retry loop. This is a DI service, not a grain, so <c>ConfigureAwait(false)</c> is
 /// correct here.
 /// </summary>
-public sealed class GrainBackedDatastore : IDatastore, IAsyncDisposable
+/// <remarks>
+/// This instance never owns the shared <see cref="SiloProjection"/>/<see cref="LogWatchHub"/> pair it
+/// reads and pulses through <paramref name="projectionHost"/> (see the constructor); their lifecycle is
+/// entirely the host contract's responsibility (<see cref="IDatastoreProjectionHost"/>) — production's
+/// silo-lifecycle-managed <see cref="DatastoreProjectionService"/>, or a test fixture's own host. This
+/// type therefore has nothing of its own to dispose.
+/// </remarks>
+public sealed class GrainBackedDatastore : IDatastore
 {
     /// <summary>Bound on CAS retries before surfacing a serialization conflict.</summary>
     private const int MaxCasAttempts = 50;
@@ -35,22 +42,15 @@ public sealed class GrainBackedDatastore : IDatastore, IAsyncDisposable
     private readonly long _quantizationNanos;
     private readonly long _gcWindowNanos;
 
-    // Per-silo materialized read projection: reads serve from the incrementally-folded local projection
-    // (one ReadState bootstrap + log-tail catch-up), never a per-Check full-state fetch. This
-    // GrainBackedDatastore is itself the per-silo singleton, so the owned projection is per-silo.
+    // Per-silo materialized read projection (see IDatastoreProjectionHost.Projection): reads serve from the
+    // incrementally-folded local projection (one ReadState bootstrap + log-tail catch-up), never a per-Check
+    // full-state fetch. Shared with every other GrainBackedDatastore on this silo — the host owns it.
     private readonly SiloProjection _projection;
 
-    // Per-silo Watch notifier (created lazily on the first Watch). The local write path pulses it on commit
+    // Per-silo Watch notifier (see IDatastoreProjectionHost.Hub). The local write path pulses it on commit
     // for instant same-silo Watch latency; cross-silo commits arrive by observer push from the datastore
-    // grain, with the hub's slow heartbeat as the missed-push backstop. Guarded by _hubLock.
-    private readonly object _hubLock = new();
-    private readonly TimeSpan? _watchFallbackInterval;
-    private LogWatchHub? _hub;
-
-    // True for the private-instance (test-seam) constructor, which owns the hub it lazily creates and must
-    // dispose it; false for the shared-host constructor, whose hub's lifecycle is owned by
-    // DatastoreProjectionService (this instance must not dispose a hub it does not own).
-    private readonly bool _ownsHub;
+    // grain, with the hub's slow heartbeat as the missed-push backstop. The host owns its lifecycle.
+    private readonly LogWatchHub _hub;
 
     // Cached optimized-revision candidate (mirrors ReferenceDatastore's CachedOptimizedRevisions): a real
     // head sampled when a window opens, held stable until the bucket boundary so near-in-time
@@ -64,8 +64,18 @@ public sealed class GrainBackedDatastore : IDatastore, IAsyncDisposable
     private RevisionWithSchemaHash? _optimizedCache;
     private long _optimizedValidThroughNanos;
 
-    /// <summary>Creates a grain-backed datastore.</summary>
+    /// <summary>
+    /// Creates a grain-backed datastore. Reads and Watch use the per-silo SHARED <see cref="SiloProjection"/>/
+    /// <see cref="LogWatchHub"/> owned by <paramref name="projectionHost"/> — in production, the same
+    /// instances the silo-lifecycle-managed <see cref="DatastoreProjectionService"/> bootstraps before the
+    /// silo accepts traffic and disposes on silo shutdown; in tests, a fixture-owned host (e.g.
+    /// <c>PrivateProjectionHost</c> in <c>Spiceport.Grains.Tests</c>) when a genuinely isolated hub is needed
+    /// (e.g. proving PUSH-driven Watch is real — see <c>Stage3WatchPushMeshTests</c> — rather than a shared
+    /// in-process shortcut). This <see cref="GrainBackedDatastore"/> instance never owns the projection/hub
+    /// lifetime; see the class remarks.
+    /// </summary>
     /// <param name="grainFactory">The Orleans grain factory used to reach the singleton datastore grain.</param>
+    /// <param name="projectionHost">The shared projection/hub pair (see <see cref="IDatastoreProjectionHost"/>).</param>
     /// <param name="quantization">Quantization window for <see cref="OptimizedRevision"/> (default 5s).</param>
     /// <param name="gcWindow">
     /// How long old revisions remain valid. Takes priority over <paramref name="gcOptions"/> when supplied
@@ -79,50 +89,12 @@ public sealed class GrainBackedDatastore : IDatastore, IAsyncDisposable
     /// window here would wrongly reject (or wrongly accept) a still-valid revision relative to the real
     /// per-host retention policy.
     /// </param>
-    /// <param name="watchFallbackInterval">
-    /// The Watch hub's heartbeat cadence (observer-registration refresh + missed-push backstop). Test seam;
-    /// leave null for the production default.
-    /// </param>
     /// <param name="gcOptions">
     /// The same <see cref="DatastoreGcOptions"/> the singleton <see cref="DatastoreGrain"/> is configured
     /// with. Optional so a host/test that never registers it still gets the 24h default (matching
     /// <see cref="DatastoreGcOptions"/>'s own default), consistent with the grain's own optional-options
     /// pattern.
     /// </param>
-    /// <remarks>
-    /// TEST/ISOLATION SEAM: this constructor builds its OWN private <see cref="SiloProjection"/> and
-    /// <see cref="LogWatchHub"/> rather than reusing the per-silo shared ones. Production code should use the
-    /// <see cref="GrainBackedDatastore(IGrainFactory, IDatastoreProjectionHost, TimeSpan?, TimeSpan?, IOptions{DatastoreGcOptions}?)"/>
-    /// overload instead. This overload exists for tests that need a genuinely isolated hub — e.g. proving
-    /// PUSH-driven Watch is real (grain-observer-driven), not a shared in-process shortcut, by committing
-    /// through one <see cref="GrainBackedDatastore"/>'s hub while asserting on another's (see
-    /// <c>Stage3WatchPushMeshTests</c>) — or that need to override the hub's heartbeat cadence via
-    /// <paramref name="watchFallbackInterval"/>.
-    /// </remarks>
-    public GrainBackedDatastore(
-        IGrainFactory grainFactory, TimeSpan? quantization = null, TimeSpan? gcWindow = null,
-        TimeSpan? watchFallbackInterval = null, IOptions<DatastoreGcOptions>? gcOptions = null)
-    {
-        _grainFactory = grainFactory;
-        _quantizationNanos = ComputeQuantizationNanos(quantization);
-        _gcWindowNanos = ComputeGcWindowNanos(gcWindow, gcOptions);
-        _watchFallbackInterval = watchFallbackInterval;
-        _projection = new SiloProjection(grainFactory.GetGrain<IDatastoreGrain>(IDatastoreGrain.Key));
-        _ownsHub = true;
-    }
-
-    /// <summary>
-    /// Production constructor: reads and Watch use the per-silo SHARED <see cref="SiloProjection"/>/
-    /// <see cref="LogWatchHub"/> owned by <paramref name="projectionHost"/> — the same instances the
-    /// silo-lifecycle-managed <see cref="DatastoreProjectionService"/> bootstraps before the silo accepts
-    /// traffic and disposes on silo shutdown. This <see cref="GrainBackedDatastore"/> instance does not own
-    /// the hub's lifetime, so <see cref="DisposeAsync"/> leaves it running for other same-silo consumers.
-    /// </summary>
-    /// <param name="grainFactory">The Orleans grain factory used to reach the singleton datastore grain.</param>
-    /// <param name="projectionHost">The per-silo shared projection/hub pair (see <see cref="IDatastoreProjectionHost"/>).</param>
-    /// <param name="quantization">Quantization window for <see cref="OptimizedRevision"/> (default 5s).</param>
-    /// <param name="gcWindow">See the other constructor's parameter of the same name.</param>
-    /// <param name="gcOptions">See the other constructor's parameter of the same name.</param>
     public GrainBackedDatastore(
         IGrainFactory grainFactory, IDatastoreProjectionHost projectionHost, TimeSpan? quantization = null,
         TimeSpan? gcWindow = null, IOptions<DatastoreGcOptions>? gcOptions = null)
@@ -131,10 +103,8 @@ public sealed class GrainBackedDatastore : IDatastore, IAsyncDisposable
         _grainFactory = grainFactory;
         _quantizationNanos = ComputeQuantizationNanos(quantization);
         _gcWindowNanos = ComputeGcWindowNanos(gcWindow, gcOptions);
-        _watchFallbackInterval = null;
         _projection = projectionHost.Projection;
         _hub = projectionHost.Hub;
-        _ownsHub = false;
     }
 
     private static long ComputeQuantizationNanos(TimeSpan? quantization) =>
@@ -272,8 +242,7 @@ public sealed class GrainBackedDatastore : IDatastore, IAsyncDisposable
         if (!(cursor <= head0.Head && cursor >= head0.Head - _gcWindowNanos && cursor >= head0.GcFloor))
             throw new RevisionNotFoundException(afterRevision);
 
-        var hub = Hub();
-        hub.EnsureStarted();
+        _hub.EnsureStarted();
 
         while (!cancellationToken.IsCancellationRequested)
         {
@@ -306,7 +275,7 @@ public sealed class GrainBackedDatastore : IDatastore, IAsyncDisposable
             // per-stream timer.
             try
             {
-                await hub.WaitForChangeAfter(cursor, cancellationToken).ConfigureAwait(false);
+                await _hub.WaitForChangeAfter(cursor, cancellationToken).ConfigureAwait(false);
             }
             catch (OperationCanceledException)
             {
@@ -315,39 +284,16 @@ public sealed class GrainBackedDatastore : IDatastore, IAsyncDisposable
         }
     }
 
-    private LogWatchHub Hub()
-    {
-        if (_hub is { } existing)
-            return existing;
-        lock (_hubLock)
-        {
-            return _hub ??= new LogWatchHub(Grain, _grainFactory, _watchFallbackInterval);
-        }
-    }
-
     public Task<string> GetUniqueId(CancellationToken cancellationToken = default) => Task.FromResult(UniqueId);
 
     public Task<IRevisionParser> GetRevisionParser(CancellationToken cancellationToken = default) =>
         Task.FromResult<IRevisionParser>(new TimestampRevisionParser(UniqueId));
 
-    public Task Close() => DisposeAsync().AsTask();
-
-    public async ValueTask DisposeAsync()
-    {
-        // The shared hub's lifecycle belongs to DatastoreProjectionService (silo shutdown), not to any one
-        // GrainBackedDatastore instance that merely references it.
-        if (!_ownsHub)
-            return;
-
-        LogWatchHub? hub;
-        lock (_hubLock)
-        {
-            hub = _hub;
-            _hub = null;
-        }
-        if (hub is not null)
-            await hub.DisposeAsync().ConfigureAwait(false);
-    }
+    /// <summary>
+    /// A no-op: this instance owns no lifetime of its own (see the class remarks) — the shared projection/hub
+    /// belongs entirely to the <see cref="IDatastoreProjectionHost"/> it was constructed with.
+    /// </summary>
+    public Task Close() => Task.CompletedTask;
 
     // --- internals ---
 

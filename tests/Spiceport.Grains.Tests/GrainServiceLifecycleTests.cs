@@ -65,10 +65,11 @@ public class GrainServiceLifecycleTests
     /// <summary>
     /// Gate (b): silo/cluster teardown does not hang or throw. <see cref="DatastoreProjectionService.Stop"/>
     /// disposes the shared hub (a bounded/timeout-guarded unsubscribe from the DatastoreGrain's observer
-    /// set, mirroring <see cref="GrainBackedDatastore.DisposeAsync"/>'s own teardown) — this proves that
-    /// path runs cleanly on real cluster disposal. (The DatastoreGrain's own watcher-registration expiry is
-    /// a backstop against a leak either way; this test is about clean, bounded teardown, not about
-    /// preventing an otherwise-catastrophic leak.)
+    /// set) — this proves that path runs cleanly on real cluster disposal. <see cref="GrainBackedDatastore"/>
+    /// itself owns no lifetime (its projection/hub always belong to the <see cref="IDatastoreProjectionHost"/>
+    /// it was constructed with), so this hub teardown is the only one that matters here. (The DatastoreGrain's
+    /// own watcher-registration expiry is a backstop against a leak either way; this test is about clean,
+    /// bounded teardown, not about preventing an otherwise-catastrophic leak.)
     /// </summary>
     [Fact]
     public async Task Cluster_Shutdown_DisposesTheSharedHub_WithoutHangingOrThrowing()

@@ -47,8 +47,8 @@ public sealed class OrleansDispatcher : IDispatcher
     /// The canonical grain key for a sub-problem, identical to the key used to address its
     /// <see cref="ICheckGrain"/>.
     /// </summary>
-    public string KeyFor(ObjectAndRelation resource, ObjectAndRelation subject, string revision, RevisionMode mode) =>
-        GrainKey.Build(resource, subject, revision, _schemaHash.CurrentSchemaHash, mode);
+    public string KeyFor(ObjectAndRelation resource, ObjectAndRelation subject, string revision) =>
+        GrainKey.Build(resource, subject, revision, _schemaHash.CurrentSchemaHash);
 
     /// <inheritdoc/>
     public async Task<DispatchCheckResult> DispatchCheck(DispatchCheckRequest request, CancellationToken ct)
@@ -60,8 +60,7 @@ public sealed class OrleansDispatcher : IDispatcher
             request.Resource,
             request.Subject,
             request.Meta.Revision.ToString(),
-            _schemaHash.CurrentSchemaHash,
-            request.Meta.Mode);
+            _schemaHash.CurrentSchemaHash);
 
         // SINGLEFLIGHT-STYLE LOOP BYPASS (SpiceDB singleflight.go:69-81): if the traversal bloom already
         // contains this sub-problem's (resource, subject) key, this is a LIKELY loop back to a grain key

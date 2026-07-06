@@ -70,8 +70,7 @@ public class ActivationMemoMeshTests
     {
         var head = await cluster.Datastore.HeadRevision();
         var schemaHash = cluster.SchemaProvider.Current.SchemaHash;
-        var key = GrainKey.Build(
-            resource, subject, head.Revision.ToString(), schemaHash, RevisionMode.Optimized);
+        var key = GrainKey.Build(resource, subject, head.Revision.ToString(), schemaHash);
         return (cluster.GrainFactory.GetGrain<ICheckGrain>(key), head.Revision.ToString());
     }
 
@@ -315,6 +314,58 @@ public class ActivationMemoMeshTests
         Assert.False(second.CycleCut);
         Assert.Equal(afterFirst.MemoMiss + 1, afterSecond.MemoMiss);
         Assert.Equal(afterFirst.MemoHit + 2, afterSecond.MemoHit);
+    }
+
+    [Fact]
+    public async Task Optimized_and_exact_checks_at_the_same_revision_share_one_activation_memo()
+    {
+        // The post-CachingDispatcher invariant this pins (see GrainKey's remarks): once a revision
+        // string is resolved, an exact-snapshot check and a minimize-latency check that happen to name
+        // the SAME revision string compute the identical answer and legitimately share the CheckGrain
+        // activation (and its memo) — there is no mode segment left to keep them apart.
+        await using var cluster = await MeshTestCluster.CreateAsync(DocumentSchema);
+        await cluster.Datastore.ReadWriteTx(tx => tx.WriteRelationships([
+            new RelationshipUpdate(
+                Relationship.Create(
+                    Resource("document", "readme", "viewer"),
+                    Subject("alice")),
+                UpdateOperation.Create),
+        ]));
+
+        var checker = cluster.Checker;
+        var subject = new ObjectAndRelation("user", "alice", CoreConstants.Ellipsis);
+
+        cluster.ResetMetrics();
+        SetDispatchContext(50);
+
+        // First call: MinimizeLatency (Optimized resolution). No prior write happened since, so the
+        // datastore's cached "optimized" revision IS the real current head — a cold pair of activations
+        // (root "view" + its bare "viewer" Sub, exactly as Warm_activation_serves_the_second_identical_call
+        // observes for this schema).
+        var optimized = await checker.Check(
+            "document", "readme", "view", subject, caveatContext: null,
+            consistency: ConsistencyRequirement.MinimizeLatency, ct: CancellationToken.None);
+        var afterOptimized = cluster.MetricsSnapshot();
+        Assert.Equal(Membership.Member, optimized.Verdict);
+
+        // Second call: AtExactSnapshot pinned to the token the FIRST call itself just evaluated at. The
+        // decoded revision round-trips to the identical string, so this must hit the very same ROOT grain
+        // activation warmed a moment ago — served entirely from its memo (which, as
+        // Warm_activation_serves_the_second_identical_call establishes for this schema, answers without
+        // re-expanding the relation graph at all, so the "viewer" child grain is never touched again).
+        SetDispatchContext(50);
+        var exact = await checker.Check(
+            "document", "readme", "view", subject, caveatContext: null,
+            consistency: ConsistencyRequirement.AtExactSnapshot(new ZedToken(optimized.EvaluatedToken)),
+            ct: CancellationToken.None);
+        var afterExact = cluster.MetricsSnapshot();
+
+        Assert.Equal(Membership.Member, exact.Verdict);
+        Assert.Equal(optimized.EvaluatedRevision, exact.EvaluatedRevision);
+
+        // Shared activation memo: the second call adds a hit, not a miss.
+        Assert.Equal(afterOptimized.MemoHit + 1, afterExact.MemoHit);
+        Assert.Equal(afterOptimized.MemoMiss, afterExact.MemoMiss);
     }
 
     [Fact]

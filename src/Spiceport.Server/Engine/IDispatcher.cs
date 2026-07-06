@@ -43,17 +43,10 @@ public readonly record struct VisitKey(
 /// <param name="Revision">The pinned revision identity to evaluate against.</param>
 /// <param name="DepthRemaining">The remaining recursion depth budget (the sole termination guarantee).</param>
 /// <param name="Bloom">The bounded traversal-bloom loop hint over (resource, subject) pairs on this path.</param>
-/// <param name="Mode">
-/// Whether <paramref name="Revision"/> is the optimized (quantizable) bucket revision or an exact
-/// revision that must NEVER be folded into the optimized cache bucket. Defaults to
-/// <see cref="RevisionMode.Optimized"/> so existing callers (and the no-consistency default) are
-/// unchanged.
-/// </param>
 public sealed record ResolverMeta(
     IRevision Revision,
     int DepthRemaining,
-    TraversalBloom Bloom,
-    RevisionMode Mode = RevisionMode.Optimized);
+    TraversalBloom Bloom);
 
 /// <summary>
 /// A single sub-problem to evaluate: "is <paramref name="Subject"/> a member of
