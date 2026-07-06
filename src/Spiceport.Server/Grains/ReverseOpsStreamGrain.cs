@@ -144,11 +144,15 @@ public sealed class ReverseOpsStreamGrain(
             .PinReader(datastore, args.Consistency, cancellationToken)
             .ConfigureAwait(ReverseOpsSupport.ContinueOnCapturedContext);
 
-        var engine = new LookupResourcesEngine(Namespaces, Caveats);
+        // Read the snapshot once so the engine's namespaces/caveats and its pre-built reachability graph
+        // are guaranteed to come from the same schema, even if a concurrent Update() swaps schemaProvider.Current
+        // mid-call.
+        var snapshot = schemaProvider.Current;
+        var engine = new LookupResourcesEngine(snapshot.Namespaces, snapshot.Caveats, snapshot.ReachabilityFirst);
         // The Leopard accelerator (null unless enabled). The engine consults it only for a fresh, unpaged
         // enumeration of a covered shape and confirms every candidate with Check, so verdicts are unchanged.
         var index = await ReverseOpsSupport
-            .AcquireIndex(membershipIndex, Namespaces, Caveats, reader, revision, cancellationToken)
+            .AcquireIndex(membershipIndex, snapshot.Namespaces, snapshot.Caveats, reader, revision, cancellationToken)
             .ConfigureAwait(ReverseOpsSupport.ContinueOnCapturedContext);
         var startCursor = ReverseOpsCursorCodec.DecodeResources(args.Cursor);
 

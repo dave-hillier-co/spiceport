@@ -21,11 +21,29 @@ public sealed record SchemaSnapshot(
     string SourceText,
     long Version)
 {
+    // Built at most once per snapshot (Lazy, not eager): the first reader of ReachabilityFull/ReachabilityFirst
+    // triggers the build and every subsequent reader of THIS snapshot observes the same cached instance; a
+    // schema Update() constructs a brand-new SchemaSnapshot (and hence fresh Lazy<> cells), so the graph is
+    // dropped for GC when the snapshot is swapped rather than accumulating in a process-wide cache.
+    private readonly Lazy<ReachabilityGraph> _reachabilityFull =
+        new(() => ReachabilityGraph.Build(Schema.Namespaces.ToImmutableDictionary(ns => ns.Name), ReachabilityMode.Full),
+            LazyThreadSafetyMode.ExecutionAndPublication);
+
+    private readonly Lazy<ReachabilityGraph> _reachabilityFirst =
+        new(() => ReachabilityGraph.Build(Schema.Namespaces.ToImmutableDictionary(ns => ns.Name), ReachabilityMode.First),
+            LazyThreadSafetyMode.ExecutionAndPublication);
+
     /// <summary>The compiled namespace definitions.</summary>
     public ImmutableList<NamespaceDefinition> Namespaces => Schema.Namespaces;
 
     /// <summary>The compiled caveat definitions.</summary>
     public ImmutableList<CaveatDefinition> Caveats => Schema.Caveats;
+
+    /// <summary>The full-mode reachability graph for this snapshot's schema, built lazily on first use.</summary>
+    public ReachabilityGraph ReachabilityFull => _reachabilityFull.Value;
+
+    /// <summary>The first-mode reachability graph for this snapshot's schema, built lazily on first use.</summary>
+    public ReachabilityGraph ReachabilityFirst => _reachabilityFirst.Value;
 }
 
 /// <summary>

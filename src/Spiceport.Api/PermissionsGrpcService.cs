@@ -45,8 +45,8 @@ public sealed class PermissionsGrpcService(IPermissionChecker checker, IGrainFac
     // IAsyncEnumerable streaming pins the enumerator to one activation. These three RPCs stay unary: they
     // drain the stream up to the request limit and echo the last item's resume cursor, so the client cursor
     // contract is byte-identical while the internal per-page grain hop is deleted.
-    private IReverseOpsStreamGrain ReverseOpsStream => grains.GetGrain<IReverseOpsStreamGrain>(Guid.NewGuid());
-    private IRelationshipsStreamGrain RelationshipsStream => grains.GetGrain<IRelationshipsStreamGrain>(Guid.NewGuid());
+    private IReverseOpsStreamGrain NewReverseOpsStream() => grains.GetGrain<IReverseOpsStreamGrain>(Guid.NewGuid());
+    private IRelationshipsStreamGrain NewRelationshipsStream() => grains.GetGrain<IRelationshipsStreamGrain>(Guid.NewGuid());
 
     /// <summary>
     /// Drains a native grain stream up to <paramref name="limit"/> items. When a further item exists beyond
@@ -266,7 +266,7 @@ public sealed class PermissionsGrpcService(IPermissionChecker checker, IGrainFac
     {
         var limit = request.OptionalLimit == 0 ? (int?)null : (int)request.OptionalLimit;
         var (items, cursor) = await Drain(
-            RelationshipsStream.StreamReadRelationships(
+            NewRelationshipsStream().StreamReadRelationships(
                 new ReadRelationshipsArgs(
                     ToWire(request.Filter),
                     limit,
@@ -411,7 +411,7 @@ public sealed class PermissionsGrpcService(IPermissionChecker checker, IGrainFac
 
         var limit = request.OptionalLimit == 0 ? (int?)null : (int)request.OptionalLimit;
         var (items, cursor) = await Drain(
-            ReverseOpsStream.StreamLookupSubjects(
+            NewReverseOpsStream().StreamLookupSubjects(
                 new LookupSubjectsArgs(
                     request.Resource.ObjectType,
                     request.Resource.ObjectId,
@@ -443,7 +443,7 @@ public sealed class PermissionsGrpcService(IPermissionChecker checker, IGrainFac
 
         var limit = request.OptionalLimit == 0 ? (int?)null : (int)request.OptionalLimit;
         var (items, cursor) = await Drain(
-            ReverseOpsStream.StreamLookupResources(
+            NewReverseOpsStream().StreamLookupResources(
                 new LookupResourcesArgs(
                     request.ResourceObjectType,
                     request.Permission,

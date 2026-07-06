@@ -32,8 +32,8 @@ public sealed class AuthzedPermissionsV1Service(
     // IAsyncEnumerable streaming pins the enumerator to one activation, so StartEnumeration and every
     // MoveNext for a stream must target the same (brand-new, never-shared) key. Read ONCE per RPC into a
     // local; a second read is a different grain. Per-stream activations are reclaimed by idle collection.
-    private IReverseOpsStreamGrain ReverseOpsStream => grains.GetGrain<IReverseOpsStreamGrain>(Guid.NewGuid());
-    private IRelationshipsStreamGrain RelationshipsStream => grains.GetGrain<IRelationshipsStreamGrain>(Guid.NewGuid());
+    private IReverseOpsStreamGrain NewReverseOpsStream() => grains.GetGrain<IReverseOpsStreamGrain>(Guid.NewGuid());
+    private IRelationshipsStreamGrain NewRelationshipsStream() => grains.GetGrain<IRelationshipsStreamGrain>(Guid.NewGuid());
 
     /// <summary>
     /// Maps a caveat-evaluation failure onto a gRPC status: a context value that does not match a
@@ -198,7 +198,7 @@ public sealed class AuthzedPermissionsV1Service(
 
         // One native grain stream over one pinned snapshot (the internal page loop is gone). Each item
         // carries the per-message read-at token, exactly as every page-message did before.
-        var stream = RelationshipsStream;
+        var stream = NewRelationshipsStream();
         try
         {
             await foreach (var item in stream.StreamReadRelationships(
@@ -317,7 +317,7 @@ public sealed class AuthzedPermissionsV1Service(
         // terminates; the client resumes via the last item's cursor). An unlimited request drains the whole
         // reachable set. `limit` also drives the grain's engine path: a limited walk is cursor-bearing (so
         // every item has a resume cursor), an unlimited/cursorless walk may take the Leopard fast path.
-        var stream = ReverseOpsStream;
+        var stream = NewReverseOpsStream();
         var emitted = 0;
         try
         {
@@ -401,7 +401,7 @@ public sealed class AuthzedPermissionsV1Service(
             new SchemaValidation.TypeAndRelation(request.SubjectObjectType, subjectRelation, AllowEllipsis: true));
 
         // One native grain stream: count non-wildcard emissions and stop once the concrete limit is met.
-        var stream = ReverseOpsStream;
+        var stream = NewReverseOpsStream();
         var emitted = 0;
         try
         {
@@ -646,7 +646,7 @@ public sealed class AuthzedPermissionsV1Service(
         // per-page reply shape — carrying the last item's cursor as that batch's continuation cursor.
         var batchSize = limit > 0 ? limit : DefaultExportBatchSize;
         var batch = new List<RelationshipStreamItem>(Math.Min(batchSize, 1024));
-        var stream = RelationshipsStream;
+        var stream = NewRelationshipsStream();
         try
         {
             await foreach (var item in stream.StreamBulkExportRelationships(
