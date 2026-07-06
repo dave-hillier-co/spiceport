@@ -45,6 +45,12 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<ISchemaProvider>(provider);
         services.AddSingleton<ISchemaHashSource>(provider);
 
+        // Per-silo compile-and-cache of the schema NAMED by each dispatch (its hash), resolved from the
+        // schema bytes folded into the log on every silo. This is what lets a CheckGrain evaluate under the
+        // schema its key pins — a pure function of the pinned revision — instead of the silo-local Current,
+        // which only reflects a WriteSchema that landed on this silo.
+        services.AddSingleton<SchemaResolver>();
+
         // The silo-wide loop-bypass / activation-memo / dispatch counters.
         services.AddSingleton<IDispatchMetrics, DispatchMetrics>();
 
@@ -86,6 +92,7 @@ public static class ServiceCollectionExtensions
             sp.GetRequiredService<IDatastore>(),
             sp.GetRequiredService<IDispatcher>(),
             sp.GetRequiredService<ISchemaProvider>(),
+            sp.GetRequiredService<SchemaResolver>(),
             maxDepth,
             batchConcurrency));
 

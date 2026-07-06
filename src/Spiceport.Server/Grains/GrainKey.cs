@@ -29,8 +29,9 @@ internal static class GrainKey
     private const char Separator = '/';
 
     // schemaHash scopes the routing keyspace (a schema change yields a fresh set of grain identities for
-    // structurally-identical sub-problems) but is not read back by the grain: CheckGrain evaluates against
-    // the ambient current schema (ISchemaProvider.Current), not the hash captured in its own key.
+    // structurally-identical sub-problems) AND names the schema the grain must evaluate under: CheckGrain
+    // resolves the compiled schema for this hash at its pinned revision (see CheckGrain), so the schema is a
+    // pure function of the key's revision rather than the grain's local ISchemaProvider.Current.
     public static string Build(
         ObjectAndRelation resource,
         ObjectAndRelation subject,
@@ -53,12 +54,13 @@ internal static class GrainKey
         if (parts.Length != 8)
             throw new FormatException($"Malformed check-grain key (expected 8 segments): '{key}'.");
 
-        // parts[7] (schemaHash) is validated for shape only; it scopes the routing keyspace (see Build)
-        // but is not read back, so it is not unescaped/carried into GrainKeyParts.
+        // parts[7] (schemaHash) is carried back: the grain resolves the compiled schema for it at the
+        // pinned revision (see CheckGrain), so evaluation is a pure function of the key's revision.
         return new GrainKeyParts(
             new ObjectAndRelation(Unescape(parts[0]), Unescape(parts[1]), Unescape(parts[2])),
             new ObjectAndRelation(Unescape(parts[3]), Unescape(parts[4]), Unescape(parts[5])),
-            Unescape(parts[6]));
+            Unescape(parts[6]),
+            Unescape(parts[7]));
     }
 
     private static string Escape(string s) => Uri.EscapeDataString(s);
@@ -70,4 +72,5 @@ internal static class GrainKey
 internal sealed record GrainKeyParts(
     ObjectAndRelation Resource,
     ObjectAndRelation Subject,
-    string Revision);
+    string Revision,
+    string SchemaHash);

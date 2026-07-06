@@ -56,11 +56,16 @@ public sealed class OrleansDispatcher : IDispatcher
         ArgumentNullException.ThrowIfNull(request);
         ct.ThrowIfCancellationRequested();
 
+        // Key off the schema hash PINNED at the check root for this revision (carried in the request meta),
+        // not this silo's ambient current hash: the schema is a pure function of the pinned revision, so
+        // every silo derives the same key and evaluates the same schema. Fall back to the ambient hash only
+        // when the root pinned none (the seed-only window, before any WriteSchema persisted a schema), where
+        // the ambient hash is the identical embedded seed on every silo.
         var key = GrainKey.Build(
             request.Resource,
             request.Subject,
             request.Meta.Revision.ToString(),
-            _schemaHash.CurrentSchemaHash);
+            request.Meta.SchemaHash ?? _schemaHash.CurrentSchemaHash);
 
         // SINGLEFLIGHT-STYLE LOOP BYPASS (SpiceDB singleflight.go:69-81): if the traversal bloom already
         // contains this sub-problem's (resource, subject) key, this is a LIKELY loop back to a grain key

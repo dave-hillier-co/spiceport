@@ -61,6 +61,7 @@ namespace Spiceport.Grains;
 public sealed class CheckGrain(
     IDatastore datastore,
     ISchemaProvider schemaProvider,
+    SchemaResolver schemaResolver,
     IDispatcher onward,
     ActivationMemoOptions? memoOptions = null,
     IDispatchMetrics? metrics = null) : Grain, ICheckGrain
@@ -103,9 +104,22 @@ public sealed class CheckGrain(
         // same staleness the branch cache's revision quantization window already accepts.
         var now = DateTimeOffset.UtcNow;
 
+        // Resolve the schema this sub-problem must evaluate under: exactly the one named by the key's
+        // schemaHash at the key's revision (see GrainKey / DispatchContext). This makes evaluation a pure
+        // function of the pinned revision — the schema bytes are folded into the log on EVERY silo, so a
+        // grain activated on a silo that never handled the WriteSchema still evaluates the right schema,
+        // rather than trusting a possibly-stale local ISchemaProvider.Current. Only when the key names no
+        // schema (the seed-only window, before any WriteSchema persisted one) do we fall back to Current,
+        // which is the identical embedded seed on every silo.
+        var schema = await schemaResolver.ResolveAsync(
+            parts.SchemaHash,
+            datastore.SnapshotReader(revision),
+            schemaProvider.Current,
+            cancellationToken.CancellationToken);
+
         // A LocalDispatcher does ONE expansion step; its onward Dispatcher (the silo-wide
         // Caching-over-Orleans dispatcher) turns each child sub-problem into a further grain call.
-        var namespaces = schemaProvider.Current.Namespaces.ToImmutableDictionary(ns => ns.Name);
+        var namespaces = schema.Namespaces.ToImmutableDictionary(ns => ns.Name);
         var local = new LocalDispatcher(
             namespaces,
             datastore.SnapshotReader,

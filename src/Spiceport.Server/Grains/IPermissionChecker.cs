@@ -123,6 +123,7 @@ public sealed class PermissionChecker(
     IDatastore datastore,
     IDispatcher root,
     ISchemaProvider schemaProvider,
+    SchemaResolver schemaResolver,
     int maxDepth = CheckEngine.DefaultMaxDepth,
     int maxConcurrency = PermissionChecker.DefaultBatchConcurrency) : IPermissionChecker
 {
@@ -131,6 +132,16 @@ public sealed class PermissionChecker(
     /// <c>maxConcurrency</c> (see <c>internal/services/v1/bulkcheck.go</c>).
     /// </summary>
     public const int DefaultBatchConcurrency = 50;
+
+    /// <summary>
+    /// Resolves the compiled schema effective at the resolved revision, matching what every CheckGrain in
+    /// the dispatched tree evaluates under (so the collapse uses the same caveats the dispatch ran under),
+    /// rather than the possibly-stale ambient current schema on a non-writer silo.
+    /// </summary>
+    private Task<SchemaSnapshot> ResolveSchema(ResolvedRevision resolved, CancellationToken ct) =>
+        schemaResolver.ResolveAsync(
+            resolved.SchemaHash, datastore.SnapshotReader(resolved.Revision), schemaProvider.Current, ct);
+
     /// <inheritdoc />
     public async Task<PermissionCheckResult> Check(
         string resourceType,
@@ -150,15 +161,16 @@ public sealed class PermissionChecker(
             .Resolve(datastore, consistency ?? ConsistencyRequirement.MinimizeLatency, cancellationToken: ct)
             .ConfigureAwait(false);
 
-        // Capture a single consistent schema snapshot for this check, so the collapse uses the same
-        // caveats the dispatch ran under. Collapse is cheap and stateless, so building a per-call
-        // engine over the live schema is sufficient (rebuild-on-version-change is a perf follow-up).
-        var schema = schemaProvider.Current;
+        // Capture the schema effective at the RESOLVED revision (not the ambient current), so the dispatch
+        // and the collapse both run under the schema that revision pins — the same one every CheckGrain in
+        // the tree resolves from its key. On a non-writer silo the ambient current can lag; the resolved
+        // schema does not.
+        var schema = await ResolveSchema(resolved, ct).ConfigureAwait(false);
         var engine = new CheckEngine(schema.Namespaces, schema.Caveats, maxDepth);
 
         var resource = new ObjectAndRelation(resourceType, resourceId, permission);
         var meta = new ResolverMeta(
-            resolved.Revision, maxDepth, TraversalBloom.ForDepth(maxDepth));
+            resolved.Revision, maxDepth, TraversalBloom.ForDepth(maxDepth), resolved.SchemaHash);
         var request = new DispatchCheckRequest(resource, subject, meta);
 
         var branch = await root.DispatchCheck(request, ct).ConfigureAwait(false);
@@ -185,13 +197,14 @@ public sealed class PermissionChecker(
             .Resolve(datastore, consistency ?? ConsistencyRequirement.MinimizeLatency, cancellationToken: ct)
             .ConfigureAwait(false);
 
-        // ONE schema snapshot and ONE collapse engine for the whole batch, so every item collapses
-        // against the same caveats the dispatch ran under.
-        var schema = schemaProvider.Current;
+        // ONE schema snapshot and ONE collapse engine for the whole batch, resolved at the batch's single
+        // pinned revision (not the ambient current), so every item collapses under the schema that revision
+        // pins — the same one every CheckGrain in the mesh resolves from its key.
+        var schema = await ResolveSchema(resolved, ct).ConfigureAwait(false);
         var engine = new CheckEngine(schema.Namespaces, schema.Caveats, maxDepth);
 
         var meta = new ResolverMeta(
-            resolved.Revision, maxDepth, TraversalBloom.ForDepth(maxDepth));
+            resolved.Revision, maxDepth, TraversalBloom.ForDepth(maxDepth), resolved.SchemaHash);
 
         // Dedup distinct sub-problems by their dispatch key (resource + subject; caveat context is
         // excluded from the dispatch key and applied per-item at collapse). Each distinct sub-problem is
