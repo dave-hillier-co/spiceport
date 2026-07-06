@@ -43,10 +43,21 @@ public readonly record struct VisitKey(
 /// <param name="Revision">The pinned revision identity to evaluate against.</param>
 /// <param name="DepthRemaining">The remaining recursion depth budget (the sole termination guarantee).</param>
 /// <param name="Bloom">The bounded traversal-bloom loop hint over (resource, subject) pairs on this path.</param>
+/// <param name="SchemaHash">
+/// The schema hash effective at <paramref name="Revision"/>, pinned ONCE at the check root (from the
+/// resolved revision's authoritative <c>SchemaHashAt</c>) and carried unchanged to every child — schema
+/// is a pure function of the pinned revision, exactly like the tuples read at it, so it must not drift
+/// mid-tree. Null means no schema is persisted at the revision (the seed-only window): the dispatcher
+/// and grain then fall back to the ambient current schema, which is the identical embedded seed on every
+/// silo. When non-null it is authoritative and cluster-consistent (every silo folds the same log), so the
+/// grain evaluates under exactly this schema rather than whatever its local <c>ISchemaProvider.Current</c>
+/// happens to hold.
+/// </param>
 public sealed record ResolverMeta(
     IRevision Revision,
     int DepthRemaining,
-    TraversalBloom Bloom);
+    TraversalBloom Bloom,
+    string? SchemaHash = null);
 
 /// <summary>
 /// A single sub-problem to evaluate: "is <paramref name="Subject"/> a member of

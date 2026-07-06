@@ -30,20 +30,27 @@ namespace Spiceport.Grains;
 public sealed class ReverseOpsStreamGrain(
     IDatastore datastore,
     ISchemaProvider schemaProvider,
+    SchemaResolver schemaResolver,
     MembershipIndexCache membershipIndex) : Grain, IReverseOpsStreamGrain
 {
-    private ImmutableList<NamespaceDefinition> Namespaces => schemaProvider.Current.Namespaces;
-    private ImmutableList<CaveatDefinition> Caveats => schemaProvider.Current.Caveats;
+    /// <summary>
+    /// Resolves the compiled schema effective at the pinned revision (the same schema the confirming Check
+    /// mesh evaluates under), rather than the possibly-stale ambient current schema on a non-writer silo.
+    /// </summary>
+    private Task<SchemaSnapshot> ResolveSchema(string? schemaHash, IDatastoreReader reader, CancellationToken ct) =>
+        schemaResolver.ResolveAsync(schemaHash, reader, schemaProvider.Current, ct);
 
     /// <inheritdoc />
     public async Task<ExpandTreeReply> ExpandPermissionTree(ExpandTreeArgs args)
     {
         ArgumentNullException.ThrowIfNull(args);
-        var (reader, now, token, _) = await ReverseOpsSupport
+        var (reader, now, token, _, schemaHash) = await ReverseOpsSupport
             .PinReader(datastore, args.Consistency, CancellationToken.None)
             .ConfigureAwait(ReverseOpsSupport.ContinueOnCapturedContext);
 
-        var engine = new ExpandEngine(Namespaces);
+        var schema = await ResolveSchema(schemaHash, reader, CancellationToken.None)
+            .ConfigureAwait(ReverseOpsSupport.ContinueOnCapturedContext);
+        var engine = new ExpandEngine(schema.Namespaces);
         var mode = args.Mode == ExpandModeWire.Recursive ? ExpandMode.Recursive : ExpandMode.Shallow;
         var resource = new ObjectAndRelation(args.ResourceType, args.ResourceId, args.Permission);
 
@@ -53,7 +60,7 @@ public sealed class ReverseOpsStreamGrain(
 
         // Expand carries verbatim caveat expressions; with no request context we collapse each against
         // an empty context so caveated nodes/subjects surface their missing parameter names.
-        var evaluator = new CaveatEvaluator(Caveats);
+        var evaluator = new CaveatEvaluator(schema.Caveats);
         return new ExpandTreeReply(ToWire(tree, evaluator), token);
     }
 
@@ -103,12 +110,14 @@ public sealed class ReverseOpsStreamGrain(
     {
         ArgumentNullException.ThrowIfNull(args);
         cancellationToken.ThrowIfCancellationRequested();
-        var (reader, now, token, _) = await ReverseOpsSupport
+        var (reader, now, token, _, schemaHash) = await ReverseOpsSupport
             .PinReader(datastore, args.Consistency, cancellationToken)
             .ConfigureAwait(ReverseOpsSupport.ContinueOnCapturedContext);
 
-        var engine = new LookupSubjectsEngine(Namespaces);
-        var evaluator = new CaveatEvaluator(Caveats);
+        var schema = await ResolveSchema(schemaHash, reader, cancellationToken)
+            .ConfigureAwait(ReverseOpsSupport.ContinueOnCapturedContext);
+        var engine = new LookupSubjectsEngine(schema.Namespaces);
+        var evaluator = new CaveatEvaluator(schema.Caveats);
         var resource = new ObjectAndRelation(args.ResourceType, args.ResourceId, args.Permission);
         var after = ReverseOpsCursorCodec.DecodeSubjectId(args.Cursor);
 
@@ -140,14 +149,17 @@ public sealed class ReverseOpsStreamGrain(
     {
         ArgumentNullException.ThrowIfNull(args);
         cancellationToken.ThrowIfCancellationRequested();
-        var (reader, now, token, revision) = await ReverseOpsSupport
+        var (reader, now, token, revision, schemaHash) = await ReverseOpsSupport
             .PinReader(datastore, args.Consistency, cancellationToken)
             .ConfigureAwait(ReverseOpsSupport.ContinueOnCapturedContext);
 
-        // Read the snapshot once so the engine's namespaces/caveats and its pre-built reachability graph
-        // are guaranteed to come from the same schema, even if a concurrent Update() swaps schemaProvider.Current
-        // mid-call.
-        var snapshot = schemaProvider.Current;
+        // Resolve the schema effective at the pinned revision (the same schema the confirming Check mesh
+        // evaluates under), so the candidate superset and the verdicts that confirm it are schema-consistent
+        // and cluster-consistent — never the possibly-stale ambient current schema on a non-writer silo. The
+        // snapshot is captured once so the engine's namespaces/caveats and its pre-built reachability graph
+        // all come from the same schema, even if a concurrent write swaps the ambient current mid-call.
+        var snapshot = await ResolveSchema(schemaHash, reader, cancellationToken)
+            .ConfigureAwait(ReverseOpsSupport.ContinueOnCapturedContext);
         var engine = new LookupResourcesEngine(snapshot.Namespaces, snapshot.Caveats, snapshot.ReachabilityFirst);
         // The Leopard accelerator (null unless enabled). The engine consults it only for a fresh, unpaged
         // enumeration of a covered shape and confirms every candidate with Check, so verdicts are unchanged.
