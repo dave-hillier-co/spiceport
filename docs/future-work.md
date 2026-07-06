@@ -192,9 +192,17 @@ no cross-shard ordering problem, because there are no cross-shard edges. Virtual
 Google's design cannot: cold tenants deactivate to zero cost; hot tenants get their own
 serialization point. The single-writer ceiling becomes per-tenant — effectively gone.
 
-**Cost.** "Tenant" enters every grain key, every projection, and the API surface — an
-architectural fork that deserves its own design document before any code. Highest leverage on
-this list: it changes what the system *is* (single-tenant engine → multi-tenant platform).
+**Discounted (maintainer decision).** The load-bearing cost is not the grain — Orleans makes the
+per-tenant `DatastoreGrain` key nearly free — but that "tenant" has no home in the
+`authzed.api.v1` wire protocol, which carries no tenant field. This project supports *only* that
+protocol (the same constraint that keeps the surface `zed`-compatible), so a tenant could enter
+only out-of-band (a metadata header threaded through every RPC), turning tenant isolation into a
+security boundary — a permanent tax on every future change — to buy write scaling this project
+does not need. Multi-customer deployments are already served the Zanzibar-native way: model a
+`tenant` object in the schema and hang everything off it, on the one existing graph, with no code.
+So per-tenant sharding is discounted, not scheduled. Were it ever revisited, the first artifact is
+a threat-model of the isolation guarantees, not a grain-key change (the grain-key change is the
+easy thing that makes the hard thing look done).
 
 ### 2.2 Incrementally-materialized reachability: O(1) checks
 
@@ -268,6 +276,14 @@ Recorded so they are not relitigated by accident:
 - **Per-object state grains.** Ruled out in `architecture-analysis.md` §3.1: too large/cold to
   activate economically; zookie point-in-time reads are incompatible with "the grain's latest
   value".
+- **Built-in multi-tenancy / per-tenant log sharding.** Discounted (see 2.1). The
+  `authzed.api.v1` surface has no tenant field and this project supports only that protocol, so a
+  tenant could enter only out-of-band and isolation would become a permanent security boundary —
+  for write scaling the project does not need. Multi-customer deployments are served the
+  Zanzibar-native way: a `tenant` object modeled in the schema, on the one graph.
+- **Any feature requiring a wire-protocol extension.** `authzed.api.v1` compatibility is a hard
+  boundary, not just a default. A direction that cannot be expressed within the existing surface
+  (or purely server-side beneath it) is out of scope by construction.
 - **Removing or weakening zookies.** They remain a first-class compatibility and consistency
   contract. Any future read-your-writes default is additive and applies only when the caller does
   not supply one.
