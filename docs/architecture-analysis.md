@@ -123,59 +123,92 @@ hops to another silo — the seam is the only thing that decides. The grain is s
 implementation behind that seam, and **its identity is the sub-problem**: the domain concept
 that has identity, is cacheable, and is the unit of distribution.
 
-The seam composes two implementations:
+Two pieces sit on the seam, and they are *not* peers in a chain:
 
-- `LocalDispatcher` — runs exactly one expansion step, then calls *back through the seam* for
-  each child sub-problem.
-- `OrleansDispatcher` + `CheckGrain` — the grain key *is* the canonical sub-problem
-  (`resourceType, resourceId, relation, subject, quantizedRevision, schemaHash`, escaped and joined).
-  A sub-problem becomes a grain call by resolving the grain for that key; the grain's own onward
-  dispatch goes *back through the seam*, so recursion crosses grain boundaries. The traversal
-  state that is *not* part of the identity (`depthRemaining`, the traversal bloom) rides ambient
-  in the Orleans `RequestContext` via `DispatchContext`, so a remote grain continues the same
-  cycle guard. `CheckGrain` activation state memoizes the pre-context `Branch` (membership + caveat
-  *expression*), never the collapsed verdict — caveat context is applied per-request at the
-  caller. Cycle-cut results are served but not retained.
+- `OrleansDispatcher` turns **every** sub-problem into a grain call. The grain key *is* the
+  canonical sub-problem (`resourceType, resourceId, relation, subject, quantizedRevision,
+  schemaHash`, escaped and joined). It resolves the `CheckGrain` for that key and invokes it; the
+  Orleans **grain directory** finds or creates the single activation, so identical concurrent
+  sub-problems coalesce there. There is no in-process shortcut for "locally owned" work and
+  therefore no hand-rolled ownership computation — placement is the directory's job, and the
+  consistent-hash ring the port once carried has been deleted.
+- `LocalDispatcher` is the **one expansion step run *inside* a `CheckGrain`**. It walks the
+  permission's set-operations for exactly one level, then calls *back through the seam* — i.e.
+  through `OrleansDispatcher` again — for each child sub-problem. So recursion crosses a grain
+  boundary at every level and the mesh is real.
+
+**The activation is the cache.** `CheckGrain` activation state memoizes the pre-context `Branch`
+(membership + caveat *expression*), never the collapsed verdict — caveat context is applied
+per-request at the caller. The grain key already carries the quantized revision and schema hash,
+so the keyspace rotates on its own each quantization window; the activation's idle-collection age
+*is* the eviction policy. This is the Zanzibar paper's *delegate-side* cache expressed by the
+runtime: the grain that owns a sub-problem is the server that caches it, and single-activation is
+the lock table that dedupes concurrent misses. Cycle-cut results are served but not retained.
+There is no separate caller-side cache layer.
+
+The traversal state that is *not* part of the identity — `depthRemaining` and the traversal
+bloom — rides ambient in the Orleans `RequestContext` (via `DispatchContext`), so a remote grain
+continues the same cycle guard while the wire contract carries nothing but the key and the
+cancellation token. Cross-cutting concerns are **grain call filters**, not hand-threaded
+plumbing: an outgoing filter maps cross-silo dispatch exceptions into the dispatch-error taxonomy
+(transient → `Unavailable`, cancellation → `Cancelled`, domain exceptions pass through), and an
+incoming filter enforces the depth ceiling at the grain boundary and counts hops.
 
 The grain identity being the sub-problem is verified by an Orleans `TestCluster` running the
 conformance corpus (set-ops, arrow, wildcard, nested-group, recursive, caveats) **through the
-grain mesh**, with results identical to the in-process engine.
+grain mesh**, with results identical to the in-process engine over the same datastore.
 
-**Cycle/termination control:**
+**Cycle / termination control.** The traversal bloom (`TraversalBloom`, ≤1KB as SpiceDB: 1024
+bits / 10 hashes by default, FNV-1a with Kirsch–Mitzenmacher double hashing, process-stable) is a
+bounded loop hint, *not* on the correctness path. Termination rests solely on `depthRemaining`: a
+genuine cycle consumes depth until `MaxDepthExceededException` (gRPC `FailedPrecondition`),
+exactly as SpiceDB does. A bloom hit at a grain boundary forces the normal (reentrant) grain call
+with the returned result tagged `CycleCut` at the caller, so the memo never stores a
+path-dependent branch; a false positive can only force a correct recompute, never change a
+verdict.
 
-- **Traversal bloom** — a bounded loop hint that crosses grain boundaries as a bounded bloom filter
-  (`TraversalBloom`, ≤1KB, as SpiceDB) rather than an exact set: 1024 bits / 10 hashes by default,
-  FNV-1a with Kirsch–Mitzenmacher double hashing (process-stable). It is NOT on the correctness path:
-  termination rests solely on `depthRemaining`, and a genuine cycle consumes depth until
-  `MaxDepthExceededException` (gRPC `FailedPrecondition`), exactly as SpiceDB does. The bloom's only
-  job is cycle detection — a hit at the grain boundary forces the normal (reentrant) grain call with
-  the result tagged `CycleCut` at the caller, avoiding re-entry into a same-key grain during the same
-  traversal. A false positive can only force a correct local step, never change a verdict.
-
-**Remaining tuning (not correctness):**
-- **Revision quantization** — every write mints a fresh revision, so an un-quantized grain key
-  never hits. A quantizer snaps the revision to a coarse bucket so concurrent requests share
-  activation state; the bucket boundary is the cache-staleness knob.
+**Revision quantization (tuning, not correctness).** Every write mints a fresh revision, so an
+un-quantized grain key would never be reused. A quantizer snaps an *optimized* (minimize-latency)
+revision to a coarse bucket so concurrent requests share one activation and its memo; an exact
+revision is pinned as-is. Consistency does not depend on the key carrying a mode tag: a read is a
+pure function of the pinned revision *value*, so two sub-problems with the same revision string
+compute the identical answer and share the activation exactly. Whether a revision was chosen as
+optimized or exact is decided once, at resolution time (§3.5's closed-timestamp gate makes an
+exact or fresh read block until its revision is visible); nothing downstream of the key needs to
+know.
 
 ### 3.4 Other components, by actor role
 
-- **Schema** → `SchemaManagerGrain`, ideally **grain-per-schema-revision** (immutable). Holds
+- **Schema** → a per-silo `ISchemaProvider` (a DI singleton holding an immutable, versioned
+  `SchemaSnapshot` that is swapped atomically on a schema write), not a grain. It holds the
   compiled `NamespaceDefinition`s + the precomputed **reachability graph** (used to prune
-  `LookupResources`). Cheap to cache everywhere because it is small and versioned.
-- **Streaming queries** (`LookupResources`/`LookupSubjects`/`Expand`) → grain methods
-  returning **`IAsyncEnumerable<T>`**, with the opaque cursor carried in the item stream
-  (matches SpiceDB's cursored LR3). Orleans Streams are *not* needed for the request path.
-  `LookupResources` prunes with the reachability graph and can be further accelerated by a
-  log-derived membership index (the Leopard projection — see §3.5).
+  `LookupResources`). It is small and versioned, so its hash scopes the dispatch keyspace: a
+  schema change yields a fresh hash and therefore a fresh keyspace, and stale activations age out.
+- **Streaming queries** (`LookupResources` / `LookupSubjects`) → **native `IAsyncEnumerable`
+  grain methods** with runtime backpressure, the opaque resume cursor carried on each item so a
+  client-facing limited stream still resumes byte-for-byte (matching SpiceDB's cursored LR3).
+  Because a live enumerator pins to one activation — which a stateless worker cannot guarantee —
+  these run on dedicated **guid-keyed stream grains** under default placement: a fresh Guid per
+  stream gives each enumeration its own private activation, reclaimed by idle collection. `Expand`
+  returns a whole tree (no cursor) and stays a unary call on the same grain family. Orleans
+  Streams are *not* needed for the request path. `LookupResources` prunes with the reachability
+  graph and is further accelerated by a log-derived membership index (the Leopard projection — §3.5).
 - **Watch / changefeed** → a consumer of the datastore's own event log (§3.5): a per-silo
-  notifier tails the log feed and fans out `RevisionChange`s to subscribers, rather than a
-  separate replication tap.
-- **Fan-out concurrency** → `Task.WhenAll` over sub-problem grain calls, bounded by a
-  semaphore that mirrors SpiceDB's `ConcurrencyLimits`. Orleans turn-based single-threading is
-  fine here because dispatch grains are stateless workers and scale out.
+  notifier registers a grain observer on the datastore grain and fans out `RevisionChange`s to
+  subscribers, rather than a separate replication tap.
+- **Per-silo components** (the read projection and the Watch notifier) → owned by an Orleans
+  **`GrainService`**, which is silo-lifecycle-managed: it bootstraps the projection *before* the
+  silo accepts traffic (so the first request never pays the bootstrap) and tears the Watch
+  observer down cleanly on shutdown. Their identity lives in a plain DI singleton so the per-Check
+  read path reaches them in-process, with no grain hop.
+- **Fan-out concurrency** → `Task.WhenAll` over sub-problem grain calls, bounded by a semaphore
+  mirroring SpiceDB's `ConcurrencyLimits`. Orleans turn-based execution is not a bottleneck: each
+  distinct sub-problem is its own grain, so a fan-out spreads across activations (and silos), and
+  `CheckGrain` is `[Reentrant]` so a same-key re-entry on a genuine cycle is accepted rather than
+  blocked.
 - **Cycle/depth control** → termination rests on `depthRemaining` (a genuine cycle errors at the
-  depth limit), with the bloom carried in `RequestContext` only as a singleflight-style loop-bypass hint,
-  exactly as SpiceDB does. No actor state required.
+  depth limit), with the bloom carried in `RequestContext` only as a loop-bypass hint, exactly as
+  SpiceDB does. No actor state required.
 
 ### 3.5 Storage as an event-sourced grain (the log is the storage/compute seam)
 
@@ -209,9 +242,10 @@ schema of its own:
   revision folded). A read pinned at revision `rev` blocks until `watermark ≥ rev` (catch-up-on-demand
   over the log) before serving. Because the log is a single total order, once the watermark reaches
   `rev` every commit `≤ rev` is present — read-your-writes / no new enemy — and `rev ≤ head`
-  guarantees the wait terminates. This sits *below* the reader seam, so the caching dispatcher's
-  quantization and exact-keying are unchanged and an exact-keyed entry is never derived from stale
-  state.
+  guarantees the wait terminates. This gate sits *below* the reader seam and combines with the
+  pinned-revision grain key (§3.3): a sub-problem is identified and served at exactly its pinned
+  revision, so an exact or fresh read blocks until that revision is visible and the activation memo
+  keyed to it is never derived from a stale prefix.
 
 - **Single-writer ceiling is intentional.** All writes serialize through the one ordered log (the
   global-order point). The design scales *reads* (per-silo projections) and cheapens *writes*
@@ -304,22 +338,24 @@ Schema DSL compiler + reachability graph; in-memory MVCC datastore; the `Check` 
 by the YAML conformance corpus. Exit: all non-caveat, non-reverse Check tests green.
 
 **Phase 2 — Introduce Orleans.**
-Wrap dispatch as stateless-worker/cache grains (granularity A vs B per §3.3). Replace direct
-recursion with grain-to-grain dispatch. Add the dispatch cache as activation state. Exit:
-corpus still green, now running on a multi-silo cluster; cache-hit metrics visible.
+Make every sub-problem a `CheckGrain` call behind the dispatcher seam, replacing direct
+recursion with grain-to-grain dispatch, and let the grain directory own placement. Move the
+dispatch cache into activation state. Exit: corpus still green, now running on a multi-silo
+cluster; hop and memo metrics visible.
 
 **Phase 3 — Reverse & expand.**
 `Expand`, `LookupResources`, `LookupSubjects` as `IAsyncEnumerable` grains with cursors, using
 the reachability graph to prune. Exit: reverse-index corpus files green.
 
 **Phase 4 — ABAC & freshness.**
-Caveats (CEL decision per §4), expiration, Watch/changefeed via Orleans Streams, BatchCheck.
-Exit: `caveat*` and `relexpiration*` corpus files green.
+Caveats (CEL decision per §4), expiration, Watch/changefeed via a per-silo grain-observer
+notifier over the datastore log, BatchCheck. Exit: `caveat*` and `relexpiration*` corpus files
+green.
 
 **Phase 5 — Storage & scale.**
 Durable persistence for the event-sourced datastore grain via the AdoNet (Postgres)
-grain-storage provider — no application SQL; consistency/perf benchmarks; tune placement
-(A→B) and concurrency limits. Exit: durable-storage tests + load test.
+grain-storage provider — no application SQL; consistency/perf benchmarks; tune the placement
+policy and concurrency limits. Exit: durable-storage tests + load test.
 
 ---
 
