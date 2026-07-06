@@ -128,13 +128,15 @@ public sealed class AuthzedSchemaV1Service(IGrainFactory grains, ISchemaProvider
     public override Task<V1::ComputablePermissionsResponse> ComputablePermissions(
         V1::ComputablePermissionsRequest request, ServerCallContext context)
     {
-        var namespaces = schema.Current.Namespaces.ToImmutableDictionary(n => n.Name);
+        var snapshot = schema.Current;
+        var namespaces = snapshot.Namespaces.ToImmutableDictionary(n => n.Name);
 
         IReadOnlyList<RelationReference> reachable;
         try
         {
             reachable = SchemaIntrospection.ComputablePermissions(
                 namespaces,
+                snapshot.ReachabilityFull,
                 request.DefinitionName,
                 request.RelationName,
                 string.IsNullOrEmpty(request.OptionalDefinitionNameFilter) ? null : request.OptionalDefinitionNameFilter);

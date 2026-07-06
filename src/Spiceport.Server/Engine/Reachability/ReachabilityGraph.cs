@@ -1,4 +1,3 @@
-using System.Collections.Concurrent;
 using System.Collections.Immutable;
 using Spiceport.Core;
 
@@ -25,8 +24,9 @@ public enum ReachabilityMode
 /// Port of SpiceDB's <c>pkg/schema/reachabilitygraphbuilder.go</c> + <c>reachabilitygraph.go</c>.
 /// Unlike SpiceDB (which builds per-target graphs lazily) this is built eagerly and immutably once
 /// per compiled schema, because our schemas are small and finite. It is a pure function of the
-/// namespace definitions (no datastore, no revision), so instances are memoized process-wide keyed by
-/// <see cref="SchemaHash"/>.
+/// namespace definitions (no datastore, no revision); callers build it once per schema snapshot (see
+/// <see cref="Spiceport.Grains.SchemaSnapshot"/>) and reuse the instance for the snapshot's lifetime
+/// rather than caching it themselves.
 /// <para>
 /// For each <c>(namespace, relation)</c> the graph holds two indices over the entrypoints that reach
 /// that relation: one keyed by subject <em>type</em> (for wildcard / public links) and one keyed by
@@ -36,8 +36,6 @@ public enum ReachabilityMode
 /// </remarks>
 public sealed class ReachabilityGraph
 {
-    private static readonly ConcurrentDictionary<string, ReachabilityGraph> Cache = new();
-
     private readonly ImmutableDictionary<string, NamespaceDefinition> _namespaces;
     private readonly ReachabilityMode _mode;
 
@@ -53,8 +51,9 @@ public sealed class ReachabilityGraph
     }
 
     /// <summary>
-    /// Returns the reachability graph for the given schema, building it once and reusing it for any
-    /// schema with the same <see cref="SchemaHash"/> and <paramref name="mode"/>.
+    /// Builds a fresh reachability graph for the given schema. Callers should build this at most once
+    /// per compiled schema (typically once per <see cref="Spiceport.Grains.SchemaSnapshot"/>) and reuse
+    /// the returned instance, rather than rebuilding it per request.
     /// </summary>
     /// <param name="namespaces">The compiled namespace definitions.</param>
     /// <param name="mode">
@@ -63,13 +62,12 @@ public sealed class ReachabilityGraph
     /// rest being validated by Check), matching SpiceDB's optimized <c>FirstEntrypointsForSubjectToResource</c>
     /// that LookupResources uses.
     /// </param>
-    public static ReachabilityGraph ForSchema(
+    public static ReachabilityGraph Build(
         ImmutableDictionary<string, NamespaceDefinition> namespaces,
         ReachabilityMode mode = ReachabilityMode.Full)
     {
         ArgumentNullException.ThrowIfNull(namespaces);
-        var key = $"{(int)mode}:{SchemaHash.Compute(namespaces)}";
-        return Cache.GetOrAdd(key, _ => new ReachabilityGraph(namespaces, mode));
+        return new ReachabilityGraph(namespaces, mode);
     }
 
     /// <summary>

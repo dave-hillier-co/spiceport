@@ -29,7 +29,7 @@ public sealed class BulkGrpcService(IGrainFactory grains)
 
     // A fresh Guid per export RPC so the native IAsyncEnumerable stream stays pinned to one activation
     // (see IRelationshipsStreamGrain). Read ONCE per RPC into a local.
-    private IRelationshipsStreamGrain RelationshipsStream => grains.GetGrain<IRelationshipsStreamGrain>(Guid.NewGuid());
+    private IRelationshipsStreamGrain NewRelationshipsStream() => grains.GetGrain<IRelationshipsStreamGrain>(Guid.NewGuid());
 
     public override async Task<ImportBulkRelationshipsResponse> ImportBulkRelationships(
         IAsyncStreamReader<ImportBulkRelationshipsRequest> requestStream,
@@ -80,7 +80,7 @@ public sealed class BulkGrpcService(IGrainFactory grains)
         // item's cursor as that batch's continuation cursor.
         var batchSize = limit > 0 ? limit : DefaultExportBatchSize;
         var batch = new List<RelationshipStreamItem>(Math.Min(batchSize, 1024));
-        var stream = RelationshipsStream;
+        var stream = NewRelationshipsStream();
         try
         {
             await foreach (var item in stream.StreamBulkExportRelationships(

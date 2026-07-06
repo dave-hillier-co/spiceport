@@ -20,6 +20,7 @@ public static class SchemaIntrospection
     /// as a subject. Port of <c>ComputablePermissions</c> / <c>RelationsEncounteredForSubject</c>.
     /// </summary>
     /// <param name="namespaces">The compiled namespaces, keyed by name.</param>
+    /// <param name="reachability">The pre-built (Full-mode) reachability graph for this schema.</param>
     /// <param name="definitionName">The starting definition.</param>
     /// <param name="relationName">The starting relation (empty defaults to the ellipsis subject).</param>
     /// <param name="optionalDefinitionNameFilter">Optional prefix filter on result definition names.</param>
@@ -29,11 +30,13 @@ public static class SchemaIntrospection
     /// </exception>
     public static IReadOnlyList<RelationReference> ComputablePermissions(
         ImmutableDictionary<string, NamespaceDefinition> namespaces,
+        ReachabilityGraph reachability,
         string definitionName,
         string relationName,
         string? optionalDefinitionNameFilter = null)
     {
         ArgumentNullException.ThrowIfNull(namespaces);
+        ArgumentNullException.ThrowIfNull(reachability);
 
         if (!namespaces.TryGetValue(definitionName, out var def))
             throw new SchemaIntrospectionException(
@@ -46,7 +49,7 @@ public static class SchemaIntrospection
                 SchemaIntrospectionErrorKind.RelationNotFound,
                 $"relation/permission `{relation}` not found under definition `{definitionName}`");
 
-        var graph = ReachabilityGraph.ForSchema(namespaces);
+        var graph = reachability;
         var input = new RelationReference(definitionName, relation);
 
         var results = new HashSet<RelationReference>();

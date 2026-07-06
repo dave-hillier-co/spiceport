@@ -7,8 +7,8 @@ namespace Spiceport.Engine;
 
 /// <summary>
 /// Computes a stable hash of a compiled schema model (namespaces + caveats), used as part of the
-/// caching dispatcher's key (so a schema change invalidates cached branches) and as the key for the
-/// process-wide <see cref="Reachability.ReachabilityGraph"/> cache.
+/// caching dispatcher's key (so a schema change invalidates cached branches) and as part of the
+/// per-request grain routing key (see <see cref="Spiceport.Grains.GrainKey"/>).
 /// </summary>
 /// <remarks>
 /// The hash is a SHA-256 over an explicit, faithful structural rendering of the namespace and caveat

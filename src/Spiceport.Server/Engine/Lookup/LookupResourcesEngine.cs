@@ -33,7 +33,13 @@ public sealed class LookupResourcesEngine
     private readonly CaveatEvaluator _caveats;
     private readonly int _maxDepth;
 
-    /// <summary>Creates a lookup-resources engine over the given schema definitions.</summary>
+    /// <summary>
+    /// Creates a lookup-resources engine over the given schema definitions, building its own reachability
+    /// graph. Convenience constructor for test ergonomics (a single construction per test is fine); the
+    /// production caller (<see cref="Spiceport.Grains.ReverseOpsStreamGrain"/>) uses the constructor that
+    /// takes a pre-built <see cref="ReachabilityGraph"/> so the graph is built once per schema snapshot,
+    /// not once per request.
+    /// </summary>
     /// <param name="namespaces">The compiled namespace definitions that make up the schema.</param>
     /// <param name="maxDepth">The maximum recursion depth before traversal stops.</param>
     public LookupResourcesEngine(IEnumerable<NamespaceDefinition> namespaces, int maxDepth = DefaultMaxDepth)
@@ -41,7 +47,11 @@ public sealed class LookupResourcesEngine
     {
     }
 
-    /// <summary>Creates a lookup-resources engine over the given schema and caveat definitions.</summary>
+    /// <summary>
+    /// Creates a lookup-resources engine over the given schema and caveat definitions, building its own
+    /// reachability graph. Convenience constructor for test ergonomics; see the remarks on the
+    /// single-parameter overload.
+    /// </summary>
     /// <param name="namespaces">The compiled namespace definitions that make up the schema.</param>
     /// <param name="caveats">The compiled caveat definitions, or null if the schema has none.</param>
     /// <param name="maxDepth">The maximum recursion depth before traversal stops.</param>
@@ -49,11 +59,37 @@ public sealed class LookupResourcesEngine
         IEnumerable<NamespaceDefinition> namespaces,
         IEnumerable<CaveatDefinition>? caveats,
         int maxDepth = DefaultMaxDepth)
+        : this(
+            namespaces,
+            caveats,
+            ReachabilityGraph.Build(
+                (namespaces ?? throw new ArgumentNullException(nameof(namespaces))).ToImmutableDictionary(ns => ns.Name),
+                ReachabilityMode.First),
+            maxDepth)
+    {
+    }
+
+    /// <summary>
+    /// Creates a lookup-resources engine over the given schema, caveat definitions, and a pre-built
+    /// reachability graph (First mode). The production caller passes the schema snapshot's
+    /// <see cref="Spiceport.Grains.SchemaSnapshot.ReachabilityFirst"/> so the graph is built at most once
+    /// per schema, not once per request.
+    /// </summary>
+    /// <param name="namespaces">The compiled namespace definitions that make up the schema.</param>
+    /// <param name="caveats">The compiled caveat definitions, or null if the schema has none.</param>
+    /// <param name="reachability">The pre-built (First-mode) reachability graph for this schema.</param>
+    /// <param name="maxDepth">The maximum recursion depth before traversal stops.</param>
+    public LookupResourcesEngine(
+        IEnumerable<NamespaceDefinition> namespaces,
+        IEnumerable<CaveatDefinition>? caveats,
+        ReachabilityGraph reachability,
+        int maxDepth = DefaultMaxDepth)
     {
         ArgumentNullException.ThrowIfNull(namespaces);
+        ArgumentNullException.ThrowIfNull(reachability);
         _namespaces = namespaces.ToImmutableDictionary(ns => ns.Name);
         var caveatList = caveats?.ToList();
-        _reachability = ReachabilityGraph.ForSchema(_namespaces, ReachabilityMode.First);
+        _reachability = reachability;
         _check = new CheckEngine(_namespaces.Values, caveatList, maxDepth);
         _caveats = new CaveatEvaluator(caveatList ?? []);
         _maxDepth = maxDepth;
