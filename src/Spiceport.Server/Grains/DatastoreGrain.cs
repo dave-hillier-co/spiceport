@@ -18,8 +18,13 @@ namespace Spiceport.Grains;
 /// truth for the whole MVCC datastore. It is EVENT-SOURCED — the append-only log of <see cref="LogEvent"/>s
 /// is the source of truth and the materialized <see cref="DatastoreGrainState"/> is the fold over that log
 /// (held in a mutable <see cref="DatastoreStateHolder"/> because <c>JournaledGrain</c> mutates state in
-/// place). It is a single non-reentrant activation, so each turn runs to completion before the next — which
-/// is what makes <see cref="AppendCommit"/> atomic (the head-compare and the append cannot interleave).
+/// place). It is a single non-reentrant activation; WRITES (<see cref="AppendCommit"/>, <see cref="RunGc"/>
+/// — no interleave attribute) never interleave EACH OTHER, so a write's turn still runs to completion
+/// before the next write's, keeping the head-compare-and-append atomic. The handful of PURE reads
+/// (<see cref="ReadState"/>, <see cref="GetHead"/>, <see cref="IDatastoreLog.ReadFrom"/>) are explicitly
+/// marked <c>[AlwaysInterleave]</c> on the grain interface and may run DURING a write's await — never
+/// concurrently with it (the scheduler is still single-threaded) and never observing a write's
+/// intermediate state; see the publication discipline in <see cref="ApplyUpdatesToStorage"/>.
 /// </summary>
 /// <remarks>
 /// Persistence is OUR responsibility via <see cref="ICustomStorageInterface{TState,TDelta}"/> over an
@@ -169,9 +174,15 @@ public sealed class DatastoreGrain :
     // --- IDatastoreGrain ---
 
     /// <inheritdoc />
+    /// <remarks>
+    /// [AlwaysInterleave]. Reads <c>State.Value</c> — the JournaledGrain-confirmed fold, an immutable
+    /// snapshot that only ever changes at a confirm boundary — so an interleaved call landing mid-write
+    /// sees, AT WORST, the previous commit; it can never observe a write's in-flight intermediate state.
+    /// </remarks>
     public Task<DatastoreGrainState> ReadState() => Task.FromResult(State.Value);
 
     /// <inheritdoc />
+    /// <remarks>[AlwaysInterleave]. Same "at worst the previous commit" guarantee as <see cref="ReadState"/>.</remarks>
     public Task<DatastoreHeadWire> GetHead()
     {
         var s = State.Value;
@@ -281,9 +292,16 @@ public sealed class DatastoreGrain :
     // --- IDatastoreLog ---
 
     /// <inheritdoc />
+    /// <remarks>
+    /// This is one of the [AlwaysInterleave] pure reads, so it can run while a write is parked at an
+    /// await. It reads the head from <c>_stored.HeadRevision</c> — never <c>State.Value.HeadRevision</c> —
+    /// so the served head and <see cref="_recent"/>/<see cref="_recentFloorRevision"/> all come from the
+    /// SAME publication unit (see <see cref="ApplyUpdatesToStorage"/>): the returned <see cref="LogSegment"/>
+    /// is internally consistent (its head is &gt;= every event it serves) even if this call lands mid-write.
+    /// </remarks>
     public Task<LogSegment> ReadFrom(long afterRevision, int maxCount)
     {
-        var head = State.Value.HeadRevision;
+        var head = _stored.HeadRevision;
 
         // The in-memory window retains only events strictly above the snapshot/GC floor; an older cursor
         // cannot be served COMPLETELY (some events in (afterRevision, floor] were compacted), so we must
@@ -302,6 +320,15 @@ public sealed class DatastoreGrain :
 
     // --- ICustomStorageInterface (WE own persistence; no application SQL) ---
 
+    /// <summary>
+    /// PUBLICATION DISCIPLINE (both this method and <see cref="ApplyUpdatesToStorage"/>): storage reads/writes
+    /// are awaited into purely LOCAL variables; the shared fields (<see cref="_stored"/>, <see cref="_recent"/>,
+    /// <see cref="_recentFloorRevision"/>, <see cref="_logVersion"/>, <see cref="_snapshotVersion"/>) are only
+    /// ever assigned in a single synchronous block with no <c>await</c> in between. Because an
+    /// <c>[AlwaysInterleave]</c> read can only run while THIS call is parked at an await, a read landing
+    /// mid-method sees either the fields wholly untouched (still whatever the previous publish left) or,
+    /// once this method's synchronous tail runs, the fully-updated fields — never a partially-applied batch.
+    /// </summary>
     /// <inheritdoc />
     public async Task<KeyValuePair<int, DatastoreStateHolder>> ReadStateFromStorage()
     {
@@ -316,6 +343,8 @@ public sealed class DatastoreGrain :
             var seeded = DatastoreGrainState.Empty(NowNanos());
             await WriteSnapshot(0, seeded).ConfigureAwait(ContinueOnCapturedContext);
             await WriteHead(new LogHeadEntry(0, seeded.HeadRevision, 0)).ConfigureAwait(ContinueOnCapturedContext);
+
+            // Publish (no await below this point in the branch).
             _logVersion = 0;
             _snapshotVersion = 0;
             _stored = seeded;
@@ -325,29 +354,35 @@ public sealed class DatastoreGrain :
         }
 
         var headEntry = _headState.State;
-        _logVersion = headEntry.LogVersion;
-        _snapshotVersion = headEntry.SnapshotVersion;
+        var logVersion = headEntry.LogVersion;
+        var snapshotVersion = headEntry.SnapshotVersion;
 
         // Load the snapshot the head points at, then replay the log tail (snapshotVersion+1 .. logVersion)
         // folding into it. The range is contiguous by construction (head is written last, the commit point),
         // so a missing in-range entry is corruption — fail loudly rather than silently fold a lossy state
         // (which would pass the durability negative control while having lost data).
-        var value = await ReadSnapshot(_snapshotVersion).ConfigureAwait(ContinueOnCapturedContext)
+        var value = await ReadSnapshot(snapshotVersion).ConfigureAwait(ContinueOnCapturedContext)
             ?? DatastoreGrainState.Empty(0);
 
-        _recent.Clear();
-        _recentFloorRevision = value.HeadRevision;
-        for (var v = _snapshotVersion + 1; v <= _logVersion; v++)
+        var recent = new List<LogEvent>();
+        var floor = value.HeadRevision;
+        for (var v = snapshotVersion + 1; v <= logVersion; v++)
         {
             var ev = await ReadLogEvent(v).ConfigureAwait(ContinueOnCapturedContext)
                 ?? throw new InvalidOperationException(
-                    $"datastore log corruption: missing log entry {v} in [{_snapshotVersion + 1}..{_logVersion}]");
+                    $"datastore log corruption: missing log entry {v} in [{snapshotVersion + 1}..{logVersion}]");
             value = LogFold.ApplyEvent(value, ev);
-            AddRecent(ev, value.HeadRevision);
+            AddPending(recent, ref floor, ev, value.HeadRevision);
         }
 
+        // Publish (no await below this point in the branch).
+        _logVersion = logVersion;
+        _snapshotVersion = snapshotVersion;
         _stored = value;
-        return new KeyValuePair<int, DatastoreStateHolder>(_logVersion, new DatastoreStateHolder { Value = value });
+        _recent.Clear();
+        _recent.AddRange(recent);
+        _recentFloorRevision = floor;
+        return new KeyValuePair<int, DatastoreStateHolder>(logVersion, new DatastoreStateHolder { Value = value });
     }
 
     /// <inheritdoc />
@@ -361,10 +396,12 @@ public sealed class DatastoreGrain :
         if (_logVersion != expectedVersion)
             return false;
 
-        // Materialize the head revision after applying these events (fold forward from the persisted state;
-        // never touch JournaledGrain.State here — that would re-enter the consistency adaptor mid-confirm).
+        // Fold forward into LOCALS only (never touch JournaledGrain.State here — that would re-enter the
+        // consistency adaptor mid-confirm — and never touch the shared _recent/_stored fields yet either;
+        // see the publication-discipline remark on ReadStateFromStorage).
         var folded = _stored;
         var version = _logVersion;
+        var pending = new List<LogEvent>();
         foreach (var ev in updates)
         {
             version++;
@@ -372,7 +409,7 @@ public sealed class DatastoreGrain :
             await _storage.WriteStateAsync($"{LogStatePrefix}{version}", this.GetGrainId(), new GrainState<LogEvent>(ev))
                 .ConfigureAwait(ContinueOnCapturedContext);
             folded = LogFold.ApplyEvent(folded, ev);
-            AddRecent(ev, folded.HeadRevision);
+            pending.Add(ev);
         }
 
         // Periodically snapshot + compact: bound the replay tail on reactivation and the in-memory window.
@@ -395,14 +432,28 @@ public sealed class DatastoreGrain :
         await WriteHead(new LogHeadEntry(version, folded.HeadRevision, newSnapshotVersion))
             .ConfigureAwait(ContinueOnCapturedContext);
 
+        // COMMITTED. Publish in one synchronous block — no await from here until the next statement with an
+        // await — so an interleaved [AlwaysInterleave] read either sees the pre-commit fields (still the
+        // PREVIOUS commit) or, once this block runs, the fully-applied new commit. This IS the atomicity
+        // argument for the read side: there is no yield point inside the block for a read to land on.
+        _logVersion = version;
+        _stored = folded;
+        _recent.AddRange(pending);
+        TrimRecent(folded.HeadRevision);
+
         // Post-commit compaction: the new snapshot subsumes log entries up to AND INCLUDING its own version,
         // and the previous snapshot is no longer referenced. Clearing after the commit point keeps a crash
-        // recoverable (the worst case leaks an entry, never loses one).
+        // recoverable (the worst case leaks an entry, never loses one). This runs AFTER publication, so it
+        // has its own awaits — an interleaved read landing between publication and here still observes the
+        // fully-committed state above; compaction only ever shrinks in-memory retention and storage, it
+        // never changes what's already been published as committed.
         if (newSnapshotVersion > oldSnapshotVersion)
         {
             for (var v = oldSnapshotVersion + 1; v <= newSnapshotVersion; v++)
                 await ClearLogEntry(v).ConfigureAwait(ContinueOnCapturedContext);
             await ClearSnapshot(oldSnapshotVersion).ConfigureAwait(ContinueOnCapturedContext);
+
+            // Its own contiguous synchronous field group.
             _snapshotVersion = newSnapshotVersion;
             // Retention now starts at the snapshot boundary (consistent with the post-reactivation rebuild,
             // which can only replay the post-snapshot tail).
@@ -410,9 +461,6 @@ public sealed class DatastoreGrain :
             _recent.RemoveAll(e => e.Revision <= _recentFloorRevision);
         }
 
-        _logVersion = version;
-        _stored = folded;
-        TrimRecent(folded.HeadRevision);
         return true;
     }
 
@@ -459,14 +507,26 @@ public sealed class DatastoreGrain :
 
     // --- recent-events window ---
 
-    private void AddRecent(LogEvent ev, long head)
+    /// <summary>
+    /// The LOCAL-list counterpart of <see cref="TrimRecent"/>, used by <see cref="ReadStateFromStorage"/>
+    /// while it is still folding into locals (before its single publish block) — never touches the shared
+    /// <see cref="_recent"/>/<see cref="_recentFloorRevision"/> fields.
+    /// </summary>
+    private void AddPending(List<LogEvent> pending, ref long floor, LogEvent ev, long head)
     {
-        _recent.Add(ev);
-        TrimRecent(head);
+        pending.Add(ev);
+        var newFloor = Math.Max(floor, head - _gcWindowNanos);
+        if (newFloor <= floor)
+            return;
+        floor = newFloor;
+        var floorValue = newFloor;
+        pending.RemoveAll(e => e.Revision <= floorValue);
     }
 
     // Raise the floor for anything aged past the GC window (never lower it — compaction may have set it
     // higher), and drop the now-unretained events. _recent always holds exactly the events above the floor.
+    // Only ever called from within a synchronous publish block (see ApplyUpdatesToStorage) or from RunGc's
+    // own append (which mints and confirms its own event via the normal write path, same guarantee).
     private void TrimRecent(long head)
     {
         var floor = Math.Max(_recentFloorRevision, head - _gcWindowNanos);
