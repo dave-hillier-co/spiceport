@@ -232,9 +232,9 @@ public class CheckEngineTests
     public async Task SameKeyCycle_ThrowsMaxDepthExceeded_NotConfidentNotMember()
     {
         // group:a#member -> group:b#member -> group:a#member (a same-key cycle), nobody real inside.
-        // Correctness now rests SOLELY on the depth budget (SpiceDB's dispatch.CheckDepth): a genuine
-        // cycle consumes depth until it errors, rather than the bloom silently cutting to a confident
-        // (and wrong) NotMember. This matches SpiceDB, which raises MaxDepthExceededError here. The check
+        // Correctness rests SOLELY on the depth budget (SpiceDB's dispatch.CheckDepth): a genuine
+        // cycle consumes depth until it errors, rather than the visited set silently cutting to a
+        // confident (and wrong) NotMember. This matches SpiceDB, which raises MaxDepthExceededError here. The check
         // must TERMINATE (no infinite loop) and surface an error, never a definitive verdict.
         var (store, rev) = await Seed(
             Tuple("group", "a", "member", Onr("group", "b", "member")),
@@ -249,8 +249,9 @@ public class CheckEngineTests
     [Fact]
     public async Task DeepLinearChain_WithinBudget_ResolvesMember_NoFalseTermination()
     {
-        // A linear chain of 49 hops (under maxDepth 50) must resolve Member: removing the bloom cut must
-        // not introduce a false termination on a legitimately deep, acyclic graph.
+        // A linear chain of 49 hops (under maxDepth 50) must resolve Member: the visited set is RECORD
+        // ONLY on the in-process path (never Contains->Cut), so it must not introduce a false termination
+        // on a legitimately deep, acyclic graph.
         var rels = new List<Relationship>();
         for (var i = 0; i < 48; i++)
             rels.Add(Tuple("group", $"g{i}", "member", Onr("group", $"g{i + 1}", "member")));
@@ -268,7 +269,7 @@ public class CheckEngineTests
     public async Task DeepLinearChain_ExceedingBudget_ThrowsMaxDepthExceeded()
     {
         // A chain deeper than maxDepth(50) must error, not silently deny — the deepest production-realistic
-        // case the bloom false-positive class used to corrupt.
+        // case a probabilistic cycle guard could have corrupted.
         var rels = new List<Relationship>();
         for (var i = 0; i < 60; i++)
             rels.Add(Tuple("group", $"g{i}", "member", Onr("group", $"g{i + 1}", "member")));

@@ -1,3 +1,4 @@
+using System.Collections.Immutable;
 using Microsoft.Extensions.DependencyInjection;
 using Orleans;
 using Spiceport.Core;
@@ -48,7 +49,7 @@ public class CancellationAndImmutabilityTests
         var request = new DispatchCheckRequest(
             new ObjectAndRelation("group", "loop", "member"),
             new ObjectAndRelation("user", "alice", CoreConstants.Ellipsis),
-            new ResolverMeta(head.Revision, 100_000, TraversalBloom.Empty));
+            new ResolverMeta(head.Revision, 100_000, ImmutableHashSet<VisitKey>.Empty));
 
         using var cancellation = new CancellationTokenSource();
         var dispatch = dispatcher.DispatchCheck(request, cancellation.Token);

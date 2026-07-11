@@ -1,10 +1,12 @@
+using System.Collections.Immutable;
 using Spiceport.Core;
 
 namespace Spiceport.Engine;
 
 /// <summary>
-/// A key identifying an in-flight (resource, subject) check. Recorded into the traversal bloom so the
-/// dispatcher can detect a LIKELY loop and bypass a same-key grain re-entry; it does not gate verdicts.
+/// A key identifying an in-flight (resource, subject) check. Recorded into the exact visited set so the
+/// dispatcher can detect a genuine same-path revisit and bypass a same-key grain re-entry; it does not
+/// gate verdicts.
 /// </summary>
 /// <remarks>
 /// Carried inside <see cref="ResolverMeta"/> rather than a closure so that a dispatch request is a
@@ -21,28 +23,54 @@ public readonly record struct VisitKey(
     string ResourceType, string ResourceId, string ResourceRelation,
     string SubjectType, string SubjectId, string SubjectRelation)
 {
+    /// <summary>The canonical field separator (U+001F); cannot appear in an ONR field, so the join is injective.</summary>
+    private const char Separator = (char)0x1F;
+
     /// <summary>Builds a key from a (resource, subject) ONR pair.</summary>
     public static VisitKey Of(ObjectAndRelation resource, ObjectAndRelation subject) =>
         new(resource.ObjectType, resource.ObjectId, resource.Relation,
             subject.ObjectType, subject.ObjectId, subject.Relation);
+
+    /// <summary>
+    /// Renders this key as a single unit-separated (U+001F) string, suitable for carrying across a
+    /// wire boundary (e.g. <see cref="Grains.Abstractions.DispatchContext"/>'s ambient RequestContext).
+    /// </summary>
+    public string ToCanonicalString() =>
+        string.Join(Separator, ResourceType, ResourceId, ResourceRelation, SubjectType, SubjectId, SubjectRelation);
+
+    /// <summary>
+    /// Parses a canonical string produced by <see cref="ToCanonicalString"/>. Throws
+    /// <see cref="FormatException"/> on a malformed value (wrong part count) rather than silently
+    /// defaulting any field.
+    /// </summary>
+    public static VisitKey FromCanonicalString(string value)
+    {
+        ArgumentNullException.ThrowIfNull(value);
+        var parts = value.Split(Separator);
+        if (parts.Length != 6)
+            throw new FormatException(
+                $"Malformed VisitKey canonical string: expected 6 unit-separated parts, got {parts.Length}.");
+        return new VisitKey(parts[0], parts[1], parts[2], parts[3], parts[4], parts[5]);
+    }
 }
 
 /// <summary>
 /// The cross-cutting metadata threaded through every dispatched sub-problem: which revision to
-/// evaluate against, how much recursion budget remains, and the traversal-bloom loop hint.
+/// evaluate against, how much recursion budget remains, and the exact visited-set loop hint.
 /// </summary>
 /// <remarks>
 /// Deliberately carries the revision <em>identity</em> (an <see cref="IRevision"/>), not an
 /// <c>IDatastoreReader</c>, so the request is serializable: a dispatcher resolves a reader for the
-/// revision itself. <see cref="Bloom"/> is an immutable (copy-on-add) bounded Bloom filter so each
-/// sub-problem can extend the loop hint without mutating its parent's, at a bounded wire/CPU cost
-/// (SpiceDB's traversal-bloom design). Termination rests SOLELY on <see cref="DepthRemaining"/>; the
-/// bloom never affects a verdict. Its only job is the dispatcher's singleflight-style loop bypass: a
-/// bloom hit forces a (correct) in-process step instead of re-entering a busy same-key grain.
+/// revision itself. <see cref="Visited"/> is an immutable (copy-on-add) exact set of every
+/// (resource, subject) pair visited on this path, bounded by the max recursion depth (at most 50
+/// entries), so each sub-problem can extend it without mutating its parent's. Termination rests SOLELY
+/// on <see cref="DepthRemaining"/>; the visited set never affects a verdict. Its only job is the
+/// dispatcher's singleflight-style loop bypass: a hit means this sub-problem is genuinely already
+/// in-flight on this path, and forces an in-process step instead of re-entering a busy same-key grain.
 /// </remarks>
 /// <param name="Revision">The pinned revision identity to evaluate against.</param>
 /// <param name="DepthRemaining">The remaining recursion depth budget (the sole termination guarantee).</param>
-/// <param name="Bloom">The bounded traversal-bloom loop hint over (resource, subject) pairs on this path.</param>
+/// <param name="Visited">The exact set of (resource, subject) pairs visited on this path (≤ max-depth entries).</param>
 /// <param name="SchemaHash">
 /// The schema hash effective at <paramref name="Revision"/>, pinned ONCE at the check root (from the
 /// resolved revision's authoritative <c>SchemaHashAt</c>) and carried unchanged to every child — schema
@@ -56,7 +84,7 @@ public readonly record struct VisitKey(
 public sealed record ResolverMeta(
     IRevision Revision,
     int DepthRemaining,
-    TraversalBloom Bloom,
+    ImmutableHashSet<VisitKey> Visited,
     string? SchemaHash = null);
 
 /// <summary>

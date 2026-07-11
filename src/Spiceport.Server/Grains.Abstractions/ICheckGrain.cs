@@ -17,8 +17,8 @@ namespace Spiceport.Grains.Abstractions;
 /// </param>
 /// <param name="CycleCut">
 /// True if this subtree was depth- or loop-affected and must not be cached. There is no visited-set
-/// verdict cut anymore: this flag is force-set on the RETURNED reply by the Orleans dispatcher when the
-/// bounded traversal Bloom reports a likely repeat on this path, purely so the result is excluded from
+/// verdict cut: this flag is force-set on the RETURNED reply by the Orleans dispatcher when the
+/// exact visited set reports a genuine repeat on this path, purely so the result is excluded from
 /// the grain's activation memo, not because the verdict itself was altered.
 /// </param>
 /// <param name="DepthRequired">
@@ -41,7 +41,7 @@ public sealed record DispatchCheckReply(
 /// <remarks>
 /// Recursion crosses grain boundaries: computing one sub-problem dispatches its children back through
 /// the Orleans dispatcher, which addresses a different grain per child key. The cross-cutting depth
-/// budget and traversal-bloom cycle guard are NOT part of that identity — they ride ambiently in the
+/// budget and exact visited-set cycle guard are NOT part of that identity — they ride ambiently in the
 /// Orleans <see cref="Orleans.Runtime.RequestContext"/> via
 /// <see cref="Spiceport.Grains.Abstractions.DispatchContext"/> rather than as a method argument, so this
 /// method's wire contract is exactly the canonical sub-problem (the grain key) plus the cancellation
@@ -52,7 +52,7 @@ public interface ICheckGrain : IGrainWithStringKey
 {
     /// <summary>
     /// Evaluates the one sub-problem this grain is keyed to, dispatching children onward. The depth
-    /// budget and traversal-bloom cycle guard are read from the ambient
+    /// budget and exact visited-set cycle guard are read from the ambient
     /// <see cref="Spiceport.Grains.Abstractions.DispatchContext"/>, which the caller must have set before
     /// making this call. The Orleans cancellation token propagates caller cancellation across the grain
     /// boundary and through every recursive child dispatch.

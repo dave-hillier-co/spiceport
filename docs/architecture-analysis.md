@@ -71,7 +71,7 @@ things Orleans provides natively**:
 3. **Cluster membership / hashring rebalancing** as nodes come and go.
 
 Cycle/termination control travels *in the request metadata*, not in state:
-`ResolverMeta { at_revision, depth_remaining, traversal_bloom, schema_hash }`. A bloom filter
+`ResolverMeta { at_revision, depth_remaining, visited, schema_hash }`. An exact visited set
 detects revisited `(definition, relation, resource, subject)` tuples; `depth_remaining`
 decrements per hop.
 
@@ -146,8 +146,8 @@ runtime: the grain that owns a sub-problem is the server that caches it, and sin
 the lock table that dedupes concurrent misses. Cycle-cut results are served but not retained.
 There is no separate caller-side cache layer.
 
-The traversal state that is *not* part of the identity — `depthRemaining` and the traversal
-bloom — rides ambient in the Orleans `RequestContext` (via `DispatchContext`), so a remote grain
+The traversal state that is *not* part of the identity — `depthRemaining` and the exact
+visited set — rides ambient in the Orleans `RequestContext` (via `DispatchContext`), so a remote grain
 continues the same cycle guard while the wire contract carries nothing but the key and the
 cancellation token. Cross-cutting concerns are **grain call filters**, not hand-threaded
 plumbing: an outgoing filter maps cross-silo dispatch exceptions into the dispatch-error taxonomy
@@ -158,14 +158,13 @@ The grain identity being the sub-problem is verified by an Orleans `TestCluster`
 conformance corpus (set-ops, arrow, wildcard, nested-group, recursive, caveats) **through the
 grain mesh**, with results identical to the in-process engine over the same datastore.
 
-**Cycle / termination control.** The traversal bloom (`TraversalBloom`, ≤1KB as SpiceDB: 1024
-bits / 10 hashes by default, FNV-1a with Kirsch–Mitzenmacher double hashing, process-stable) is a
-bounded loop hint, *not* on the correctness path. Termination rests solely on `depthRemaining`: a
-genuine cycle consumes depth until `MaxDepthExceededException` (gRPC `FailedPrecondition`),
-exactly as SpiceDB does. A bloom hit at a grain boundary forces the normal (reentrant) grain call
-with the returned result tagged `CycleCut` at the caller, so the memo never stores a
-path-dependent branch; a false positive can only force a correct recompute, never change a
-verdict.
+**Cycle / termination control.** The exact visited set (an `ImmutableHashSet<VisitKey>`, bounded
+by the max recursion depth — at most 50 entries) is a loop hint, *not* on the correctness path.
+Termination rests solely on `depthRemaining`: a genuine cycle consumes depth until
+`MaxDepthExceededException` (gRPC `FailedPrecondition`), exactly as SpiceDB does. A visited-set
+hit at a grain boundary forces the normal (reentrant) grain call with the returned result tagged
+`CycleCut` at the caller, so the memo never stores a path-dependent branch; the hit is exact, so
+it can only force a correct recompute, never change a verdict.
 
 **Revision quantization (tuning, not correctness).** Every write mints a fresh revision, so an
 un-quantized grain key would never be reused. A quantizer snaps an *optimized* (minimize-latency)
@@ -207,8 +206,8 @@ know.
   `CheckGrain` is `[Reentrant]` so a same-key re-entry on a genuine cycle is accepted rather than
   blocked.
 - **Cycle/depth control** → termination rests on `depthRemaining` (a genuine cycle errors at the
-  depth limit), with the bloom carried in `RequestContext` only as a loop-bypass hint, exactly as
-  SpiceDB does. No actor state required.
+  depth limit), with the exact visited set carried in `RequestContext` only as a loop-bypass hint,
+  exactly as SpiceDB does. No actor state required.
 
 ### 3.5 Storage as an event-sourced grain (the log is the storage/compute seam)
 
@@ -334,7 +333,7 @@ loader. Exit: corpus files parse into in-memory objects.
 
 **Phase 1 — Single-node correctness (no Orleans yet).**
 Schema DSL compiler + reachability graph; in-memory MVCC datastore; the `Check` engine
-(unions/intersections/exclusions/arrows/wildcards) with bloom+depth termination. Drive entirely
+(unions/intersections/exclusions/arrows/wildcards) with visited-set+depth termination. Drive entirely
 by the YAML conformance corpus. Exit: all non-caveat, non-reverse Check tests green.
 
 **Phase 2 — Introduce Orleans.**

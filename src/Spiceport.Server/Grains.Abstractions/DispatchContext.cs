@@ -1,4 +1,5 @@
 using Orleans.Runtime;
+using Spiceport.Engine;
 using Spiceport.Grains;
 
 namespace Spiceport.Grains.Abstractions;
@@ -11,11 +12,11 @@ namespace Spiceport.Grains.Abstractions;
 /// <para>
 /// <b>Why these fields are context, not identity.</b> The grain's own string key already pins the
 /// canonical sub-problem (resource, subject, quantized revision, schema hash) — see the remarks on
-/// <see cref="ICheckGrain"/>. The remaining recursion budget and the traversal-bloom cycle guard are
+/// <see cref="ICheckGrain"/>. The remaining recursion budget and the exact visited-set cycle guard are
 /// NOT part of that identity: two callers asking the exact same sub-problem on different recursion
-/// paths address the same grain but may carry a different depth budget / bloom state. Since the wire
-/// contract for a dispatch call should be exactly the canonical sub-problem, these cross-cutting fields
-/// ride in <see cref="RequestContext"/> instead of a request argument.
+/// paths address the same grain but may carry a different depth budget / visited-set state. Since the
+/// wire contract for a dispatch call should be exactly the canonical sub-problem, these cross-cutting
+/// fields ride in <see cref="RequestContext"/> instead of a request argument.
 /// </para>
 /// <para>
 /// <b>Scoping guarantee (verified against this repo's Orleans 10.1.0).</b>
@@ -43,11 +44,11 @@ namespace Spiceport.Grains.Abstractions;
 /// On the receiving side, Orleans imports the message's context (a wholesale replace, see
 /// <c>RequestContextExtensions.Import</c>) BEFORE running incoming grain-call filters or invoking the
 /// grain body (see <c>InsideRuntimeClient.Invoke</c>), so <see cref="TryGetDepthRemaining"/> /
-/// <see cref="RequireBloom"/> observe the sender's values from the very first incoming filter onward.
+/// <see cref="RequireVisited"/> observe the sender's values from the very first incoming filter onward.
 /// </para>
 /// <para>
 /// A missing key when reading is treated as a bug, not a default: every legitimate call path (the
-/// dispatcher, or a test's <c>SetDispatchContext</c> helper) sets all three values before the grain
+/// dispatcher, or a test's <c>SetDispatchContext</c> helper) sets both values before the grain
 /// call, so an absence means some caller reached <see cref="ICheckGrain.DispatchCheck"/> without going
 /// through that seam. The <c>Require*</c> accessors throw a clear <see cref="InvalidOperationException"/>
 /// naming the missing key rather than silently defaulting, so such a bug surfaces immediately instead of
@@ -57,20 +58,18 @@ namespace Spiceport.Grains.Abstractions;
 public static class DispatchContext
 {
     private const string DepthRemainingKey = "spiceport.dispatch.depthRemaining";
-    private const string BloomBitsKey = "spiceport.dispatch.bloomBits";
-    private const string BloomKKey = "spiceport.dispatch.bloomK";
+    private const string VisitedKey = "spiceport.dispatch.visited";
 
     /// <summary>
-    /// Sets the depth budget and traversal-bloom cycle guard for the NEXT outgoing
+    /// Sets the depth budget and exact visited-set cycle guard for the NEXT outgoing
     /// <see cref="ICheckGrain.DispatchCheck"/> call made from this point in the current async flow.
     /// Call this immediately before that call — see the scoping guarantee on <see cref="DispatchContext"/>.
     /// </summary>
-    public static void Set(int depthRemaining, byte[] bloomBits, int bloomK)
+    public static void Set(int depthRemaining, string[] visited)
     {
-        ArgumentNullException.ThrowIfNull(bloomBits);
+        ArgumentNullException.ThrowIfNull(visited);
         RequestContext.Set(DepthRemainingKey, depthRemaining);
-        RequestContext.Set(BloomBitsKey, bloomBits);
-        RequestContext.Set(BloomKKey, bloomK);
+        RequestContext.Set(VisitedKey, visited);
     }
 
     /// <summary>Attempts to read the remaining recursion depth budget from the ambient context.</summary>
@@ -94,15 +93,11 @@ public static class DispatchContext
         TryGetDepthRemaining(out var depthRemaining) ? depthRemaining : throw Missing(DepthRemainingKey);
 
     /// <summary>
-    /// Reads the traversal-bloom cycle guard (its raw bits and hash count) from the ambient context,
-    /// throwing if either half is absent.
+    /// Reads the exact visited-set cycle guard (canonical <see cref="VisitKey"/> strings) from the
+    /// ambient context, throwing if it is absent.
     /// </summary>
-    public static (byte[] BloomBits, int BloomK) RequireBloom()
-    {
-        var bits = RequestContext.Get(BloomBitsKey) as byte[] ?? throw Missing(BloomBitsKey);
-        var k = RequestContext.Get(BloomKKey) is int value ? value : throw Missing(BloomKKey);
-        return (bits, k);
-    }
+    public static string[] RequireVisited() =>
+        RequestContext.Get(VisitedKey) as string[] ?? throw Missing(VisitedKey);
 
     private static InvalidOperationException Missing(string key) => new(
         $"DispatchContext key '{key}' is missing from the Orleans RequestContext. Every " +

@@ -19,7 +19,7 @@ namespace Spiceport.Grains;
 /// remote, is a grain call; Orleans' own placement director and grain directory are the only router. The
 /// dispatcher maps the engine's <see cref="DispatchCheckRequest"/> / <see cref="DispatchCheckResult"/> to
 /// and from the serializable grain <see cref="DispatchCheckReply"/>, threading the depth budget and
-/// traversal-bloom cycle guard ambiently via <see cref="DispatchContext"/> rather than a method argument.
+/// exact visited-set cycle guard ambiently via <see cref="DispatchContext"/> rather than a method argument.
 /// </remarks>
 public sealed class OrleansDispatcher : IDispatcher
 {
@@ -67,27 +67,29 @@ public sealed class OrleansDispatcher : IDispatcher
             request.Meta.Revision.ToString(),
             request.Meta.SchemaHash ?? _schemaHash.CurrentSchemaHash);
 
-        // SINGLEFLIGHT-STYLE LOOP BYPASS (SpiceDB singleflight.go:69-81): if the traversal bloom already
-        // contains this sub-problem's (resource, subject) key, this is a LIKELY loop back to a grain key
+        // SINGLEFLIGHT-STYLE LOOP BYPASS (SpiceDB singleflight.go:69-81): if the exact visited set already
+        // contains this sub-problem's (resource, subject) key, this is a GENUINE loop back to a grain key
         // that is (or would be) busy on the path above us. The grain call still happens NORMALLY — the
         // grain is [Reentrant], so a genuine same-key re-entry is accepted and terminates deterministically
         // on the depth budget (MaxDepthExceededException), exactly as a fresh call would. What changes is
         // the RETURNED result: it is force-tagged CycleCut so no CheckGrain activation memo up the call
-        // chain ever stores this path-dependent branch (see CheckGrain's CACHING remarks). A bloom
-        // false-positive is harmless here — same verdict, just an uncached hop.
+        // chain ever stores this path-dependent branch (see CheckGrain's CACHING remarks). A hit here is
+        // exact, never a false positive — it always means a real same-path revisit.
         var visit = VisitKey.Of(request.Resource, request.Subject);
-        var loopBypass = request.Meta.Bloom.Contains(visit);
+        var loopBypass = request.Meta.Visited.Contains(visit);
         if (loopBypass)
             _metrics?.RecordLoopBypass();
 
         var grain = _grains.GetGrain<ICheckGrain>(key);
 
-        // The depth budget and traversal-bloom cycle guard are call-chain context, not sub-problem
+        // The depth budget and exact visited-set cycle guard are call-chain context, not sub-problem
         // identity (already pinned by `key` above), so they ride ambiently via DispatchContext /
         // Orleans RequestContext rather than as a method argument — see the scoping guarantee documented
         // on DispatchContext. Set immediately before the grain call so it is exactly what flows down into
         // THIS hop (never a stale value from a previous sibling dispatch).
-        DispatchContext.Set(request.Meta.DepthRemaining, request.Meta.Bloom.ToBytes(), request.Meta.Bloom.Hashes);
+        DispatchContext.Set(
+            request.Meta.DepthRemaining,
+            request.Meta.Visited.Select(v => v.ToCanonicalString()).ToArray());
 
         // Deliberate cross-silo error mapping (cf. SpiceDB rewriteError / remote cluster boundary) now
         // happens INSIDE the grain call itself, via CheckDispatchOutgoingCallFilter: known typed domain
