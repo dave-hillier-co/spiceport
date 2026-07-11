@@ -1,3 +1,5 @@
+using Orleans.Concurrency;
+
 namespace Spiceport.Grains.Abstractions;
 
 /// <summary>
@@ -13,10 +15,19 @@ public interface IDatastoreGrain : IGrainWithIntegerKey, IDatastoreLog
     /// <summary>The fixed key of the single datastore activation.</summary>
     public const long Key = 0;
 
-    /// <summary>Returns the full materialized committed state (the write base / snapshot source).</summary>
+    /// <summary>
+    /// Returns the full materialized committed state (the write base / snapshot source). Marked
+    /// <see cref="AlwaysInterleaveAttribute"/> — see the remark on <see cref="AppendCommit"/> — never
+    /// <c>[ReadOnly]</c>, which would not interleave against the non-read-only <see cref="AppendCommit"/>.
+    /// </summary>
+    [AlwaysInterleave]
     Task<DatastoreGrainState> ReadState();
 
-    /// <summary>Returns the head revision and schema hash without shipping the whole state blob.</summary>
+    /// <summary>
+    /// Returns the head revision and schema hash without shipping the whole state blob. Marked
+    /// <see cref="AlwaysInterleaveAttribute"/> — see the remark on <see cref="AppendCommit"/>.
+    /// </summary>
+    [AlwaysInterleave]
     Task<DatastoreHeadWire> GetHead();
 
     /// <summary>
@@ -24,8 +35,13 @@ public interface IDatastoreGrain : IGrainWithIntegerKey, IDatastoreLog
     /// still equals <paramref name="expectedHead"/> it mints the new (timestamp) revision, builds the
     /// canonical <see cref="LogEvent"/> stamping that revision, raises + confirms it (an append to durable
     /// grain storage) and returns the new revision; if the head moved it returns null and the caller must
-    /// reload and re-run its precondition-bearing lambda. The non-reentrant single-activation turn makes the
-    /// head-compare and the append atomic with respect to all other writes.
+    /// reload and re-run its precondition-bearing lambda. WRITES carry no interleave attribute, so they
+    /// never interleave EACH OTHER — the head-compare and the append stay atomic with respect to all other
+    /// writes. Only the explicitly <see cref="AlwaysInterleaveAttribute"/>-marked pure reads (this
+    /// interface's <see cref="ReadState"/>/<see cref="GetHead"/>, and <see cref="IDatastoreLog.ReadFrom"/>)
+    /// may run DURING an await inside this call — the activation's scheduler is still single-threaded, so
+    /// an interleaved read only ever runs while this call itself is parked at an await, never concurrently
+    /// with its own execution.
     /// </summary>
     Task<long?> AppendCommit(long expectedHead, ProposedWrite write);
 

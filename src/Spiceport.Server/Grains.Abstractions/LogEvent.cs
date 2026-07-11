@@ -1,3 +1,5 @@
+using Orleans.Concurrency;
+
 namespace Spiceport.Grains.Abstractions;
 
 /// <summary>
@@ -54,5 +56,16 @@ public interface IDatastoreLog
     /// Throws <c>RevisionNotFoundException</c> if <paramref name="afterRevision"/> is older than the
     /// retained GC window.
     /// </summary>
+    /// <remarks>
+    /// VERIFIED Orleans 10.1 semantics (do not swap this for <c>[ReadOnly]</c> — that attribute only
+    /// interleaves a blocking request when BOTH the blocking request and the incoming one are read-only,
+    /// so it does nothing here since <c>AppendCommit</c> carries no such attribute). <see cref="AlwaysInterleaveAttribute"/>,
+    /// applied on the grain-INTERFACE method declaration, interleaves with anything: while an in-flight
+    /// write is parked at an await on the single-threaded activation scheduler, an interleaved call to this
+    /// method runs to completion in that gap before the write's turn resumes. Only pure reads carry this
+    /// attribute; mutating members never do, so writes still never interleave writes and the
+    /// <c>AppendCommit</c> head-compare-and-append stays atomic.
+    /// </remarks>
+    [AlwaysInterleave]
     Task<LogSegment> ReadFrom(long afterRevision, int maxCount);
 }

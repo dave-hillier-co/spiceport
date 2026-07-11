@@ -1,0 +1,292 @@
+using Microsoft.Extensions.DependencyInjection;
+using Orleans.Hosting;
+using Orleans.Runtime;
+using Orleans.Storage;
+using Orleans.TestingHost;
+using Spiceport.Core;
+using Spiceport.Datastore;
+using Spiceport.Grains.Abstractions;
+
+namespace Spiceport.Grains.Tests;
+
+/// <summary>
+/// Grain-level gates for interleaving pure reads (<see cref="IDatastoreGrain.GetHead"/>,
+/// <see cref="IDatastoreGrain.ReadState"/>, <see cref="IDatastoreLog.ReadFrom"/>) past an in-flight
+/// <see cref="IDatastoreGrain.AppendCommit"/> on the cluster-singleton <see cref="DatastoreGrain"/>. Drives
+/// the REAL grain through an Orleans <see cref="TestCluster"/>, with the keyed "datastore" storage provider
+/// swapped for <see cref="PausableGrainStorage"/> so a write can be parked mid-flight (at the <c>head</c>
+/// write, or at a <c>log/{n}</c> write) while a read is issued concurrently.
+/// </summary>
+[Collection(MeshClusterCollection.Name)]
+public sealed class DatastoreInterleavedReadTests
+{
+    private static readonly TimeSpan Timeout = TimeSpan.FromSeconds(5);
+
+    private static Relationship Rel(string rid, string sid) =>
+        Relationship.Create(new ObjectAndRelation("doc", rid, "viewer"), new ObjectAndRelation("user", sid, CoreConstants.Ellipsis));
+
+    private static ProposedWrite TouchWrite(string rid, string sid) =>
+        new(new[] { new RelationshipUpdateWire(RelationshipUpdateOpWire.Touch, WireConvert.ToWire(Rel(rid, sid))) },
+            null, Array.Empty<CounterDeltaWire>());
+
+    private static IDatastoreGrain Grain(TestCluster cluster) =>
+        cluster.GrainFactory.GetGrain<IDatastoreGrain>(IDatastoreGrain.Key);
+
+    private static async Task<TestCluster> NewClusterAsync()
+    {
+        Gate.Reset();
+        var builder = new TestClusterBuilder(initialSilosCount: 1);
+        builder.AddSiloBuilderConfigurator<PausableSiloConfigurator>();
+        var cluster = builder.Build();
+        await cluster.DeployAsync();
+        return cluster;
+    }
+
+    private sealed class Scope(TestCluster cluster) : IAsyncDisposable
+    {
+        public TestCluster Cluster { get; } = cluster;
+        public async ValueTask DisposeAsync() => await Cluster.DisposeAsync();
+    }
+
+    /// <summary>
+    /// Process-wide gate state consulted by <see cref="PausableGrainStorage"/>. Safe as static state because
+    /// every cluster-using test class (including this one, via <see cref="MeshClusterCollection"/>) is
+    /// serialized by xUnit — never two of these tests run concurrently.
+    /// </summary>
+    private static class Gate
+    {
+        public static TaskCompletionSource<bool>? HeadWriteBlock;
+        public static TaskCompletionSource<bool>? HeadWriteParked;
+        public static TaskCompletionSource<bool>? LogWriteBlock;
+        public static TaskCompletionSource<bool>? LogWriteParked;
+        public static volatile bool ThrowOnceOnHeadWrite;
+
+        public static void Reset()
+        {
+            HeadWriteBlock = null;
+            HeadWriteParked = null;
+            LogWriteBlock = null;
+            LogWriteParked = null;
+            ThrowOnceOnHeadWrite = false;
+        }
+    }
+
+    /// <summary>
+    /// Wraps the in-memory grain-storage provider so a test can park a <c>head</c> or <c>log/{n}</c> write
+    /// mid-flight (an await that only resumes once the test releases the corresponding <see cref="Gate"/>
+    /// TCS), or make the next <c>head</c> write throw once. Reads (<c>ReadStateAsync</c>) are never gated —
+    /// only the write path is under test here.
+    /// </summary>
+    private sealed class PausableGrainStorage(IGrainStorage inner) : IGrainStorage
+    {
+        public Task ReadStateAsync<T>(string stateName, GrainId grainId, IGrainState<T> grainState) =>
+            inner.ReadStateAsync(stateName, grainId, grainState);
+
+        public async Task WriteStateAsync<T>(string stateName, GrainId grainId, IGrainState<T> grainState)
+        {
+            if (stateName == "head")
+            {
+                if (Gate.ThrowOnceOnHeadWrite)
+                {
+                    Gate.ThrowOnceOnHeadWrite = false;
+                    throw new InvalidOperationException("injected head-write failure (test seam)");
+                }
+
+                if (Gate.HeadWriteBlock is { } headGate)
+                {
+                    Gate.HeadWriteParked?.TrySetResult(true);
+                    await headGate.Task;
+                }
+            }
+            else if (stateName.StartsWith("log/", StringComparison.Ordinal) && Gate.LogWriteBlock is { } logGate)
+            {
+                Gate.LogWriteParked?.TrySetResult(true);
+                await logGate.Task;
+            }
+
+            await inner.WriteStateAsync(stateName, grainId, grainState);
+        }
+
+        public Task ClearStateAsync<T>(string stateName, GrainId grainId, IGrainState<T> grainState) =>
+            inner.ClearStateAsync(stateName, grainId, grainState);
+    }
+
+    private sealed class PausableSiloConfigurator : ISiloConfigurator
+    {
+        public void Configure(ISiloBuilder b)
+        {
+            b.AddMemoryGrainStorage("datastore-inner");
+            b.AddCustomStorageBasedLogConsistencyProvider("CustomStorage");
+            b.ConfigureServices(services => services.AddKeyedSingleton<IGrainStorage>(
+                "datastore",
+                (sp, _) => new PausableGrainStorage(sp.GetRequiredKeyedService<IGrainStorage>("datastore-inner"))));
+        }
+    }
+
+    /// <summary>
+    /// Gate 1: with a write parked at the <c>head</c> storage write (the commit point), <c>GetHead</c> and
+    /// <c>ReadFrom</c> must still complete promptly — proving the pure reads interleave past the blocking
+    /// write turn rather than queuing behind it on the non-reentrant activation. MUST FAIL on the
+    /// unmodified grain (reads queue behind the parked write and the assertion times out) — verified red
+    /// before adding <c>[AlwaysInterleave]</c>, green after.
+    /// </summary>
+    [Fact]
+    public async Task Reads_complete_while_a_write_is_parked()
+    {
+        await using var scope = new Scope(await NewClusterAsync());
+        var grain = Grain(scope.Cluster);
+        var oldHead = (await grain.GetHead()).Head;
+
+        Gate.HeadWriteBlock = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        Gate.HeadWriteParked = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        var appendTask = grain.AppendCommit(oldHead, TouchWrite("a", "alice"));
+        try
+        {
+            await Gate.HeadWriteParked.Task.WaitAsync(Timeout);
+
+            var headTask = grain.GetHead();
+            var readTask = grain.ReadFrom(oldHead, -1);
+            var combined = Task.WhenAll((Task)headTask, readTask);
+            var winner = await Task.WhenAny(combined, Task.Delay(Timeout));
+
+            Assert.True(
+                ReferenceEquals(winner, combined),
+                "GetHead/ReadFrom did not complete while the head write was parked — reads are still queuing behind the write.");
+        }
+        finally
+        {
+            Gate.HeadWriteBlock.TrySetResult(true);
+            await appendTask;
+        }
+    }
+
+    /// <summary>
+    /// Gate 2: a write parked mid-flight must never be observable by an interleaved reader — neither at the
+    /// <c>head</c> write (log entries already durable) nor at a <c>log/{n}</c> write (nothing durable yet
+    /// for this commit). Once the write completes, the event and the advanced head become visible together
+    /// (one consistent publication).
+    /// </summary>
+    [Fact]
+    public async Task Parked_write_is_invisible_until_the_head_commit()
+    {
+        await using var scope = new Scope(await NewClusterAsync());
+        var grain = Grain(scope.Cluster);
+        var oldHead = (await grain.GetHead()).Head;
+
+        // Phase 1: park at the head write itself.
+        Gate.HeadWriteBlock = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        Gate.HeadWriteParked = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var append1 = grain.AppendCommit(oldHead, TouchWrite("a", "alice"));
+        long? newHead1;
+        try
+        {
+            await Gate.HeadWriteParked.Task.WaitAsync(Timeout);
+
+            var segmentDuringPark = await grain.ReadFrom(oldHead, -1).WaitAsync(Timeout);
+            Assert.Empty(segmentDuringPark.Events);
+            Assert.Equal(oldHead, segmentDuringPark.HeadRevision);
+
+            var headDuringPark = await grain.GetHead().WaitAsync(Timeout);
+            Assert.Equal(oldHead, headDuringPark.Head);
+        }
+        finally
+        {
+            Gate.HeadWriteBlock.TrySetResult(true);
+            newHead1 = await append1;
+        }
+
+        Assert.NotNull(newHead1);
+        var segmentAfterCommit = await grain.ReadFrom(oldHead, -1);
+        var committedEvent = Assert.Single(segmentAfterCommit.Events);
+        Assert.Equal(newHead1, committedEvent.Revision);
+        Assert.Equal(newHead1, segmentAfterCommit.HeadRevision);
+
+        // Phase 2: repeat, this time parking at the log-entry write (nothing durable for this commit yet).
+        Gate.HeadWriteBlock = null;
+        Gate.HeadWriteParked = null;
+        Gate.LogWriteBlock = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        Gate.LogWriteParked = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var append2 = grain.AppendCommit(newHead1!.Value, TouchWrite("b", "bob"));
+        long? newHead2;
+        try
+        {
+            await Gate.LogWriteParked.Task.WaitAsync(Timeout);
+
+            var segmentDuringLogPark = await grain.ReadFrom(newHead1.Value, -1).WaitAsync(Timeout);
+            Assert.Empty(segmentDuringLogPark.Events);
+
+            var headDuringLogPark = await grain.GetHead().WaitAsync(Timeout);
+            Assert.Equal(newHead1, headDuringLogPark.Head);
+        }
+        finally
+        {
+            Gate.LogWriteBlock.TrySetResult(true);
+            newHead2 = await append2;
+        }
+
+        Assert.NotNull(newHead2);
+        var segmentFinal = await grain.ReadFrom(newHead1.Value, -1);
+        var finalEvent = Assert.Single(segmentFinal.Events);
+        Assert.Equal(newHead2, finalEvent.Revision);
+        Assert.Equal(newHead2, segmentFinal.HeadRevision);
+    }
+
+    /// <summary>
+    /// Gate 3: a commit whose <c>head</c> write throws must never leak its log entries into a read, whether
+    /// observed on the same (faulted) activation or a freshly reactivated one.
+    /// </summary>
+    [Fact]
+    public async Task Failed_head_write_never_leaks_events()
+    {
+        await using var scope = new Scope(await NewClusterAsync());
+        var grain = Grain(scope.Cluster);
+        var oldHead = (await grain.GetHead()).Head;
+
+        Gate.ThrowOnceOnHeadWrite = true;
+        await Assert.ThrowsAnyAsync<Exception>(() => grain.AppendCommit(oldHead, TouchWrite("a", "alice")));
+
+        // Whether this call lands on a reactivated grain (a faulted activation deactivates) or the same one,
+        // the orphaned log entry must never surface.
+        var head = await grain.GetHead().WaitAsync(Timeout);
+        Assert.Equal(oldHead, head.Head);
+        var segment = await grain.ReadFrom(oldHead, -1).WaitAsync(Timeout);
+        Assert.Empty(segment.Events);
+
+        // NOTE: intentionally not asserting the datastore is writable again afterwards here — the injected
+        // head-write failure leaves the CustomStorage adaptor mid an internal retry of the SAME (already
+        // durably-written) log entry with a fresh write-once wrapper, which the memory grain-storage
+        // provider correctly rejects as a conflicting duplicate, and that retry loop is a pre-existing
+        // property of the write path unrelated to interleaved reads (which is exactly what this test proves
+        // above: GetHead/ReadFrom still interleave past that stuck retry and never see the orphaned event).
+    }
+
+    /// <summary>
+    /// Gate 4: the CAS remains exact under concurrent writers even while reads hammer the activation
+    /// concurrently — exactly one of two same-<c>expectedHead</c> commits succeeds.
+    /// </summary>
+    [Fact]
+    public async Task Cas_still_exact_under_concurrent_writers()
+    {
+        await using var scope = new Scope(await NewClusterAsync());
+        var grain = Grain(scope.Cluster);
+        var head = (await grain.GetHead()).Head;
+
+        using var cts = new CancellationTokenSource();
+        var hammer = Task.Run(async () =>
+        {
+            while (!cts.IsCancellationRequested)
+                await grain.GetHead();
+        });
+
+        var t1 = grain.AppendCommit(head, TouchWrite("a", "alice"));
+        var t2 = grain.AppendCommit(head, TouchWrite("b", "bob"));
+        var results = await Task.WhenAll(t1, t2).WaitAsync(Timeout);
+
+        await cts.CancelAsync();
+        await hammer;
+
+        Assert.Single(results, r => r is not null);
+        Assert.Single(results, r => r is null);
+    }
+}
