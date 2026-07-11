@@ -39,6 +39,19 @@ public interface IDispatchMetrics
     /// </summary>
     void RecordMemoMiss();
 
+    /// <summary>
+    /// A <see cref="SubjectFrontierGrain"/> per-activation frontier memo hit: the whole
+    /// LookupSubjects frontier for this grain's key was served from a warm activation without
+    /// re-walking the relation graph.
+    /// </summary>
+    void RecordFrontierMemoHit();
+
+    /// <summary>
+    /// A <see cref="SubjectFrontierGrain"/> per-activation frontier memo miss: the activation had no
+    /// usable memo (cold, or disabled) and recomputed the frontier.
+    /// </summary>
+    void RecordFrontierMemoMiss();
+
     /// <summary>An immutable point-in-time snapshot of the counters.</summary>
     DispatchMetricsSnapshot Snapshot();
 
@@ -54,15 +67,25 @@ public interface IDispatchMetrics
 /// Real grain-call boundary crossings recorded by <see cref="CheckDispatchIncomingCallFilter"/> — every
 /// incoming <c>ICheckGrain.DispatchCheck</c> call, accepted or rejected.
 /// </param>
+/// <param name="FrontierMemoHit"><see cref="SubjectFrontierGrain"/> per-activation frontier-memo hits.</param>
+/// <param name="FrontierMemoMiss"><see cref="SubjectFrontierGrain"/> per-activation frontier-memo misses.</param>
 public readonly record struct DispatchMetricsSnapshot(
     long LoopBypass,
     long MemoHit = 0,
     long MemoMiss = 0,
-    long Dispatch = 0)
+    long Dispatch = 0,
+    long FrontierMemoHit = 0,
+    long FrontierMemoMiss = 0)
 {
     /// <summary>Component-wise sum, for aggregating snapshots across silos.</summary>
     public static DispatchMetricsSnapshot operator +(DispatchMetricsSnapshot a, DispatchMetricsSnapshot b) =>
-        new(a.LoopBypass + b.LoopBypass, a.MemoHit + b.MemoHit, a.MemoMiss + b.MemoMiss, a.Dispatch + b.Dispatch);
+        new(
+            a.LoopBypass + b.LoopBypass,
+            a.MemoHit + b.MemoHit,
+            a.MemoMiss + b.MemoMiss,
+            a.Dispatch + b.Dispatch,
+            a.FrontierMemoHit + b.FrontierMemoHit,
+            a.FrontierMemoMiss + b.FrontierMemoMiss);
 }
 
 /// <summary>Thread-safe atomic-counter <see cref="IDispatchMetrics"/>.</summary>
@@ -72,6 +95,8 @@ public sealed class DispatchMetrics : IDispatchMetrics
     private long _memoHit;
     private long _memoMiss;
     private long _dispatch;
+    private long _frontierMemoHit;
+    private long _frontierMemoMiss;
 
     /// <inheritdoc />
     public void RecordLoopBypass() => Interlocked.Increment(ref _loopBypass);
@@ -86,11 +111,19 @@ public sealed class DispatchMetrics : IDispatchMetrics
     public void RecordMemoMiss() => Interlocked.Increment(ref _memoMiss);
 
     /// <inheritdoc />
+    public void RecordFrontierMemoHit() => Interlocked.Increment(ref _frontierMemoHit);
+
+    /// <inheritdoc />
+    public void RecordFrontierMemoMiss() => Interlocked.Increment(ref _frontierMemoMiss);
+
+    /// <inheritdoc />
     public DispatchMetricsSnapshot Snapshot() => new(
         Interlocked.Read(ref _loopBypass),
         Interlocked.Read(ref _memoHit),
         Interlocked.Read(ref _memoMiss),
-        Interlocked.Read(ref _dispatch));
+        Interlocked.Read(ref _dispatch),
+        Interlocked.Read(ref _frontierMemoHit),
+        Interlocked.Read(ref _frontierMemoMiss));
 
     /// <inheritdoc />
     public void Reset()
@@ -99,5 +132,7 @@ public sealed class DispatchMetrics : IDispatchMetrics
         Interlocked.Exchange(ref _memoHit, 0);
         Interlocked.Exchange(ref _memoMiss, 0);
         Interlocked.Exchange(ref _dispatch, 0);
+        Interlocked.Exchange(ref _frontierMemoHit, 0);
+        Interlocked.Exchange(ref _frontierMemoMiss, 0);
     }
 }

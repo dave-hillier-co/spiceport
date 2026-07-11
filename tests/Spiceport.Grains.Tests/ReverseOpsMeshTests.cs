@@ -131,6 +131,52 @@ public class ReverseOpsMeshTests
     }
 
     [Fact]
+    public async Task LookupSubjects_Resume_Through_The_SubjectFrontier_Memo_Union_Equals_Unlimited_No_Duplicates()
+    {
+        // The consumer cursor contract must be unchanged now that StreamLookupSubjects consults the
+        // SubjectFrontierGrain memo: a limited first page, resumed via ITS OWN cursor on a FRESH
+        // Guid-keyed stream grain instance (a brand-new activation, unrelated to whichever
+        // SubjectFrontierGrain activation served either call), must union with no duplicates to the
+        // unlimited result, and the resume token itself must still be the SAME opaque
+        // ReverseOpsCursorCodec.EncodeSubjectId(lastSubjectId) shape (a plain last-subject-id token,
+        // unaffected by which frontier source produced the item).
+        await using var cluster = await MeshTestCluster.CreateAsync(SchemaText);
+        await SeedAsync(cluster.Datastore,
+            ("readme", "viewer", "alice"),
+            ("readme", "viewer", "bob"),
+            ("readme", "viewer", "carol"),
+            ("readme", "viewer", "dave"),
+            ("readme", "viewer", "erin"));
+
+        var unlimited = await Collect(StreamGrain(cluster).StreamLookupSubjects(new LookupSubjectsArgs(
+            "document", "readme", "view", "user", CoreConstants.Ellipsis,
+            Context: null, Limit: null, Cursor: null)));
+        var unlimitedIds = unlimited.Select(s => s.Subject.SubjectId).ToList();
+
+        var page1 = await TakeN(StreamGrain(cluster).StreamLookupSubjects(new LookupSubjectsArgs(
+            "document", "readme", "view", "user", CoreConstants.Ellipsis,
+            Context: null, Limit: 2, Cursor: null)), 2);
+        Assert.Equal(2, page1.Count);
+        var resumeToken = page1[^1].ResumeCursor;
+        Assert.False(string.IsNullOrEmpty(resumeToken));
+        // The cursor is still exactly ReverseOpsCursorCodec's plain last-subject-id token — unchanged
+        // format/constant.
+        Assert.Equal(
+            ReverseOpsCursorCodec.EncodeSubjectId(page1[^1].Subject.SubjectId), resumeToken);
+
+        var page2 = await Collect(StreamGrain(cluster).StreamLookupSubjects(new LookupSubjectsArgs(
+            "document", "readme", "view", "user", CoreConstants.Ellipsis,
+            Context: null, Limit: null, Cursor: resumeToken)));
+
+        var resumedIds = page1.Concat(page2).Select(s => s.Subject.SubjectId).ToList();
+
+        // No duplicates and exact union with the unlimited result (order-independent: both walks share
+        // the same underlying engine order, but comparing as sets is the contract that matters here).
+        Assert.Equal(resumedIds.Count, resumedIds.Distinct().Count());
+        Assert.Equal(unlimitedIds.ToHashSet(), resumedIds.ToHashSet());
+    }
+
+    [Fact]
     public async Task LookupResources_Returns_All_Reachable_Resources()
     {
         await using var cluster = await MeshTestCluster.CreateAsync(SchemaText);
