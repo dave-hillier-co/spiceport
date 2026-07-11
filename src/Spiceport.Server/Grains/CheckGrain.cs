@@ -39,7 +39,7 @@ namespace Spiceport.Grains;
 /// serve requests for up to one collection-age window within one quantized-revision keyspace.
 /// </para>
 /// <para>
-/// Every other seam — the Orleans dispatcher, the traversal-bloom cycle guard — is unchanged. Disabling
+/// Every other seam — the Orleans dispatcher, the exact visited-set cycle guard — is unchanged. Disabling
 /// <see cref="ActivationMemoOptions.Enabled"/> reverts this grain to a stateless expansion step with no
 /// memo at all.
 /// </para>
@@ -77,13 +77,15 @@ public sealed class CheckGrain(
     /// <inheritdoc />
     public async Task<DispatchCheckReply> DispatchCheck(GrainCancellationToken cancellationToken)
     {
-        // The depth budget and traversal-bloom cycle guard are call-chain context, not part of this
+        // The depth budget and exact visited-set cycle guard are call-chain context, not part of this
         // grain's identity, so they arrive ambiently via the Orleans RequestContext (imported before any
         // incoming call filter runs) rather than as a method argument — see DispatchContext's remarks. A
         // missing value here means some caller reached DispatchCheck without going through the
         // OrleansDispatcher / test seam that sets it; that is a bug and must throw loudly, not default.
         var depthRemaining = DispatchContext.RequireDepthRemaining();
-        var (bloomBits, bloomK) = DispatchContext.RequireBloom();
+        var visited = DispatchContext.RequireVisited()
+            .Select(VisitKey.FromCanonicalString)
+            .ToImmutableHashSet();
 
         if (_memoOptions.Enabled
             && _memo is { } cached
@@ -131,7 +133,7 @@ public sealed class CheckGrain(
         var meta = new ResolverMeta(
             revision,
             depthRemaining,
-            TraversalBloom.FromBytes(bloomBits, bloomK));
+            visited);
         var request = new DispatchCheckRequest(parts.Resource, parts.Subject, meta);
 
         var result = await local.DispatchCheck(request, cancellationToken.CancellationToken);

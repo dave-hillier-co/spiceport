@@ -3,7 +3,7 @@ namespace Spiceport.Core;
 /// <summary>
 /// Thrown when a permission check exhausts its recursion depth budget before reaching a definitive
 /// answer. Mirrors SpiceDB's <c>MaxDepthExceededError</c> (dispatch.CheckDepth): a graph/schema deeper
-/// than the configured max depth (or a true cycle the bloom cannot otherwise bound) is treated as a
+/// than the configured max depth (or a true cycle the visited set cannot otherwise bound) is treated as a
 /// misconfiguration error, NOT a confident "not a member" verdict. The API layer maps this to gRPC
 /// <c>FailedPrecondition</c>, matching observable <c>zed</c>/SpiceDB behaviour.
 /// </summary>

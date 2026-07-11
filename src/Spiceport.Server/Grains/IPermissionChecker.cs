@@ -170,7 +170,7 @@ public sealed class PermissionChecker(
 
         var resource = new ObjectAndRelation(resourceType, resourceId, permission);
         var meta = new ResolverMeta(
-            resolved.Revision, maxDepth, TraversalBloom.ForDepth(maxDepth), resolved.SchemaHash);
+            resolved.Revision, maxDepth, ImmutableHashSet<VisitKey>.Empty, resolved.SchemaHash);
         var request = new DispatchCheckRequest(resource, subject, meta);
 
         var branch = await root.DispatchCheck(request, ct).ConfigureAwait(false);
@@ -204,7 +204,7 @@ public sealed class PermissionChecker(
         var engine = new CheckEngine(schema.Namespaces, schema.Caveats, maxDepth);
 
         var meta = new ResolverMeta(
-            resolved.Revision, maxDepth, TraversalBloom.ForDepth(maxDepth), resolved.SchemaHash);
+            resolved.Revision, maxDepth, ImmutableHashSet<VisitKey>.Empty, resolved.SchemaHash);
 
         // Dedup distinct sub-problems by their dispatch key (resource + subject; caveat context is
         // excluded from the dispatch key and applied per-item at collapse). Each distinct sub-problem is

@@ -54,12 +54,12 @@ dotnet test tests/Spiceport.Conformance.Tests  # the SpiceDB conformance corpus 
   `(resourceType, resourceId, relation, subject, quantizedRevision, schemaHash)`.
 - **Dispatch via grain calls.** Every sub-problem is a grain call; the Orleans grain directory
   owns location. `CheckGrain` activation state is the only dispatch cache, memoizing the
-  pre-context `Branch` with idle-collection eviction. A bounded **traversal bloom** carries the
+  pre-context `Branch` with idle-collection eviction. An **exact visited set** carries the
   cycle guard across grain boundaries.
 - **Caching subtleties (do not regress):** the `CheckGrain` activation memo stores the
   *pre-context* `Branch` (membership + caveat expression), never the collapsed verdict — caveat
   context is applied per-request at the caller. The grain key is exactly the canonical
-  sub-problem; the traversal bloom and `DepthRemaining` ride ambient in `RequestContext` via
+  sub-problem; the exact visited set and `DepthRemaining` ride ambient in `RequestContext` via
   `DispatchContext`, not in the grain key. Cycle-cut results are served but not retained.
   Revisions are quantized so grain keys are shared within a window; `schemaHash` is in the key
   so a schema change yields a fresh keyspace.

@@ -138,7 +138,7 @@ public sealed class CheckEngine
         // `_readerFor` above already closes over the pinned reader); fall back to the in-process
         // placeholder identity when none is supplied.
         var revision = atRevision is null ? (IRevision)InProcessRevision.Instance : atRevision;
-        var meta = new ResolverMeta(revision, _maxDepth, TraversalBloom.ForDepth(_maxDepth));
+        var meta = new ResolverMeta(revision, _maxDepth, ImmutableHashSet<VisitKey>.Empty);
         var request = new DispatchCheckRequest(resource, subject, meta);
         var result = await dispatcher.DispatchCheck(request, cancellationToken).ConfigureAwait(false);
 

@@ -23,7 +23,7 @@ Check(
     subject: ObjectAndRelation,         // Target subject (namespace, object_id, relation)
     revision: DatastoreRevision,        // Snapshot for consistent reads
     depth: uint32,                      // Current recursion depth; max enforced
-    visitedSet: BloomFilter            // Traversal cycle detection
+    visitedSet: ExactVisitedSet         // Traversal cycle detection
 ) -> MembershipResult
 ```
 
@@ -45,20 +45,20 @@ record MembershipResult {
 - If depth reaches 0 before completion, return error: ErrDepthExceeded.
 - Initial depth typically 50 (configurable).
 
-### 1.4 Cycle Detection via Traversal Bloom Filter
+### 1.4 Cycle Detection via Exact Visited Set
 
-- Bloom filter prevents infinite loops during relation walks.
+- The exact visited set prevents infinite loops during relation walks.
 - On entry, check if (resource.Namespace, resource.Relation, subject.Namespace, subject.Relation) 
-  is already in the bloom.
+  is already in the visited set.
 - If present, return NO_MEMBER (assumed cyclic).
-- Add key to bloom on entry.
+- Add key to the visited set on entry.
 
 ---
 
 ## 2. High-Level Flow
 
 ```
-Check(resource, relation, subject, revision, depth, bloom):
+Check(resource, relation, subject, revision, depth, visited):
   1. Depth validation
   2. Wildcard validation (reject if subject is `*:*`)
   3. Load relation definition from schema at revision
@@ -85,7 +85,7 @@ checkDirect(
     subject: ObjectAndRelation,
     revision: DatastoreRevision,
     depth: uint32,
-    bloom: BloomFilter
+    visited: ExactVisitedSet
 ) -> MembershipResult:
   
   foundMembers = {}  // Set of (resourceId → caveat) direct matches
@@ -146,7 +146,7 @@ checkDirect(
       subject: subject,
       revision: revision,
       depth: depth - 1,
-      bloom: bloom.Copy()
+      visited: visited.Copy()
     )
     
     // Map results back to original resource ID(s)
@@ -182,7 +182,7 @@ checkComputedUserset(
     subject: ObjectAndRelation,
     revision: DatastoreRevision,
     depth: uint32,
-    bloom: BloomFilter
+    visited: ExactVisitedSet
 ) -> MembershipResult:
   
   // Determine target namespace and resource IDs based on object type
@@ -210,7 +210,7 @@ checkComputedUserset(
     subject: subject,
     revision: revision,
     depth: depth - 1,
-    bloom: bloom
+    visited: visited
   )
   
   RETURN childResult
@@ -237,7 +237,7 @@ checkTupleToUserset(
     subject: ObjectAndRelation,
     revision: DatastoreRevision,
     depth: uint32,
-    bloom: BloomFilter
+    visited: ExactVisitedSet
 ) -> MembershipResult:
   
   // Query for intermediate subjects from tupleset relation
@@ -258,7 +258,7 @@ checkTupleToUserset(
       subject: subject,
       revision: revision,
       depth: depth - 1,
-      bloom: bloom
+      visited: visited
     )
     
     IF childResult.IsMember:
@@ -328,14 +328,14 @@ checkUnion(
     subject: ObjectAndRelation,
     revision: DatastoreRevision,
     depth: uint32,
-    bloom: BloomFilter
+    visited: ExactVisitedSet
 ) -> MembershipResult:
   
   membershipSet = {}
   errors = []
   
   FOR EACH child IN children (parallel dispatch):
-    childResult = runSetOperation(resource, child, subject, revision, depth, bloom)
+    childResult = runSetOperation(resource, child, subject, revision, depth, visited)
     
     IF childResult.Error != nil:
       errors.Add(childResult.Error)
@@ -363,14 +363,14 @@ checkIntersection(
     subject: ObjectAndRelation,
     revision: DatastoreRevision,
     depth: uint32,
-    bloom: BloomFilter
+    visited: ExactVisitedSet
 ) -> MembershipResult:
   
   membershipSet = null
   errors = []
   
   FOR EACH child IN children (parallel, resultsSetting = REQUIRE_ALL_RESULTS):
-    childResult = runSetOperation(resource, child, subject, revision, depth, bloom)
+    childResult = runSetOperation(resource, child, subject, revision, depth, visited)
     
     IF childResult.Error != nil:
       RETURN CheckResult.Error(childResult.Error)
@@ -398,11 +398,11 @@ checkExclusion(
     subject: ObjectAndRelation,
     revision: DatastoreRevision,
     depth: uint32,
-    bloom: BloomFilter
+    visited: ExactVisitedSet
 ) -> MembershipResult:
   
   // Base: first child determines initial membership
-  baseResult = runSetOperation(resource, children[0], subject, revision, depth, bloom)
+  baseResult = runSetOperation(resource, children[0], subject, revision, depth, visited)
   
   IF baseResult.Error != nil:
     RETURN baseResult
@@ -415,7 +415,7 @@ checkExclusion(
   
   // Subtract all other children
   FOR i = 1 TO len(children) - 1:
-    childResult = runSetOperation(resource, children[i], subject, revision, depth, bloom)
+    childResult = runSetOperation(resource, children[i], subject, revision, depth, visited)
     
     IF childResult.Error != nil:
       RETURN childResult
@@ -602,7 +602,7 @@ record ResponseMetadata {
 
 ---
 
-## 11. Traversal Bloom Filter (Cycle Detection)
+## 11. Exact Visited Set (Cycle Detection)
 
 ### 11.1 Purpose
 Prevent infinite recursion on cyclic schema definitions.
@@ -610,7 +610,7 @@ Prevent infinite recursion on cyclic schema definitions.
 ### 11.2 Key Composition
 
 ```
-bloomKey = (
+visitKey = (
   resource.Namespace +
   resource.Relation +
   subject.Namespace +
@@ -621,23 +621,23 @@ bloomKey = (
 ### 11.2 Implementation
 
 ```csharp
-class TraversalBloom {
-  private BloomFilter<string> filter;
+class ExactVisitedSet {
+  private HashSet<string> visited;
   
   bool Contains(string resourceNs, string resourceRel, 
                 string subjectNs, string subjectRel) {
     string key = $"{resourceNs}#{resourceRel}@{subjectNs}#{subjectRel}";
-    return filter.Contains(key);
+    return visited.Contains(key);
   }
   
   void Add(string resourceNs, string resourceRel, 
            string subjectNs, string subjectRel) {
     string key = $"{resourceNs}#{resourceRel}@{subjectNs}#{subjectRel}";
-    filter.Add(key);
+    visited.Add(key);
   }
   
-  TraversalBloom Copy() {
-    return new TraversalBloom(filter.DeepCopy());
+  ExactVisitedSet Copy() {
+    return new ExactVisitedSet(new HashSet<string>(visited));
   }
 }
 ```
@@ -719,7 +719,7 @@ record MembershipResult {
 ## 14. Algorithm Pseudo-Code Summary
 
 ```
-CHECK(resource, relation, subject, revision, depth, bloom):
+CHECK(resource, relation, subject, revision, depth, visited):
   IF depth == 0:
     RETURN ERROR(ErrDepthExceeded)
   
@@ -760,7 +760,7 @@ CHECKDIRECT(relation, ...):
   IF nonTerminalsExist:
     nonTerminalTuples = QueryRelationships(nonTerminalFilter)
     FOR chunk IN Chunk(nonTerminalTuples, chunkSize):
-      childResult = Check(chunk, ..., depth-1, bloom)
+      childResult = Check(chunk, ..., depth-1, visited)
       foundMembers.UnionWith(childResult)
   
   RETURN foundMembers
@@ -771,7 +771,7 @@ CHECKCOMPUTEDUSERSET(cu, ...):
               parentNamespace, 
               cu.Relation)
   
-  RETURN Check(targetRR, subject, ..., depth-1, bloom)
+  RETURN Check(targetRR, subject, ..., depth-1, visited)
 
 CHECKTTUPLEUSERSET(ttu, ...):
   intermediates = QueryRelationships(ttu.Tupleset)
@@ -779,7 +779,7 @@ CHECKTTUPLEUSERSET(ttu, ...):
   FOR intermediate IN intermediates:
     childResult = Check(
       (intermediate.Subject.Namespace, intermediate.Subject.ObjectId, ttu.ComputedUserset.Relation),
-      subject, ..., depth-1, bloom)
+      subject, ..., depth-1, visited)
     
     IF childResult.IsMember:
       foundMembers.Add(originalResource, childResult.Caveat)
@@ -793,7 +793,7 @@ CHECKTTUPLEUSERSET(ttu, ...):
 
 - [ ] Define `CheckRequest` and `CheckResponse` records
 - [ ] Implement `MembershipSet` with union/intersection/subtract semantics
-- [ ] Implement `TraversalBloom` for cycle detection
+- [ ] Implement `ExactVisitedSet` for cycle detection
 - [ ] Create `ICheckEvaluator` interface with `Check()` method
 - [ ] Implement `CheckDirect()` with two-phase datastore querying
 - [ ] Implement `CheckComputedUserset()` dispatcher
@@ -816,7 +816,7 @@ CHECKTTUPLEUSERSET(ttu, ...):
 3. **Records vs Classes**: Use C# records for immutable data structures.
 4. **Nullable Reference Types**: Leverage C# nullable annotations for caveat/optional fields.
 5. **No Generics Varargs**: Use explicit overloads for `runSetOperation` variants.
-6. **Bloom Filter Library**: Source from `System.Collections.Generic` or third-party library.
+6. **Visited Set**: A plain `HashSet<string>` (or immutable equivalent) from `System.Collections.Generic`/`System.Collections.Immutable`.
 
 ---
 
@@ -834,7 +834,7 @@ CHECKTTUPLEUSERSET(ttu, ...):
 - Tuple-to-userset arrow walking
 - Set operations (union, intersection, exclusion)
 - Depth limiting
-- Cycle detection via bloom filter
+- Cycle detection via exact visited set
 - Parallel dispatch with concurrency control
 - Error propagation and context handling
 

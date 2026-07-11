@@ -1,3 +1,4 @@
+using System.Collections.Immutable;
 using Orleans;
 using Spiceport.Core;
 using Spiceport.Datastore;
@@ -37,18 +38,17 @@ public class ActivationMemoMeshTests
         }
         """;
 
-    // A finite (acyclic) two-hop schema used to provoke the OrleansDispatcher's bloom loop-bypass
+    // A finite (acyclic) two-hop schema used to provoke the OrleansDispatcher's visited-set loop-bypass
     // WITHOUT a genuine relation cycle: doc1 has no direct viewer but a parent doc2 that does. A true
     // self/mutual cycle only ever terminates via MaxDepthExceededException (see LocalDispatcher's
     // remarks: "a true cycle simply consumes depth ... until it throws" — there is no visited-set cut on
     // the verdict path), so it can never surface a graceful CycleCut=true reply to assert against. Instead
-    // this test hand-seeds the dispatched TraversalBloom with the SECOND hop's own visit key before
-    // making the call, so the dispatcher believes (falsely, but harmlessly per the bloom's false-positive
-    // contract) that hop is already in flight and takes the loop-bypass path — the grain call still
-    // happens normally (doc2 has a direct viewer tuple, no further recursion needed) but the RETURNED
-    // result is unconditionally tagged CycleCut = true by OrleansDispatcher, regardless of whether that
-    // resolution itself needed the loop guard. This reaches a genuinely successful CycleCut = true reply
-    // out of a normal, finite graph.
+    // this test hand-seeds the dispatched visited set with the SECOND hop's own visit key before making
+    // the call, so the dispatcher DETERMINISTICALLY sees that hop as already in flight and takes the
+    // loop-bypass path — the grain call still happens normally (doc2 has a direct viewer tuple, no
+    // further recursion needed) but the RETURNED result is unconditionally tagged CycleCut = true by
+    // OrleansDispatcher, regardless of whether that resolution itself needed the loop guard. This reaches
+    // a genuinely successful CycleCut = true reply out of a normal, finite graph.
     private const string ArrowSchema = """
         definition user {}
 
@@ -277,10 +277,11 @@ public class ActivationMemoMeshTests
         var (grain, _) = await ResolveGrain(
             cluster, Resource("document", "doc1", "view"), Subject("alice"));
 
-        // Hand-seed the bloom with the SECOND hop's own visit key (doc2/view/alice), so the dispatcher's
-        // loop-bypass fires when the root's parent->view arrow reaches it, and OrleansDispatcher
-        // unconditionally tags the resulting reply CycleCut = true (see the class remarks on ArrowSchema).
-        var seeded = TraversalBloom.Empty.Add(
+        // Hand-seed the visited set with the SECOND hop's own visit key (doc2/view/alice), so the
+        // dispatcher's loop-bypass fires when the root's parent->view arrow reaches it, and
+        // OrleansDispatcher unconditionally tags the resulting reply CycleCut = true (see the class
+        // remarks on ArrowSchema).
+        var seeded = ImmutableHashSet<VisitKey>.Empty.Add(
             VisitKey.Of(Resource("document", "doc2", "view"), Subject("alice")));
 
         using var ct1 = new GrainCancellationTokenSource();
@@ -290,7 +291,7 @@ public class ActivationMemoMeshTests
         var afterFirst = cluster.MetricsSnapshot();
 
         Assert.True(first.Member);
-        Assert.True(first.CycleCut, "expected the pre-seeded bloom to provoke a cycle-cut reply.");
+        Assert.True(first.CycleCut, "expected the pre-seeded visited set to provoke a cycle-cut reply.");
         // Every hop of this check is now a genuine grain, since there is no in-process local-recurse
         // shortcut: the root (doc1/view), the root's bare "viewer" reference (doc1/viewer, a
         // ComputedUsersetChild Sub), the arrow target (doc2/view, the loop-bypassed hop) and ITS bare
@@ -299,7 +300,7 @@ public class ActivationMemoMeshTests
         // from the force-tagged doc2/view branch.
         Assert.Equal(before.MemoMiss + 4, afterFirst.MemoMiss);
 
-        // A second call with an EMPTY bloom (no seeding) asks the exact same sub-problem; if the root's
+        // A second call with an EMPTY visited set (no seeding) asks the exact same sub-problem; if the root's
         // cycle-cut reply had been (wrongly) memoized, this would be served from it. It must instead
         // recompute at the root (a miss) — but doc1/viewer and doc2/view are each warm from the first
         // call (their OWN replies were computed with CycleCut = false, since the force-tag is applied only

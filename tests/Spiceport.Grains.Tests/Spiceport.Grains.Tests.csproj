@@ -35,7 +35,7 @@
 
   <!-- Link the FULL conformance corpus as content (copied to output), so the grain-mesh tests can run
        both the representative subset (ConformanceMeshTests) AND the entire corpus through the mesh with
-       the traversal bloom (FullCorpusMeshBloomTests, the mandatory bloom-correctness gate). -->
+       the exact visited set (FullCorpusMeshVisitedSetTests, the mandatory visited-set-correctness gate). -->
   <ItemGroup>
     <None Include="..\Spiceport.Conformance.Tests\TestData\*.yaml" Link="TestData\%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>

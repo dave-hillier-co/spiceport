@@ -5,14 +5,14 @@ namespace Spiceport.Grains;
 
 /// <summary>
 /// Silo-singleton dispatch counters, aggregated across every grain/dispatch on a silo: how often the
-/// traversal-bloom loop bypass fired (<see cref="RecordLoopBypass"/>), plus the <see cref="CheckGrain"/>
+/// exact visited-set loop bypass fired (<see cref="RecordLoopBypass"/>), plus the <see cref="CheckGrain"/>
 /// activation memo hit/miss. Summing the snapshot from every silo's container yields cluster-wide totals.
 /// </summary>
 public interface IDispatchMetrics
 {
     /// <summary>
-    /// A sub-problem whose (resource, subject) key was already on the traversal bloom (a likely same-key
-    /// loop): the grain call still happens as normal (the grain is reentrant), but the caller forces
+    /// A sub-problem whose (resource, subject) key was already in the exact visited set (a genuine
+    /// same-key loop): the grain call still happens as normal (the grain is reentrant), but the caller forces
     /// <see cref="Engine.DispatchCheckResult.CycleCut"/> on the returned result so it is never memoized.
     /// </summary>
     void RecordLoopBypass();
@@ -47,7 +47,7 @@ public interface IDispatchMetrics
 }
 
 /// <summary>An immutable snapshot of <see cref="IDispatchMetrics"/> counters.</summary>
-/// <param name="LoopBypass">Traversal-bloom loop-bypass hits (grain call still made, result force-cut).</param>
+/// <param name="LoopBypass">Exact visited-set loop-bypass hits (grain call still made, result force-cut).</param>
 /// <param name="MemoHit">CheckGrain per-activation reply-memo hits.</param>
 /// <param name="MemoMiss">CheckGrain per-activation reply-memo misses.</param>
 /// <param name="Dispatch">

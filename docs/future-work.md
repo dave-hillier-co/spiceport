@@ -67,7 +67,7 @@ The invariants transfer structurally:
 Stages (b) and (c) — deletion of the caller-side `CachingDispatcher` and the elimination of the
 locally-owned subproblem bypass — were resolved by **MAINTAINER DECISION for simplicity over
 performance** (the benchmark gate was deliberately skipped). Every sub-problem now flows through
-a grain call, and a traversal-bloom hit forces the normal (reentrant) grain call with the result
+a grain call, and an exact visited-set hit forces the normal (reentrant) grain call with the result
 force-tagged `CycleCut` at the caller.
 
 ### 1.4 Directory-owned location: delete the hash ring (implemented)
@@ -93,12 +93,13 @@ unwinds, so gRPC deadline expiry prunes the mesh-wide computation.
 dispatch-error taxonomy (transient → `Unavailable`, cancellation → `Cancelled`, domain
 exceptions pass through unchanged). `CheckDispatchIncomingCallFilter` increments the hop
 counter and enforces the boundary-depth ceiling via the `DepthRemaining` RequestContext value.
-The dispatchers now carry only dispatch logic (key building, cancellation bridging, the bloom
-loop-bypass tag), with error mapping and hop counting delegated to the native interceptor seam.
+The dispatchers now carry only dispatch logic (key building, cancellation bridging, the exact
+visited-set loop-bypass tag), with error mapping and hop counting delegated to the native
+interceptor seam.
 
 ### 1.7 `RequestContext` for traversal state (implemented)
 
-`DepthRemaining` and the traversal bloom now ride in the Orleans `RequestContext` via the
+`DepthRemaining` and the exact visited set now ride in the Orleans `RequestContext` via the
 scoped `DispatchContext` helper, not in the request DTOs. The wire contract for `DispatchCheck`
 is now exactly the canonical sub-problem (the grain key) plus the cancellation token.
 **Trade, stated honestly:** implicit context is harder to see in tests and debuggers — the

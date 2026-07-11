@@ -10,10 +10,10 @@ namespace Spiceport.Grains.Tests;
 /// </summary>
 /// <remarks>
 /// A genuine same-key cycle (<c>group:a#member -&gt; group:b#member -&gt; group:a#member</c>) re-addresses
-/// the SAME grain key on the way back round, because the grain key excludes the bloom/depth. On the
-/// pre-change code (non-reentrant grain, bloom cycle-cut living below the grain hop) the outer grain call
-/// blocks awaiting the inner call to its own key — a deadlock that only breaks on a timeout. After the
-/// change: (B1) the dispatcher detects the likely loop via the traversal bloom and recurses IN-PROCESS
+/// the SAME grain key on the way back round, because the grain key excludes the visited set/depth. On the
+/// pre-change code (non-reentrant grain, visited-set cycle-cut living below the grain hop) the outer grain
+/// call blocks awaiting the inner call to its own key — a deadlock that only breaks on a timeout. After the
+/// change: (B1) the dispatcher detects the genuine loop via the exact visited set and recurses IN-PROCESS
 /// instead of re-entering the busy grain, and (B2) <c>CheckGrain</c> is <c>[Reentrant]</c> so even a
 /// re-entry that slips past B1 is accepted, never blocked. With correctness now resting solely on the
 /// depth budget (A1), the cycle terminates deterministically with <see cref="MaxDepthExceededException"/>
@@ -69,7 +69,7 @@ public class SameKeyCycleMeshTests
     public async Task DeepAcyclicChain_within_budget_resolves_member_across_the_mesh()
     {
         // A linear chain of 49 hops (under maxDepth 50) must resolve Member across the real grain mesh:
-        // removing the bloom cut must not falsely terminate a legitimately deep, acyclic graph.
+        // the exact visited-set loop guard must not falsely terminate a legitimately deep, acyclic graph.
         await using var cluster = await MeshTestCluster.CreateMultiSiloAsync(CycleSchema, siloCount: 3);
 
         var updates = new List<RelationshipUpdate>();
@@ -103,8 +103,8 @@ public class SameKeyCycleMeshTests
     /// never a confident (wrong) verdict on either side. Now that <see cref="OrleansDispatcher"/> has no
     /// in-process local-recurse shortcut, every hop of the cycle — including the one that re-addresses the
     /// SAME grain key it started from — is a real grain call; termination rests solely on the depth
-    /// budget, and the grain's <c>[Reentrant]</c> attribute (not a bloom-based in-process bypass) is what
-    /// keeps a same-key re-entry from deadlocking.
+    /// budget, and the grain's <c>[Reentrant]</c> attribute (not a visited-set-based in-process bypass) is
+    /// what keeps a same-key re-entry from deadlocking.
     /// </summary>
     [Fact]
     public async Task SameKeyCycle_mesh_verdict_matches_the_ReferenceDatastore_oracle()
@@ -124,7 +124,7 @@ public class SameKeyCycleMeshTests
         };
         var subject = new ObjectAndRelation("user", "x", CoreConstants.Ellipsis);
 
-        // The oracle: a plain in-process CheckEngine over a ReferenceDatastore, no grains, no bloom.
+        // The oracle: a plain in-process CheckEngine over a ReferenceDatastore, no grains, no visited-set wiring.
         var compiled = SchemaCompiler.CompileSchema(CycleSchema);
         var oracleStore = new ReferenceDatastore();
         var oracleRevision = await oracleStore.ReadWriteTx(tx => tx.WriteRelationships(relationships));
