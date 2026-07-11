@@ -366,7 +366,7 @@ public class ReverseOpsMeshTests
         var engine = new LookupResourcesEngine(schema.Namespaces, schema.Caveats);
         var oracle = new SortedSet<string>(StringComparer.Ordinal);
         await foreach (var f in engine.LookupResources(
-            reader, "user", "alice", CoreConstants.Ellipsis, "document", "view", index: null))
+            reader, "user", "alice", CoreConstants.Ellipsis, "document", "view", coveredCandidateIds: null))
             oracle.Add(f.ResourceId);
 
         Assert.NotEmpty(streamed);

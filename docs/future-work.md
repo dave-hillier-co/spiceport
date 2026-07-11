@@ -31,13 +31,24 @@ Whatever is taken from this list, these do not move:
 
 ## Part 1 — Leaning further into Orleans
 
-### 1.1 Leopard as an incremental log projection (implemented)
+### 1.1 Leopard as addressable sibling-recursion walk grains (implemented)
 
-`MembershipIndexCache` now bootstraps once from a snapshot and folds incrementally from the log
-tail, following the `SiloProjection` pattern. It applies each `LogEvent`'s relationship deltas
-to the reverse-adjacency sets incrementally, with full rebuild only on schema change or when log
-compaction advances past the cache watermark. The index remains a complete candidate superset
-confirmed by `CheckEngine`, never an oracle — it cannot change a verdict.
+The per-silo `MembershipIndexCache`/`MembershipIndex` replica (a flattened reverse-adjacency
+snapshot, folded incrementally from the log tail) is retired. In its place, `IMembershipWalkGrain`
+is a grain keyed by "the membership-walk closure rooted at subject key `type:id#relation` at
+(revision, schemaHash)": each activation computes ONE reverse-adjacency hop
+(`MembershipWalk.DirectParents`, a single `ReverseQueryRelationships` post-filtered to the schema's
+coverage scan set — see `MembershipCoverage`, the pure schema analysis extracted from the retired
+index's `Build`) and dispatches every parent onward to the SIBLING grain keyed by that parent — the
+same cross-grain-recursion idiom `CheckGrain` uses for `DispatchCheck`, with an exact ancestor path
+(not a probabilistic bloom) as the cycle guard, since a false-positive skip here would silently drop
+a candidate subtree. Because a walk runs over a reader pinned to one exact MVCC revision, it is
+revision-exact by construction — there is no fold/catch-up machinery to keep correct as the log
+advances, and a delete excludes its detached subtree immediately at the post-delete revision (the
+old replica's weak spot). Cold subject keys simply never activate; warm ones deactivate on ordinary
+idle collection like any other grain, sharding the working set instead of replicating it whole on
+every silo. The accelerator remains a complete candidate superset confirmed by `CheckEngine`, never
+an oracle — it cannot change a verdict.
 
 ### 1.2 Reminder-driven MVCC garbage collection (implemented)
 
@@ -115,8 +126,10 @@ request never pays the bootstrap — and disposes the hub (bounded observer unsu
 shutdown. Identity lives in the `IDatastoreProjectionHost` DI singleton rather than the
 `GrainService` itself: the only supported DI-reachable client of a live `GrainService` is the
 message-passing `GrainServiceClient<T>`, which would put a hop back on the per-Check read path the
-projection exists to eliminate. `MembershipIndexCache` stays a plain DI singleton — its build is
-request-schema-driven, so lifecycle management adds nothing. `GrainBackedDatastore` has a single,
+projection exists to eliminate. The Leopard accelerator (§1.1) needs no analogous per-silo
+lifecycle-managed component: `IMembershipWalkGrain` activations resolve on demand via
+`IGrainFactory` exactly like every other grain, keyed by (subject, revision, schemaHash), so there
+is no shared singleton to bootstrap. `GrainBackedDatastore` has a single,
 host-fed constructor; the push-Watch proofs get a genuinely isolated hub via a test-only
 `IDatastoreProjectionHost` implementation (`PrivateProjectionHost` in `Spiceport.Grains.Tests`)
 rather than a dedicated constructor.
@@ -175,6 +188,16 @@ A per-silo implicit subscription could unify projection freshness and the Watch 
 push feed. Deferred because the observer + slow-heartbeat design is simpler than adding a stream
 provider, and the closed-timestamp gate needs a pull path for exactness anyway. Revisit only if
 projection catch-up latency appears in profiles.
+
+### 1.12 `ISnapshotSegmentGrain` for the bootstrap read path (deliberately deferred)
+
+`ISnapshotSegmentGrain` keyed by snapshot log version reading the write-once snapshot/{version} row
+via a shared DatastoreSnapshotStore helper; GetHead gaining SnapshotVersion; bounded loud-failing
+retry on the compaction race (DatastoreGrain clears the old snapshot right after each new head
+commit); deferred because bootstrap ReadState is once-per-silo pre-traffic while the dominant
+singleton load is the write path's per-write ReadState (whose fix — deriving the write base from
+the local projection — is a separate candidate); build only if multi-silo cold-start contention is
+observed.
 
 ---
 

@@ -124,18 +124,19 @@ public sealed class LookupResourcesEngine
         int? limit = null,
         CancellationToken cancellationToken = default) =>
         LookupResources(reader, subjectType, subjectId, subjectRelation, resourceType, permission,
-            index: null, caveatContext, evaluationTime, cursor, limit, cancellationToken);
+            coveredCandidateIds: null, caveatContext, evaluationTime, cursor, limit, cancellationToken);
 
     /// <summary>
     /// As <see cref="LookupResources(IDatastoreReader,string,string,string,string,string,IReadOnlyDictionary{string,object}?,DateTimeOffset?,LookupResourcesCursor?,int?,CancellationToken)"/>,
-    /// but offered an optional <see cref="MembershipIndex"/> accelerator. The index is consulted ONLY for a
-    /// fresh, unpaged enumeration (<paramref name="cursor"/> null and <paramref name="limit"/> null) of a
-    /// shape it covers; in that case it produces a COMPLETE candidate set walked in-memory and each candidate
-    /// is confirmed by the same trusted <see cref="CheckEngine"/> the live path uses — so verdicts are
-    /// identical to the live traversal, and a stale/over-broad index can only add Check work. Every other call
-    /// (paged, resumed, or an uncovered shape) runs the unchanged live traversal, so the cursored streaming
-    /// contract is never touched. The caller must only pass an index whose <see cref="MembershipIndex.SchemaHash"/>
-    /// matches the resolved request hash and that was built at a revision at least as fresh as the reader's.
+    /// but offered an optional pre-computed COMPLETE candidate set (the Leopard membership-walk accelerator's
+    /// output — see <c>Spiceport.Grains.ReverseOpsSupport.AcquireCoveredCandidates</c>, which is the only
+    /// legitimate producer: it dispatches the walk grains, confirms the reply is not partial, and filters to
+    /// this exact (resourceType, permission) shape before calling here). When supplied, this overload just
+    /// confirms each id with the same trusted <see cref="CheckEngine"/> the live path uses — so verdicts are
+    /// identical to the live traversal, and an over-broad candidate set can only add Check work. The
+    /// cursor==null / limit==null guard that gated the old in-engine fast path now lives entirely in the
+    /// caller (a candidate set is only ever produced for a fresh, unpaged enumeration), so this overload does
+    /// not re-check them: passing a non-null <paramref name="coveredCandidateIds"/> always takes this path.
     /// </summary>
     public async IAsyncEnumerable<FoundResource> LookupResources(
         IDatastoreReader reader,
@@ -144,7 +145,7 @@ public sealed class LookupResourcesEngine
         string subjectRelation,
         string resourceType,
         string permission,
-        MembershipIndex? index,
+        IReadOnlyList<string>? coveredCandidateIds,
         IReadOnlyDictionary<string, object?>? caveatContext = null,
         DateTimeOffset? evaluationTime = null,
         LookupResourcesCursor? cursor = null,
@@ -163,13 +164,12 @@ public sealed class LookupResourcesEngine
         var terminalSubject = new ObjectAndRelation(subjectType, subjectId, subjectRelation);
         var sections = cursor?.Sections ?? [];
 
-        // Leopard fast path: only for a fresh, unpaged enumeration of a covered shape. The index yields a
-        // complete candidate set; Check confirms each, so the result set equals the live traversal's. Paged /
-        // resumed / uncovered requests fall through to the live engine untouched (cursor contract preserved).
-        if (index is not null && cursor is null && limit is null &&
-            index.TryCoveredResources(subjectType, subjectId, subjectRelation, resourceType, permission, out var candidateIds))
+        // Leopard fast path: the caller (ReverseOpsSupport.AcquireCoveredCandidates) has already decided
+        // this is a fresh, unpaged enumeration of a covered shape and produced a COMPLETE candidate set;
+        // Check confirms each, so the result set equals the live traversal's.
+        if (coveredCandidateIds is not null)
         {
-            foreach (var resourceId in candidateIds)
+            foreach (var resourceId in coveredCandidateIds)
             {
                 cancellationToken.ThrowIfCancellationRequested();
                 var resource = new ObjectAndRelation(resourceType, resourceId, permission);

@@ -63,9 +63,11 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<IOutgoingGrainCallFilter, CheckDispatchOutgoingCallFilter>();
         services.AddSingleton<IIncomingGrainCallFilter, CheckDispatchIncomingCallFilter>();
 
-        // Per-silo Leopard membership-index accelerator (default ON; opt out via a registered options override).
+        // Leopard membership-walk accelerator toggle (default ON; opt out via a registered options override).
+        // The accelerator itself has no per-silo singleton to register: it is the addressable
+        // IMembershipWalkGrain mesh (see MembershipWalkGrain), resolved on demand via IGrainFactory exactly
+        // like every other grain, and its idle-collection age is wired by AddActivationMemoCollectionAge.
         services.AddSingleton<MembershipIndexOptions>();
-        services.AddSingleton<MembershipIndexCache>();
 
         // CheckGrain's per-activation reply memo (default ON; opt out via a registered options override).
         // Also drives the grain's idle-collection age — see SiloBuilderExtensions.AddActivationMemoCollectionAge.

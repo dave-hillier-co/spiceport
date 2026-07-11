@@ -38,22 +38,98 @@ internal static class ReverseOpsSupport
     }
 
     /// <summary>
-    /// Acquires the trusted Leopard membership index for this request (built from the current schema at the
-    /// resolved revision), or null when the accelerator is disabled — in which case the lookup engine runs its
-    /// unchanged live traversal.
+    /// Acquires a COMPLETE candidate set for a fresh, unpaged (<paramref name="hasCursorOrLimit"/> false)
+    /// <c>LookupResources</c> enumeration of <paramref name="resourceType"/>/<paramref name="permission"/>
+    /// via the Leopard membership-walk grain mesh (the addressable replacement for the retired per-silo
+    /// <c>MembershipIndexCache</c> replica) — or null when the accelerator is disabled, the request is
+    /// paged/resumed, the target shape is not covered, or either walk reports an incomplete result (a
+    /// depth-exhausted subtree), in every one of which cases the caller MUST run the live traversal instead.
     /// </summary>
-    public static async Task<MembershipIndex?> AcquireIndex(
-        MembershipIndexCache membershipIndex,
-        ImmutableList<NamespaceDefinition> namespaces,
-        ImmutableList<CaveatDefinition> caveats,
-        IDatastoreReader reader,
+    /// <remarks>
+    /// Dispatches TWO root walks — the concrete subject key and its same-type/relation wildcard key (so a
+    /// <c>type:*#rel</c> userset edge is followed too, mirroring the retired index's wildcard-seed rule) —
+    /// and unions their nodes. The union is then filtered to nodes whose (type, relation) match the target
+    /// shape's coverage yields, the reflexive self-membership candidate is added when the subject and
+    /// resource types match (mirroring <c>MembershipIndex.TryCoveredResources</c> exactly), and the result is
+    /// returned sorted/distinct — the identical contract the retired index's <c>TryCoveredResources</c> gave.
+    /// </remarks>
+    public static async Task<IReadOnlyList<string>?> AcquireCoveredCandidates(
+        IGrainFactory grainFactory,
+        MembershipIndexOptions options,
+        SchemaSnapshot schema,
+        string subjectType,
+        string subjectId,
+        string subjectRelation,
+        string resourceType,
+        string permission,
         IRevision revision,
+        bool hasCursorOrLimit,
         CancellationToken cancellationToken)
     {
-        var revisionNanos = revision is TimestampRevision t ? t.TimestampNanosSinceEpoch : 0;
-        return await membershipIndex
-            .TryGet(namespaces, caveats, reader, revisionNanos, cancellationToken)
+        ArgumentNullException.ThrowIfNull(grainFactory);
+        ArgumentNullException.ThrowIfNull(options);
+        ArgumentNullException.ThrowIfNull(schema);
+
+        if (!options.Enabled || hasCursorOrLimit)
+            return null;
+
+        // A wildcard subject is not a concrete membership query; leave it to the live engine (mirrors the
+        // retired index's TryCoveredResources decline rule).
+        if (subjectId == CoreConstants.PublicWildcard)
+            return null;
+
+        var coverage = schema.MembershipCoverage;
+        if (!coverage.TryGetYields(resourceType, permission, out var yieldRelations))
+            return null;
+
+        var revisionString = revision.ToString()!;
+        var schemaHash = schema.SchemaHash;
+
+        var concreteReply = await WalkRoot(grainFactory, subjectType, subjectId, subjectRelation, revisionString, schemaHash, cancellationToken)
             .ConfigureAwait(ContinueOnCapturedContext);
+        var wildcardReply = await WalkRoot(grainFactory, subjectType, CoreConstants.PublicWildcard, subjectRelation, revisionString, schemaHash, cancellationToken)
+            .ConfigureAwait(ContinueOnCapturedContext);
+
+        if (concreteReply.Incomplete || wildcardReply.Incomplete)
+            return null; // never return a silently short candidate set — fall back to live.
+
+        var nodes = concreteReply.Nodes.Concat(wildcardReply.Nodes)
+            .Select(n => new MembershipWalk.ResourceNode(n.Type, n.Id, n.Relation));
+        return MembershipWalk.ToCoveredCandidates(nodes, yieldRelations, resourceType, subjectType, subjectId);
+    }
+
+    private static async Task<MembershipClosureReply> WalkRoot(
+        IGrainFactory grainFactory,
+        string subjectType,
+        string subjectId,
+        string subjectRelation,
+        string revision,
+        string schemaHash,
+        CancellationToken cancellationToken)
+    {
+        var key = MembershipWalkKey.Build(subjectType, subjectId, subjectRelation, revision, schemaHash);
+        var grain = grainFactory.GetGrain<IMembershipWalkGrain>(key);
+        var args = new MembershipWalkArgs(Path: [], DepthRemaining: CheckEngine.DefaultMaxDepth);
+
+        using var grainCancellation = new GrainCancellationTokenSource();
+        try
+        {
+            return await grain.GetContainingSet(args, grainCancellation.Token)
+                .WaitAsync(cancellationToken)
+                .ConfigureAwait(ContinueOnCapturedContext);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            try
+            {
+                await grainCancellation.Cancel().ConfigureAwait(ContinueOnCapturedContext);
+            }
+            catch
+            {
+                // Cancellation is already the primary outcome.
+            }
+            throw;
+        }
     }
 
     /// <summary>

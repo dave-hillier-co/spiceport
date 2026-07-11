@@ -33,6 +33,12 @@ public sealed record SchemaSnapshot(
         new(() => ReachabilityGraph.Build(Schema.Namespaces.ToImmutableDictionary(ns => ns.Name), ReachabilityMode.First),
             LazyThreadSafetyMode.ExecutionAndPublication);
 
+    // Built at most once per snapshot, exactly like the reachability graphs above: the Leopard membership-walk
+    // accelerator's pure schema analysis (which targets flatten to stored base-relation edges) is a function
+    // of the compiled schema alone, so it is computed once here rather than once per MembershipWalkGrain call.
+    private readonly Lazy<MembershipCoverage> _membershipCoverage =
+        new(() => MembershipCoverage.Build(Schema.Namespaces), LazyThreadSafetyMode.ExecutionAndPublication);
+
     /// <summary>The compiled namespace definitions.</summary>
     public ImmutableList<NamespaceDefinition> Namespaces => Schema.Namespaces;
 
@@ -44,6 +50,9 @@ public sealed record SchemaSnapshot(
 
     /// <summary>The first-mode reachability graph for this snapshot's schema, built lazily on first use.</summary>
     public ReachabilityGraph ReachabilityFirst => _reachabilityFirst.Value;
+
+    /// <summary>The Leopard membership-coverage analysis for this snapshot's schema, built lazily on first use.</summary>
+    public MembershipCoverage MembershipCoverage => _membershipCoverage.Value;
 }
 
 /// <summary>
