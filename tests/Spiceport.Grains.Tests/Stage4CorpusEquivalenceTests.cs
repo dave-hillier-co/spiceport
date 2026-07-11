@@ -8,10 +8,13 @@ namespace Spiceport.Grains.Tests;
 
 /// <summary>
 /// Stage-4 NON-NEGOTIABLE oracle gate: across the ENTIRE SpiceDB conformance corpus, the Leopard
-/// <see cref="MembershipIndex"/> must not change a single LookupResources verdict. For every file, every
-/// assertion's (subject, resource-type, permission) is run through <see cref="LookupResourcesEngine"/> twice —
-/// once with the index, once without — and the (resource id, membership) result sets must be identical. Run at
-/// the engine level (no Orleans) so the whole corpus sweeps in seconds.
+/// membership-walk accelerator (<see cref="MembershipCoverage"/> + <see cref="MembershipWalk.LocalClosure"/>)
+/// must not change a single LookupResources verdict. For every file, every assertion's
+/// (subject, resource-type, permission) is run through <see cref="LookupResourcesEngine"/> twice — once with
+/// the walked candidate set, once without — and the (resource id, membership) result sets must be identical.
+/// Run at the engine level (no Orleans) so the whole corpus sweeps in seconds. This is the walk-based
+/// replacement for the retired flattened-index equivalence gate; VERDICT-level comparison is unchanged
+/// (candidate-set comparison would be a weakening — deliberately not done here).
 /// </summary>
 public class Stage4CorpusEquivalenceTests
 {
@@ -24,20 +27,19 @@ public class Stage4CorpusEquivalenceTests
 
     [Theory]
     [MemberData(nameof(CorpusFiles))]
-    public async Task IndexOn_EqualsIndexOff_ForEveryAssertionShape(string fileName)
+    public async Task WalkOn_EqualsWalkOff_ForEveryAssertionShape(string fileName)
     {
         var path = Path.Combine(AppContext.BaseDirectory, "TestData", fileName);
         var file = ValidationFileLoader.LoadFromFile(path);
 
         var compiled = SchemaCompiler.CompileSchema(file.SchemaText);
         var engine = new LookupResourcesEngine(compiled.Namespaces, compiled.Caveats);
+        var coverage = MembershipCoverage.Build(compiled.Namespaces);
 
         var store = new ReferenceDatastore();
         var rev = await store.ReadWriteTx(tx => tx.WriteRelationships(
             file.Relationships.Select(r => new RelationshipUpdate(r, UpdateOperation.Create)).ToList()));
         var reader = store.SnapshotReader(rev);
-
-        var index = await MembershipIndex.Build(compiled.Namespaces, reader, "corpus-hash");
 
         // Distinct (subject, resourceType, permission) shapes drawn from the file's assertions.
         var shapes = file.Assertions
@@ -53,22 +55,31 @@ public class Stage4CorpusEquivalenceTests
 
             var live = await Collect(engine.LookupResources(
                 reader, subject.ObjectType, subject.ObjectId, subject.Relation, resourceType, permission,
-                index: null, context));
-            var indexed = await Collect(engine.LookupResources(
+                coveredCandidateIds: null, context));
+
+            IReadOnlyList<string>? candidates = null;
+            if (coverage.TryGetYields(resourceType, permission, out var yields))
+            {
+                var nodes = await MembershipWalk.LocalClosure(
+                    reader, coverage, new MembershipWalk.SubjectKey(subject.ObjectType, subject.ObjectId, subject.Relation));
+                candidates = MembershipWalk.ToCoveredCandidates(nodes, yields, resourceType, subject.ObjectType, subject.ObjectId);
+            }
+
+            var walked = await Collect(engine.LookupResources(
                 reader, subject.ObjectType, subject.ObjectId, subject.Relation, resourceType, permission,
-                index, context));
+                candidates, context));
 
             // Compare the per-resource collapsed verdict. The live engine has NO global dedup (it may emit a
-            // resource once per entrypoint); the index Checks each id once. A duplicate is not a verdict change,
-            // so collapse both by id (Member dominates Caveated) before comparing.
-            if (live.Count != indexed.Count || live.Any(kv => !indexed.TryGetValue(kv.Key, out var m) || m != kv.Value))
+            // resource once per entrypoint); the walked path Checks each id once. A duplicate is not a
+            // verdict change, so collapse both by id (Member dominates Caveated) before comparing.
+            if (live.Count != walked.Count || live.Any(kv => !walked.TryGetValue(kv.Key, out var m) || m != kv.Value))
                 mismatches.Add(
                     $"  {subject.ObjectType}:{subject.ObjectId}#{subject.Relation} -> {resourceType}#{permission}: " +
-                    $"live=[{Render(live)}] indexed=[{Render(indexed)}]");
+                    $"live=[{Render(live)}] walked=[{Render(walked)}]");
         }
 
         Assert.True(mismatches.Count == 0,
-            $"{fileName}: index changed {mismatches.Count} LookupResources verdict(s):\n{string.Join('\n', mismatches)}");
+            $"{fileName}: the walk-based accelerator changed {mismatches.Count} LookupResources verdict(s):\n{string.Join('\n', mismatches)}");
     }
 
     private static string Render(Dictionary<string, Membership> d) =>

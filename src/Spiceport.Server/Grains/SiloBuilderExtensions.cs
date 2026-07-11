@@ -16,24 +16,27 @@ namespace Spiceport.Grains;
 public static class SiloBuilderExtensions
 {
     /// <summary>
-    /// Applies <see cref="ActivationMemoOptions.CollectionAge"/> as <see cref="CheckGrain"/>'s and
-    /// <see cref="SubjectFrontierMemoOptions.CollectionAge"/> as <see cref="SubjectFrontierGrain"/>'s
+    /// Applies <see cref="ActivationMemoOptions.CollectionAge"/> as <see cref="CheckGrain"/>'s,
+    /// <see cref="SubjectFrontierMemoOptions.CollectionAge"/> as <see cref="SubjectFrontierGrain"/>'s, and
+    /// <see cref="MembershipIndexOptions.CollectionAge"/> as <see cref="MembershipWalkGrain"/>'s
     /// class-specific idle-collection age (<see cref="GrainCollectionOptions.ClassSpecificCollectionAge"/>),
     /// so a warm activation — and hence its per-activation reply memo (stage (a) of
     /// "Activation-as-cache") — survives at least that long between calls.
     /// </summary>
     /// <remarks>
-    /// Reads <see cref="ActivationMemoOptions"/> and <see cref="SubjectFrontierMemoOptions"/> from DI
-    /// lazily, via the Options pattern's dependent-<c>Configure</c> overload, so it does not matter
-    /// whether this is called before or after <see cref="ServiceCollectionExtensions.AddSpiceportGrainServices"/>
-    /// registers (or a caller overrides) either options type — the values are resolved when Orleans
-    /// actually builds <see cref="GrainCollectionOptions"/>, not at wiring time.
+    /// Reads <see cref="ActivationMemoOptions"/>, <see cref="SubjectFrontierMemoOptions"/> and
+    /// <see cref="MembershipIndexOptions"/> from DI lazily, via the Options pattern's
+    /// dependent-<c>Configure</c> overload, so it does not matter whether this is called before or after
+    /// <see cref="ServiceCollectionExtensions.AddSpiceportGrainServices"/> registers (or a caller overrides)
+    /// any of the three options types — the values are resolved when Orleans actually builds
+    /// <see cref="GrainCollectionOptions"/>, not at wiring time.
     /// </remarks>
     public static ISiloBuilder AddActivationMemoCollectionAge(this ISiloBuilder siloBuilder)
     {
         ArgumentNullException.ThrowIfNull(siloBuilder);
         siloBuilder.Services.AddOptions<GrainCollectionOptions>()
-            .Configure<ActivationMemoOptions, SubjectFrontierMemoOptions>((options, memo, frontierMemo) =>
+            .Configure<ActivationMemoOptions, SubjectFrontierMemoOptions, MembershipIndexOptions>(
+                (options, memo, frontierMemo, walkMemo) =>
             {
                 // GrainCollectionOptions rejects a ClassSpecificCollectionAge entry that does not exceed
                 // CollectionQuantum (default 1 minute) at configuration-validation time; clamp up instead
@@ -50,6 +53,12 @@ public static class SiloBuilderExtensions
                 {
                     var age = frontierMemo.CollectionAge < floor ? floor : frontierMemo.CollectionAge;
                     options.ClassSpecificCollectionAge[typeof(SubjectFrontierGrain).FullName!] = age;
+                }
+
+                if (walkMemo.Enabled)
+                {
+                    var age = walkMemo.CollectionAge < floor ? floor : walkMemo.CollectionAge;
+                    options.ClassSpecificCollectionAge[typeof(MembershipWalkGrain).FullName!] = age;
                 }
             });
         return siloBuilder;

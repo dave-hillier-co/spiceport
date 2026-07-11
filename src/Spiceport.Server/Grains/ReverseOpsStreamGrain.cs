@@ -31,7 +31,7 @@ public sealed class ReverseOpsStreamGrain(
     IDatastore datastore,
     ISchemaProvider schemaProvider,
     SchemaResolver schemaResolver,
-    MembershipIndexCache membershipIndex,
+    MembershipIndexOptions membershipIndexOptions,
     SubjectFrontierMemoOptions? frontierMemoOptions = null) : Grain, IReverseOpsStreamGrain
 {
     private readonly SubjectFrontierMemoOptions _frontierMemoOptions = frontierMemoOptions ?? new SubjectFrontierMemoOptions();
@@ -225,11 +225,6 @@ public sealed class ReverseOpsStreamGrain(
         var snapshot = await ResolveSchema(schemaHash, reader, cancellationToken)
             .ConfigureAwait(ReverseOpsSupport.ContinueOnCapturedContext);
         var engine = new LookupResourcesEngine(snapshot.Namespaces, snapshot.Caveats, snapshot.ReachabilityFirst);
-        // The Leopard accelerator (null unless enabled). The engine consults it only for a fresh, unpaged
-        // enumeration of a covered shape and confirms every candidate with Check, so verdicts are unchanged.
-        var index = await ReverseOpsSupport
-            .AcquireIndex(membershipIndex, snapshot.Namespaces, snapshot.Caveats, reader, revision, cancellationToken)
-            .ConfigureAwait(ReverseOpsSupport.ContinueOnCapturedContext);
         var startCursor = ReverseOpsCursorCodec.DecodeResources(args.Cursor);
 
         // A supplied client limit means the caller needs per-item resume cursors: pass the limit into the
@@ -238,9 +233,18 @@ public sealed class ReverseOpsStreamGrain(
         // cursors). This mirrors the prior unary grain's engine-invocation decision exactly.
         var limit = args.Limit is { } l && l > 0 ? l : (int?)null;
 
+        // The Leopard accelerator (null unless it decides this request is a fresh, unpaged enumeration of
+        // a covered shape). Dispatches the membership-walk grain mesh and confirms every candidate with
+        // Check, so verdicts are unchanged from the live traversal.
+        var candidates = await ReverseOpsSupport.AcquireCoveredCandidates(
+                GrainFactory, membershipIndexOptions, snapshot,
+                args.SubjectType, args.SubjectId, args.SubjectRelation, args.ResourceType, args.Permission,
+                revision, hasCursorOrLimit: args.Cursor is not null || limit is not null, cancellationToken)
+            .ConfigureAwait(ReverseOpsSupport.ContinueOnCapturedContext);
+
         await foreach (var found in engine.LookupResources(
                 reader, args.SubjectType, args.SubjectId, args.SubjectRelation,
-                args.ResourceType, args.Permission, index, args.Context, now, startCursor, limit, cancellationToken)
+                args.ResourceType, args.Permission, candidates, args.Context, now, startCursor, limit, cancellationToken)
             .WithCancellation(cancellationToken))
         {
             var permissionship = found.Membership == Membership.Caveated

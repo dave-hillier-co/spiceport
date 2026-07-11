@@ -9,8 +9,10 @@ namespace Spiceport.Grains.Tests;
 /// Fold-level gates for GC <see cref="LogEvent"/>s (<c>ev.GcFloor</c> non-null): proves
 /// <see cref="LogFold.ApplyEvent"/> on a GC event is exactly "collect below the floor, then advance the
 /// head to the event's revision" — the same equivalence <see cref="LogEventEquivalenceTests"/> establishes
-/// for ordinary events — and that <see cref="SiloProjection"/> / <see cref="MembershipIndexCache"/> fold a
-/// GC event in their log tail harmlessly (it carries no relationship/schema/counter changes).
+/// for ordinary events — and that <see cref="SiloProjection"/> folds a GC event in its log tail harmlessly
+/// (it carries no relationship/schema/counter changes). The Leopard membership-walk grain mesh needs no
+/// analogous fold-tolerance gate: each walk runs over a reader pinned to one exact revision (see
+/// <c>Spiceport.Engine.MembershipWalk</c>), so a GC event elsewhere in the log never touches it.
 /// </summary>
 public sealed class DatastoreGcFoldTests
 {
@@ -104,42 +106,6 @@ public sealed class DatastoreGcFoldTests
         foreach (var rel in state.LiveAt(state.HeadRevision))
             set.Add($"{rel.Resource.ObjectId}:{rel.Subject.ObjectId}");
         return set;
-    }
-
-    [Fact]
-    public async Task MembershipIndexCache_CatchUp_folds_a_gc_event_in_the_tail_harmlessly()
-    {
-        const string schema = """
-            definition user {}
-            definition doc {
-                relation viewer: user
-                permission view = viewer
-            }
-            """;
-        var compiled = SchemaCompiler.CompileSchema(schema);
-        var store = new ReferenceDatastore();
-        var grain = new FakeLog(Seed);
-        var cache = new MembershipIndexCache(new MembershipIndexOptions(), grain);
-
-        var r1 = await store.ReadWriteTx(tx => tx.WriteRelationships(new List<RelationshipUpdate>
-        {
-            new(Rel("a", "alice"), UpdateOperation.Create),
-        }));
-        var reader1 = store.SnapshotReader(r1);
-        var index1 = await cache.TryGet(compiled.Namespaces, compiled.Caveats, reader1, Seed);
-        Assert.NotNull(index1);
-
-        // The log advances via a delete, THEN a GC event that carries no content — the cache must fold
-        // past it without error and the candidates must be unaffected.
-        grain.Append(DeleteEvent(Seed + 1, "a", "alice"));
-        grain.Append(GcEvent(Seed + 2, Seed + 1));
-
-        var reader2 = store.SnapshotReader(r1); // unused by the incremental fold path
-        var index2 = await cache.TryGet(compiled.Namespaces, compiled.Caveats, reader2, Seed + 2);
-
-        Assert.NotNull(index2);
-        Assert.True(index2!.TryCoveredResources("user", "alice", CoreConstants.Ellipsis, "doc", "viewer", out var ids));
-        Assert.Empty(ids); // alice's viewer relationship was deleted before the GC event
     }
 
     /// <summary>
