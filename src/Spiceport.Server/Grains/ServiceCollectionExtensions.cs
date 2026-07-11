@@ -71,6 +71,11 @@ public static class ServiceCollectionExtensions
         // Also drives the grain's idle-collection age — see SiloBuilderExtensions.AddActivationMemoCollectionAge.
         services.AddSingleton<ActivationMemoOptions>();
 
+        // SubjectFrontierGrain's per-activation LookupSubjects frontier memo (default ON; opt out via a
+        // registered options override). Also drives the grain's idle-collection age — see
+        // SiloBuilderExtensions.AddActivationMemoCollectionAge.
+        services.AddSingleton<SubjectFrontierMemoOptions>();
+
         // The Orleans dispatcher turns each sub-problem into a grain call. This single instance is the
         // silo-wide root: the API enters through it AND each grain routes its child sub-problems back
         // through it (so ALL recursion crosses grain boundaries — there is no in-process local-recurse

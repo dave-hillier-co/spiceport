@@ -31,8 +31,12 @@ public sealed class ReverseOpsStreamGrain(
     IDatastore datastore,
     ISchemaProvider schemaProvider,
     SchemaResolver schemaResolver,
-    MembershipIndexCache membershipIndex) : Grain, IReverseOpsStreamGrain
+    MembershipIndexCache membershipIndex,
+    SubjectFrontierMemoOptions? frontierMemoOptions = null) : Grain, IReverseOpsStreamGrain
 {
+    private readonly SubjectFrontierMemoOptions _frontierMemoOptions = frontierMemoOptions ?? new SubjectFrontierMemoOptions();
+
+
     /// <summary>
     /// Resolves the compiled schema effective at the pinned revision (the same schema the confirming Check
     /// mesh evaluates under), rather than the possibly-stale ambient current schema on a non-writer silo.
@@ -110,20 +114,27 @@ public sealed class ReverseOpsStreamGrain(
     {
         ArgumentNullException.ThrowIfNull(args);
         cancellationToken.ThrowIfCancellationRequested();
-        var (reader, now, token, _, schemaHash) = await ReverseOpsSupport
+        var (reader, now, token, revision, schemaHash) = await ReverseOpsSupport
             .PinReader(datastore, args.Consistency, cancellationToken)
             .ConfigureAwait(ReverseOpsSupport.ContinueOnCapturedContext);
 
         var schema = await ResolveSchema(schemaHash, reader, cancellationToken)
             .ConfigureAwait(ReverseOpsSupport.ContinueOnCapturedContext);
-        var engine = new LookupSubjectsEngine(schema.Namespaces);
         var evaluator = new CaveatEvaluator(schema.Caveats);
         var resource = new ObjectAndRelation(args.ResourceType, args.ResourceId, args.Permission);
         var after = ReverseOpsCursorCodec.DecodeSubjectId(args.Cursor);
 
-        await foreach (var found in engine
-            .LookupSubjects(reader, resource, args.SubjectType, args.SubjectRelation, now, cancellationToken)
-            .WithCancellation(cancellationToken))
+        // BELOW the pin/schema resolution: the pre-context frontier is either served from the
+        // SubjectFrontierGrain activation memo (an exact memo of this identical computation at a pinned
+        // identity, same class as CheckGrain's memo) or walked live via the engine, unchanged. Either way
+        // the result feeds the SAME cursor-skip / caveat-collapse loop below, so the two paths cannot drift.
+        var walk = _frontierMemoOptions.Enabled
+            ? await MemoizedFrontier(resource, args, revision, schemaHash, cancellationToken)
+                .ConfigureAwait(ReverseOpsSupport.ContinueOnCapturedContext)
+            : new LookupSubjectsEngine(schema.Namespaces)
+                .LookupSubjects(reader, resource, args.SubjectType, args.SubjectRelation, now, cancellationToken);
+
+        await foreach (var found in walk.WithCancellation(cancellationToken))
         {
             // Deterministic-by-id resume: skip ids at or before the cursor.
             if (after is { } a && string.CompareOrdinal(found.SubjectId, a) <= 0)
@@ -135,11 +146,64 @@ public sealed class ReverseOpsStreamGrain(
 
             // NOTE: FoundSubject.ExcludedSubjects (wildcard exclusions) are not yet carried over the wire —
             // FoundSubjectWire has no excluded-subjects field, so the cross-silo path drops them (unchanged
-            // from the prior unary grain). The in-process engine preserves them.
+            // from the prior unary grain). The in-process engine (and the memoized frontier, which mirrors
+            // it byte-for-byte) preserves them internally; only this client-edge wire shape drops them.
             var subject = new FoundSubjectWire(found.SubjectId, found.IsWildcard, permissionship);
             yield return new FoundSubjectStreamItem(
                 subject, ReverseOpsCursorCodec.EncodeSubjectId(found.SubjectId), token);
         }
+    }
+
+    /// <summary>
+    /// Resolves the pre-context frontier via the <see cref="ISubjectFrontierGrain"/> activation memo and
+    /// replays it as an <see cref="IAsyncEnumerable{T}"/> in the engine's own walk order (no sort/reorder),
+    /// so it slots into the identical post-processing loop the live engine walk uses.
+    /// </summary>
+    private async Task<IAsyncEnumerable<FoundSubject>> MemoizedFrontier(
+        ObjectAndRelation resource, LookupSubjectsArgs args, IRevision revision, string? schemaHash,
+        CancellationToken cancellationToken)
+    {
+        var key = SubjectFrontierKey.Build(
+            resource, args.SubjectType, args.SubjectRelation,
+            revision.ToString(), schemaHash ?? schemaProvider.Current.SchemaHash);
+        var frontierGrain = GrainFactory.GetGrain<ISubjectFrontierGrain>(key);
+
+        // Mirrors OrleansDispatcher's GrainCancellationToken bridging: the Orleans token drives the grain
+        // call, and caller cancellation (observed via WaitAsync) is propagated onward to the activation
+        // rather than left to complete unobserved.
+        using var grainCancellation = new GrainCancellationTokenSource();
+        var grainCall = frontierGrain.GetFrontier(grainCancellation.Token);
+        SubjectFrontierReply reply;
+        try
+        {
+            reply = await grainCall.WaitAsync(cancellationToken).ConfigureAwait(ReverseOpsSupport.ContinueOnCapturedContext);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            try
+            {
+                await grainCancellation.Cancel().ConfigureAwait(ReverseOpsSupport.ContinueOnCapturedContext);
+            }
+            catch
+            {
+                // Cancellation is already the primary outcome.
+            }
+            throw;
+        }
+
+        return ToAsyncEnumerable(reply.Subjects.Select(FrontierWire.FromWire).ToList());
+    }
+
+    private static async IAsyncEnumerable<FoundSubject> ToAsyncEnumerable(
+        IReadOnlyList<FoundSubject> items,
+        [EnumeratorCancellation] CancellationToken cancellationToken = default)
+    {
+        foreach (var item in items)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            yield return item;
+        }
+        await Task.CompletedTask.ConfigureAwait(ReverseOpsSupport.ContinueOnCapturedContext);
     }
 
     /// <inheritdoc />

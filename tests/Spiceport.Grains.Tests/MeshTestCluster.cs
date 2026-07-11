@@ -84,12 +84,17 @@ public sealed class MeshTestCluster : IAsyncDisposable
         string schemaText,
         int batchConcurrency = PermissionChecker.DefaultBatchConcurrency,
         bool useMembershipIndex = true,
-        bool useActivationMemo = true)
+        bool useActivationMemo = true,
+        bool useSubjectFrontierMemo = true,
+        int? subjectFrontierMaxMemoSubjects = null)
     {
         SchemaHolder.SchemaText = schemaText;
         SchemaHolder.BatchConcurrency = batchConcurrency;
         SchemaHolder.UseMembershipIndex = useMembershipIndex;
         SchemaHolder.UseActivationMemo = useActivationMemo;
+        SchemaHolder.UseSubjectFrontierMemo = useSubjectFrontierMemo;
+        SchemaHolder.SubjectFrontierMaxMemoSubjects =
+            subjectFrontierMaxMemoSubjects ?? new SubjectFrontierMemoOptions().MaxMemoSubjects;
         SchemaHolder.UseRandomPlacement = false;
 
         var builder = new TestClusterBuilder(initialSilosCount: 1);
@@ -126,6 +131,7 @@ public sealed class MeshTestCluster : IAsyncDisposable
         int batchConcurrency = PermissionChecker.DefaultBatchConcurrency,
         bool useMembershipIndex = true,
         bool useActivationMemo = true,
+        bool useSubjectFrontierMemo = true,
         bool useRandomPlacement = false)
     {
         if (siloCount < 1)
@@ -135,6 +141,7 @@ public sealed class MeshTestCluster : IAsyncDisposable
         SchemaHolder.BatchConcurrency = batchConcurrency;
         SchemaHolder.UseMembershipIndex = useMembershipIndex;
         SchemaHolder.UseActivationMemo = useActivationMemo;
+        SchemaHolder.UseSubjectFrontierMemo = useSubjectFrontierMemo;
         SchemaHolder.UseRandomPlacement = useRandomPlacement;
 
         var builder = new TestClusterBuilder(initialSilosCount: (short)siloCount);
@@ -160,6 +167,8 @@ public sealed class MeshTestCluster : IAsyncDisposable
         public static int BatchConcurrency = PermissionChecker.DefaultBatchConcurrency;
         public static bool UseMembershipIndex;
         public static bool UseActivationMemo = true;
+        public static bool UseSubjectFrontierMemo = true;
+        public static int SubjectFrontierMaxMemoSubjects = new SubjectFrontierMemoOptions().MaxMemoSubjects;
         public static bool UseRandomPlacement;
     }
 
@@ -185,6 +194,11 @@ public sealed class MeshTestCluster : IAsyncDisposable
                         sp.GetRequiredService<IGrainFactory>(), sp.GetRequiredService<IDatastoreProjectionHost>()));
                 services.AddSingleton(new MembershipIndexOptions { Enabled = SchemaHolder.UseMembershipIndex });
                 services.AddSingleton(new ActivationMemoOptions { Enabled = SchemaHolder.UseActivationMemo });
+                services.AddSingleton(new SubjectFrontierMemoOptions
+                {
+                    Enabled = SchemaHolder.UseSubjectFrontierMemo,
+                    MaxMemoSubjects = SchemaHolder.SubjectFrontierMaxMemoSubjects,
+                });
             });
         }
     }
@@ -213,6 +227,11 @@ public sealed class MeshTestCluster : IAsyncDisposable
                         sp.GetRequiredService<IGrainFactory>(), sp.GetRequiredService<IDatastoreProjectionHost>()));
                 services.AddSingleton(new MembershipIndexOptions { Enabled = SchemaHolder.UseMembershipIndex });
                 services.AddSingleton(new ActivationMemoOptions { Enabled = SchemaHolder.UseActivationMemo });
+                services.AddSingleton(new SubjectFrontierMemoOptions
+                {
+                    Enabled = SchemaHolder.UseSubjectFrontierMemo,
+                    MaxMemoSubjects = SchemaHolder.SubjectFrontierMaxMemoSubjects,
+                });
 
                 // See CreateMultiSiloAsync's useRandomPlacement doc: an opt-in override of the cluster's
                 // DEFAULT placement (Orleans 10's ResourceOptimizedPlacement makes no spread guarantee) for
