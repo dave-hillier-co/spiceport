@@ -8,8 +8,8 @@ namespace Spiceport.Grains.Tests;
 /// <see cref="SubjectFrontierGrain"/>'s per-activation LookupSubjects frontier memo — the LookupSubjects
 /// analogue of stage (a) of "Activation-as-cache" (<c>docs/future-work.md</c> item 1.3). Every test
 /// resolves the <see cref="ISubjectFrontierGrain"/> directly by its <see cref="SubjectFrontierKey"/> (or
-/// drives <see cref="IReverseOpsStreamGrain.StreamLookupSubjects"/>, for the caveat-context test), so only
-/// this feature's own memo/consumer behaviour is under test.
+/// drives <see cref="ReverseOps.StreamLookupSubjects"/>, for the caveat-context test), so only this
+/// feature's own memo/consumer behaviour is under test.
 /// </summary>
 [Collection(MeshClusterCollection.Name)]
 public class SubjectFrontierMemoMeshTests
@@ -94,8 +94,8 @@ public class SubjectFrontierMemoMeshTests
     public async Task Memoized_frontier_collapses_differently_under_different_request_contexts_via_the_stream()
     {
         // (b) The memoized frontier is the pre-context shape: caveat context is applied per-request at
-        // ReverseOpsStreamGrain, so two StreamLookupSubjects calls sharing the SAME warm memoized frontier
-        // correctly collapse to different verdicts for the caveated subject.
+        // ReverseOps, so two StreamLookupSubjects calls sharing the SAME warm memoized frontier correctly
+        // collapse to different verdicts for the caveated subject.
         await using var cluster = await MeshTestCluster.CreateAsync(CaveatSchema);
         await cluster.Datastore.ReadWriteTx(tx => tx.WriteRelationships([
             new RelationshipUpdate(
@@ -111,8 +111,7 @@ public class SubjectFrontierMemoMeshTests
             var args = new LookupSubjectsArgs(
                 "document", "doc1", "view", "user", CoreConstants.Ellipsis,
                 Context: context, Limit: null, Cursor: null);
-            await foreach (var item in cluster.GrainFactory
-                .GetGrain<IReverseOpsStreamGrain>(Guid.NewGuid()).StreamLookupSubjects(args))
+            await foreach (var item in cluster.ReverseOps.StreamLookupSubjects(args))
             {
                 if (item.Subject.SubjectId == "alice")
                     return item.Subject.Permissionship;
@@ -190,13 +189,11 @@ public class SubjectFrontierMemoMeshTests
             Context: null, Limit: null, Cursor: null);
 
         var found = new List<string>();
-        await foreach (var item in cluster.GrainFactory
-            .GetGrain<IReverseOpsStreamGrain>(Guid.NewGuid()).StreamLookupSubjects(args))
+        await foreach (var item in cluster.ReverseOps.StreamLookupSubjects(args))
         {
             found.Add(item.Subject.SubjectId);
         }
-        await foreach (var item in cluster.GrainFactory
-            .GetGrain<IReverseOpsStreamGrain>(Guid.NewGuid()).StreamLookupSubjects(args))
+        await foreach (var item in cluster.ReverseOps.StreamLookupSubjects(args))
         {
             found.Add(item.Subject.SubjectId);
         }

@@ -7,10 +7,10 @@ using Spiceport.Grains.Abstractions;
 namespace Spiceport.Grains;
 
 /// <summary>
-/// The pinning / index-acquisition / caveat-collapse logic shared by the unary <c>ExpandPermissionTree</c>
-/// and the streaming <c>StreamLookupSubjects</c> / <c>StreamLookupResources</c> methods on
-/// <see cref="ReverseOpsStreamGrain"/>. Kept as one copy so the snapshot-pinning and collapse rules cannot
-/// drift between the unary and streaming paths.
+/// The pinning / index-acquisition / caveat-collapse logic shared by <see cref="ReverseOps.ExpandPermissionTree"/>
+/// and the streaming <see cref="ReverseOps.StreamLookupSubjects"/> / <see cref="ReverseOps.StreamLookupResources"/>
+/// ops. Kept as one copy so the snapshot-pinning and collapse rules cannot drift between the unary and
+/// streaming paths.
 /// </summary>
 internal static class ReverseOpsSupport
 {

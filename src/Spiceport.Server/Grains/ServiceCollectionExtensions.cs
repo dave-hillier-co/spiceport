@@ -103,6 +103,24 @@ public static class ServiceCollectionExtensions
             maxDepth,
             batchConcurrency));
 
+        // The reverse-ops (LookupSubjects/LookupResources/ExpandPermissionTree) and relationship-read
+        // (ReadRelationships/BulkExportRelationships) in-process helpers: they read straight off the local
+        // silo's IDatastore projection (the same pattern AuthzedWatchV1Service uses for Watch), dispatching
+        // onward to SubjectFrontierGrain/MembershipWalkGrain/the check mesh exactly as the retired stream
+        // grains did. IDatastore is host-owned and not registered here (see the remarks above), but that is
+        // fine — these are lazy factory registrations resolved after the host completes its own DI setup.
+        services.AddSingleton<ReverseOps>(sp => new ReverseOps(
+            sp.GetRequiredService<IDatastore>(),
+            sp.GetRequiredService<ISchemaProvider>(),
+            sp.GetRequiredService<SchemaResolver>(),
+            sp.GetRequiredService<IGrainFactory>(),
+            sp.GetRequiredService<MembershipWalkOptions>(),
+            sp.GetRequiredService<SubjectFrontierMemoOptions>()));
+
+        services.AddSingleton<RelationshipReads>(sp => new RelationshipReads(
+            sp.GetRequiredService<IDatastore>(),
+            sp.GetRequiredService<ISchemaProvider>()));
+
         return services;
     }
 }

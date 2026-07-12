@@ -80,7 +80,9 @@ dotnet test tests/Spiceport.Conformance.Tests  # the SpiceDB conformance corpus 
 - Idiomatic modern C#: records for immutable data, file-scoped namespaces, `IAsyncEnumerable`
   for streaming, `[GenerateSerializer]` for any type crossing a grain boundary.
 - Keep engine logic out of the API layer. gRPC service classes are pure translation over the
-  grains; engine/graph logic lives in `Spiceport.Engine`/`Spiceport.Grains`.
+  grains and the Server-layer read helpers (`ReverseOps`, `RelationshipReads`) that run in-process
+  over the local silo's projection — the same pattern `AuthzedWatchV1Service` uses for Watch;
+  engine/graph logic lives in `Spiceport.Engine`/`Spiceport.Grains`.
 - Map errors to gRPC status codes deliberately (e.g. CREATE-conflict -> `AlreadyExists`,
   precondition/schema-validation failure -> `FailedPrecondition`, bad consistency token ->
   `InvalidArgument`). A wrong code makes `zed` retry or crash.

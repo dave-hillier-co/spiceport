@@ -9,10 +9,11 @@ namespace Spiceport.Grains.Tests;
 
 /// <summary>
 /// Exercises the three reverse / tree ops (ExpandPermissionTree, LookupSubjects, LookupResources)
-/// THROUGH the in-process Orleans <see cref="MeshTestCluster"/> grain surface — the
-/// <see cref="IReverseOpsStreamGrain"/> resolved from the cluster's grain factory — against representative
-/// SpiceDB corpus schemas (a nested-group / exclusion file and a caveat file), NOT against the
-/// in-process engine directly.
+/// THROUGH the <see cref="MeshTestCluster"/>'s <see cref="ReverseOps"/> in-process read helper (the same
+/// instance a silo's gRPC services resolve) against representative SpiceDB corpus schemas (a nested-group
+/// / exclusion file and a caveat file), NOT against the in-process engine directly. The helper still
+/// dispatches onward to the SubjectFrontierGrain / MembershipWalkGrain / Check mesh, so this remains a
+/// distributed exercise, not a purely local one.
 /// </summary>
 /// <remarks>
 /// Each test asserts two things:
@@ -48,18 +49,13 @@ public class ReverseOpsCorpusMeshTests
         await datastore.ReadWriteTx(tx => tx.WriteRelationships(updates));
     }
 
-    // ExpandPermissionTree is unary with no follow-up MoveNext, so it reuses the well-known Expand key.
-    private static IReverseOpsStreamGrain Grain(MeshTestCluster cluster) =>
-        cluster.GrainFactory.GetGrain<IReverseOpsStreamGrain>(IReverseOpsStreamGrain.ExpandKey);
-
-    // The reverse LOOKUP ops now stream from the Guid-keyed IReverseOpsStreamGrain (a fresh key per
-    // enumeration); collect the whole stream so the corpus assertions read the same shape as before.
+    // The reverse LOOKUP ops stream from the in-process ReverseOps helper; collect the whole stream so the
+    // corpus assertions read the same shape as before.
     private static async Task<List<FoundSubjectWire>> LookupSubjectsViaMesh(
         MeshTestCluster cluster, LookupSubjectsArgs args)
     {
         var list = new List<FoundSubjectWire>();
-        await foreach (var item in cluster.GrainFactory
-            .GetGrain<IReverseOpsStreamGrain>(Guid.NewGuid()).StreamLookupSubjects(args))
+        await foreach (var item in cluster.ReverseOps.StreamLookupSubjects(args))
             list.Add(item.Subject);
         return list;
     }
@@ -68,8 +64,7 @@ public class ReverseOpsCorpusMeshTests
         MeshTestCluster cluster, LookupResourcesArgs args)
     {
         var list = new List<FoundResourceWire>();
-        await foreach (var item in cluster.GrainFactory
-            .GetGrain<IReverseOpsStreamGrain>(Guid.NewGuid()).StreamLookupResources(args))
+        await foreach (var item in cluster.ReverseOps.StreamLookupResources(args))
             list.Add(item);
         return list;
     }
@@ -201,7 +196,7 @@ public class ReverseOpsCorpusMeshTests
         await using var cluster = await MeshTestCluster.CreateAsync(file.SchemaText);
         await SeedAsync(cluster.Datastore, file);
 
-        var reply = await Grain(cluster).ExpandPermissionTree(
+        var reply = await cluster.ReverseOps.ExpandPermissionTree(
             new ExpandTreeArgs("document", "firstdoc", "view", ExpandModeWire.Shallow));
 
         // view = viewer, so the tree root expands the "view" permission over the document.

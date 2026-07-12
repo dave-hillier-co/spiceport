@@ -7,10 +7,11 @@ using Spiceport.Grains.Abstractions;
 namespace Spiceport.Grains.Tests;
 
 /// <summary>
-/// Exercises the three reverse / tree ops through the REAL Orleans grain mesh: the
-/// <see cref="IReverseOpsStreamGrain"/> resolved from the in-process <see cref="TestCluster"/>'s grain
-/// factory, running ExpandPermissionTree, LookupSubjects and LookupResources against the silo's
-/// datastore snapshot.
+/// Exercises the three reverse / tree ops through the <see cref="MeshTestCluster"/>'s
+/// <see cref="ReverseOps"/> in-process read helper (the same instance a silo's gRPC services resolve),
+/// running ExpandPermissionTree, LookupSubjects and LookupResources against the silo's datastore snapshot
+/// (and, for LookupResources, still dispatching onward to the SubjectFrontierGrain / MembershipWalkGrain
+/// mesh).
 /// </summary>
 [Collection(MeshClusterCollection.Name)]
 public class ReverseOpsMeshTests
@@ -36,15 +37,6 @@ public class ReverseOpsMeshTests
             .ToList();
         await datastore.ReadWriteTx(tx => tx.WriteRelationships(updates));
     }
-
-    // ExpandPermissionTree is unary with no follow-up MoveNext, so it reuses the well-known Expand key.
-    private static IReverseOpsStreamGrain Grain(MeshTestCluster cluster) =>
-        cluster.GrainFactory.GetGrain<IReverseOpsStreamGrain>(IReverseOpsStreamGrain.ExpandKey);
-
-    // A FRESH Guid per enumeration: native IAsyncEnumerable streaming pins the enumerator to one activation,
-    // so every stream (and every resume) must resolve its own brand-new grain key.
-    private static IReverseOpsStreamGrain StreamGrain(MeshTestCluster cluster) =>
-        cluster.GrainFactory.GetGrain<IReverseOpsStreamGrain>(Guid.NewGuid());
 
     private static async Task<List<T>> Collect<T>(IAsyncEnumerable<T> stream)
     {
@@ -72,7 +64,7 @@ public class ReverseOpsMeshTests
         await using var cluster = await MeshTestCluster.CreateAsync(SchemaText);
         await SeedAsync(cluster.Datastore, ("readme", "viewer", "alice"), ("readme", "editor", "bob"));
 
-        var reply = await Grain(cluster).ExpandPermissionTree(
+        var reply = await cluster.ReverseOps.ExpandPermissionTree(
             new ExpandTreeArgs("document", "readme", "view", ExpandModeWire.Shallow));
 
         var root = reply.Root;
@@ -96,7 +88,7 @@ public class ReverseOpsMeshTests
         await using var cluster = await MeshTestCluster.CreateAsync(SchemaText);
         await SeedAsync(cluster.Datastore, ("readme", "viewer", "alice"), ("readme", "editor", "bob"));
 
-        var items = await Collect(StreamGrain(cluster).StreamLookupSubjects(new LookupSubjectsArgs(
+        var items = await Collect(cluster.ReverseOps.StreamLookupSubjects(new LookupSubjectsArgs(
             "document", "readme", "view", "user", CoreConstants.Ellipsis,
             Context: null, Limit: null, Cursor: null)));
 
@@ -115,13 +107,13 @@ public class ReverseOpsMeshTests
             ("readme", "viewer", "carol"));
 
         // Take 2 from a fresh stream, then resume from the 2nd item's cursor on a FRESH grain activation.
-        var page1 = await TakeN(StreamGrain(cluster).StreamLookupSubjects(new LookupSubjectsArgs(
+        var page1 = await TakeN(cluster.ReverseOps.StreamLookupSubjects(new LookupSubjectsArgs(
             "document", "readme", "view", "user", CoreConstants.Ellipsis,
             Context: null, Limit: 2, Cursor: null)), 2);
         Assert.Equal(2, page1.Count);
         Assert.False(string.IsNullOrEmpty(page1[^1].ResumeCursor));
 
-        var page2 = await Collect(StreamGrain(cluster).StreamLookupSubjects(new LookupSubjectsArgs(
+        var page2 = await Collect(cluster.ReverseOps.StreamLookupSubjects(new LookupSubjectsArgs(
             "document", "readme", "view", "user", CoreConstants.Ellipsis,
             Context: null, Limit: 2, Cursor: page1[^1].ResumeCursor)));
         Assert.Single(page2);
@@ -134,12 +126,11 @@ public class ReverseOpsMeshTests
     public async Task LookupSubjects_Resume_Through_The_SubjectFrontier_Memo_Union_Equals_Unlimited_No_Duplicates()
     {
         // The consumer cursor contract must be unchanged now that StreamLookupSubjects consults the
-        // SubjectFrontierGrain memo: a limited first page, resumed via ITS OWN cursor on a FRESH
-        // Guid-keyed stream grain instance (a brand-new activation, unrelated to whichever
-        // SubjectFrontierGrain activation served either call), must union with no duplicates to the
-        // unlimited result, and the resume token itself must still be the SAME opaque
-        // ReverseOpsCursorCodec.EncodeSubjectId(lastSubjectId) shape (a plain last-subject-id token,
-        // unaffected by which frontier source produced the item).
+        // SubjectFrontierGrain memo: a limited first page, resumed via ITS OWN cursor on a fresh
+        // enumeration (unrelated to whichever SubjectFrontierGrain activation served either call), must
+        // union with no duplicates to the unlimited result, and the resume token itself must still be the
+        // SAME opaque ReverseOpsCursorCodec.EncodeSubjectId(lastSubjectId) shape (a plain last-subject-id
+        // token, unaffected by which frontier source produced the item).
         await using var cluster = await MeshTestCluster.CreateAsync(SchemaText);
         await SeedAsync(cluster.Datastore,
             ("readme", "viewer", "alice"),
@@ -148,12 +139,12 @@ public class ReverseOpsMeshTests
             ("readme", "viewer", "dave"),
             ("readme", "viewer", "erin"));
 
-        var unlimited = await Collect(StreamGrain(cluster).StreamLookupSubjects(new LookupSubjectsArgs(
+        var unlimited = await Collect(cluster.ReverseOps.StreamLookupSubjects(new LookupSubjectsArgs(
             "document", "readme", "view", "user", CoreConstants.Ellipsis,
             Context: null, Limit: null, Cursor: null)));
         var unlimitedIds = unlimited.Select(s => s.Subject.SubjectId).ToList();
 
-        var page1 = await TakeN(StreamGrain(cluster).StreamLookupSubjects(new LookupSubjectsArgs(
+        var page1 = await TakeN(cluster.ReverseOps.StreamLookupSubjects(new LookupSubjectsArgs(
             "document", "readme", "view", "user", CoreConstants.Ellipsis,
             Context: null, Limit: 2, Cursor: null)), 2);
         Assert.Equal(2, page1.Count);
@@ -164,7 +155,7 @@ public class ReverseOpsMeshTests
         Assert.Equal(
             ReverseOpsCursorCodec.EncodeSubjectId(page1[^1].Subject.SubjectId), resumeToken);
 
-        var page2 = await Collect(StreamGrain(cluster).StreamLookupSubjects(new LookupSubjectsArgs(
+        var page2 = await Collect(cluster.ReverseOps.StreamLookupSubjects(new LookupSubjectsArgs(
             "document", "readme", "view", "user", CoreConstants.Ellipsis,
             Context: null, Limit: null, Cursor: resumeToken)));
 
@@ -185,7 +176,7 @@ public class ReverseOpsMeshTests
             ("design", "editor", "alice"),
             ("secret", "viewer", "bob"));
 
-        var items = await Collect(StreamGrain(cluster).StreamLookupResources(new LookupResourcesArgs(
+        var items = await Collect(cluster.ReverseOps.StreamLookupResources(new LookupResourcesArgs(
             "document", "view", "user", "alice", CoreConstants.Ellipsis,
             Context: null, Limit: null, Cursor: null)));
 
@@ -204,13 +195,13 @@ public class ReverseOpsMeshTests
             ("d3", "viewer", "alice"));
 
         // Take 2 from a fresh stream (a limited walk emits a per-item cursor), then resume on a FRESH grain.
-        var page1 = await TakeN(StreamGrain(cluster).StreamLookupResources(new LookupResourcesArgs(
+        var page1 = await TakeN(cluster.ReverseOps.StreamLookupResources(new LookupResourcesArgs(
             "document", "view", "user", "alice", CoreConstants.Ellipsis,
             Context: null, Limit: 2, Cursor: null)), 2);
         Assert.Equal(2, page1.Count);
         Assert.False(string.IsNullOrEmpty(page1[^1].AfterResultCursor));
 
-        var page2 = await Collect(StreamGrain(cluster).StreamLookupResources(new LookupResourcesArgs(
+        var page2 = await Collect(cluster.ReverseOps.StreamLookupResources(new LookupResourcesArgs(
             "document", "view", "user", "alice", CoreConstants.Ellipsis,
             Context: null, Limit: 2, Cursor: page1[^1].AfterResultCursor)));
 
@@ -249,7 +240,7 @@ public class ReverseOpsMeshTests
             Viewer("doc_b", new ObjectAndRelation("group", "g3b", "member")),
             Viewer("doc_m", new ObjectAndRelation("group", "g3b", "member")),
         ]));
-        var unpaged = await Collect(StreamGrain(cluster).StreamLookupResources(new LookupResourcesArgs(
+        var unpaged = await Collect(cluster.ReverseOps.StreamLookupResources(new LookupResourcesArgs(
             "document", "view", "user", "alice", CoreConstants.Ellipsis,
             Context: null, Limit: null, Cursor: null)));
         var expected = unpaged.Select(r => r.ResourceId)
@@ -262,7 +253,7 @@ public class ReverseOpsMeshTests
         string? cursor = null;
         while (paged.Count <= unpaged.Count)
         {
-            var page = await TakeN(StreamGrain(cluster).StreamLookupResources(new LookupResourcesArgs(
+            var page = await TakeN(cluster.ReverseOps.StreamLookupResources(new LookupResourcesArgs(
                 "document", "view", "user", "alice", CoreConstants.Ellipsis,
                 Context: null, Limit: 1, Cursor: cursor)), 1);
             if (page.Count == 0)
@@ -293,7 +284,7 @@ public class ReverseOpsMeshTests
 
         async Task Drain(CancellationToken ct)
         {
-            await foreach (var _ in StreamGrain(cluster).StreamLookupResources(new LookupResourcesArgs(
+            await foreach (var _ in cluster.ReverseOps.StreamLookupResources(new LookupResourcesArgs(
                 "document", "view", "user", "alice", CoreConstants.Ellipsis,
                 Context: null, Limit: null, Cursor: null), ct))
             {
@@ -321,7 +312,7 @@ public class ReverseOpsMeshTests
         {
             try
             {
-                await foreach (var _ in StreamGrain(cluster).StreamLookupResources(new LookupResourcesArgs(
+                await foreach (var _ in cluster.ReverseOps.StreamLookupResources(new LookupResourcesArgs(
                     "document", "view", "user", "alice", CoreConstants.Ellipsis,
                     Context: null, Limit: null, Cursor: null), cts.Token))
                 {
@@ -340,9 +331,10 @@ public class ReverseOpsMeshTests
     [Fact]
     public async Task StreamLookupResources_CrossesSiloBoundary_MatchesEngineOracle()
     {
-        // A genuine multi-silo cluster: the client grain factory resolves a Guid-keyed stream grain that may
-        // activate on any silo, so the enumeration crosses the grain boundary. The full streamed set must
-        // equal the engine's own (index-off) LookupResources over the same pinned snapshot.
+        // A genuine multi-silo cluster: the in-process read runs on the primary silo but the Leopard
+        // membership-walk accelerator it dispatches to (IMembershipWalkGrain) may activate on any silo, so
+        // the enumeration still crosses a real grain boundary. The full streamed set must equal the
+        // engine's own (index-off) LookupResources over the same pinned snapshot.
         await using var cluster = await MeshTestCluster.CreateMultiSiloAsync(NestedSchemaText, siloCount: 3);
         Assert.True(cluster.SiloCount >= 2);
         await cluster.Datastore.ReadWriteTx(tx => tx.WriteRelationships(
@@ -354,7 +346,7 @@ public class ReverseOpsMeshTests
         ]));
 
         var streamed = new SortedSet<string>(StringComparer.Ordinal);
-        await foreach (var r in StreamGrain(cluster).StreamLookupResources(new LookupResourcesArgs(
+        await foreach (var r in cluster.ReverseOps.StreamLookupResources(new LookupResourcesArgs(
             "document", "view", "user", "alice", CoreConstants.Ellipsis,
             Context: null, Limit: null, Cursor: null)))
             streamed.Add(r.ResourceId);

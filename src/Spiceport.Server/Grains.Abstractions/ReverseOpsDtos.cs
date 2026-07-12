@@ -1,5 +1,3 @@
-using Orleans.Concurrency;
-
 namespace Spiceport.Grains.Abstractions;
 
 /// <summary>
@@ -8,13 +6,14 @@ namespace Spiceport.Grains.Abstractions;
 /// </summary>
 /// <remarks>
 /// Non-members are never represented — they are simply not yielded. The reverse engine ops already
-/// shear caveats against the request context, so the cross-grain reply carries the post-context
-/// collapsed shape (a missing-fields list) rather than a verbatim caveat-expression tree.
+/// shear caveats against the request context, so this shape carries the post-context collapsed shape
+/// (a missing-fields list) rather than a verbatim caveat-expression tree. Runs entirely in-process
+/// between <see cref="ReverseOps"/> and the gRPC front doors — it crosses no grain boundary, so it is a
+/// plain record with no Orleans serialization attributes.
 /// </remarks>
-[GenerateSerializer]
 public sealed record Permissionship(
-    [property: Id(0)] bool IsCaveated,
-    [property: Id(1)] IReadOnlyList<string> MissingContextParams)
+    bool IsCaveated,
+    IReadOnlyList<string> MissingContextParams)
 {
     /// <summary>An unconditional member.</summary>
     public static Permissionship Member { get; } = new(false, []);
@@ -48,32 +47,30 @@ public enum SetOpWire
     Exclusion = 2,
 }
 
-/// <summary>Arguments for <see cref="IReverseOpsStreamGrain.ExpandPermissionTree"/>.</summary>
+/// <summary>Arguments for <see cref="ReverseOps.ExpandPermissionTree"/>.</summary>
 /// <param name="ResourceType">The resource namespace.</param>
 /// <param name="ResourceId">The resource object id.</param>
 /// <param name="Permission">The relation or permission to expand.</param>
 /// <param name="Mode">Shallow or recursive expansion.</param>
 /// <param name="Consistency">The consistency requirement; null means minimize-latency (default).</param>
-[GenerateSerializer]
 public sealed record ExpandTreeArgs(
-    [property: Id(0)] string ResourceType,
-    [property: Id(1)] string ResourceId,
-    [property: Id(2)] string Permission,
-    [property: Id(3)] ExpandModeWire Mode,
-    [property: Id(4)] ConsistencyWire? Consistency = null);
+    string ResourceType,
+    string ResourceId,
+    string Permission,
+    ExpandModeWire Mode,
+    ConsistencyWire? Consistency = null);
 
-/// <summary>The reply from <see cref="IReverseOpsStreamGrain.ExpandPermissionTree"/>: the whole tree root.</summary>
+/// <summary>The reply from <see cref="ReverseOps.ExpandPermissionTree"/>: the whole tree root.</summary>
 /// <param name="Root">The expanded tree root.</param>
 /// <param name="ExpandedAtToken">The ZedToken for the revision actually evaluated.</param>
-[GenerateSerializer]
 public sealed record ExpandTreeReply(
-    [property: Id(0)] ExpandTreeNodeWire Root,
-    [property: Id(1)] string ExpandedAtToken = "");
+    ExpandTreeNodeWire Root,
+    string ExpandedAtToken = "");
 
 /// <summary>
-/// A serializable node of an expanded permission tree, structurally mirroring the engine's
-/// <c>PermissionTreeNode</c>. Exactly one of <see cref="Subjects"/> (leaf) or <see cref="Children"/>
-/// (set operation) is populated; <see cref="Operation"/> applies only to set-operation nodes.
+/// A node of an expanded permission tree, structurally mirroring the engine's <c>PermissionTreeNode</c>.
+/// Exactly one of <see cref="Subjects"/> (leaf) or <see cref="Children"/> (set operation) is populated;
+/// <see cref="Operation"/> applies only to set-operation nodes.
 /// </summary>
 /// <param name="ExpandedType">Object type of the resource ONR this node expands.</param>
 /// <param name="ExpandedId">Object id of the resource ONR this node expands.</param>
@@ -83,16 +80,15 @@ public sealed record ExpandTreeReply(
 /// <param name="Operation">The combining operation for a set-operation node.</param>
 /// <param name="Subjects">The directly-written subjects, for a leaf node.</param>
 /// <param name="Children">The child nodes, for a set-operation node.</param>
-[GenerateSerializer]
 public sealed record ExpandTreeNodeWire(
-    [property: Id(0)] string ExpandedType,
-    [property: Id(1)] string ExpandedId,
-    [property: Id(2)] string ExpandedRelation,
-    [property: Id(3)] IReadOnlyList<string> CaveatMissingFields,
-    [property: Id(4)] bool IsLeaf,
-    [property: Id(5)] SetOpWire Operation,
-    [property: Id(6)] IReadOnlyList<ExpandSubjectWire> Subjects,
-    [property: Id(7)] IReadOnlyList<ExpandTreeNodeWire> Children);
+    string ExpandedType,
+    string ExpandedId,
+    string ExpandedRelation,
+    IReadOnlyList<string> CaveatMissingFields,
+    bool IsLeaf,
+    SetOpWire Operation,
+    IReadOnlyList<ExpandSubjectWire> Subjects,
+    IReadOnlyList<ExpandTreeNodeWire> Children);
 
 /// <summary>A directly-written subject within an expand leaf node.</summary>
 /// <param name="SubjectType">The subject namespace.</param>
@@ -100,17 +96,16 @@ public sealed record ExpandTreeNodeWire(
 /// <param name="SubjectRelation">The subject relation (ellipsis for a terminal subject).</param>
 /// <param name="IsWildcard">True when the subject is the public wildcard.</param>
 /// <param name="CaveatMissingFields">Caveat params gating this subject (non-empty = subject is caveated).</param>
-[GenerateSerializer]
 public sealed record ExpandSubjectWire(
-    [property: Id(0)] string SubjectType,
-    [property: Id(1)] string SubjectId,
-    [property: Id(2)] string SubjectRelation,
-    [property: Id(3)] bool IsWildcard,
-    [property: Id(4)] IReadOnlyList<string> CaveatMissingFields);
+    string SubjectType,
+    string SubjectId,
+    string SubjectRelation,
+    bool IsWildcard,
+    IReadOnlyList<string> CaveatMissingFields);
 
 // ---- LookupSubjects ----
 
-/// <summary>Arguments for <see cref="IReverseOpsStreamGrain.StreamLookupSubjects"/>. <c>Limit</c> is advisory.</summary>
+/// <summary>Arguments for <see cref="ReverseOps.StreamLookupSubjects"/>. <c>Limit</c> is advisory.</summary>
 /// <param name="ResourceType">The resource namespace.</param>
 /// <param name="ResourceId">The resource object id.</param>
 /// <param name="Permission">The relation or permission.</param>
@@ -120,47 +115,42 @@ public sealed record ExpandSubjectWire(
 /// <param name="Limit">Soft page size; null or 0 for the engine default / unbounded in this slice.</param>
 /// <param name="Cursor">Opaque continuation token from a prior page; null to start.</param>
 /// <param name="Consistency">The consistency requirement; null means minimize-latency (default).</param>
-[GenerateSerializer]
 public sealed record LookupSubjectsArgs(
-    [property: Id(0)] string ResourceType,
-    [property: Id(1)] string ResourceId,
-    [property: Id(2)] string Permission,
-    [property: Id(3)] string SubjectType,
-    [property: Id(4)] string SubjectRelation,
-    [property: Id(5)] IReadOnlyDictionary<string, object?>? Context,
-    [property: Id(6)] int? Limit,
-    [property: Id(7)] string? Cursor,
-    [property: Id(8)] ConsistencyWire? Consistency = null);
+    string ResourceType,
+    string ResourceId,
+    string Permission,
+    string SubjectType,
+    string SubjectRelation,
+    IReadOnlyDictionary<string, object?>? Context,
+    int? Limit,
+    string? Cursor,
+    ConsistencyWire? Consistency = null);
 
 /// <summary>A subject found by a lookup, with its collapsed permissionship.</summary>
 /// <param name="SubjectId">The subject object id ("*" for a wildcard).</param>
 /// <param name="IsWildcard">True when the subject is the public wildcard.</param>
 /// <param name="Permissionship">Member or caveated (with missing context params).</param>
-[GenerateSerializer]
 public sealed record FoundSubjectWire(
-    [property: Id(0)] string SubjectId,
-    [property: Id(1)] bool IsWildcard,
-    [property: Id(2)] Permissionship Permissionship);
+    string SubjectId,
+    bool IsWildcard,
+    Permissionship Permissionship);
 
 /// <summary>
-/// One item of the <see cref="IReverseOpsStreamGrain.StreamLookupSubjects"/> native
-/// <see cref="IAsyncEnumerable{T}"/>: a found subject plus the opaque resume cursor positioned
-/// immediately after it. The cursor lets a client-facing limited stream resume from a fresh grain
-/// activation with byte-identical token semantics — the internal page-loop is gone, the client contract
-/// is not.
+/// One item of the <see cref="ReverseOps.StreamLookupSubjects"/> stream: a found subject plus the opaque
+/// resume cursor positioned immediately after it. The cursor lets a client-facing limited stream resume
+/// with byte-identical token semantics.
 /// </summary>
 /// <param name="Subject">The found subject with its collapsed permissionship.</param>
 /// <param name="ResumeCursor">The opaque resume cursor positioned immediately after this subject.</param>
 /// <param name="LookedUpAtToken">The ZedToken for the revision actually evaluated (constant across the stream).</param>
-[GenerateSerializer, Immutable]
 public sealed record FoundSubjectStreamItem(
-    [property: Id(0)] FoundSubjectWire Subject,
-    [property: Id(1)] string ResumeCursor,
-    [property: Id(2)] string LookedUpAtToken = "");
+    FoundSubjectWire Subject,
+    string ResumeCursor,
+    string LookedUpAtToken = "");
 
 // ---- LookupResources ----
 
-/// <summary>Arguments for <see cref="IReverseOpsStreamGrain.StreamLookupResources"/>.</summary>
+/// <summary>Arguments for <see cref="ReverseOps.StreamLookupResources"/>.</summary>
 /// <param name="ResourceType">The resource namespace to enumerate.</param>
 /// <param name="Permission">The relation or permission.</param>
 /// <param name="SubjectType">The subject namespace.</param>
@@ -170,17 +160,16 @@ public sealed record FoundSubjectStreamItem(
 /// <param name="Limit">Soft page size; null or 0 for the engine default / unbounded in this slice.</param>
 /// <param name="Cursor">Opaque continuation token from a prior page; null to start.</param>
 /// <param name="Consistency">The consistency requirement; null means minimize-latency (default).</param>
-[GenerateSerializer]
 public sealed record LookupResourcesArgs(
-    [property: Id(0)] string ResourceType,
-    [property: Id(1)] string Permission,
-    [property: Id(2)] string SubjectType,
-    [property: Id(3)] string SubjectId,
-    [property: Id(4)] string SubjectRelation,
-    [property: Id(5)] IReadOnlyDictionary<string, object?>? Context,
-    [property: Id(6)] int? Limit,
-    [property: Id(7)] string? Cursor,
-    [property: Id(8)] ConsistencyWire? Consistency = null);
+    string ResourceType,
+    string Permission,
+    string SubjectType,
+    string SubjectId,
+    string SubjectRelation,
+    IReadOnlyDictionary<string, object?>? Context,
+    int? Limit,
+    string? Cursor,
+    ConsistencyWire? Consistency = null);
 
 /// <summary>A resource found by a lookup, with its collapsed permissionship.</summary>
 /// <param name="ResourceId">The reachable resource object id.</param>
@@ -191,13 +180,11 @@ public sealed record LookupResourcesArgs(
 /// </param>
 /// <param name="LookedUpAtToken">The ZedToken for the revision actually evaluated (constant across the stream).</param>
 /// <remarks>
-/// This record doubles as its own stream item for <see cref="IReverseOpsStreamGrain.StreamLookupResources"/>:
-/// it already carries the per-item resume cursor, so no wrapper is needed. It is <c>[Immutable]</c> so the
-/// native <see cref="IAsyncEnumerable{T}"/> grain stream avoids a defensive copy per item on same-silo calls.
+/// This record doubles as its own stream item for <see cref="ReverseOps.StreamLookupResources"/>: it
+/// already carries the per-item resume cursor, so no wrapper is needed.
 /// </remarks>
-[GenerateSerializer, Immutable]
 public sealed record FoundResourceWire(
-    [property: Id(0)] string ResourceId,
-    [property: Id(1)] Permissionship Permissionship,
-    [property: Id(2)] string? AfterResultCursor = null,
-    [property: Id(3)] string LookedUpAtToken = "");
+    string ResourceId,
+    Permissionship Permissionship,
+    string? AfterResultCursor = null,
+    string LookedUpAtToken = "");

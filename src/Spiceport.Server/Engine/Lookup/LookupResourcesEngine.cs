@@ -36,7 +36,7 @@ public sealed class LookupResourcesEngine
     /// <summary>
     /// Creates a lookup-resources engine over the given schema definitions, building its own reachability
     /// graph. Convenience constructor for test ergonomics (a single construction per test is fine); the
-    /// production caller (<see cref="Spiceport.Grains.ReverseOpsStreamGrain"/>) uses the constructor that
+    /// production caller (<see cref="Spiceport.Grains.ReverseOps"/>) uses the constructor that
     /// takes a pre-built <see cref="ReachabilityGraph"/> so the graph is built once per schema snapshot,
     /// not once per request.
     /// </summary>

@@ -41,7 +41,7 @@ public class ReverseOpsGrpcServiceTests
     }
 
     private static PermissionsGrpcService Service(MeshTestCluster cluster) =>
-        new(cluster.Services.GetRequiredService<IPermissionChecker>(), cluster.GrainFactory);
+        new(cluster.Services.GetRequiredService<IPermissionChecker>(), cluster.GrainFactory, cluster.ReverseOps, cluster.RelationshipReads);
 
     [Fact]
     public async Task ExpandPermissionTree_Rpc_Returns_Union_Tree()

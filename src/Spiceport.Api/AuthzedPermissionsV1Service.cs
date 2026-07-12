@@ -14,26 +14,16 @@ namespace Spiceport.Api;
 
 /// <summary>
 /// gRPC front door for the <c>authzed.api.v1.PermissionsService</c>. A pure translation layer over the
-/// SAME grain mesh the internal <see cref="PermissionsGrpcService"/> uses: unary check/expand/write/delete
-/// dispatch through <see cref="IPermissionChecker"/> / <see cref="IReverseOpsStreamGrain"/> /
-/// <see cref="IRelationshipsGrain"/>; the read + lookup RPCs are server-streaming and page the grain's
-/// opaque cursor internally over a single pinned snapshot (mirroring <see cref="BulkGrpcService"/>).
+/// SAME grain mesh and in-process read helpers the internal <see cref="PermissionsGrpcService"/> uses:
+/// unary check/write/delete dispatch through <see cref="IPermissionChecker"/> / <see cref="IRelationshipsGrain"/>;
+/// expand and the read + lookup RPCs run in-process over the local silo's projection via
+/// <see cref="Grains.ReverseOps"/> / <see cref="Grains.RelationshipReads"/> (mirroring <see cref="BulkGrpcService"/>).
 /// </summary>
 public sealed class AuthzedPermissionsV1Service(
-    IPermissionChecker checker, IGrainFactory grains, ISchemaProvider schema)
+    IPermissionChecker checker, IGrainFactory grains, Grains.ReverseOps reverseOps, Grains.RelationshipReads relationshipReads, ISchemaProvider schema)
     : V1::PermissionsService.PermissionsServiceBase
 {
-    // ExpandPermissionTree is unary with no follow-up MoveNext, so it reuses the one well-known
-    // activation instead of minting a fresh Guid per call (see IReverseOpsStreamGrain remarks).
-    private IReverseOpsStreamGrain ReverseOps => grains.GetGrain<IReverseOpsStreamGrain>(IReverseOpsStreamGrain.ExpandKey);
     private IRelationshipsGrain Relationships => grains.GetGrain<IRelationshipsGrain>(IRelationshipsGrain.Key);
-
-    // Each read mints a FRESH Guid so every streaming RPC gets its OWN grain identity/activation — native
-    // IAsyncEnumerable streaming pins the enumerator to one activation, so StartEnumeration and every
-    // MoveNext for a stream must target the same (brand-new, never-shared) key. Read ONCE per RPC into a
-    // local; a second read is a different grain. Per-stream activations are reclaimed by idle collection.
-    private IReverseOpsStreamGrain NewReverseOpsStream() => grains.GetGrain<IReverseOpsStreamGrain>(Guid.NewGuid());
-    private IRelationshipsStreamGrain NewRelationshipsStream() => grains.GetGrain<IRelationshipsStreamGrain>(Guid.NewGuid());
 
     /// <summary>
     /// Maps a caveat-evaluation failure onto a gRPC status: a context value that does not match a
@@ -196,12 +186,11 @@ public sealed class AuthzedPermissionsV1Service(
         var filter = ToWire(request.RelationshipFilter);
         var consistency = ToWire(request.Consistency);
 
-        // One native grain stream over one pinned snapshot (the internal page loop is gone). Each item
-        // carries the per-message read-at token, exactly as every page-message did before.
-        var stream = NewRelationshipsStream();
+        // One in-process read over one pinned snapshot (the grain hop and page loop are both gone). Each
+        // item carries the per-message read-at token, exactly as every page-message did before.
         try
         {
-            await foreach (var item in stream.StreamReadRelationships(
+            await foreach (var item in relationshipReads.ReadRelationships(
                 new ReadRelationshipsArgs(filter, null, null, consistency), context.CancellationToken))
             {
                 await responseStream.WriteAsync(new V1::ReadRelationshipsResponse
@@ -220,6 +209,11 @@ public sealed class AuthzedPermissionsV1Service(
             // The pinned revision has been garbage-collected (or never existed): same client-facing
             // contract as an invalid consistency token.
             throw new RpcException(new Status(StatusCode.InvalidArgument, ex.Message));
+        }
+        catch (OperationCanceledException) when (context.CancellationToken.IsCancellationRequested)
+        {
+            // A client that stops reading (or disconnects) cancels the request token; treat it as a
+            // normal end of the stream, not an error (mirrors AuthzedWatchV1Service.Watch).
         }
     }
 
@@ -257,7 +251,7 @@ public sealed class AuthzedPermissionsV1Service(
         ExpandTreeReply reply;
         try
         {
-            reply = await ReverseOps.ExpandPermissionTree(new ExpandTreeArgs(
+            reply = await reverseOps.ExpandPermissionTree(new ExpandTreeArgs(
                 request.Resource.ObjectType,
                 request.Resource.ObjectId,
                 request.Permission,
@@ -313,15 +307,14 @@ public sealed class AuthzedPermissionsV1Service(
             new SchemaValidation.TypeAndRelation(request.ResourceObjectType, request.Permission, AllowEllipsis: false),
             new SchemaValidation.TypeAndRelation(request.Subject.Object.ObjectType, subjectRelation, AllowEllipsis: true));
 
-        // One native grain stream. A limited request takes at most `limit` items then stops (the RPC stream
+        // One in-process stream. A limited request takes at most `limit` items then stops (the RPC stream
         // terminates; the client resumes via the last item's cursor). An unlimited request drains the whole
-        // reachable set. `limit` also drives the grain's engine path: a limited walk is cursor-bearing (so
-        // every item has a resume cursor), an unlimited/cursorless walk may take the Leopard fast path.
-        var stream = NewReverseOpsStream();
+        // reachable set. `limit` also drives the engine path: a limited walk is cursor-bearing (so every item
+        // has a resume cursor), an unlimited/cursorless walk may take the Leopard fast path.
         var emitted = 0;
         try
         {
-            await foreach (var r in stream.StreamLookupResources(
+            await foreach (var r in reverseOps.StreamLookupResources(
                 new LookupResourcesArgs(
                     request.ResourceObjectType,
                     request.Permission,
@@ -373,6 +366,11 @@ public sealed class AuthzedPermissionsV1Service(
         {
             throw ToRpc(ex);
         }
+        catch (OperationCanceledException) when (context.CancellationToken.IsCancellationRequested)
+        {
+            // A client that stops reading (or disconnects) cancels the request token; treat it as a
+            // normal end of the stream, not an error (mirrors AuthzedWatchV1Service.Watch).
+        }
     }
 
     public override async Task LookupSubjects(
@@ -400,12 +398,11 @@ public sealed class AuthzedPermissionsV1Service(
             new SchemaValidation.TypeAndRelation(request.Resource.ObjectType, request.Permission, AllowEllipsis: false),
             new SchemaValidation.TypeAndRelation(request.SubjectObjectType, subjectRelation, AllowEllipsis: true));
 
-        // One native grain stream: count non-wildcard emissions and stop once the concrete limit is met.
-        var stream = NewReverseOpsStream();
+        // One in-process stream: count non-wildcard emissions and stop once the concrete limit is met.
         var emitted = 0;
         try
         {
-            await foreach (var item in stream.StreamLookupSubjects(
+            await foreach (var item in reverseOps.StreamLookupSubjects(
                 new LookupSubjectsArgs(
                     request.Resource.ObjectType,
                     request.Resource.ObjectId,
@@ -469,6 +466,11 @@ public sealed class AuthzedPermissionsV1Service(
         catch (DispatchFailedException ex)
         {
             throw ToRpc(ex);
+        }
+        catch (OperationCanceledException) when (context.CancellationToken.IsCancellationRequested)
+        {
+            // A client that stops reading (or disconnects) cancels the request token; treat it as a
+            // normal end of the stream, not an error (mirrors AuthzedWatchV1Service.Watch).
         }
     }
 
@@ -641,15 +643,14 @@ public sealed class AuthzedPermissionsV1Service(
         var consistency = ToWire(request.Consistency);
         var cursor = request.OptionalCursor is { Token.Length: > 0 } c ? c.Token : null;
 
-        // One native grain stream over a single pinned snapshot (the grain pins once from the cursor or the
-        // request consistency). Batch up to `limit` relationships per response message — mirroring the prior
-        // per-page reply shape — carrying the last item's cursor as that batch's continuation cursor.
+        // One in-process stream over a single pinned snapshot (pinned once from the cursor or the request
+        // consistency). Batch up to `limit` relationships per response message — mirroring the prior per-page
+        // reply shape — carrying the last item's cursor as that batch's continuation cursor.
         var batchSize = limit > 0 ? limit : DefaultExportBatchSize;
         var batch = new List<RelationshipStreamItem>(Math.Min(batchSize, 1024));
-        var stream = NewRelationshipsStream();
         try
         {
-            await foreach (var item in stream.StreamBulkExportRelationships(
+            await foreach (var item in relationshipReads.BulkExportRelationships(
                 new BulkExportRelationshipsArgs(filter, limit, cursor, consistency), context.CancellationToken))
             {
                 batch.Add(item);
@@ -673,6 +674,12 @@ public sealed class AuthzedPermissionsV1Service(
         catch (FormatException ex)
         {
             throw new RpcException(new Status(StatusCode.InvalidArgument, ex.Message));
+        }
+        catch (OperationCanceledException) when (context.CancellationToken.IsCancellationRequested)
+        {
+            // A client that stops reading (or disconnects) cancels the request token; treat it as a
+            // normal end of the stream, not an error (mirrors AuthzedWatchV1Service.Watch). Any
+            // already-written batches stand; nothing further is written below.
         }
 
         if (batch.Count > 0)

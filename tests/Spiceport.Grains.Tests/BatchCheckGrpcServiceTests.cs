@@ -41,7 +41,7 @@ public class BatchCheckGrpcServiceTests
         """;
 
     private static PermissionsGrpcService Service(MeshTestCluster cluster) =>
-        new(cluster.Services.GetRequiredService<IPermissionChecker>(), cluster.GrainFactory);
+        new(cluster.Services.GetRequiredService<IPermissionChecker>(), cluster.GrainFactory, cluster.ReverseOps, cluster.RelationshipReads);
 
     private static BatchCheckPermissionRequestItem Item(
         string doc, string permission, string subject, Struct? context = null)

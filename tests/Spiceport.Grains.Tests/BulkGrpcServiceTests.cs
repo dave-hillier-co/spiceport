@@ -32,7 +32,8 @@ public class BulkGrpcServiceTests
         }
         """;
 
-    private static BulkGrpcService Service(MeshTestCluster cluster) => new(cluster.GrainFactory);
+    private static BulkGrpcService Service(MeshTestCluster cluster) =>
+        new(cluster.GrainFactory, cluster.RelationshipReads);
 
     private static ProtoRelationship Viewer(string doc, string user) => new()
     {

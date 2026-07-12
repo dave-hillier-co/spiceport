@@ -30,26 +30,17 @@ namespace Spiceport.Api;
 /// gRPC front door: translates the proto <see cref="CheckPermissionRequest"/> into a top-level
 /// permission check, dispatches it through the silo-wide Caching-over-Orleans root dispatcher (so the
 /// recursion runs across the grain mesh), and maps the verdict back to the proto permissionship.
-/// The three reverse / tree ops are routed to <see cref="IReverseOpsStreamGrain"/> and its replies
-/// mapped back to proto.
+/// The reverse / tree ops run in-process over the local silo's projection via <see cref="Grains.ReverseOps"/>
+/// and their replies are mapped back to proto.
 /// </summary>
-public sealed class PermissionsGrpcService(IPermissionChecker checker, IGrainFactory grains)
+public sealed class PermissionsGrpcService(
+    IPermissionChecker checker, IGrainFactory grains, Grains.ReverseOps reverseOps, Grains.RelationshipReads relationshipReads)
     : PermissionsService.PermissionsServiceBase
 {
-    // ExpandPermissionTree is unary with no follow-up MoveNext, so it reuses the one well-known
-    // activation instead of minting a fresh Guid per call (see IReverseOpsStreamGrain remarks).
-    private IReverseOpsStreamGrain ReverseOps => grains.GetGrain<IReverseOpsStreamGrain>(IReverseOpsStreamGrain.ExpandKey);
     private IRelationshipsGrain Relationships => grains.GetGrain<IRelationshipsGrain>(IRelationshipsGrain.Key);
 
-    // Each read mints a FRESH Guid so every enumeration gets its OWN grain identity/activation — native
-    // IAsyncEnumerable streaming pins the enumerator to one activation. These three RPCs stay unary: they
-    // drain the stream up to the request limit and echo the last item's resume cursor, so the client cursor
-    // contract is byte-identical while the internal per-page grain hop is deleted.
-    private IReverseOpsStreamGrain NewReverseOpsStream() => grains.GetGrain<IReverseOpsStreamGrain>(Guid.NewGuid());
-    private IRelationshipsStreamGrain NewRelationshipsStream() => grains.GetGrain<IRelationshipsStreamGrain>(Guid.NewGuid());
-
     /// <summary>
-    /// Drains a native grain stream up to <paramref name="limit"/> items. When a further item exists beyond
+    /// Drains an in-process stream up to <paramref name="limit"/> items. When a further item exists beyond
     /// the limit, the last kept item's cursor is returned as the continuation cursor (mirroring the prior
     /// grain's "one extra row detects more" paging); an unlimited (null) drain returns no cursor.
     /// </summary>
@@ -266,7 +257,7 @@ public sealed class PermissionsGrpcService(IPermissionChecker checker, IGrainFac
     {
         var limit = request.OptionalLimit == 0 ? (int?)null : (int)request.OptionalLimit;
         var (items, cursor) = await Drain(
-            NewRelationshipsStream().StreamReadRelationships(
+            relationshipReads.ReadRelationships(
                 new ReadRelationshipsArgs(
                     ToWire(request.Filter),
                     limit,
@@ -388,7 +379,7 @@ public sealed class PermissionsGrpcService(IPermissionChecker checker, IGrainFac
             ? ExpandModeWire.Recursive
             : ExpandModeWire.Shallow;
 
-        var reply = await ReverseOps.ExpandPermissionTree(new ExpandTreeArgs(
+        var reply = await reverseOps.ExpandPermissionTree(new ExpandTreeArgs(
             request.Resource.ObjectType,
             request.Resource.ObjectId,
             request.Permission,
@@ -411,7 +402,7 @@ public sealed class PermissionsGrpcService(IPermissionChecker checker, IGrainFac
 
         var limit = request.OptionalLimit == 0 ? (int?)null : (int)request.OptionalLimit;
         var (items, cursor) = await Drain(
-            NewReverseOpsStream().StreamLookupSubjects(
+            reverseOps.StreamLookupSubjects(
                 new LookupSubjectsArgs(
                     request.Resource.ObjectType,
                     request.Resource.ObjectId,
@@ -443,7 +434,7 @@ public sealed class PermissionsGrpcService(IPermissionChecker checker, IGrainFac
 
         var limit = request.OptionalLimit == 0 ? (int?)null : (int)request.OptionalLimit;
         var (items, cursor) = await Drain(
-            NewReverseOpsStream().StreamLookupResources(
+            reverseOps.StreamLookupResources(
                 new LookupResourcesArgs(
                     request.ResourceObjectType,
                     request.Permission,

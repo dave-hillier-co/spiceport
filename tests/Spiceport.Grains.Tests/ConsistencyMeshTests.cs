@@ -29,7 +29,7 @@ public class ConsistencyMeshTests
         """;
 
     private static PermissionsGrpcService Service(MeshTestCluster cluster) =>
-        new(cluster.Services.GetRequiredService<IPermissionChecker>(), cluster.GrainFactory);
+        new(cluster.Services.GetRequiredService<IPermissionChecker>(), cluster.GrainFactory, cluster.ReverseOps, cluster.RelationshipReads);
 
     private static RelationshipUpdate TouchViewer(string res, string subj) => new()
     {
