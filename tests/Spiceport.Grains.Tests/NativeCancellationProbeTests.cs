@@ -10,9 +10,9 @@ namespace Spiceport.Grains.Tests;
 /// cancellation actually propagates to the callee's token rather than only aborting the caller-side
 /// await. This is the gate for replacing the legacy Orleans grain-cancellation-token type with a plain
 /// <see cref="CancellationToken"/> across the unary grain interfaces (see
-/// <c>docs/future-work.md</c> §1.5): the repo's streaming grain interfaces
-/// (<c>IReverseOpsStreamGrain</c>, <c>IRelationshipsStreamGrain</c>) already take a plain token, which is
-/// the evidence that motivated this probe.
+/// <c>docs/future-work.md</c> §1.5): the repo's in-process reverse-ops / relationship-read streaming ops
+/// (<c>ReverseOps</c>, <c>RelationshipReads</c> — no longer grains at all) already take a plain token,
+/// which is the evidence that motivated this probe.
 /// </summary>
 public interface INativeCancellationProbeGrain : IGrainWithStringKey
 {

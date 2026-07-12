@@ -37,6 +37,7 @@ public class AuthzedPermissionsV1ServiceTests
 
     private static AuthzedPermissionsV1Service Service(MeshTestCluster cluster) =>
         new(cluster.Services.GetRequiredService<IPermissionChecker>(), cluster.GrainFactory,
+            cluster.ReverseOps, cluster.RelationshipReads,
             cluster.Services.GetRequiredService<ISchemaProvider>());
 
     private static async Task SeedAsync(IDatastore datastore, params (string res, string rel, string subj)[] tuples)
@@ -956,6 +957,8 @@ public class AuthzedPermissionsV1ServiceTests
         var service = new AuthzedPermissionsV1Service(
             new ThrowingChecker(new DispatchFailedException(code, "boom")),
             cluster.GrainFactory,
+            cluster.ReverseOps,
+            cluster.RelationshipReads,
             cluster.Services.GetRequiredService<ISchemaProvider>());
 
         var ex = await Assert.ThrowsAsync<RpcException>(() => service.CheckPermission(

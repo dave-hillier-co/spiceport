@@ -5,14 +5,16 @@ namespace Spiceport.Grains.Abstractions;
 /// side of the system (the check / reverse-ops grains are the read side).
 /// </summary>
 /// <remarks>
-/// Like the unary <see cref="IReverseOpsStreamGrain.ExpandPermissionTree"/>, every method here is a whole operation against the datastore
-/// (or the live schema provider) rather than a per-key dispatch, so it is exposed on ONE grain keyed by
-/// the constant integer <see cref="Key"/> and the implementation is <c>[StatelessWorker]</c> so the
-/// silo scales activations with load without fragmenting any keyspace. Writes persist through the
-/// host-owned <see cref="Spiceport.Datastore.IDatastore"/> and (for schema) swap the live schema
-/// snapshot; replies carry an opaque revision token. The relationship READ ops (ReadRelationships,
-/// BulkExportRelationships) moved to the Guid-keyed <see cref="IRelationshipsStreamGrain"/>, which streams
-/// them natively; this grain keeps the write side and the on-demand counter/schema ops.
+/// Every method here is a whole operation against the datastore (or the live schema provider) rather than
+/// a per-key dispatch, so it is exposed on ONE grain keyed by the constant integer <see cref="Key"/> and
+/// the implementation is <c>[StatelessWorker]</c> so the silo scales activations with load without
+/// fragmenting any keyspace. Writes persist through the host-owned
+/// <see cref="Spiceport.Datastore.IDatastore"/> and (for schema) swap the live schema snapshot; replies
+/// carry an opaque revision token. The relationship READ ops (ReadRelationships, BulkExportRelationships)
+/// and the reverse-ops reads (ExpandPermissionTree, LookupSubjects, LookupResources) run in-process over
+/// the local <see cref="Spiceport.Datastore.IDatastore"/> projection via <see cref="RelationshipReads"/>
+/// and <see cref="ReverseOps"/> respectively; this grain keeps the write side and the on-demand
+/// counter/schema ops.
 /// </remarks>
 public interface IRelationshipsGrain : IGrainWithIntegerKey
 {

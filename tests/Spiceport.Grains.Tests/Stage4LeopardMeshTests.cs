@@ -9,7 +9,7 @@ namespace Spiceport.Grains.Tests;
 /// <summary>
 /// Stage-4 gates for the Leopard membership-walk grain mesh (<see cref="MembershipWalkGrain"/>) wired into
 /// the mesh behind the <c>useMembershipWalk</c> flag. Drives
-/// <see cref="IReverseOpsStreamGrain.StreamLookupResources"/> with the accelerator ON and proves the result
+/// <see cref="ReverseOps.StreamLookupResources"/> with the accelerator ON and proves the result
 /// set is IDENTICAL to the accelerator-OFF engine over the same snapshot (oracle equivalence end-to-end),
 /// that every returned resource is Check-confirmed, that a runtime schema swap rotates the walk-grain
 /// keyspace (a new schema hash addresses disjoint activations rather than requiring cache invalidation), and
@@ -32,9 +32,6 @@ public class Stage4LeopardMeshTests
             permission view = viewer + editor
         }
         """;
-
-    private static IReverseOpsStreamGrain StreamGrain(MeshTestCluster cluster) =>
-        cluster.GrainFactory.GetGrain<IReverseOpsStreamGrain>(Guid.NewGuid());
 
     private static Relationship Rel(string rt, string rid, string rel, ObjectAndRelation subject) =>
         Relationship.Create(new ObjectAndRelation(rt, rid, rel), subject);
@@ -68,7 +65,7 @@ public class Stage4LeopardMeshTests
         string resourceType, string permission, ConsistencyWire? consistency = null)
     {
         var ids = new SortedSet<string>(StringComparer.Ordinal);
-        await foreach (var r in StreamGrain(cluster).StreamLookupResources(new LookupResourcesArgs(
+        await foreach (var r in cluster.ReverseOps.StreamLookupResources(new LookupResourcesArgs(
             resourceType, permission, subjectType, subjectId, subjectRelation, null, null, null, consistency)))
             ids.Add(r.ResourceId);
         return ids;

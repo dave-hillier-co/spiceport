@@ -18,8 +18,8 @@ namespace Spiceport.Grains.Tests;
 /// both sides can run in-process over a <see cref="ReferenceDatastore"/>. This memo instead lives on
 /// <see cref="SubjectFrontierGrain"/>, so the "on" side genuinely needs ONE real mesh
 /// (<see cref="MeshTestCluster"/>, memo enabled — the production default) driving
-/// <see cref="IReverseOpsStreamGrain.StreamLookupSubjects"/>. The "off" side does not need a SECOND
-/// Orleans stack: disabling the memo makes <c>ReverseOpsStreamGrain</c> fall back to running
+/// <see cref="ReverseOps.StreamLookupSubjects"/>. The "off" side does not need a SECOND
+/// Orleans stack: disabling the memo makes <c>ReverseOps</c> fall back to running
 /// <see cref="LookupSubjectsEngine"/> directly and collapsing with <see cref="CaveatEvaluator"/> via
 /// <c>ReverseOpsSupport.TryCollapse</c> — exactly what this test computes in-process over a
 /// <see cref="ReferenceDatastore"/> seeded with the same relationships, so it is a faithful "off" oracle
@@ -56,8 +56,7 @@ public class FrontierCorpusEquivalenceTests
             Context: null, Limit: null, Cursor: null);
 
         var result = new HashSet<Found>();
-        await foreach (var item in cluster.GrainFactory
-            .GetGrain<IReverseOpsStreamGrain>(Guid.NewGuid()).StreamLookupSubjects(args))
+        await foreach (var item in cluster.ReverseOps.StreamLookupSubjects(args))
         {
             result.Add(new Found(item.Subject.SubjectId, item.Subject.IsWildcard, item.Subject.Permissionship.IsCaveated));
         }
@@ -65,7 +64,7 @@ public class FrontierCorpusEquivalenceTests
     }
 
     /// <summary>
-    /// The memo-OFF oracle: the identical computation <c>ReverseOpsStreamGrain.StreamLookupSubjects</c>
+    /// The memo-OFF oracle: the identical computation <c>ReverseOps.StreamLookupSubjects</c>
     /// runs when <see cref="SubjectFrontierMemoOptions.Enabled"/> is false — a direct
     /// <see cref="LookupSubjectsEngine"/> walk collapsed against a null request context via
     /// <see cref="ReverseOpsSupport.TryCollapse"/> — computed in-process over a

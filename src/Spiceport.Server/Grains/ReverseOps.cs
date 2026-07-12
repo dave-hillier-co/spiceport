@@ -1,4 +1,3 @@
-using System.Collections.Immutable;
 using System.Runtime.CompilerServices;
 using Spiceport.Core;
 using Spiceport.Datastore;
@@ -8,34 +7,30 @@ using Spiceport.Grains.Abstractions;
 namespace Spiceport.Grains;
 
 /// <summary>
-/// Default-placement, Guid-keyed implementation of <see cref="IReverseOpsStreamGrain"/>: streams the reverse
-/// engine ops as native Orleans <see cref="IAsyncEnumerable{T}"/> iterators over a pinned datastore snapshot,
-/// and also serves the unary whole-resource permission tree expansion. The pinning / index / collapse logic
-/// is shared across all three ops via <see cref="ReverseOpsSupport"/>, so there is exactly one copy.
+/// The reverse engine ops (LookupSubjects, LookupResources, ExpandPermissionTree) served IN-PROCESS over
+/// the local silo's <see cref="IDatastore"/> projection — the same pattern <see cref="Spiceport.Api.AuthzedWatchV1Service"/>
+/// uses deliberately for Watch (see its remarks). Every read these ops perform is served from the per-silo
+/// <c>SiloProjection</c> (local memory), so an Orleans grain hop bought only compute placement, not a
+/// consistency or caching benefit — unlike <see cref="CheckGrain"/>, <see cref="ISubjectFrontierGrain"/>,
+/// and <see cref="IMembershipWalkGrain"/>, which memoize state across calls and so stay real grains, called
+/// from these in-process walks exactly as they were called from the retired stream grains.
 /// </summary>
 /// <remarks>
-/// Each streaming call holds one enumeration for the life of a single stream (the calling service mints a
-/// fresh Guid per streaming RPC), so this grain is deliberately NOT a <c>[StatelessWorker]</c> — see the
-/// interface remarks. The engine ops are themselves <see cref="IAsyncEnumerable{T}"/>, so a nested
-/// <c>await foreach</c> + <c>yield</c> genuinely streams: when the caller stops enumerating (a client limit
-/// reached), the upstream engine walk stops too. The cancellation token is threaded into the engine walk (the
-/// prior unary methods ignored it).
-/// <para>
-/// <see cref="ExpandPermissionTree"/> touches no field outside its own method body/locals — it holds no
-/// per-stream state — so it is safe for many callers to share the one well-known activation
-/// (<see cref="IReverseOpsStreamGrain.ExpandKey"/>) that Expand calls target, even though that activation may
-/// also be independently backing an unrelated Guid-keyed streaming enumeration under a different key.
-/// </para>
+/// The pinning / index-acquisition / caveat-collapse logic is the same as before the retired grains: see
+/// <see cref="ReverseOpsSupport"/> for the shared PinReader / AcquireCoveredCandidates / TryCollapse helpers.
+/// Since this is no longer grain code, the streaming ops take the caller's plain <see cref="CancellationToken"/>
+/// with no Orleans grain-method plumbing — simpler than the retired grain's per-stream-activation scheme,
+/// with identical per-item cancellation behavior.
 /// </remarks>
-public sealed class ReverseOpsStreamGrain(
+public sealed class ReverseOps(
     IDatastore datastore,
     ISchemaProvider schemaProvider,
     SchemaResolver schemaResolver,
+    IGrainFactory grainFactory,
     MembershipWalkOptions membershipWalkOptions,
-    SubjectFrontierMemoOptions? frontierMemoOptions = null) : Grain, IReverseOpsStreamGrain
+    SubjectFrontierMemoOptions? frontierMemoOptions = null)
 {
     private readonly SubjectFrontierMemoOptions _frontierMemoOptions = frontierMemoOptions ?? new SubjectFrontierMemoOptions();
-
 
     /// <summary>
     /// Resolves the compiled schema effective at the pinned revision (the same schema the confirming Check
@@ -44,23 +39,19 @@ public sealed class ReverseOpsStreamGrain(
     private Task<SchemaSnapshot> ResolveSchema(string? schemaHash, IDatastoreReader reader, CancellationToken ct) =>
         schemaResolver.ResolveAsync(schemaHash, reader, schemaProvider.Current, ct);
 
-    /// <inheritdoc />
+    /// <summary>Expands the resource's permission into a structural permission tree.</summary>
     public async Task<ExpandTreeReply> ExpandPermissionTree(ExpandTreeArgs args)
     {
         ArgumentNullException.ThrowIfNull(args);
         var (reader, now, token, _, schemaHash) = await ReverseOpsSupport
-            .PinReader(datastore, args.Consistency, CancellationToken.None)
-            .ConfigureAwait(ReverseOpsSupport.ContinueOnCapturedContext);
+            .PinReader(datastore, args.Consistency, CancellationToken.None);
 
-        var schema = await ResolveSchema(schemaHash, reader, CancellationToken.None)
-            .ConfigureAwait(ReverseOpsSupport.ContinueOnCapturedContext);
+        var schema = await ResolveSchema(schemaHash, reader, CancellationToken.None);
         var engine = new ExpandEngine(schema.Namespaces);
         var mode = args.Mode == ExpandModeWire.Recursive ? ExpandMode.Recursive : ExpandMode.Shallow;
         var resource = new ObjectAndRelation(args.ResourceType, args.ResourceId, args.Permission);
 
-        var tree = await engine
-            .ExpandPermissionTree(reader, resource, mode, now, CancellationToken.None)
-            .ConfigureAwait(ReverseOpsSupport.ContinueOnCapturedContext);
+        var tree = await engine.ExpandPermissionTree(reader, resource, mode, now, CancellationToken.None);
 
         // Expand carries verbatim caveat expressions; with no request context we collapse each against
         // an empty context so caveated nodes/subjects surface their missing parameter names.
@@ -107,7 +98,11 @@ public sealed class ReverseOpsStreamGrain(
         _ => SetOpWire.Union,
     };
 
-    /// <inheritdoc />
+    /// <summary>
+    /// Streams the subjects (of the requested type/subrelation) holding the resource's permission, one at a
+    /// time, each with the opaque cursor positioned immediately after it. The caller applies any client
+    /// limit by stopping enumeration; there is no page cap inside this walk.
+    /// </summary>
     public async IAsyncEnumerable<FoundSubjectStreamItem> StreamLookupSubjects(
         LookupSubjectsArgs args,
         [EnumeratorCancellation] CancellationToken cancellationToken = default)
@@ -115,11 +110,9 @@ public sealed class ReverseOpsStreamGrain(
         ArgumentNullException.ThrowIfNull(args);
         cancellationToken.ThrowIfCancellationRequested();
         var (reader, now, token, revision, schemaHash) = await ReverseOpsSupport
-            .PinReader(datastore, args.Consistency, cancellationToken)
-            .ConfigureAwait(ReverseOpsSupport.ContinueOnCapturedContext);
+            .PinReader(datastore, args.Consistency, cancellationToken);
 
-        var schema = await ResolveSchema(schemaHash, reader, cancellationToken)
-            .ConfigureAwait(ReverseOpsSupport.ContinueOnCapturedContext);
+        var schema = await ResolveSchema(schemaHash, reader, cancellationToken);
         var evaluator = new CaveatEvaluator(schema.Caveats);
         var resource = new ObjectAndRelation(args.ResourceType, args.ResourceId, args.Permission);
         var after = ReverseOpsCursorCodec.DecodeSubjectId(args.Cursor);
@@ -130,7 +123,6 @@ public sealed class ReverseOpsStreamGrain(
         // the result feeds the SAME cursor-skip / caveat-collapse loop below, so the two paths cannot drift.
         var walk = _frontierMemoOptions.Enabled
             ? await MemoizedFrontier(resource, args, revision, schemaHash, cancellationToken)
-                .ConfigureAwait(ReverseOpsSupport.ContinueOnCapturedContext)
             : new LookupSubjectsEngine(schema.Namespaces)
                 .LookupSubjects(reader, resource, args.SubjectType, args.SubjectRelation, now, cancellationToken);
 
@@ -145,9 +137,9 @@ public sealed class ReverseOpsStreamGrain(
                 continue; // sheared off entirely.
 
             // NOTE: FoundSubject.ExcludedSubjects (wildcard exclusions) are not yet carried over the wire —
-            // FoundSubjectWire has no excluded-subjects field, so the cross-silo path drops them (unchanged
-            // from the prior unary grain). The in-process engine (and the memoized frontier, which mirrors
-            // it byte-for-byte) preserves them internally; only this client-edge wire shape drops them.
+            // FoundSubjectWire has no excluded-subjects field, so the client-facing shape drops them
+            // (unchanged from before). The engine (and the memoized frontier, which mirrors it
+            // byte-for-byte) preserves them internally; only this client-edge wire shape drops them.
             var subject = new FoundSubjectWire(found.SubjectId, found.IsWildcard, permissionship);
             yield return new FoundSubjectStreamItem(
                 subject, ReverseOpsCursorCodec.EncodeSubjectId(found.SubjectId), token);
@@ -166,12 +158,11 @@ public sealed class ReverseOpsStreamGrain(
         var key = SubjectFrontierKey.Build(
             resource, args.SubjectType, args.SubjectRelation,
             revision.ToString(), schemaHash ?? schemaProvider.Current.SchemaHash);
-        var frontierGrain = GrainFactory.GetGrain<ISubjectFrontierGrain>(key);
+        var frontierGrain = grainFactory.GetGrain<ISubjectFrontierGrain>(key);
 
         // The caller's own token drives the grain call directly: Orleans' native cancellation-token
         // support propagates it to the activation, so caller cancellation is never left unobserved.
-        var reply = await frontierGrain.GetFrontier(cancellationToken)
-            .ConfigureAwait(ReverseOpsSupport.ContinueOnCapturedContext);
+        var reply = await frontierGrain.GetFrontier(cancellationToken);
 
         return ToAsyncEnumerable(reply.Subjects.Select(FrontierWire.FromWire).ToList());
     }
@@ -185,10 +176,16 @@ public sealed class ReverseOpsStreamGrain(
             cancellationToken.ThrowIfCancellationRequested();
             yield return item;
         }
-        await Task.CompletedTask.ConfigureAwait(ReverseOpsSupport.ContinueOnCapturedContext);
+        await Task.CompletedTask;
     }
 
-    /// <inheritdoc />
+    /// <summary>
+    /// Streams the resources (of the requested type) on which the subject holds the permission, one at a
+    /// time, each with the opaque cursor positioned immediately after it. When <see cref="LookupResourcesArgs.Limit"/>
+    /// is set this runs the cursor-bearing live traversal (so every item carries a resume cursor); an
+    /// unlimited, cursorless enumeration may take the Leopard fast path (a complete candidate set confirmed
+    /// by Check). The caller applies any client limit by stopping.
+    /// </summary>
     public async IAsyncEnumerable<FoundResourceWire> StreamLookupResources(
         LookupResourcesArgs args,
         [EnumeratorCancellation] CancellationToken cancellationToken = default)
@@ -196,33 +193,30 @@ public sealed class ReverseOpsStreamGrain(
         ArgumentNullException.ThrowIfNull(args);
         cancellationToken.ThrowIfCancellationRequested();
         var (reader, now, token, revision, schemaHash) = await ReverseOpsSupport
-            .PinReader(datastore, args.Consistency, cancellationToken)
-            .ConfigureAwait(ReverseOpsSupport.ContinueOnCapturedContext);
+            .PinReader(datastore, args.Consistency, cancellationToken);
 
         // Resolve the schema effective at the pinned revision (the same schema the confirming Check mesh
         // evaluates under), so the candidate superset and the verdicts that confirm it are schema-consistent
         // and cluster-consistent — never the possibly-stale ambient current schema on a non-writer silo. The
         // snapshot is captured once so the engine's namespaces/caveats and its pre-built reachability graph
         // all come from the same schema, even if a concurrent write swaps the ambient current mid-call.
-        var snapshot = await ResolveSchema(schemaHash, reader, cancellationToken)
-            .ConfigureAwait(ReverseOpsSupport.ContinueOnCapturedContext);
+        var snapshot = await ResolveSchema(schemaHash, reader, cancellationToken);
         var engine = new LookupResourcesEngine(snapshot.Namespaces, snapshot.Caveats, snapshot.ReachabilityFirst);
         var startCursor = ReverseOpsCursorCodec.DecodeResources(args.Cursor);
 
         // A supplied client limit means the caller needs per-item resume cursors: pass the limit into the
         // engine so it runs the cursor-bearing live traversal (the Leopard fast path yields no per-item
         // cursor and is reachable only for an unlimited, cursorless enumeration, where the caller wants no
-        // cursors). This mirrors the prior unary grain's engine-invocation decision exactly.
+        // cursors). This mirrors the retired grain's engine-invocation decision exactly.
         var limit = args.Limit is { } l && l > 0 ? l : (int?)null;
 
         // The Leopard accelerator (null unless it decides this request is a fresh, unpaged enumeration of
         // a covered shape). Dispatches the membership-walk grain mesh and confirms every candidate with
         // Check, so verdicts are unchanged from the live traversal.
         var candidates = await ReverseOpsSupport.AcquireCoveredCandidates(
-                GrainFactory, membershipWalkOptions, snapshot,
-                args.SubjectType, args.SubjectId, args.SubjectRelation, args.ResourceType, args.Permission,
-                revision, hasCursorOrLimit: args.Cursor is not null || limit is not null, cancellationToken)
-            .ConfigureAwait(ReverseOpsSupport.ContinueOnCapturedContext);
+            grainFactory, membershipWalkOptions, snapshot,
+            args.SubjectType, args.SubjectId, args.SubjectRelation, args.ResourceType, args.Permission,
+            revision, hasCursorOrLimit: args.Cursor is not null || limit is not null, cancellationToken);
 
         await foreach (var found in engine.LookupResources(
                 reader, args.SubjectType, args.SubjectId, args.SubjectRelation,

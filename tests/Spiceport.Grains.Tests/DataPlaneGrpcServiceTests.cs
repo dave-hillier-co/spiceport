@@ -42,7 +42,7 @@ public class DataPlaneGrpcServiceTests
         """;
 
     private static PermissionsGrpcService Service(MeshTestCluster cluster) =>
-        new(cluster.Services.GetRequiredService<IPermissionChecker>(), cluster.GrainFactory);
+        new(cluster.Services.GetRequiredService<IPermissionChecker>(), cluster.GrainFactory, cluster.ReverseOps, cluster.RelationshipReads);
 
     private static RelationshipUpdate Touch(string res, string rel, string subj) => new()
     {

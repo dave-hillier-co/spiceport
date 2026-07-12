@@ -20,16 +20,13 @@ namespace Spiceport.Api;
 /// gRPC front door for streaming bulk import / export of relationships. Both RPCs are streaming but the
 /// data-plane grain stays request/response: this service consumes the client import stream and calls the
 /// grain ONCE PER inbound batch (one write transaction per batch), and drives the server export stream by
-/// paging the grain over a single pinned snapshot. Mirrors authzed.api.v1 ImportBulk / ExportBulk.
+/// reading in-process over the local silo's projection via <see cref="Grains.RelationshipReads"/>. Mirrors
+/// authzed.api.v1 ImportBulk / ExportBulk.
 /// </summary>
-public sealed class BulkGrpcService(IGrainFactory grains)
+public sealed class BulkGrpcService(IGrainFactory grains, Grains.RelationshipReads relationshipReads)
     : Spiceport.Protos.BulkService.BulkServiceBase
 {
     private IRelationshipsGrain Relationships => grains.GetGrain<IRelationshipsGrain>(IRelationshipsGrain.Key);
-
-    // A fresh Guid per export RPC so the native IAsyncEnumerable stream stays pinned to one activation
-    // (see IRelationshipsStreamGrain). Read ONCE per RPC into a local.
-    private IRelationshipsStreamGrain NewRelationshipsStream() => grains.GetGrain<IRelationshipsStreamGrain>(Guid.NewGuid());
 
     public override async Task<ImportBulkRelationshipsResponse> ImportBulkRelationships(
         IAsyncStreamReader<ImportBulkRelationshipsRequest> requestStream,
@@ -75,15 +72,14 @@ public sealed class BulkGrpcService(IGrainFactory grains)
         var consistency = ToWire(request.Consistency);
         var cursor = string.IsNullOrEmpty(request.OptionalCursor) ? null : request.OptionalCursor;
 
-        // One native grain stream over a single pinned snapshot (the grain pins once from the cursor or the
-        // request consistency). Batch up to `limit` relationships per response message, carrying the last
-        // item's cursor as that batch's continuation cursor.
+        // One in-process stream over a single pinned snapshot (pinned once from the cursor or the request
+        // consistency). Batch up to `limit` relationships per response message, carrying the last item's
+        // cursor as that batch's continuation cursor.
         var batchSize = limit > 0 ? limit : DefaultExportBatchSize;
         var batch = new List<RelationshipStreamItem>(Math.Min(batchSize, 1024));
-        var stream = NewRelationshipsStream();
         try
         {
-            await foreach (var item in stream.StreamBulkExportRelationships(
+            await foreach (var item in relationshipReads.BulkExportRelationships(
                 new BulkExportRelationshipsArgs(filter, limit, cursor, consistency), context.CancellationToken))
             {
                 batch.Add(item);
@@ -107,6 +103,12 @@ public sealed class BulkGrpcService(IGrainFactory grains)
         catch (FormatException ex)
         {
             throw new RpcException(new Status(StatusCode.InvalidArgument, ex.Message));
+        }
+        catch (OperationCanceledException) when (context.CancellationToken.IsCancellationRequested)
+        {
+            // A client that stops reading (or disconnects) cancels the request token; treat it as a
+            // normal end of the stream, not an error (mirrors AuthzedWatchV1Service.Watch's cancellation
+            // handling). Any already-written batches stand; nothing further is written below.
         }
 
         if (batch.Count > 0)

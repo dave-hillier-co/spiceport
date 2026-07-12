@@ -9,7 +9,7 @@ namespace Spiceport.Grains.Tests;
 /// <summary>
 /// Mesh-level gates for <see cref="MembershipWalkGrain"/>: warm-activation reuse, correctness over a
 /// genuine data cycle end-to-end, the depth-exhaustion/incomplete-reply contract (and that
-/// <see cref="ReverseOpsStreamGrain.StreamLookupResources"/> falls back to the live traversal rather than
+/// <see cref="ReverseOps.StreamLookupResources"/> falls back to the live traversal rather than
 /// trusting a partial candidate set), and that <see cref="MembershipWalkOptions.Enabled"/>=false still
 /// produces correct results via the unaccelerated live path.
 /// </summary>
@@ -45,8 +45,7 @@ public class MembershipWalkGrainTests
         string resourceType, string permission)
     {
         var ids = new SortedSet<string>(StringComparer.Ordinal);
-        await foreach (var r in cluster.GrainFactory.GetGrain<IReverseOpsStreamGrain>(Guid.NewGuid())
-            .StreamLookupResources(new LookupResourcesArgs(
+        await foreach (var r in cluster.ReverseOps.StreamLookupResources(new LookupResourcesArgs(
                 resourceType, permission, subjectType, subjectId, subjectRelation, null, null, null)))
             ids.Add(r.ResourceId);
         return ids;

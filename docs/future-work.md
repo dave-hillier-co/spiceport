@@ -150,14 +150,19 @@ was deleted in 1.7; the wire contract is now just the grain key + cancellation t
 the "always call the grain, even locally" pattern (1.3(c)/1.4) by reducing the cost of intra-silo
 grain calls.
 
-### 1.10 Native `IAsyncEnumerable` grain streaming (internal paths) (implemented)
+### 1.10 In-process reverse-ops / data-plane reads (implemented)
 
-The internal page-loop plumbing between the gRPC services and the reverse-ops / data-plane grains is
-now native Orleans `IAsyncEnumerable` grain streaming. `LookupSubjects`, `LookupResources`,
-`ReadRelationships`, and `BulkExportRelationships` are single grain calls whose results stream back one
-item at a time with runtime backpressure — the per-page service→grain round-trip is deleted. Each gRPC
-front door drives one `await foreach` and stops enumerating when it has enough; stopping the client-side
-loop stops the upstream engine walk, because the engine ops are themselves `IAsyncEnumerable`.
+`LookupSubjects`, `LookupResources`, `ExpandPermissionTree`, `ReadRelationships`, and
+`BulkExportRelationships` run IN-PROCESS in the gRPC service layer, over the co-hosted silo's local
+`SiloProjection` — the same pattern `AuthzedWatchV1Service` already uses for Watch (see its remarks). Two
+Server-layer helper classes, `ReverseOps` (`Spiceport.Grains.ReverseOps`) and `RelationshipReads`
+(`Spiceport.Grains.RelationshipReads`), hold the pinning / schema-at-revision resolution / caveat-collapse
+logic and expose the same `IAsyncEnumerable`/`Task` shapes an earlier Guid-keyed grain layer used to; they
+are registered as DI singletons alongside the rest of the grain mesh services
+(`AddSpiceportGrainServices`) and injected straight into the gRPC services. Every read these ops perform is
+served from local memory, so a grain hop bought only compute placement, not a consistency or caching
+benefit — unlike `CheckGrain`, `SubjectFrontierGrain`, and `MembershipWalkGrain`, which memoize state
+across calls and so stay real grains, dispatched to from these in-process walks exactly as before.
 
 Client-facing cursors are unchanged API contract. Every streamed item still carries its own opaque resume
 cursor (the byte-identical token from the existing codecs — the subject-id cursor, the multi-section
@@ -165,30 +170,20 @@ lookup-resources keyset cursor, the revision-pinned bulk-export cursor), so a cl
 resumes mid-stream and the token formats are unchanged. The limited RPCs take at most the requested items
 and echo the last item's cursor exactly as before.
 
-**The `[StatelessWorker]` incompatibility and the Guid-keyed adaptation.** Native `IAsyncEnumerable`
-streaming is not safe on a stateless-worker grain: the grain-side extension that backs it holds the live
-enumerator in memory on one specific activation keyed by a client-minted request id, and a stateless
-worker's activations are not individually addressable — a follow-up `MoveNext` can land on an activation
-that never started the stream. The reverse-ops and data-plane grains that page today are stateless workers,
-so the streaming ops moved to NEW `IGrainWithGuidKey` grains (`IReverseOpsStreamGrain`,
-`IRelationshipsStreamGrain`) under default placement. Each service mints a fresh `Guid` per RPC, so
-`StartEnumeration` and every `MoveNext` for that stream target the same brand-new, never-shared activation.
-These per-stream activations are reclaimed by ordinary idle collection, like any other grain — a real but
-minor cost against the deleted per-page hops. The shared pinning / index / caveat-collapse logic lives in
-one place (`ReverseOpsSupport`) so the unary and streaming paths cannot drift.
+Being plain in-process C# rather than grain code, the streaming ops take the caller's plain
+`CancellationToken` directly with no Orleans grain-method plumbing to bridge — simpler than the retired
+Guid-per-stream grain scheme, with identical per-item cancellation behavior. The Leopard membership index
+still accelerates an unlimited, cursorless `LookupResources` (its fast path yields a complete candidate set
+confirmed by Check, dispatched via `IMembershipWalkGrain` across the mesh); a *limited* walk runs the
+cursor-bearing live traversal so every item carries a resume cursor.
 
-`Expand` stays unary — folded onto `IReverseOpsStreamGrain` alongside the streaming lookups, since it was
-the sole remaining member of the now-deleted stateless-worker `IReverseOpsGrain`. Callers target it via a
-stable well-known Guid (`IReverseOpsStreamGrain.ExpandKey`, `Guid.Empty`) rather than minting a fresh one
-per call, since Expand has no follow-up `MoveNext` and needs no per-stream activation affinity — it returns
-a whole tree, has no cursor, and needs no streaming. The Leopard membership index still accelerates an
-unlimited, cursorless
-`LookupResources` (its fast path yields a complete candidate set confirmed by Check); a *limited* walk runs
-the cursor-bearing live traversal so every item carries a resume cursor. Native streaming also gives
-per-item cancellation for free — the trailing `CancellationToken` threads into the engine walk, which the
-prior unary methods ignored. `Orleans.Runtime.AsyncEnumerableExtensions.WithBatchSize(n)` is available on
-the caller side as the native backpressure/batching knob that replaces the deleted manual page-size
-plumbing.
+A prior iteration of this design routed these ops through Guid-keyed grains under default placement,
+because native Orleans `IAsyncEnumerable` grain streaming is not safe on a `[StatelessWorker]` grain (the
+grain-side extension pins the live enumerator to one activation keyed by a client-minted request id, and a
+stateless worker's activations are not individually addressable). Since every read those grains performed
+was already served from local memory, the grain hop bought no consistency or caching benefit — only a real
+but pointless per-stream activation cost — so that layer was deleted in favor of running the same logic
+directly in the gRPC service process.
 
 ### 1.11 Broadcast channel for the log fan-out (deliberately deferred)
 

@@ -46,7 +46,7 @@ public class SchemaAtRevisionMeshTests
         """;
 
     private static PermissionsGrpcService Service(MeshTestCluster cluster) =>
-        new(cluster.Services.GetRequiredService<IPermissionChecker>(), cluster.GrainFactory);
+        new(cluster.Services.GetRequiredService<IPermissionChecker>(), cluster.GrainFactory, cluster.ReverseOps, cluster.RelationshipReads);
 
     private static RelationshipUpdateWire TouchEditor(string res, string subj) =>
         new(RelationshipUpdateOpWire.Touch,

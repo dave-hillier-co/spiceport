@@ -60,8 +60,22 @@ public sealed class MeshTestCluster : IAsyncDisposable
         return total;
     }
 
-    /// <summary>The cluster grain factory, for resolving grains (e.g. the reverse-ops worker) in tests.</summary>
+    /// <summary>The cluster grain factory, for resolving grains (e.g. the membership-walk mesh) in tests.</summary>
     public IGrainFactory GrainFactory => _cluster.GrainFactory;
+
+    /// <summary>
+    /// The reverse-ops in-process read helper (LookupSubjects/LookupResources/ExpandPermissionTree),
+    /// resolved from the primary silo's container — the same instance the silo's gRPC services would
+    /// resolve, so tests exercise it exactly as production wiring does (still dispatching onward to
+    /// SubjectFrontierGrain/MembershipWalkGrain/the check mesh across silos).
+    /// </summary>
+    public ReverseOps ReverseOps => Services.GetRequiredService<ReverseOps>();
+
+    /// <summary>
+    /// The relationship-read in-process helper (ReadRelationships/BulkExportRelationships), resolved from
+    /// the primary silo's container.
+    /// </summary>
+    public RelationshipReads RelationshipReads => Services.GetRequiredService<RelationshipReads>();
 
     /// <summary>The live, mutable schema provider (for asserting the current snapshot after a swap).</summary>
     public ISchemaProvider SchemaProvider => Services.GetRequiredService<ISchemaProvider>();

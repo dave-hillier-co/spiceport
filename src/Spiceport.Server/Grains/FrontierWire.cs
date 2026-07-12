@@ -7,7 +7,7 @@ namespace Spiceport.Grains;
 /// Maps between the engine's in-process <c>FoundSubject</c> tree and the Orleans-serializable
 /// <see cref="FrontierSubjectWire"/> wire form carried across the <see cref="ISubjectFrontierGrain"/>
 /// boundary, delegating caveat (de)serialization to <see cref="CaveatWire"/>. Both the live engine-walk
-/// path and the memoized path in <see cref="ReverseOpsStreamGrain"/> consume the SAME
+/// path and the memoized path in <see cref="ReverseOps"/> consume the SAME
 /// <c>FoundSubject</c> shape (the memoized path reconstructs it via <see cref="FromWire"/>), so the
 /// caveat-collapse / cursor-skip post-processing loop is written once and shared by both.
 /// </summary>

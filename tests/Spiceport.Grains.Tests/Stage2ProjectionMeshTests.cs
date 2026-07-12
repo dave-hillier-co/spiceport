@@ -125,7 +125,8 @@ public class Stage2ProjectionMeshTests
     {
         await using var cluster = await MeshTestCluster.CreateMultiSiloAsync(ViewerSchema, siloCount: 2);
         var service = new PermissionsGrpcService(
-            cluster.Services.GetRequiredService<IPermissionChecker>(), cluster.GrainFactory);
+            cluster.Services.GetRequiredService<IPermissionChecker>(), cluster.GrainFactory,
+            cluster.ReverseOps, cluster.RelationshipReads);
 
         for (var i = 0; i < 12; i++)
         {

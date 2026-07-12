@@ -7,7 +7,7 @@ namespace Spiceport.Grains;
 /// </summary>
 /// <remarks>
 /// When <see cref="MemoGrainOptions.Enabled"/> is false, <see cref="SubjectFrontierGrain"/> never
-/// consults or populates its memo and <see cref="ReverseOpsStreamGrain.StreamLookupSubjects"/> falls
+/// consults or populates its memo and <see cref="ReverseOps.StreamLookupSubjects"/> falls
 /// back to its direct engine walk.
 /// </remarks>
 public sealed class SubjectFrontierMemoOptions : MemoGrainOptions

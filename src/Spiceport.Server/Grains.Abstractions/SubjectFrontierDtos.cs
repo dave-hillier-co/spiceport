@@ -14,7 +14,7 @@ namespace Spiceport.Grains.Abstractions;
 /// <param name="ExcludedSubjects">
 /// For a wildcard match, the concrete subjects excluded from it. Note: <see cref="FoundSubjectWire"/>
 /// (the client-facing collapsed shape) still has no excluded-subjects field, so
-/// <c>ReverseOpsStreamGrain</c> drops these at the client edge exactly as it always has — carrying them
+/// <c>ReverseOps</c> drops these at the client edge exactly as it always has — carrying them
 /// here only keeps the memoized frontier a byte-faithful mirror of the engine's own output.
 /// </param>
 [GenerateSerializer, Immutable]

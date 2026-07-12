@@ -42,13 +42,12 @@ public class DataPlaneMeshTests
 
     private static ObjectAndRelation User(string id) => new("user", id, CoreConstants.Ellipsis);
 
-    // ReadRelationships now streams from the Guid-keyed IRelationshipsStreamGrain (a fresh key per
-    // enumeration). Collect the whole stream, or take a bounded prefix, so the assertions read as before.
+    // ReadRelationships now streams from the in-process RelationshipReads helper. Collect the whole
+    // stream, or take a bounded prefix, so the assertions read as before.
     private static async Task<List<RelationshipStreamItem>> ReadAll(MeshTestCluster cluster, ReadRelationshipsArgs args)
     {
         var list = new List<RelationshipStreamItem>();
-        await foreach (var item in cluster.GrainFactory
-            .GetGrain<IRelationshipsStreamGrain>(Guid.NewGuid()).StreamReadRelationships(args))
+        await foreach (var item in cluster.RelationshipReads.ReadRelationships(args))
             list.Add(item);
         return list;
     }
@@ -57,8 +56,7 @@ public class DataPlaneMeshTests
         MeshTestCluster cluster, ReadRelationshipsArgs args, int n)
     {
         var list = new List<RelationshipStreamItem>();
-        await foreach (var item in cluster.GrainFactory
-            .GetGrain<IRelationshipsStreamGrain>(Guid.NewGuid()).StreamReadRelationships(args))
+        await foreach (var item in cluster.RelationshipReads.ReadRelationships(args))
         {
             list.Add(item);
             if (list.Count >= n)

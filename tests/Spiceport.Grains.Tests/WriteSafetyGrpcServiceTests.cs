@@ -31,7 +31,7 @@ public class WriteSafetyGrpcServiceTests
         """;
 
     private static PermissionsGrpcService Service(MeshTestCluster cluster) =>
-        new(cluster.Services.GetRequiredService<IPermissionChecker>(), cluster.GrainFactory);
+        new(cluster.Services.GetRequiredService<IPermissionChecker>(), cluster.GrainFactory, cluster.ReverseOps, cluster.RelationshipReads);
 
     private static RelationshipUpdate Touch(string resType, string res, string rel, string subjType, string subj, string subjRel = "") => new()
     {

@@ -24,7 +24,7 @@ namespace Spiceport.Grains;
 /// <para>
 /// The memoized value is the PRE-CONTEXT frontier (verbatim caveat expressions, exactly as the engine
 /// yields them), never a collapsed verdict — caveat context is applied per-request at the caller
-/// (<see cref="ReverseOpsStreamGrain.StreamLookupSubjects"/>), matching <see cref="CheckGrain"/>'s memo
+/// (<see cref="ReverseOps.StreamLookupSubjects"/>), matching <see cref="CheckGrain"/>'s memo
 /// contract.
 /// </para>
 /// <para>
