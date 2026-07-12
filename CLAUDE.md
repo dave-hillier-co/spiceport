@@ -32,7 +32,7 @@ dotnet test tests/Spiceport.Conformance.Tests  # the SpiceDB conformance corpus 
 - **Storage is not *dispatch*-grain state.** Evaluation is a pure function of
   `(schema@revision, tuples@revision, request)`; dispatch grains never hold relationship data.
   The MVCC mechanics (visibility at a revision, the per-revision diff) live in `Spiceport.Datastore`
-  and are reused everywhere — the `ReferenceDatastore` conformance oracle and the silo projections
+  and are reused everywhere — the `ReferenceDatastore` reference model and the silo projections
   share one fold.
 - **Storage is an event-sourced grain (the log is the storage/compute seam).** All
   relationship/schema/counter state lives behind a single cluster-singleton `DatastoreGrain`, a
@@ -51,8 +51,10 @@ dotnet test tests/Spiceport.Conformance.Tests  # the SpiceDB conformance corpus 
   (opt-out via `MembershipWalkOptions`) **Leopard membership-walk grain mesh** (`IMembershipWalkGrain`,
   sharded as addressable per-subject walk grains — sibling recursion across grain boundaries, cold sets
   deactivate, revision-exact by construction because each hop reads a pinned MVCC snapshot) for
-  `LookupResources` (a complete candidate superset confirmed by `CheckEngine`, never an oracle — it cannot
-  change a verdict). See `docs/architecture-analysis.md` §3.5.
+  `LookupResources` (**candidates, never verdicts**: Check confirmation guarantees soundness — no false
+  member can survive; completeness is pinned by the walk-on==walk-off equivalence gates, because a
+  silently *missing* candidate is the failure Check confirmation cannot see). See
+  `docs/architecture-analysis.md` §3.5.
 - **The dispatcher seam is the core mechanism.** `Spiceport.Engine`'s `CheckEngine` never
   recurses into itself directly — every sub-problem flows through `IDispatcher.DispatchCheck`.
   Implementations are `OrleansDispatcher` (resolves a grain call via the Orleans directory) and
@@ -90,10 +92,14 @@ dotnet test tests/Spiceport.Conformance.Tests  # the SpiceDB conformance corpus 
 
 ## Testing discipline
 
-- **The SpiceDB conformance corpus is the correctness oracle.** `tests/.../TestData/*.yaml`
-  (schema + relationships + Check/Lookup assertions) must stay green; the same corpus runs
-  through the engine over the `ReferenceDatastore` oracle and the Orleans grain mesh, and both
-  must agree. Never weaken/skip a corpus case to make something pass.
+- **The SpiceDB conformance corpus is the compatibility anchor — a finite regression suite, not an
+  oracle.** `tests/.../TestData/*.yaml` (schema + relationships + Check/Lookup assertions) must stay
+  green; the same corpus runs through the engine over the `ReferenceDatastore` reference model and
+  the Orleans grain mesh, and both must agree. Never weaken/skip a corpus case to make something
+  pass. Know its limits: it covers only the shapes its cases exercise, both sides of the "two-way"
+  run share the same engine (agreement proves the distribution layer, not engine semantics), and it
+  tests one static snapshot (no MVCC/revision/write-race behavior). Correctness beyond it rests on
+  the property-based, metamorphic, and differential gates.
 - **Verify grains via the Orleans `TestingHost`** (in-process `TestCluster`), not by booting a
   host. For server/client-streaming gRPC, drive the service in-process with a fake
   `IServerStreamWriter`/`IAsyncStreamReader` + a fake `ServerCallContext`. Do **not** start a

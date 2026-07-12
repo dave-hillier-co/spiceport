@@ -254,7 +254,7 @@ public class ExpandEngineTests
     [InlineData("view")]
     [InlineData("edit_only")]
     [InlineData("allowed_view")]
-    public async Task FlattenedTree_AgreesWithCheckOracle(string permission)
+    public async Task FlattenedTree_AgreesWithCheck(string permission)
     {
         var (store, rev) = await Seed(
             Tuple("document", "doc1", "viewer", Onr("user", "alice")),

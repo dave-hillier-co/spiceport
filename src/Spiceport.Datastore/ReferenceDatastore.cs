@@ -5,7 +5,7 @@ using Spiceport.Core;
 namespace Spiceport.Datastore;
 
 /// <summary>
-/// The independent conformance-oracle and engine-test datastore: an in-memory MVCC implementation
+/// The reference model: an independent, executable specification of the MVCC semantics, used by conformance and engine tests: an in-memory MVCC implementation
 /// deliberately NOT built from the event-sourced <c>DatastoreGrain</c> path, so the two can disagree
 /// and catch bugs. It is not a deployable backend (durability is a grain-storage provider choice,
 /// see <c>DatastoreStorageConfig</c>). Revisions are monotonically increasing nanosecond timestamps.

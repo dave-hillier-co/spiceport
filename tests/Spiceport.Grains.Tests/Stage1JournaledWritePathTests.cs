@@ -117,10 +117,10 @@ public sealed class Stage1JournaledWritePathTests
     /// <summary>
     /// Gate 2: folding the event list from EMPTY via the same ApplyEvent the grain uses reproduces the
     /// grain's materialized state (LiveAt head, schema, counters) AND matches an independent
-    /// ReferenceDatastore oracle run with the same ops.
+    /// ReferenceDatastore reference model run with the same ops.
     /// </summary>
     [Fact]
-    public async Task Replay_FromEmpty_ReconstructsGrainStateAndMatchesOracle()
+    public async Task Replay_FromEmpty_ReconstructsGrainStateAndMatchesReferenceModel()
     {
         await using var scope = new Scope(await NewClusterAsync());
         await using var host = new PrivateProjectionHost(scope.Cluster.GrainFactory);
@@ -149,18 +149,18 @@ public sealed class Stage1JournaledWritePathTests
             CounterResource(grainState, "doc_viewers", grainState.HeadRevision),
             CounterResource(folded, "doc_viewers", grainState.HeadRevision));
 
-        // Independent oracle: the SAME ops through a fresh ReferenceDatastore yield the same live set.
-        var oracle = new ReferenceDatastore();
-        await RunWorkload(oracle);
-        var oracleHead = await oracle.HeadRevision();
-        var oracleReader = oracle.SnapshotReader(oracleHead.Revision);
-        var oracleSet = new SortedSet<string>();
-        await foreach (var r in oracleReader.QueryRelationships(new RelationshipsFilter()))
-            oracleSet.Add(Identity(r));
+        // Independent reference model: the SAME ops through a fresh ReferenceDatastore yield the same live set.
+        var reference = new ReferenceDatastore();
+        await RunWorkload(reference);
+        var referenceHead = await reference.HeadRevision();
+        var referenceReader = reference.SnapshotReader(referenceHead.Revision);
+        var referenceSet = new SortedSet<string>();
+        await foreach (var r in referenceReader.QueryRelationships(new RelationshipsFilter()))
+            referenceSet.Add(Identity(r));
         // Compare identity sets (revisions differ between backends; expiration is dropped symmetrically by
         // the same QueryRelationships path, so exclude the expiring row's possibly-filtered state by using
         // the grain live set's identities too).
-        Assert.Equal(oracleSet, GrainLiveIdentities(grainState));
+        Assert.Equal(referenceSet, GrainLiveIdentities(grainState));
     }
 
     /// <summary>Gate 4: a cursor older than the GC window throws RevisionNotFoundException.</summary>

@@ -2,7 +2,7 @@ using System.Runtime.CompilerServices;
 
 // The grain-backed datastore (Spiceport.Server) reuses these MVCC mechanics — the same
 // (DatastoreState fold, MvccReadWriteTransaction staging/commit, MvccSnapshotReader queries) that
-// back the ReferenceDatastore oracle — by converting the Orleans wire state into DatastoreState
+// back the ReferenceDatastore reference model — by converting the Orleans wire state into DatastoreState
 // rather than re-deriving that logic. These types are deliberately internal MVCC encapsulation,
 // so expose them to Server (only) as friends.
 [assembly: InternalsVisibleTo("Spiceport.Server")]

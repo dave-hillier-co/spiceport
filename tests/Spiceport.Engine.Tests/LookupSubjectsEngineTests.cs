@@ -342,7 +342,7 @@ public class LookupSubjectsEngineTests
     [InlineData("edit_only")]
     [InlineData("allowed_view")]
     [InlineData("inherited_view")]
-    public async Task LookupSubjects_AgreesWithCheckOracle(string permission)
+    public async Task LookupSubjects_AgreesWithCheck(string permission)
     {
         var (store, rev) = await Seed(
             Tuple("document", "doc1", "parent", Onr("document", "folder")),
@@ -359,7 +359,7 @@ public class LookupSubjectsEngineTests
         var found = await Collect(engine.LookupSubjects(reader, Onr("document", "doc1", permission), "user"));
         var foundIds = found.Select(f => f.SubjectId).ToHashSet();
 
-        // Soundness + completeness against the Check oracle across the full universe.
+        // Soundness + completeness against Check (the definitional semantics for lookups) across the full universe.
         string[] universe = ["alice", "bob", "carol", "dave", "erin"];
         foreach (var id in universe)
         {

@@ -7,7 +7,7 @@ using Spiceport.Schema;
 namespace Spiceport.Grains.Tests;
 
 /// <summary>
-/// Stage-4 NON-NEGOTIABLE oracle gate: across the ENTIRE SpiceDB conformance corpus, the Leopard
+/// Stage-4 NON-NEGOTIABLE conformance gate: across the ENTIRE SpiceDB conformance corpus, the Leopard
 /// membership-walk accelerator (<see cref="MembershipCoverage"/> + <see cref="MembershipWalk.LocalClosure"/>)
 /// must not change a single LookupResources verdict. For every file, every assertion's
 /// (subject, resource-type, permission) is run through <see cref="LookupResourcesEngine"/> twice — once with

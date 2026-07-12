@@ -8,7 +8,7 @@ namespace Spiceport.Engine.Tests;
 /// Stage-4 gates for the Leopard membership-walk accelerator (<see cref="MembershipCoverage"/> +
 /// <see cref="MembershipWalk"/>): candidates produced by <see cref="MembershipWalk.LocalClosure"/> plus
 /// coverage filtering must produce verdicts IDENTICAL to the live traversal for the shapes coverage
-/// recognizes (oracle equivalence), and coverage must decline the shapes it cannot flatten (arrows). Driven
+/// recognizes (equivalence gate), and coverage must decline the shapes it cannot flatten (arrows). Driven
 /// directly against a <see cref="ReferenceDatastore"/> (no Orleans) so the matrix runs fast. This is the
 /// engine-level counterpart of the retired <c>Stage4MembershipIndexTests</c>, now walking instead of
 /// consulting a flattened replica.
@@ -116,7 +116,7 @@ public class Stage4MembershipWalkEquivalenceTests
         return MembershipWalk.ToCoveredCandidates(nodes, yields, resourceType, subjectType, subjectId);
     }
 
-    /// <summary>The core oracle gate: walk-derived candidate verdicts == live verdicts, across a matrix of subjects/targets.</summary>
+    /// <summary>The core equivalence gate: walk-derived candidate verdicts == live verdicts, across a matrix of subjects/targets.</summary>
     private static async Task AssertEquivalent(
         LookupResourcesEngine engine, MembershipCoverage coverage, IDatastoreReader reader,
         string subjectType, string subjectId, string subjectRelation, string resourceType, string permission,

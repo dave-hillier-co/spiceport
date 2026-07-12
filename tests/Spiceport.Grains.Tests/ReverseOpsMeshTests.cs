@@ -329,7 +329,7 @@ public class ReverseOpsMeshTests
     }
 
     [Fact]
-    public async Task StreamLookupResources_CrossesSiloBoundary_MatchesEngineOracle()
+    public async Task StreamLookupResources_CrossesSiloBoundary_MatchesEngine()
     {
         // A genuine multi-silo cluster: the in-process read runs on the primary silo but the Leopard
         // membership-walk accelerator it dispatches to (IMembershipWalkGrain) may activate on any silo, so
@@ -351,18 +351,18 @@ public class ReverseOpsMeshTests
             Context: null, Limit: null, Cursor: null)))
             streamed.Add(r.ResourceId);
 
-        // Engine oracle over the same snapshot the mesh pinned.
+        // Engine baseline over the same snapshot the mesh pinned.
         var schema = cluster.Services.GetRequiredService<ISchemaProvider>().Current;
         var rev = await cluster.Datastore.OptimizedRevision();
         var reader = cluster.Datastore.SnapshotReader(rev.Revision);
         var engine = new LookupResourcesEngine(schema.Namespaces, schema.Caveats);
-        var oracle = new SortedSet<string>(StringComparer.Ordinal);
+        var baseline = new SortedSet<string>(StringComparer.Ordinal);
         await foreach (var f in engine.LookupResources(
             reader, "user", "alice", CoreConstants.Ellipsis, "document", "view", coveredCandidateIds: null))
-            oracle.Add(f.ResourceId);
+            baseline.Add(f.ResourceId);
 
         Assert.NotEmpty(streamed);
-        Assert.Equal(oracle, streamed);
+        Assert.Equal(baseline, streamed);
         Assert.Contains("doc_a", streamed);
         Assert.Contains("doc_b", streamed);
     }

@@ -14,7 +14,7 @@ namespace Spiceport.Engine;
 /// <see cref="Spiceport.Grains.SchemaSnapshot.MembershipCoverage"/>) rather than once per request.
 /// </summary>
 /// <remarks>
-/// SAFETY MODEL — unchanged from the retired index: coverage is a CANDIDATE-set predicate, never an oracle.
+/// SAFETY MODEL — unchanged from the retired index: coverage is a CANDIDATE-set predicate — candidates, never verdicts.
 /// A covered target's yield relations describe a COMPLETE superset of the resources a subject can reach; the
 /// caller (<see cref="MembershipWalk"/> plus the confirming <see cref="CheckEngine"/>) is responsible for
 /// exactness. For intersection/exclusion only the first (positive) operand seeds candidates (the rest can

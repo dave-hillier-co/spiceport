@@ -19,10 +19,10 @@ namespace Spiceport.Grains.Tests;
 
 /// <summary>
 /// Stage-2 gates for the per-silo materialized projection (<see cref="SiloProjection"/>), the only read
-/// path of <see cref="GrainBackedDatastore"/>. Proves (a) ORACLE EQUIVALENCE: the same conformance corpus
+/// path of <see cref="GrainBackedDatastore"/>. Proves (a) REFERENCE EQUIVALENCE: the same conformance corpus
 /// subset that the in-process engine asserts stays green when every read serves from the projection;
 /// (b) READER FIDELITY: at every committed revision the projection reader returns exactly the rows an
-/// independent <see cref="ReferenceDatastore"/> oracle returns; (c) the CLOSED-TIMESTAMP gate: a cross-silo
+/// independent <see cref="ReferenceDatastore"/> reference model returns; (c) the CLOSED-TIMESTAMP gate: a cross-silo
 /// exact / at-least-as-fresh read observes a write immediately (the projection blocks for catch-up), never
 /// serving a stale prefix.
 /// </summary>
@@ -42,7 +42,7 @@ public class Stage2ProjectionMeshTests
         ["caveatip.yaml"],
     ];
 
-    /// <summary>Gate (a): the corpus oracle stays green with the projection reader on the read path.</summary>
+    /// <summary>Gate (a): the conformance gate stays green with the projection reader on the read path.</summary>
     [Theory]
     [MemberData(nameof(MeshFiles))]
     public async Task Conformance_Through_Projection_Mesh(string fileName)
@@ -80,10 +80,10 @@ public class Stage2ProjectionMeshTests
     /// <summary>
     /// Gate (b): at every committed revision, a projection reader on a SEPARATE datastore instance (so the
     /// rows can only have arrived by folding the singleton grain's log, never by local write echo) exposes
-    /// the same live relationship set as an independent in-memory oracle replaying the same ops.
+    /// the same live relationship set as an independent in-memory reference model replaying the same ops.
     /// </summary>
     [Fact]
-    public async Task ProjectionReader_MatchesOracle_AtEveryRevision()
+    public async Task ProjectionReader_MatchesReferenceModel_AtEveryRevision()
     {
         await using var scope = new Scope(await NewDatastoreClusterAsync());
         var gf = scope.Cluster.GrainFactory;
@@ -93,24 +93,24 @@ public class Stage2ProjectionMeshTests
         await using var projectedHost = new PrivateProjectionHost(gf);
         IDatastore writer = new GrainBackedDatastore(gf, writerHost);
         IDatastore projected = new GrainBackedDatastore(gf, projectedHost);
-        var oracle = new ReferenceDatastore();
+        var reference = new ReferenceDatastore();
 
-        // Drive the SAME ordered workload through the grain (writer) and the oracle, capturing each backend's
+        // Drive the SAME ordered workload through the grain (writer) and the reference model, capturing each backend's
         // commit revision so we can compare the readers revision-by-revision.
         var grainRevs = new List<IRevision>();
-        var oracleRevs = new List<IRevision>();
+        var referenceRevs = new List<IRevision>();
         foreach (var step in Workload())
         {
             grainRevs.Add(await writer.ReadWriteTx(step));
-            oracleRevs.Add(await oracle.ReadWriteTx(step));
+            referenceRevs.Add(await reference.ReadWriteTx(step));
         }
 
         for (var i = 0; i < grainRevs.Count; i++)
         {
             var viaProjection = await LiveIds(projected.SnapshotReader(grainRevs[i]));
-            var viaOracle = await LiveIds(oracle.SnapshotReader(oracleRevs[i]));
+            var viaReference = await LiveIds(reference.SnapshotReader(referenceRevs[i]));
 
-            Assert.Equal(viaOracle, viaProjection);
+            Assert.Equal(viaReference, viaProjection);
         }
     }
 

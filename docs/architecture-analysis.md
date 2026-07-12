@@ -265,15 +265,19 @@ feed, and Leopard index below are all pure folds of that one log.
   one heartbeat per silo, not a poller per stream; checkpoints ride the revision the feed has
   progressed through, so a consumer filtering to a content subset still observes liveness.
 
-- **A Leopard-style membership index** (on by default, opt-out) bootstraps once from a snapshot
-  and folds incrementally from the log tail (following the `SiloProjection` pattern), flattening
-  nested-group / userset chains into reverse adjacency so `LookupResources` can enumerate candidate
-  resources in-memory instead of by repeated reverse queries; a full rebuild occurs only on schema
-  change or when log compaction advances past the cache watermark. It is **never an oracle**: it
-  produces a *complete candidate superset* that the trusted `CheckEngine` confirms, so a stale or
-  over-broad index can only cost an extra Check, never change a verdict. It engages only for shapes
-  it can fully flatten (no tuple-to-userset arrows) and only for fresh, unpaged enumerations, leaving
-  the cursored live traversal untouched.
+- **A Leopard-style membership accelerator** (on by default, opt-out) is a mesh of per-subject
+  walk grains (`IMembershipWalkGrain`, keyed by subject key + exact revision + schema hash): each
+  activation computes one reverse-adjacency hop over a reader pinned at the key's revision and
+  recurses through the sibling grains for its parents' own containers, memoizing the containing-set
+  closure. A walk over a pinned MVCC snapshot is revision-exact by construction — no fold/catch-up
+  machinery, deletes are the trivial case — and cold subject keys simply never activate. It yields
+  **candidates, never verdicts**: the trusted `CheckEngine` confirms every candidate (soundness — an
+  over-broad walk can only cost an extra Check), and the walk-on==walk-off equivalence gates pin
+  completeness (an *incomplete* candidate set would silently drop results, which confirmation cannot
+  detect). It engages only for shapes the schema coverage analysis can fully flatten (no
+  tuple-to-userset arrows) and only for fresh, unpaged enumerations, leaving the cursored live
+  traversal untouched; a depth-exhausted walk reports itself incomplete and the caller falls back to
+  the live traversal.
 
 ---
 
@@ -298,7 +302,7 @@ These are pure CPU and must be ported faithfully; they carry the real porting ri
   dependency risk; it is now retired.
 - **Datastore + revision model** — the in-memory MVCC mechanics (visibility at a revision, the
   per-revision diff, ZedToken encode/decode) are a straight port and stay the reusable core: the
-  same `MvccSnapshotReader` fold serves both the `ReferenceDatastore` conformance oracle and the
+  same `MvccSnapshotReader` fold serves both the `ReferenceDatastore` reference model and the
   silo projections.
   Durability is *not* a hand-rolled SQL datastore but the event-sourced grain's own storage (§3.5) —
   the log + snapshots persist via an Orleans grain-storage provider (AdoNet/Postgres), so there is no
@@ -372,7 +376,7 @@ consistent hashing, deduplicates with singleflight, and rebalances across a hash
 those three mechanisms are precisely what Orleans virtual actors give for free via placement,
 single-activation, and cluster membership. So we port the *graph evaluation engine* and the
 *schema compiler* (the genuinely hard, actor-agnostic code), keep the v1 gRPC API byte-
-compatible, reuse SpiceDB's YAML conformance corpus as a TDD oracle, and let the Orleans
+compatible, reuse SpiceDB's YAML conformance corpus as the compatibility anchor (a finite regression suite), and let the Orleans
 runtime replace the entire `remote`/`cluster`/hashring distribution layer.
 
 Candidate directions beyond this design — further Orleans-native consolidation and deliberate

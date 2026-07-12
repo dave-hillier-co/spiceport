@@ -98,7 +98,7 @@ public class SameKeyCycleMeshTests
     /// <summary>
     /// Step 2 mesh gate for the local-recurse deletion: a genuine same-key grain re-entry (the SAME
     /// group:a &lt;-&gt; group:b cycle as above) must terminate through the multi-silo mesh with EXACTLY the
-    /// verdict the <see cref="ReferenceDatastore"/> oracle's in-process <see cref="CheckEngine"/> produces
+    /// verdict the <see cref="ReferenceDatastore"/> reference model’s in-process <see cref="CheckEngine"/> produces
     /// for the identical schema/relationships/request — an error (<see cref="MaxDepthExceededException"/>),
     /// never a confident (wrong) verdict on either side. Now that <see cref="OrleansDispatcher"/> has no
     /// in-process local-recurse shortcut, every hop of the cycle — including the one that re-addresses the
@@ -107,7 +107,7 @@ public class SameKeyCycleMeshTests
     /// what keeps a same-key re-entry from deadlocking.
     /// </summary>
     [Fact]
-    public async Task SameKeyCycle_mesh_verdict_matches_the_ReferenceDatastore_oracle()
+    public async Task SameKeyCycle_mesh_verdict_matches_the_ReferenceDatastore_reference_model()
     {
         var relationships = new List<RelationshipUpdate>
         {
@@ -124,15 +124,15 @@ public class SameKeyCycleMeshTests
         };
         var subject = new ObjectAndRelation("user", "x", CoreConstants.Ellipsis);
 
-        // The oracle: a plain in-process CheckEngine over a ReferenceDatastore, no grains, no visited-set wiring.
+        // The reference model: a plain in-process CheckEngine over a ReferenceDatastore, no grains, no visited-set wiring.
         var compiled = SchemaCompiler.CompileSchema(CycleSchema);
-        var oracleStore = new ReferenceDatastore();
-        var oracleRevision = await oracleStore.ReadWriteTx(tx => tx.WriteRelationships(relationships));
-        var oracleReader = oracleStore.SnapshotReader(oracleRevision);
-        var oracleEngine = new CheckEngine(compiled.Namespaces, compiled.Caveats);
+        var referenceStore = new ReferenceDatastore();
+        var referenceRevision = await referenceStore.ReadWriteTx(tx => tx.WriteRelationships(relationships));
+        var referenceReader = referenceStore.SnapshotReader(referenceRevision);
+        var referenceEngine = new CheckEngine(compiled.Namespaces, compiled.Caveats);
 
         await Assert.ThrowsAsync<MaxDepthExceededException>(
-            () => oracleEngine.Check(oracleReader, "group", "a", "member", subject, caveatContext: null));
+            () => referenceEngine.Check(referenceReader, "group", "a", "member", subject, caveatContext: null));
 
         // The mesh: the same schema/relationships/request across a real 3-silo Orleans cluster, where the
         // cycle's second hop re-addresses the SAME grain key the check started from.
