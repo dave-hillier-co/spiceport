@@ -43,7 +43,10 @@ dotnet test tests/Spiceport.Conformance.Tests  # the SpiceDB conformance corpus 
   grain-storage provider — **no application SQL** (per-version log entries + periodic snapshots +
   compaction). Each silo reads from a **`SiloProjection`** folded incrementally from the log
   (`ReadFrom` tail, bootstrap-once) — no per-Check full fetch; exact/at-least-as-fresh reads block
-  until the projection watermark covers the pinned revision (closed-timestamp gate). The same log feed
+  until the projection watermark covers the pinned revision (closed-timestamp gate). The write path
+  (`GrainBackedDatastore.ReadWriteTx`) derives its write base from this same local projection rather
+  than a per-attempt grain `ReadState`, so `ReadState` is now used only for the projection's one-time
+  bootstrap; the grain's CAS append remains the sole serialization point. The same log feed
   drives **Watch** (one per-silo `LogWatchHub` notifier, no per-stream polling) and an on-by-default
   (opt-out via `MembershipIndexOptions`) **Leopard membership-walk grain mesh** (`IMembershipWalkGrain`,
   sharded as addressable per-subject walk grains — sibling recursion across grain boundaries, cold sets
