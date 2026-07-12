@@ -51,14 +51,16 @@ public sealed class GrainBackedDatastoreWriteBaseTests
     {
         var (ds, grain) = NewDatastore();
 
-        // Force a genuine race: both writers' FIRST GetHead probe rendezvous here (a 2-party barrier) so
-        // both observe the SAME expectedHead before either reaches AppendCommit — a plain Task.WhenAll over
-        // an in-process fake with no real I/O would otherwise just run one ReadWriteTx to full completion
-        // before the other starts, never actually racing. A retry's later GetHead call arrives after the
-        // barrier has already opened, so it passes straight through.
+        // Force a genuine race: both writers' FIRST AppendCommit rendezvous here (a 2-party barrier), so
+        // both proposals were built from bases that predate EITHER commit — guaranteeing exactly one loses
+        // the CAS. The barrier must sit at AppendCommit, not GetHead: expectedHead comes from the PROJECTION
+        // base (deliberately — see ReadWriteTx), and a projection pull that lands after the winner's commit
+        // legitimately rescues the second writer with a fresher base, no retry needed. Rendezvousing at the
+        // head probe therefore does NOT guarantee a CAS loss; rendezvousing at the append does. A retry's
+        // later AppendCommit arrives after the barrier has opened, so it passes straight through.
         var arrivals = 0;
         var bothArrived = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        grain.OnGetHead = () =>
+        grain.OnAppendCommit = () =>
         {
             if (Interlocked.Increment(ref arrivals) >= 2)
                 bothArrived.TrySetResult();
@@ -71,10 +73,9 @@ public sealed class GrainBackedDatastoreWriteBaseTests
             new[] { new RelationshipUpdate(Rel("b", "bob"), UpdateOperation.Create) }));
         await Task.WhenAll(t1, t2);
 
-        // Exactly one AppendCommit attempt lost the CAS and retried (2 writers -> at least 3 AppendCommit
-        // calls: 2 that raced plus >=1 retry), yet the write base never came from a fresh ReadState — still
-        // just the one bootstrap.
-        Assert.True(grain.AppendCommitCalls >= 3, $"expected at least one retry, saw {grain.AppendCommitCalls} AppendCommit calls");
+        // Exactly one AppendCommit attempt lost the CAS and retried (2 that raced + 1 retry), yet the write
+        // base never came from a fresh ReadState — still just the one bootstrap.
+        Assert.Equal(3, grain.AppendCommitCalls);
         Assert.Equal(1, grain.ReadStateCalls);
 
         var head = await ds.HeadRevision();
@@ -181,39 +182,40 @@ public sealed class GrainBackedDatastoreWriteBaseTests
         }
 
         /// <summary>
-        /// Test-only rendezvous hook, awaited before every <see cref="GetHead"/> call resolves. Used by
-        /// <c>RacingWrites_LoserRetries_WithoutReReadingFullState_AndBothLand</c> to force two concurrent
-        /// <see cref="GrainBackedDatastore.ReadWriteTx"/> calls to genuinely race (both observe the same
-        /// head) rather than one running this synchronous in-process fake to completion before the other
-        /// starts. Null (the default) is a no-op.
+        /// Test-only rendezvous hook, awaited before every <see cref="AppendCommit"/> call takes the lock.
+        /// Used by <c>RacingWrites_LoserRetries_WithoutReReadingFullState_AndBothLand</c> to force two
+        /// concurrent <see cref="GrainBackedDatastore.ReadWriteTx"/> calls to genuinely race — both
+        /// proposals built from pre-commit bases — rather than one running this synchronous in-process fake
+        /// to completion before the other starts. Null (the default) is a no-op.
         /// </summary>
-        public Func<Task>? OnGetHead;
+        public Func<Task>? OnAppendCommit;
 
-        public async Task<DatastoreHeadWire> GetHead()
+        public Task<DatastoreHeadWire> GetHead()
         {
-            if (OnGetHead is { } hook)
-                await hook();
             lock (_lock)
             {
                 GetHeadCalls++;
-                return new DatastoreHeadWire(_state.HeadRevision, _state.SchemaHashAt(_state.HeadRevision), _state.GcFloor);
+                return Task.FromResult(
+                    new DatastoreHeadWire(_state.HeadRevision, _state.SchemaHashAt(_state.HeadRevision), _state.GcFloor));
             }
         }
 
-        public Task<long?> AppendCommit(long expectedHead, ProposedWrite write)
+        public async Task<long?> AppendCommit(long expectedHead, ProposedWrite write)
         {
+            if (OnAppendCommit is { } hook)
+                await hook();
             lock (_lock)
             {
                 AppendCommitCalls++;
                 if (_state.HeadRevision != expectedHead)
-                    return Task.FromResult((long?)null);
+                    return null;
 
                 var now = (DateTimeOffset.UtcNow - DateTimeOffset.UnixEpoch).Ticks * 100L;
                 var newRevision = now > expectedHead ? now : expectedHead + 1;
                 var ev = LogFold.EventFromProposal(write, newRevision);
                 _events.Add(ev);
                 _state = LogFold.ApplyEvent(_state, ev);
-                return Task.FromResult((long?)newRevision);
+                return newRevision;
             }
         }
 
