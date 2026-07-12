@@ -10,7 +10,7 @@ using Spiceport.Grains;
 namespace Spiceport.Grains.Tests;
 
 /// <summary>
-/// Proves the LIVE grain-backed datastore is faithful to the <see cref="ReferenceDatastore"/> oracle through
+/// Proves the LIVE grain-backed datastore is faithful to the <see cref="ReferenceDatastore"/> reference model through
 /// the <see cref="IDatastore"/> contract: an identical ordered sequence of write transactions through (a) a
 /// plain <see cref="ReferenceDatastore"/> and (b) a <see cref="GrainBackedDatastore"/> over the singleton
 /// <c>DatastoreGrain</c> yields equal live relationship sets at head, plus matching delete counts and

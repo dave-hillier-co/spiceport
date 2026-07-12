@@ -22,9 +22,10 @@ Whatever is taken from this list, these do not move:
 - **New-enemy protection can be strengthened, never weakened.** Zookies remain a first-class API
   contract: they must not be removed, deprecated, or semantically weakened, even if they stop
   being the primary consistency mechanism.
-- **The never-an-oracle discipline generalizes.** Any accelerating index or materialized view
-  either has its candidates confirmed by `CheckEngine`, or earns oracle status only through a
-  fold-correctness equivalence gate (the Leopard on==off pattern).
+- **The candidates-never-verdicts discipline generalizes.** Any accelerating index or materialized
+  view has its candidates confirmed by `CheckEngine` (soundness) with completeness pinned by an
+  on==off equivalence gate (the Leopard pattern); it may serve verdicts directly only after a
+  fold-correctness equivalence gate proves it verdict-identical to the live evaluator.
 - **The `authzed.api.v1` surface** stays `zed`-compatible.
 
 ---
@@ -47,8 +48,9 @@ revision-exact by construction — there is no fold/catch-up machinery to keep c
 advances, and a delete excludes its detached subtree immediately at the post-delete revision (the
 old replica's weak spot). Cold subject keys simply never activate; warm ones deactivate on ordinary
 idle collection like any other grain, sharding the working set instead of replicating it whole on
-every silo. The accelerator remains a complete candidate superset confirmed by `CheckEngine`, never
-an oracle — it cannot change a verdict.
+every silo. The accelerator yields candidates, never verdicts: `CheckEngine` confirmation
+guarantees soundness, and the walk-on==walk-off equivalence gates pin completeness (a silently
+missing candidate is the failure confirmation cannot see).
 
 ### 1.2 Reminder-driven MVCC garbage collection (implemented)
 
@@ -240,8 +242,8 @@ not a correctness one.
 **The relaxation.** With the event log, a materialized "who-can-see-what" reachability set is
 *just another fold*, incrementally maintained like the projection. For non-caveated paths, Check
 becomes a hash lookup; the dispatch mesh remains the evaluator for caveated/complex paths and the
-verifier for the view. The never-an-oracle discipline applies until a corpus equivalence gate
-(the Leopard on==off pattern) earns the view oracle status.
+verifier for the view. The candidates-never-verdicts discipline applies until an equivalence gate
+(the Leopard on==off pattern) proves the view verdict-identical and lets it serve verdicts directly.
 **Sequencing.** The performance moonshot; wait until 1.1 proves the incremental-fold pattern.
 
 ### 2.3 Read-your-writes by default without weakening zookies

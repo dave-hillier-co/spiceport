@@ -9,7 +9,7 @@ namespace Spiceport.Conformance.Tests;
 /// <summary>
 /// Property-style consistency cross-check that ties the Phase 3 reverse/tree APIs
 /// (<see cref="LookupSubjectsEngine"/>, <see cref="LookupResourcesEngine"/>,
-/// <see cref="ExpandEngine"/>) back to the trusted forward oracle
+/// <see cref="ExpandEngine"/>) back to the trusted forward Check semantics
 /// (<see cref="CheckEngine"/>). For a representative slice of the conformance corpus
 /// it asserts the soundness+completeness invariants from the design's §4:
 ///
@@ -71,7 +71,7 @@ public class ReverseConsistencyCrossCheckTests
                     // relations (e.g. group#member) LookupSubjects yields the *directly written*
                     // usersets matching the type+relation, whereas Check resolves userset
                     // membership transitively, so the two are deliberately not 1:1 there (the
-                    // design's §4 oracle is framed over concrete subjects). Terminal subjects are
+                    // design’s §4 cross-check is framed over concrete subjects). Terminal subjects are
                     // exactly where SpiceDB's own consistency tests operate.
                     foreach (var subjectType in ctx.TerminalSubjectTypes)
                     {
@@ -169,7 +169,7 @@ public class ReverseConsistencyCrossCheckTests
 
         // The flattened concrete (terminal) subject set of an expansion tree, evaluated
         // by interpreting the set operations, must agree with Check for each candidate
-        // subject id of every subject type. This makes Expand testable via the same oracle.
+        // subject id of every subject type. This makes Expand testable via the same cross-check.
         foreach (var ns in ctx.Namespaces)
         {
             foreach (var relation in ns.Relations)

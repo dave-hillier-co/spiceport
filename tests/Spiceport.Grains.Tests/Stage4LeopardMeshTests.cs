@@ -10,7 +10,7 @@ namespace Spiceport.Grains.Tests;
 /// Stage-4 gates for the Leopard membership-walk grain mesh (<see cref="MembershipWalkGrain"/>) wired into
 /// the mesh behind the <c>useMembershipWalk</c> flag. Drives
 /// <see cref="ReverseOps.StreamLookupResources"/> with the accelerator ON and proves the result
-/// set is IDENTICAL to the accelerator-OFF engine over the same snapshot (oracle equivalence end-to-end),
+/// set is IDENTICAL to the accelerator-OFF engine over the same snapshot (equivalence end-to-end),
 /// that every returned resource is Check-confirmed, that a runtime schema swap rotates the walk-grain
 /// keyspace (a new schema hash addresses disjoint activations rather than requiring cache invalidation), and
 /// that a delete immediately excludes the detached subtree at the post-delete revision (the retired per-silo

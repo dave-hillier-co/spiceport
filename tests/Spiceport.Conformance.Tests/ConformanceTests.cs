@@ -10,7 +10,7 @@ namespace Spiceport.Conformance.Tests;
 /// SpiceDB consistency/validation conformance harness. For every YAML test config it
 /// compiles the schema (yielding namespace AND caveat definitions), loads the
 /// relationships (with caveat context + expiration) into a <see cref="ReferenceDatastore"/>
-/// (the conformance oracle), and
+/// (the reference model), and
 /// runs every assertion through the <see cref="CheckEngine"/>, comparing the engine's
 /// membership verdict against the file's expected outcome
 /// (assertTrue → Member, assertFalse → NotMember, assertCaveated → Caveated).

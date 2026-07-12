@@ -8,7 +8,7 @@ using Spiceport.Schema;
 namespace Spiceport.Grains.Tests;
 
 /// <summary>
-/// NON-NEGOTIABLE oracle gate for the <see cref="SubjectFrontierGrain"/> memo: across the entire SpiceDB
+/// NON-NEGOTIABLE equivalence gate for the <see cref="SubjectFrontierGrain"/> memo: across the entire SpiceDB
 /// conformance corpus, every LookupSubjects-shaped assertion (resource, permission, subject type) must
 /// yield the IDENTICAL <see cref="StreamLookupSubjects"/> result set whether the memo is consulted or not.
 /// </summary>
@@ -22,7 +22,7 @@ namespace Spiceport.Grains.Tests;
 /// Orleans stack: disabling the memo makes <c>ReverseOps</c> fall back to running
 /// <see cref="LookupSubjectsEngine"/> directly and collapsing with <see cref="CaveatEvaluator"/> via
 /// <c>ReverseOpsSupport.TryCollapse</c> — exactly what this test computes in-process over a
-/// <see cref="ReferenceDatastore"/> seeded with the same relationships, so it is a faithful "off" oracle
+/// <see cref="ReferenceDatastore"/> seeded with the same relationships, so it is a faithful "off" baseline
 /// without paying for a second cluster per file.
 /// </remarks>
 [Collection(MeshClusterCollection.Name)]
@@ -64,7 +64,7 @@ public class FrontierCorpusEquivalenceTests
     }
 
     /// <summary>
-    /// The memo-OFF oracle: the identical computation <c>ReverseOps.StreamLookupSubjects</c>
+    /// The memo-OFF baseline: the identical computation <c>ReverseOps.StreamLookupSubjects</c>
     /// runs when <see cref="SubjectFrontierMemoOptions.Enabled"/> is false — a direct
     /// <see cref="LookupSubjectsEngine"/> walk collapsed against a null request context via
     /// <see cref="ReverseOpsSupport.TryCollapse"/> — computed in-process over a
