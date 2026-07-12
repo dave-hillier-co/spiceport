@@ -202,8 +202,14 @@ public class DatastoreGcMeshTests
     }
 
     [Fact]
-    public async Task Reader_pinned_below_the_floor_throws_RevisionNotFoundException()
+    public async Task Reader_pinned_below_the_floor_throws_once_the_gc_event_is_observed_locally()
     {
+        // The floor rejection is enforced from the projection's OWN folded floor — deliberately local,
+        // never probed from the singleton per reader (see GrainBackedDatastore.SnapshotReader's remarks).
+        // The contract this pins is therefore two-sided: a projection whose watermark still sits BEFORE
+        // the GC event serves the pinned revision with MVCC-CORRECT retained data (never wrong data, and
+        // no spurious rejection), and once the projection has folded the GC event — any catch-up past it —
+        // the same pinned revision is rejected with RevisionNotFoundException.
         await using var scope = new Scope(await NewClusterAsync<GcSiloConfigurator>());
         await using var host = new PrivateProjectionHost(scope.Cluster.GrainFactory);
         IDatastore ds = new GrainBackedDatastore(scope.Cluster.GrainFactory, host);
@@ -215,6 +221,17 @@ public class DatastoreGcMeshTests
         var floor = await grain.RunGc();
         Assert.NotNull(floor);
 
+        // Behind the GC event (the write above bootstrapped the projection at the pre-GC head): the pinned
+        // reader serves the state that was live at oldHead — alice did not exist yet, and the rows that did
+        // are still retained by the un-collected local fold. Correct data, deferred error.
+        var behind = await LiveIds(ds.SnapshotReader(oldHead.Revision));
+        Assert.DoesNotContain("a:alice", behind);
+
+        // Catch up past the GC event (an at-head read folds it), advancing the local floor…
+        var head = await ds.HeadRevision();
+        _ = await LiveIds(ds.SnapshotReader(head.Revision));
+
+        // …after which the same below-floor pin is rejected.
         var reader = ds.SnapshotReader(oldHead.Revision);
         await Assert.ThrowsAsync<RevisionNotFoundException>(async () =>
         {

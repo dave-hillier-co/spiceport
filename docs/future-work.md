@@ -202,10 +202,10 @@ projection catch-up latency appears in profiles.
 `ISnapshotSegmentGrain` keyed by snapshot log version reading the write-once snapshot/{version} row
 via a shared DatastoreSnapshotStore helper; GetHead gaining SnapshotVersion; bounded loud-failing
 retry on the compaction race (DatastoreGrain clears the old snapshot right after each new head
-commit); deferred because bootstrap ReadState is once-per-silo pre-traffic while the dominant
-singleton load is the write path's per-write ReadState (whose fix — deriving the write base from
-the local projection — is a separate candidate); build only if multi-silo cold-start contention is
-observed.
+commit); deferred because bootstrap ReadState is now the ONLY ReadState call in production
+(GrainBackedDatastore.ReadWriteTx derives its write base from the local SiloProjection instead of a
+per-write ReadState) and it is once-per-silo pre-traffic; build only if multi-silo cold-start
+contention is observed.
 
 ---
 

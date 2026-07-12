@@ -124,6 +124,17 @@ public sealed class GrainBackedDatastore : IDatastore
         // The (async) state acquisition defers to the first read; every subsequent query is served
         // in-process via one MvccSnapshotReader. The projection catches up on demand (and blocks
         // until watermark >= rev, the closed-timestamp gate).
+        //
+        // The GC-floor rejection (MvccSnapshotReader's guard) is enforced from the projection's OWN folded
+        // floor — deliberately LOCAL, never probed from the singleton (a per-reader GetHead would put a
+        // cluster-wide hop back on the very read path the projection exists to keep singleton-free). A GC
+        // event is itself a log entry, so a projection whose watermark sits between a pinned revision and a
+        // LATER GC event serves that reader instead of rejecting it — and that is safe by construction: a
+        // state that has not folded the GC event still RETAINS every row live at the pinned revision (the
+        // data served is MVCC-correct; only the stale-zookie ERROR is deferred), while any state that has
+        // collected those rows necessarily carries the advanced floor and throws. Floor enforcement is
+        // therefore bounded-lag (it lands when the GC event is folded, at the latest on the next catch-up
+        // past it) against a retention boundary measured in hours — never a wrong-data window.
         return new DeferredReader(async ct =>
             new MvccSnapshotReader(await _projection.StateAtLeast(rev, ct).ConfigureAwait(false), rev, _ => true));
     }
@@ -173,9 +184,23 @@ public sealed class GrainBackedDatastore : IDatastore
 
         for (var attempt = 0; ; attempt++)
         {
-            // 1. Read the current grain state (the write base).
-            var grainState = await Grain.ReadState().ConfigureAwait(false);
-            var baseState = DatastoreStateConverters.ToMemory(grainState);
+            // 1. Sample a light head probe (no state blob), then take the write base from the per-silo
+            //    SiloProjection rather than a grain ReadState — the projection already holds the same
+            //    memory-form DatastoreState locally (see SiloProjection._memoryState), so this makes the
+            //    write path free of full-state transfers; ReadState is now used only for the projection's
+            //    one-time bootstrap (see SiloProjection.Bootstrap). GetHead reads the grain's confirmed fold
+            //    (State.Value, post-C6) and is at worst one commit behind an in-flight write; that is fine —
+            //    the CAS below is still the sole serialization point, so a stale sample just loses the CAS it
+            //    would have lost anyway and retries with a fresher one. StateAtLeast blocks (closed-timestamp
+            //    gate) until the local projection watermark covers the sampled head, then returns its
+            //    snapshot; the projection may already be AHEAD (another commit folded in the meantime), which
+            //    is fine and even fresher — so expectedHead is taken from baseState.HeadRevision (NOT the
+            //    sampled head) to keep the CAS and the diff base exactly in agreement. Read-your-writes across
+            //    successive calls on this same instance holds because AppendCommit only returns after the
+            //    grain has confirmed the new head (see DatastoreGrain), so the next attempt's GetHead observes
+            //    it.
+            var head = (await Grain.GetHead().ConfigureAwait(false)).Head;
+            var baseState = await _projection.StateAtLeast(head, cancellationToken).ConfigureAwait(false);
             var expectedHead = baseState.HeadRevision;
 
             // 2. Mint a provisional revision monotonically over the observed head (mirrors ReferenceDatastore).
