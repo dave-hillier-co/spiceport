@@ -15,41 +15,32 @@ namespace Spiceport.Grains;
 /// </remarks>
 internal static class SubjectFrontierKey
 {
-    private const char Separator = '/';
-
     public static string Build(
         ObjectAndRelation resource,
         string subjectType,
         string subjectRelation,
         string revision,
         string schemaHash) =>
-        string.Join(Separator, [
-            Escape(resource.ObjectType),
-            Escape(resource.ObjectId),
-            Escape(resource.Relation),
-            Escape(subjectType),
-            Escape(subjectRelation),
-            Escape(revision),
-            Escape(schemaHash),
-        ]);
+        GrainKeyCodec.Join(
+            resource.ObjectType,
+            resource.ObjectId,
+            resource.Relation,
+            subjectType,
+            subjectRelation,
+            revision,
+            schemaHash);
 
     public static SubjectFrontierKeyParts Parse(string key)
     {
-        var parts = key.Split(Separator);
-        if (parts.Length != 7)
-            throw new FormatException($"Malformed subject-frontier-grain key (expected 7 segments): '{key}'.");
+        var parts = GrainKeyCodec.Split(key, 7);
 
         return new SubjectFrontierKeyParts(
-            new ObjectAndRelation(Unescape(parts[0]), Unescape(parts[1]), Unescape(parts[2])),
-            Unescape(parts[3]),
-            Unescape(parts[4]),
-            Unescape(parts[5]),
-            Unescape(parts[6]));
+            new ObjectAndRelation(parts[0], parts[1], parts[2]),
+            parts[3],
+            parts[4],
+            parts[5],
+            parts[6]);
     }
-
-    private static string Escape(string s) => Uri.EscapeDataString(s);
-
-    private static string Unescape(string s) => Uri.UnescapeDataString(s);
 }
 
 /// <summary>The decoded components of an <c>ISubjectFrontierGrain</c> string key.</summary>

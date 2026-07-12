@@ -14,34 +14,15 @@ namespace Spiceport.Grains;
 /// </remarks>
 internal static class MembershipWalkKey
 {
-    private const char Separator = '/';
-
     public static string Build(string subjectType, string subjectId, string subjectRelation, string revision, string schemaHash) =>
-        string.Join(Separator, [
-            Escape(subjectType),
-            Escape(subjectId),
-            Escape(subjectRelation),
-            Escape(revision),
-            Escape(schemaHash),
-        ]);
+        GrainKeyCodec.Join(subjectType, subjectId, subjectRelation, revision, schemaHash);
 
     public static MembershipWalkKeyParts Parse(string key)
     {
-        var parts = key.Split(Separator);
-        if (parts.Length != 5)
-            throw new FormatException($"Malformed membership-walk-grain key (expected 5 segments): '{key}'.");
+        var parts = GrainKeyCodec.Split(key, 5);
 
-        return new MembershipWalkKeyParts(
-            Unescape(parts[0]),
-            Unescape(parts[1]),
-            Unescape(parts[2]),
-            Unescape(parts[3]),
-            Unescape(parts[4]));
+        return new MembershipWalkKeyParts(parts[0], parts[1], parts[2], parts[3], parts[4]);
     }
-
-    private static string Escape(string s) => Uri.EscapeDataString(s);
-
-    private static string Unescape(string s) => Uri.UnescapeDataString(s);
 }
 
 /// <summary>The decoded components of an <c>IMembershipWalkGrain</c> string key.</summary>
