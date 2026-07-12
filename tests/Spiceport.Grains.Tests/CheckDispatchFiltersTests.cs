@@ -97,7 +97,7 @@ public class CheckDispatchFiltersTests
         var grain = cluster.GrainFactory.GetGrain<ICheckGrain>(key);
 
         cluster.ResetMetrics();
-        using var cancellation = new GrainCancellationTokenSource();
+        using var cancellation = new CancellationTokenSource();
 
         // DepthRemaining = 0: the incoming filter must reject this BEFORE the grain body (and hence its
         // activation-memo lookup) ever runs. If the filter did not exist, this would instead reach

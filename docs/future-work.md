@@ -92,11 +92,19 @@ use of `ResourceOptimizedPlacement` and Orleans activation rebalancing.
 
 ### 1.5 Native cancellation propagation (implemented)
 
-`OrleansDispatcher` now bridges each engine `CancellationToken` to an Orleans
-`GrainCancellationToken`, and `CheckGrain` passes its underlying token into the local engine.
-Cancellation therefore continues through every recursive child dispatch instead of stopping at
-the first grain boundary. Delivery to a remote activation is awaited before the cancelled hop
-unwinds, so gRPC deadline expiry prunes the mesh-wide computation.
+Every unary grain method (`ICheckGrain.DispatchCheck`, `ISubjectFrontierGrain.GetFrontier`,
+`IMembershipWalkGrain.GetContainingSet`) takes a plain `CancellationToken` directly — Orleans
+10.1 propagates it natively across the grain boundary, so there is no hand-rolled bridging type
+and no per-call-site cancellation-source plumbing. `OrleansDispatcher` passes the caller's own
+token straight into `ICheckGrain.DispatchCheck`; `CheckGrain` passes its own incoming token into
+the local engine and into every recursive child dispatch, so cancellation continues through the
+whole call tree instead of stopping at the first grain boundary. A caller-cancelled call faults
+the underlying grain call itself with an `OperationCanceledException`, which
+`CheckDispatchOutgoingCallFilter` classifies exactly like any other dispatch failure (→
+`Cancelled`) — no separate caller-side race is needed. Delivery to the remote activation is
+fire-and-forget by default (Orleans' `WaitForCancellationAcknowledgement` messaging option, off
+by default): the local await unwinds as soon as the cancellation signal is sent, without waiting
+for the remote activation to acknowledge it.
 
 ### 1.6 Grain call filters for the cross-cutting layer (implemented)
 

@@ -48,7 +48,7 @@ public sealed class SubjectFrontierGrain(
     private SubjectFrontierReply? _memo;
 
     /// <inheritdoc />
-    public async Task<SubjectFrontierReply> GetFrontier(GrainCancellationToken cancellationToken)
+    public async Task<SubjectFrontierReply> GetFrontier(CancellationToken cancellationToken)
     {
         if (_memoOptions.Enabled && _memo is { } cached)
         {
@@ -72,13 +72,13 @@ public sealed class SubjectFrontierGrain(
             parts.SchemaHash,
             reader,
             schemaProvider.Current,
-            cancellationToken.CancellationToken);
+            cancellationToken);
 
         var engine = new LookupSubjectsEngine(schema.Namespaces);
         var subjects = new List<FrontierSubjectWire>();
         await foreach (var found in engine.LookupSubjects(
             reader, parts.Resource, parts.SubjectType, parts.SubjectRelation, now,
-            cancellationToken.CancellationToken))
+            cancellationToken))
         {
             subjects.Add(FrontierWire.ToWire(found));
         }

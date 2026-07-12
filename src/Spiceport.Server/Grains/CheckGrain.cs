@@ -75,7 +75,7 @@ public sealed class CheckGrain(
     private DispatchCheckReply? _memo;
 
     /// <inheritdoc />
-    public async Task<DispatchCheckReply> DispatchCheck(GrainCancellationToken cancellationToken)
+    public async Task<DispatchCheckReply> DispatchCheck(CancellationToken cancellationToken)
     {
         // The depth budget and exact visited-set cycle guard are call-chain context, not part of this
         // grain's identity, so they arrive ambiently via the Orleans RequestContext (imported before any
@@ -117,7 +117,7 @@ public sealed class CheckGrain(
             parts.SchemaHash,
             datastore.SnapshotReader(revision),
             schemaProvider.Current,
-            cancellationToken.CancellationToken);
+            cancellationToken);
 
         // A LocalDispatcher does ONE expansion step; its onward Dispatcher (the silo-wide
         // Caching-over-Orleans dispatcher) turns each child sub-problem into a further grain call.
@@ -136,7 +136,7 @@ public sealed class CheckGrain(
             visited);
         var request = new DispatchCheckRequest(parts.Resource, parts.Subject, meta);
 
-        var result = await local.DispatchCheck(request, cancellationToken.CancellationToken);
+        var result = await local.DispatchCheck(request, cancellationToken);
 
         var reply = new DispatchCheckReply(
             result.Member, CaveatWire.ToWire(result.Caveat), result.CycleCut, result.DepthRequired);

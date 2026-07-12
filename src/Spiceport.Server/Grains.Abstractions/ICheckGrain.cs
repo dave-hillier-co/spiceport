@@ -54,8 +54,8 @@ public interface ICheckGrain : IGrainWithStringKey
     /// Evaluates the one sub-problem this grain is keyed to, dispatching children onward. The depth
     /// budget and exact visited-set cycle guard are read from the ambient
     /// <see cref="Spiceport.Grains.Abstractions.DispatchContext"/>, which the caller must have set before
-    /// making this call. The Orleans cancellation token propagates caller cancellation across the grain
+    /// making this call. The cancellation token propagates caller cancellation across the grain
     /// boundary and through every recursive child dispatch.
     /// </summary>
-    Task<DispatchCheckReply> DispatchCheck(GrainCancellationToken cancellationToken);
+    Task<DispatchCheckReply> DispatchCheck(CancellationToken cancellationToken);
 }

@@ -65,8 +65,8 @@ public class SubjectFrontierMemoMeshTests
 
         var grain = await ResolveGrain(cluster, Resource("document", "readme", "view"), "user");
 
-        using var ct1 = new GrainCancellationTokenSource();
-        using var ct2 = new GrainCancellationTokenSource();
+        using var ct1 = new CancellationTokenSource();
+        using var ct2 = new CancellationTokenSource();
 
         var before = cluster.MetricsSnapshot();
         var first = await grain.GetFrontier(ct1.Token);
@@ -154,8 +154,8 @@ public class SubjectFrontierMemoMeshTests
 
         var grain = await ResolveGrain(cluster, Resource("document", "readme", "view"), "user");
 
-        using var ct1 = new GrainCancellationTokenSource();
-        using var ct2 = new GrainCancellationTokenSource();
+        using var ct1 = new CancellationTokenSource();
+        using var ct2 = new CancellationTokenSource();
 
         var before = cluster.MetricsSnapshot();
         var first = await grain.GetFrontier(ct1.Token);

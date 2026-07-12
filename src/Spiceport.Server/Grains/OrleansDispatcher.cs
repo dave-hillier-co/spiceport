@@ -91,43 +91,17 @@ public sealed class OrleansDispatcher : IDispatcher
             request.Meta.DepthRemaining,
             request.Meta.Visited.Select(v => v.ToCanonicalString()).ToArray());
 
-        // Deliberate cross-silo error mapping (cf. SpiceDB rewriteError / remote cluster boundary) now
+        // Deliberate cross-silo error mapping (cf. SpiceDB rewriteError / remote cluster boundary)
         // happens INSIDE the grain call itself, via CheckDispatchOutgoingCallFilter: known typed domain
         // exceptions keep their own semantics and pass through; transport/availability failures become a
         // RETRIABLE Unavailable; anything else collapses to Internal. The mapped failure travels back as
         // a [GenerateSerializer] DispatchFailedException so its code survives any further grain hops up
-        // the recursion. This dispatcher therefore no longer wraps the call in its own catch(Exception) —
-        // only the cancellation bridging below remains, because that ONE case (the caller's own `ct`
-        // firing first inside Task.WaitAsync) never reaches the filter: WaitAsync raises its own
-        // OperationCanceledException locally, against an abandoned await, without observing whatever the
-        // still-running (filter-wrapped) grain call itself eventually faults with.
-        DispatchCheckReply reply;
-        using var grainCancellation = new GrainCancellationTokenSource();
-        var grainCall = grain.DispatchCheck(grainCancellation.Token);
-        try
-        {
-            reply = await grainCall.WaitAsync(ct).ConfigureAwait(false);
-        }
-        catch (OperationCanceledException ex) when (ct.IsCancellationRequested)
-        {
-            // GrainCancellationTokenSource.Cancel is asynchronous: await delivery so cancellation
-            // has reached the remote activation before unwinding this hop. The receiver converts
-            // the Orleans token back to the engine's System.Threading.CancellationToken.
-            try
-            {
-                await grainCancellation.Cancel().ConfigureAwait(false);
-            }
-            catch
-            {
-                // Cancellation is already the primary outcome. A silo disappearing while the
-                // cancellation notification is in flight must not replace it with a transport error.
-            }
-
-            // Mirror the SAME classification the outgoing filter applies to every other dispatch
-            // failure, so caller-cancellation still surfaces as the DispatchFailedException(Cancelled)
-            // callers have always seen — even though this exception never touched the filter.
-            throw DispatchErrorMapper.Translate(ex);
-        }
+        // the recursion. Caller cancellation is no exception to this: `ct` is the SAME token Orleans'
+        // native cancellation-token support propagates to the remote activation, so a caller-cancelled
+        // call faults the grain call itself with an OperationCanceledException the outgoing filter
+        // observes and classifies exactly like any other dispatch failure — no separate bridging catch
+        // is needed here.
+        var reply = await grain.DispatchCheck(ct).ConfigureAwait(false);
 
         var result = new DispatchCheckResult(
             reply.Member, CaveatWire.FromWire(reply.Caveat), reply.CycleCut, reply.DepthRequired);

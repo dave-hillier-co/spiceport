@@ -27,14 +27,11 @@ internal static class CheckDispatchFilter
 /// unchanged; everything else is collapsed via <see cref="DispatchErrorMapper.Translate"/>.
 /// </summary>
 /// <remarks>
-/// This filter never sees the ONE cancellation case the caller's own <see cref="CancellationToken"/>
-/// produces: <see cref="OrleansDispatcher"/> races the grain call against that token with
-/// <see cref="Task.WaitAsync(CancellationToken)"/>, which — if the caller's token fires first — raises
-/// its OWN <see cref="OperationCanceledException"/> locally, against an abandoned await, without ever
-/// observing a fault from the still-running grain call this filter wraps. That specific case is
-/// translated directly by the dispatcher itself, via the same <see cref="DispatchErrorMapper.Translate"/>;
-/// this filter only ever classifies a fault the underlying grain call genuinely produced (a domain
-/// exception, a transport failure, or e.g. a grain-side cancellation unrelated to that caller token).
+/// <see cref="OrleansDispatcher"/> passes the caller's own <see cref="CancellationToken"/> straight into
+/// <see cref="ICheckGrain.DispatchCheck"/>: Orleans' native cancellation-token support propagates that
+/// SAME token to the remote activation, so a caller cancellation faults the grain call this filter wraps
+/// with an <see cref="OperationCanceledException"/> exactly like any other dispatch failure — there is no
+/// separate caller-side race to special-case here.
 /// </remarks>
 public sealed class CheckDispatchOutgoingCallFilter : IOutgoingGrainCallFilter
 {

@@ -73,8 +73,8 @@ public class CancellationAndImmutabilityTests
             schemaHash);
         var grain = cluster.GrainFactory.GetGrain<ICheckGrain>(key);
 
-        using var cancellation = new GrainCancellationTokenSource();
-        await cancellation.Cancel();
+        using var cancellation = new CancellationTokenSource();
+        cancellation.Cancel();
 
         SetDispatchContext(50);
         await Assert.ThrowsAnyAsync<OperationCanceledException>(

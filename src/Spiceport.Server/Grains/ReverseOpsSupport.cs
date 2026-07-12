@@ -111,25 +111,10 @@ internal static class ReverseOpsSupport
         var grain = grainFactory.GetGrain<IMembershipWalkGrain>(key);
         var args = new MembershipWalkArgs(Path: [], DepthRemaining: CheckEngine.DefaultMaxDepth);
 
-        using var grainCancellation = new GrainCancellationTokenSource();
-        try
-        {
-            return await grain.GetContainingSet(args, grainCancellation.Token)
-                .WaitAsync(cancellationToken)
-                .ConfigureAwait(ContinueOnCapturedContext);
-        }
-        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-        {
-            try
-            {
-                await grainCancellation.Cancel().ConfigureAwait(ContinueOnCapturedContext);
-            }
-            catch
-            {
-                // Cancellation is already the primary outcome.
-            }
-            throw;
-        }
+        // The caller's own token drives the grain call directly: Orleans' native cancellation-token
+        // support propagates it to the activation, so there is nothing left to bridge here.
+        return await grain.GetContainingSet(args, cancellationToken)
+            .ConfigureAwait(ContinueOnCapturedContext);
     }
 
     /// <summary>
