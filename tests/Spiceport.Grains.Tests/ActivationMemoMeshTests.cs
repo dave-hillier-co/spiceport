@@ -89,8 +89,8 @@ public class ActivationMemoMeshTests
         var (grain, _) = await ResolveGrain(
             cluster, Resource("document", "readme", "view"), Subject("alice"));
 
-        using var ct1 = new GrainCancellationTokenSource();
-        using var ct2 = new GrainCancellationTokenSource();
+        using var ct1 = new CancellationTokenSource();
+        using var ct2 = new CancellationTokenSource();
 
         var before = cluster.MetricsSnapshot();
         SetDispatchContext(50);
@@ -148,8 +148,8 @@ public class ActivationMemoMeshTests
         var (grain, _) = await ResolveGrain(
             cluster, Resource("document", "doc1", "view"), Subject("alice"));
 
-        using var ct1 = new GrainCancellationTokenSource();
-        using var ct2 = new GrainCancellationTokenSource();
+        using var ct1 = new CancellationTokenSource();
+        using var ct2 = new CancellationTokenSource();
 
         var before = cluster.MetricsSnapshot();
         SetDispatchContext(50);
@@ -217,7 +217,7 @@ public class ActivationMemoMeshTests
 
         // Prime the memo with a generous budget so it genuinely completes and records the sub-problem's
         // real DepthRequired (D).
-        using var ctPrime = new GrainCancellationTokenSource();
+        using var ctPrime = new CancellationTokenSource();
         SetDispatchContext(1_000);
         var primed = await grain.DispatchCheck(ctPrime.Token);
         Assert.True(primed.Member);
@@ -226,7 +226,7 @@ public class ActivationMemoMeshTests
 
         // Served: a budget exactly equal to what the memo required is sufficient (DepthRemaining >=
         // DepthRequired), so the memo answers without touching the datastore/graph again.
-        using var ctServed = new GrainCancellationTokenSource();
+        using var ctServed = new CancellationTokenSource();
         var beforeServed = cluster.MetricsSnapshot();
         SetDispatchContext(required);
         var served = await grain.DispatchCheck(ctServed.Token);
@@ -238,7 +238,7 @@ public class ActivationMemoMeshTests
         // the tighter budget — proven by the recompute legitimately exhausting depth and throwing
         // MaxDepthExceededException (the memo, had it been (wrongly) served, would have returned
         // successfully instead).
-        using var ctTight = new GrainCancellationTokenSource();
+        using var ctTight = new CancellationTokenSource();
         var beforeTight = cluster.MetricsSnapshot();
         SetDispatchContext(required - 1);
         await Assert.ThrowsAsync<MaxDepthExceededException>(
@@ -284,7 +284,7 @@ public class ActivationMemoMeshTests
         var seeded = ImmutableHashSet<VisitKey>.Empty.Add(
             VisitKey.Of(Resource("document", "doc2", "view"), Subject("alice")));
 
-        using var ct1 = new GrainCancellationTokenSource();
+        using var ct1 = new CancellationTokenSource();
         var before = cluster.MetricsSnapshot();
         SetDispatchContext(50, seeded);
         var first = await grain.DispatchCheck(ct1.Token);
@@ -306,7 +306,7 @@ public class ActivationMemoMeshTests
         // call (their OWN replies were computed with CycleCut = false, since the force-tag is applied only
         // to what OrleansDispatcher hands back to the CALLER, never to a callee's own memo decision), so
         // both are served from their own memos (two hits) without re-touching doc2/viewer at all.
-        using var ct2 = new GrainCancellationTokenSource();
+        using var ct2 = new CancellationTokenSource();
         SetDispatchContext(50);
         var second = await grain.DispatchCheck(ct2.Token);
         var afterSecond = cluster.MetricsSnapshot();
@@ -385,8 +385,8 @@ public class ActivationMemoMeshTests
             cluster, Resource("document", "readme", "view"), Subject("alice"));
 
         cluster.ResetMetrics();
-        using var ct1 = new GrainCancellationTokenSource();
-        using var ct2 = new GrainCancellationTokenSource();
+        using var ct1 = new CancellationTokenSource();
+        using var ct2 = new CancellationTokenSource();
         SetDispatchContext(50);
         var first = await grain.DispatchCheck(ct1.Token);
         SetDispatchContext(50);

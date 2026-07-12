@@ -83,7 +83,7 @@ public sealed class MembershipWalkGrain(
     private MembershipClosureReply? _memo;
 
     /// <inheritdoc />
-    public async Task<MembershipClosureReply> GetContainingSet(MembershipWalkArgs args, GrainCancellationToken cancellationToken)
+    public async Task<MembershipClosureReply> GetContainingSet(MembershipWalkArgs args, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(args);
 
@@ -96,12 +96,12 @@ public sealed class MembershipWalkGrain(
         var reader = datastore.SnapshotReader(revision);
 
         var schema = await schemaResolver.ResolveAsync(
-            parts.SchemaHash, reader, schemaProvider.Current, cancellationToken.CancellationToken);
+            parts.SchemaHash, reader, schemaProvider.Current, cancellationToken);
         var coverage = schema.MembershipCoverage;
 
         var subject = new MembershipWalk.SubjectKey(parts.SubjectType, parts.SubjectId, parts.SubjectRelation);
         var directParents = await MembershipWalk
-            .DirectParents(reader, coverage, subject, cancellationToken.CancellationToken)
+            .DirectParents(reader, coverage, subject, cancellationToken)
             .ConfigureAwait(true);
 
         var nodes = new List<ResourceNodeWire>(directParents.Count);
@@ -126,7 +126,7 @@ public sealed class MembershipWalkGrain(
 
         foreach (var parent in directParents)
         {
-            cancellationToken.CancellationToken.ThrowIfCancellationRequested();
+            cancellationToken.ThrowIfCancellationRequested();
 
             var parentSubjectKey = new MembershipWalk.SubjectKey(parent.Type, parent.Id, parent.Relation).ToString();
             if (args.Path.Contains(parentSubjectKey))
@@ -141,27 +141,11 @@ public sealed class MembershipWalkGrain(
             var siblingGrain = grainFactory.GetGrain<IMembershipWalkGrain>(parentGrainKey);
             var childArgs = new MembershipWalkArgs(childPath, args.DepthRemaining - 1);
 
-            using var childCancellation = new GrainCancellationTokenSource();
-            MembershipClosureReply childReply;
-            try
-            {
-                childReply = await siblingGrain
-                    .GetContainingSet(childArgs, childCancellation.Token)
-                    .WaitAsync(cancellationToken.CancellationToken)
-                    .ConfigureAwait(true);
-            }
-            catch (OperationCanceledException) when (cancellationToken.CancellationToken.IsCancellationRequested)
-            {
-                try
-                {
-                    await childCancellation.Cancel().ConfigureAwait(true);
-                }
-                catch
-                {
-                    // Cancellation is already the primary outcome.
-                }
-                throw;
-            }
+            // The caller's own token drives the sibling call directly: Orleans' native cancellation-token
+            // support propagates it to that activation, so there is nothing left to bridge here.
+            var childReply = await siblingGrain
+                .GetContainingSet(childArgs, cancellationToken)
+                .ConfigureAwait(true);
 
             nodes.AddRange(childReply.Nodes);
             cycleCut |= childReply.CycleCut;

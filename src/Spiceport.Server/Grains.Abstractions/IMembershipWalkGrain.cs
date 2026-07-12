@@ -71,5 +71,5 @@ public interface IMembershipWalkGrain : IGrainWithStringKey
     /// for each parent not already on <paramref name="args"/>'s path, the recursively-walked sibling
     /// grain's contribution. See <see cref="MembershipClosureReply"/> for the completeness contract.
     /// </summary>
-    Task<MembershipClosureReply> GetContainingSet(MembershipWalkArgs args, GrainCancellationToken cancellationToken);
+    Task<MembershipClosureReply> GetContainingSet(MembershipWalkArgs args, CancellationToken cancellationToken);
 }

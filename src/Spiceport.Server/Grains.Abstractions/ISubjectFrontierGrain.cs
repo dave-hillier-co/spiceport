@@ -17,5 +17,5 @@ namespace Spiceport.Grains.Abstractions;
 public interface ISubjectFrontierGrain : IGrainWithStringKey
 {
     /// <summary>Returns the pre-context frontier this grain is keyed to, computing it on a cold activation.</summary>
-    Task<SubjectFrontierReply> GetFrontier(GrainCancellationToken cancellationToken);
+    Task<SubjectFrontierReply> GetFrontier(CancellationToken cancellationToken);
 }

@@ -168,28 +168,10 @@ public sealed class ReverseOpsStreamGrain(
             revision.ToString(), schemaHash ?? schemaProvider.Current.SchemaHash);
         var frontierGrain = GrainFactory.GetGrain<ISubjectFrontierGrain>(key);
 
-        // Mirrors OrleansDispatcher's GrainCancellationToken bridging: the Orleans token drives the grain
-        // call, and caller cancellation (observed via WaitAsync) is propagated onward to the activation
-        // rather than left to complete unobserved.
-        using var grainCancellation = new GrainCancellationTokenSource();
-        var grainCall = frontierGrain.GetFrontier(grainCancellation.Token);
-        SubjectFrontierReply reply;
-        try
-        {
-            reply = await grainCall.WaitAsync(cancellationToken).ConfigureAwait(ReverseOpsSupport.ContinueOnCapturedContext);
-        }
-        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-        {
-            try
-            {
-                await grainCancellation.Cancel().ConfigureAwait(ReverseOpsSupport.ContinueOnCapturedContext);
-            }
-            catch
-            {
-                // Cancellation is already the primary outcome.
-            }
-            throw;
-        }
+        // The caller's own token drives the grain call directly: Orleans' native cancellation-token
+        // support propagates it to the activation, so caller cancellation is never left unobserved.
+        var reply = await frontierGrain.GetFrontier(cancellationToken)
+            .ConfigureAwait(ReverseOpsSupport.ContinueOnCapturedContext);
 
         return ToAsyncEnumerable(reply.Subjects.Select(FrontierWire.FromWire).ToList());
     }

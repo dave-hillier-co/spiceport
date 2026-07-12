@@ -118,7 +118,7 @@ public class MembershipWalkGrainTests
         var key = MembershipWalkKey.Build("user", "alice", CoreConstants.Ellipsis, head.Revision.ToString(), schemaHash);
         var grain = cluster.GrainFactory.GetGrain<IMembershipWalkGrain>(key);
 
-        using var ct = new GrainCancellationTokenSource();
+        using var ct = new CancellationTokenSource();
         var reply = await grain.GetContainingSet(
             new MembershipWalkArgs(Path: [], DepthRemaining: CheckEngine.DefaultMaxDepth), ct.Token);
 
@@ -144,7 +144,7 @@ public class MembershipWalkGrainTests
         var key = MembershipWalkKey.Build("user", "alice", CoreConstants.Ellipsis, head.Revision.ToString(), schemaHash);
         var grain = cluster.GrainFactory.GetGrain<IMembershipWalkGrain>(key);
 
-        using var ct = new GrainCancellationTokenSource();
+        using var ct = new CancellationTokenSource();
         // Budget exhausted before it can recurse past alice's own direct parent (g1): the walk still returns
         // g1 as a direct-parent node, but marks the reply incomplete because it never explored beyond it.
         var reply = await grain.GetContainingSet(new MembershipWalkArgs(Path: [], DepthRemaining: 0), ct.Token);
