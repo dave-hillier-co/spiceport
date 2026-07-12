@@ -10,7 +10,7 @@ namespace Spiceport.Grains.Tests;
 /// Mesh-level gates for <see cref="MembershipWalkGrain"/>: warm-activation reuse, correctness over a
 /// genuine data cycle end-to-end, the depth-exhaustion/incomplete-reply contract (and that
 /// <see cref="ReverseOpsStreamGrain.StreamLookupResources"/> falls back to the live traversal rather than
-/// trusting a partial candidate set), and that <see cref="MembershipIndexOptions.Enabled"/>=false still
+/// trusting a partial candidate set), and that <see cref="MembershipWalkOptions.Enabled"/>=false still
 /// produces correct results via the unaccelerated live path.
 /// </summary>
 [Collection(MeshClusterCollection.Name)]
@@ -186,9 +186,9 @@ public class MembershipWalkGrainTests
     }
 
     [Fact]
-    public async Task Disabled_MembershipIndex_StillProducesCorrectResults()
+    public async Task Disabled_MembershipWalk_StillProducesCorrectResults()
     {
-        await using var cluster = await MeshTestCluster.CreateAsync(NestedSchema, useMembershipIndex: false);
+        await using var cluster = await MeshTestCluster.CreateAsync(NestedSchema, useMembershipWalk: false);
         await Seed(cluster,
             Rel("group", "g1", "member", Onr("user", "alice")),
             Rel("group", "g2", "member", Onr("group", "g1", "member")),

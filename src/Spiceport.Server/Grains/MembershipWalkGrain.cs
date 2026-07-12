@@ -6,21 +6,6 @@ using Spiceport.Grains.Abstractions;
 
 namespace Spiceport.Grains;
 
-/// <summary>Toggle for the Leopard membership-walk accelerator. Default ON (opt-out).</summary>
-public sealed class MembershipIndexOptions
-{
-    /// <summary>When false the accelerator is never consulted; lookups run the live traversal.</summary>
-    public bool Enabled { get; init; } = true;
-
-    /// <summary>
-    /// The <see cref="MembershipWalkGrain"/> activation's idle-collection age. The grain key already embeds
-    /// the exact revision and schema hash, so the keyspace rotates on its own as revisions/schema advance;
-    /// idle activation collection at this age IS the memo's eviction policy — no separate cache/TTL
-    /// bookkeeping is needed. Default 2 minutes (mirrors <see cref="ActivationMemoOptions.CollectionAge"/>).
-    /// </summary>
-    public TimeSpan CollectionAge { get; init; } = TimeSpan.FromMinutes(2);
-}
-
 /// <summary>
 /// A grain keyed by "the membership-walk closure rooted at subject key <c>subjType:subjId#subjRelation</c>
 /// at (revision, schemaHash)" (see <see cref="IMembershipWalkGrain"/>). It computes ONE reverse-adjacency
@@ -64,7 +49,7 @@ public sealed class MembershipIndexOptions
 /// is stored ONLY when it is neither <see cref="MembershipClosureReply.CycleCut"/> nor
 /// <see cref="MembershipClosureReply.Incomplete"/> (a cut/incomplete result is path- or budget-dependent, not
 /// a pure function of this grain's identity alone, so caching it would be unsound for another caller). The
-/// activation's idle-collection age (<see cref="MembershipIndexOptions.CollectionAge"/>, applied via
+/// activation's idle-collection age (<see cref="MembershipWalkOptions.CollectionAge"/>, applied via
 /// <see cref="SiloBuilderExtensions.AddActivationMemoCollectionAge"/>) IS the memo's eviction policy.
 /// </para>
 /// </remarks>
@@ -75,9 +60,9 @@ public sealed class MembershipWalkGrain(
     ISchemaProvider schemaProvider,
     SchemaResolver schemaResolver,
     IGrainFactory grainFactory,
-    MembershipIndexOptions? options = null) : Grain, IMembershipWalkGrain
+    MembershipWalkOptions? options = null) : Grain, IMembershipWalkGrain
 {
-    private readonly MembershipIndexOptions _options = options ?? new MembershipIndexOptions();
+    private readonly MembershipWalkOptions _options = options ?? new MembershipWalkOptions();
 
     /// <summary>The most-recently computed complete (non-cut, non-incomplete) reply, or null before one exists.</summary>
     private MembershipClosureReply? _memo;

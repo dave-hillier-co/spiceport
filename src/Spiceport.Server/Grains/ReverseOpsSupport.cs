@@ -55,7 +55,7 @@ internal static class ReverseOpsSupport
     /// </remarks>
     public static async Task<IReadOnlyList<string>?> AcquireCoveredCandidates(
         IGrainFactory grainFactory,
-        MembershipIndexOptions options,
+        MembershipWalkOptions options,
         SchemaSnapshot schema,
         string subjectType,
         string subjectId,

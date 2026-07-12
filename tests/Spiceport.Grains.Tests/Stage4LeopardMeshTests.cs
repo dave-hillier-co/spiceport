@@ -8,7 +8,7 @@ namespace Spiceport.Grains.Tests;
 
 /// <summary>
 /// Stage-4 gates for the Leopard membership-walk grain mesh (<see cref="MembershipWalkGrain"/>) wired into
-/// the mesh behind the <c>useMembershipIndex</c> flag. Drives
+/// the mesh behind the <c>useMembershipWalk</c> flag. Drives
 /// <see cref="IReverseOpsStreamGrain.StreamLookupResources"/> with the accelerator ON and proves the result
 /// set is IDENTICAL to the accelerator-OFF engine over the same snapshot (oracle equivalence end-to-end),
 /// that every returned resource is Check-confirmed, that a runtime schema swap rotates the walk-grain
@@ -94,7 +94,7 @@ public class Stage4LeopardMeshTests
     [Fact]
     public async Task IndexedLookupResources_EqualsLiveEngine_AcrossNestedGroups()
     {
-        await using var cluster = await MeshTestCluster.CreateAsync(NestedSchema, useMembershipIndex: true);
+        await using var cluster = await MeshTestCluster.CreateAsync(NestedSchema, useMembershipWalk: true);
         await Seed(cluster,
             Rel("group", "g1", "member", Onr("user", "alice")),
             Rel("group", "g2", "member", Onr("group", "g1", "member")),
@@ -130,7 +130,7 @@ public class Stage4LeopardMeshTests
     [Fact]
     public async Task SchemaSwap_InvalidatesOldHashIndex_AndStaysCorrect()
     {
-        await using var cluster = await MeshTestCluster.CreateAsync(FlatGroupSchema, useMembershipIndex: true);
+        await using var cluster = await MeshTestCluster.CreateAsync(FlatGroupSchema, useMembershipWalk: true);
         await Seed(cluster,
             Rel("group", "g1", "member", Onr("user", "alice")),
             Rel("document", "d1", "viewer", Onr("group", "g1", "member")));
@@ -171,7 +171,7 @@ public class Stage4LeopardMeshTests
         // cache could still serve a stale membership for a request pinned exactly at the post-delete
         // revision. A walk over a reader pinned to that EXACT revision has no such window — this is its
         // trivial case, not a special one.
-        await using var cluster = await MeshTestCluster.CreateAsync(DeleteHeavySchema, useMembershipIndex: true);
+        await using var cluster = await MeshTestCluster.CreateAsync(DeleteHeavySchema, useMembershipWalk: true);
         await Seed(cluster,
             Rel("group", "g1", "member", Onr("user", "alice")),
             Rel("group", "g2", "member", Onr("group", "g1", "member")),

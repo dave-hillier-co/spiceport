@@ -31,7 +31,7 @@ public sealed class ReverseOpsStreamGrain(
     IDatastore datastore,
     ISchemaProvider schemaProvider,
     SchemaResolver schemaResolver,
-    MembershipIndexOptions membershipIndexOptions,
+    MembershipWalkOptions membershipWalkOptions,
     SubjectFrontierMemoOptions? frontierMemoOptions = null) : Grain, IReverseOpsStreamGrain
 {
     private readonly SubjectFrontierMemoOptions _frontierMemoOptions = frontierMemoOptions ?? new SubjectFrontierMemoOptions();
@@ -219,7 +219,7 @@ public sealed class ReverseOpsStreamGrain(
         // a covered shape). Dispatches the membership-walk grain mesh and confirms every candidate with
         // Check, so verdicts are unchanged from the live traversal.
         var candidates = await ReverseOpsSupport.AcquireCoveredCandidates(
-                GrainFactory, membershipIndexOptions, snapshot,
+                GrainFactory, membershipWalkOptions, snapshot,
                 args.SubjectType, args.SubjectId, args.SubjectRelation, args.ResourceType, args.Permission,
                 revision, hasCursorOrLimit: args.Cursor is not null || limit is not null, cancellationToken)
             .ConfigureAwait(ReverseOpsSupport.ContinueOnCapturedContext);
