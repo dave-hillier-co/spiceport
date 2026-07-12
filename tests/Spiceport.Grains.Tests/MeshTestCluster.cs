@@ -83,14 +83,14 @@ public sealed class MeshTestCluster : IAsyncDisposable
     public static async Task<MeshTestCluster> CreateAsync(
         string schemaText,
         int batchConcurrency = PermissionChecker.DefaultBatchConcurrency,
-        bool useMembershipIndex = true,
+        bool useMembershipWalk = true,
         bool useActivationMemo = true,
         bool useSubjectFrontierMemo = true,
         int? subjectFrontierMaxMemoSubjects = null)
     {
         SchemaHolder.SchemaText = schemaText;
         SchemaHolder.BatchConcurrency = batchConcurrency;
-        SchemaHolder.UseMembershipIndex = useMembershipIndex;
+        SchemaHolder.UseMembershipWalk = useMembershipWalk;
         SchemaHolder.UseActivationMemo = useActivationMemo;
         SchemaHolder.UseSubjectFrontierMemo = useSubjectFrontierMemo;
         SchemaHolder.SubjectFrontierMaxMemoSubjects =
@@ -129,7 +129,7 @@ public sealed class MeshTestCluster : IAsyncDisposable
         string schemaText,
         int siloCount = 3,
         int batchConcurrency = PermissionChecker.DefaultBatchConcurrency,
-        bool useMembershipIndex = true,
+        bool useMembershipWalk = true,
         bool useActivationMemo = true,
         bool useSubjectFrontierMemo = true,
         bool useRandomPlacement = false)
@@ -139,7 +139,7 @@ public sealed class MeshTestCluster : IAsyncDisposable
 
         SchemaHolder.SchemaText = schemaText;
         SchemaHolder.BatchConcurrency = batchConcurrency;
-        SchemaHolder.UseMembershipIndex = useMembershipIndex;
+        SchemaHolder.UseMembershipWalk = useMembershipWalk;
         SchemaHolder.UseActivationMemo = useActivationMemo;
         SchemaHolder.UseSubjectFrontierMemo = useSubjectFrontierMemo;
         SchemaHolder.UseRandomPlacement = useRandomPlacement;
@@ -165,7 +165,7 @@ public sealed class MeshTestCluster : IAsyncDisposable
     {
         public static string SchemaText = string.Empty;
         public static int BatchConcurrency = PermissionChecker.DefaultBatchConcurrency;
-        public static bool UseMembershipIndex;
+        public static bool UseMembershipWalk;
         public static bool UseActivationMemo = true;
         public static bool UseSubjectFrontierMemo = true;
         public static int SubjectFrontierMaxMemoSubjects = new SubjectFrontierMemoOptions().MaxMemoSubjects;
@@ -192,7 +192,7 @@ public sealed class MeshTestCluster : IAsyncDisposable
                 services.AddSingleton<IDatastore>(sp =>
                     new GrainBackedDatastore(
                         sp.GetRequiredService<IGrainFactory>(), sp.GetRequiredService<IDatastoreProjectionHost>()));
-                services.AddSingleton(new MembershipIndexOptions { Enabled = SchemaHolder.UseMembershipIndex });
+                services.AddSingleton(new MembershipWalkOptions { Enabled = SchemaHolder.UseMembershipWalk });
                 services.AddSingleton(new ActivationMemoOptions { Enabled = SchemaHolder.UseActivationMemo });
                 services.AddSingleton(new SubjectFrontierMemoOptions
                 {
@@ -225,7 +225,7 @@ public sealed class MeshTestCluster : IAsyncDisposable
                 services.AddSingleton<IDatastore>(sp =>
                     new GrainBackedDatastore(
                         sp.GetRequiredService<IGrainFactory>(), sp.GetRequiredService<IDatastoreProjectionHost>()));
-                services.AddSingleton(new MembershipIndexOptions { Enabled = SchemaHolder.UseMembershipIndex });
+                services.AddSingleton(new MembershipWalkOptions { Enabled = SchemaHolder.UseMembershipWalk });
                 services.AddSingleton(new ActivationMemoOptions { Enabled = SchemaHolder.UseActivationMemo });
                 services.AddSingleton(new SubjectFrontierMemoOptions
                 {

@@ -48,7 +48,7 @@ dotnet test tests/Spiceport.Conformance.Tests  # the SpiceDB conformance corpus 
   than a per-attempt grain `ReadState`, so `ReadState` is now used only for the projection's one-time
   bootstrap; the grain's CAS append remains the sole serialization point. The same log feed
   drives **Watch** (one per-silo `LogWatchHub` notifier, no per-stream polling) and an on-by-default
-  (opt-out via `MembershipIndexOptions`) **Leopard membership-walk grain mesh** (`IMembershipWalkGrain`,
+  (opt-out via `MembershipWalkOptions`) **Leopard membership-walk grain mesh** (`IMembershipWalkGrain`,
   sharded as addressable per-subject walk grains — sibling recursion across grain boundaries, cold sets
   deactivate, revision-exact by construction because each hop reads a pinned MVCC snapshot) for
   `LookupResources` (a complete candidate superset confirmed by `CheckEngine`, never an oracle — it cannot

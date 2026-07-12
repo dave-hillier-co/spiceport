@@ -67,7 +67,7 @@ public static class ServiceCollectionExtensions
         // The accelerator itself has no per-silo singleton to register: it is the addressable
         // IMembershipWalkGrain mesh (see MembershipWalkGrain), resolved on demand via IGrainFactory exactly
         // like every other grain, and its idle-collection age is wired by AddActivationMemoCollectionAge.
-        services.AddSingleton<MembershipIndexOptions>();
+        services.AddSingleton<MembershipWalkOptions>();
 
         // CheckGrain's per-activation reply memo (default ON; opt out via a registered options override).
         // Also drives the grain's idle-collection age — see SiloBuilderExtensions.AddActivationMemoCollectionAge.

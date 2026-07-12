@@ -18,14 +18,14 @@ public static class SiloBuilderExtensions
     /// <summary>
     /// Applies <see cref="ActivationMemoOptions.CollectionAge"/> as <see cref="CheckGrain"/>'s,
     /// <see cref="SubjectFrontierMemoOptions.CollectionAge"/> as <see cref="SubjectFrontierGrain"/>'s, and
-    /// <see cref="MembershipIndexOptions.CollectionAge"/> as <see cref="MembershipWalkGrain"/>'s
+    /// <see cref="MembershipWalkOptions.CollectionAge"/> as <see cref="MembershipWalkGrain"/>'s
     /// class-specific idle-collection age (<see cref="GrainCollectionOptions.ClassSpecificCollectionAge"/>),
     /// so a warm activation — and hence its per-activation reply memo (stage (a) of
     /// "Activation-as-cache") — survives at least that long between calls.
     /// </summary>
     /// <remarks>
-    /// Reads <see cref="ActivationMemoOptions"/>, <see cref="SubjectFrontierMemoOptions"/> and
-    /// <see cref="MembershipIndexOptions"/> from DI lazily, via the Options pattern's
+    /// Reads each of <see cref="ActivationMemoOptions"/>, <see cref="SubjectFrontierMemoOptions"/> and
+    /// <see cref="MembershipWalkOptions"/> from DI lazily, via <see cref="AddMemoCollectionAge{TOptions,TGrain}"/>'s
     /// dependent-<c>Configure</c> overload, so it does not matter whether this is called before or after
     /// <see cref="ServiceCollectionExtensions.AddSpiceportGrainServices"/> registers (or a caller overrides)
     /// any of the three options types — the values are resolved when Orleans actually builds
@@ -34,34 +34,33 @@ public static class SiloBuilderExtensions
     public static ISiloBuilder AddActivationMemoCollectionAge(this ISiloBuilder siloBuilder)
     {
         ArgumentNullException.ThrowIfNull(siloBuilder);
+        siloBuilder.AddMemoCollectionAge<ActivationMemoOptions, CheckGrain>();
+        siloBuilder.AddMemoCollectionAge<SubjectFrontierMemoOptions, SubjectFrontierGrain>();
+        siloBuilder.AddMemoCollectionAge<MembershipWalkOptions, MembershipWalkGrain>();
+        return siloBuilder;
+    }
+
+    /// <summary>
+    /// Wires one <typeparamref name="TOptions"/>'s <see cref="MemoGrainOptions.CollectionAge"/> as
+    /// <typeparamref name="TGrain"/>'s class-specific idle-collection age — the one shared clamp/skip rule
+    /// behind all three <see cref="AddActivationMemoCollectionAge"/> registrations.
+    /// </summary>
+    private static void AddMemoCollectionAge<TOptions, TGrain>(this ISiloBuilder siloBuilder)
+        where TOptions : MemoGrainOptions
+    {
         siloBuilder.Services.AddOptions<GrainCollectionOptions>()
-            .Configure<ActivationMemoOptions, SubjectFrontierMemoOptions, MembershipIndexOptions>(
-                (options, memo, frontierMemo, walkMemo) =>
+            .Configure<TOptions>((options, memo) =>
             {
+                if (!memo.Enabled)
+                    return;
+
                 // GrainCollectionOptions rejects a ClassSpecificCollectionAge entry that does not exceed
                 // CollectionQuantum (default 1 minute) at configuration-validation time; clamp up instead
                 // of letting the silo fail to start over a too-small configured value.
                 var floor = options.CollectionQuantum + TimeSpan.FromSeconds(1);
-
-                if (memo.Enabled)
-                {
-                    var age = memo.CollectionAge < floor ? floor : memo.CollectionAge;
-                    options.ClassSpecificCollectionAge[typeof(CheckGrain).FullName!] = age;
-                }
-
-                if (frontierMemo.Enabled)
-                {
-                    var age = frontierMemo.CollectionAge < floor ? floor : frontierMemo.CollectionAge;
-                    options.ClassSpecificCollectionAge[typeof(SubjectFrontierGrain).FullName!] = age;
-                }
-
-                if (walkMemo.Enabled)
-                {
-                    var age = walkMemo.CollectionAge < floor ? floor : walkMemo.CollectionAge;
-                    options.ClassSpecificCollectionAge[typeof(MembershipWalkGrain).FullName!] = age;
-                }
+                var age = memo.CollectionAge < floor ? floor : memo.CollectionAge;
+                options.ClassSpecificCollectionAge[typeof(TGrain).FullName!] = age;
             });
-        return siloBuilder;
     }
 
     /// <summary>
