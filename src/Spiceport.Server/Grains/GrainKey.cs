@@ -26,8 +26,6 @@ namespace Spiceport.Grains;
 /// </remarks>
 internal static class GrainKey
 {
-    private const char Separator = '/';
-
     // schemaHash scopes the routing keyspace (a schema change yields a fresh set of grain identities for
     // structurally-identical sub-problems) AND names the schema the grain must evaluate under: CheckGrain
     // resolves the compiled schema for this hash at its pinned revision (see CheckGrain), so the schema is a
@@ -37,35 +35,28 @@ internal static class GrainKey
         ObjectAndRelation subject,
         string revision,
         string schemaHash) =>
-        string.Join(Separator, [
-            Escape(resource.ObjectType),
-            Escape(resource.ObjectId),
-            Escape(resource.Relation),
-            Escape(subject.ObjectType),
-            Escape(subject.ObjectId),
-            Escape(subject.Relation),
-            Escape(revision),
-            Escape(schemaHash),
-        ]);
+        GrainKeyCodec.Join(
+            resource.ObjectType,
+            resource.ObjectId,
+            resource.Relation,
+            subject.ObjectType,
+            subject.ObjectId,
+            subject.Relation,
+            revision,
+            schemaHash);
 
     public static GrainKeyParts Parse(string key)
     {
-        var parts = key.Split(Separator);
-        if (parts.Length != 8)
-            throw new FormatException($"Malformed check-grain key (expected 8 segments): '{key}'.");
+        var parts = GrainKeyCodec.Split(key, 8);
 
         // parts[7] (schemaHash) is carried back: the grain resolves the compiled schema for it at the
         // pinned revision (see CheckGrain), so evaluation is a pure function of the key's revision.
         return new GrainKeyParts(
-            new ObjectAndRelation(Unescape(parts[0]), Unescape(parts[1]), Unescape(parts[2])),
-            new ObjectAndRelation(Unescape(parts[3]), Unescape(parts[4]), Unescape(parts[5])),
-            Unescape(parts[6]),
-            Unescape(parts[7]));
+            new ObjectAndRelation(parts[0], parts[1], parts[2]),
+            new ObjectAndRelation(parts[3], parts[4], parts[5]),
+            parts[6],
+            parts[7]);
     }
-
-    private static string Escape(string s) => Uri.EscapeDataString(s);
-
-    private static string Unescape(string s) => Uri.UnescapeDataString(s);
 }
 
 /// <summary>The decoded components of an <c>ICheckGrain</c> string key.</summary>
