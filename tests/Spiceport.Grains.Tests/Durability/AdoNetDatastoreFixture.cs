@@ -13,8 +13,7 @@ namespace Spiceport.Grains.Tests.Durability;
 /// </summary>
 public sealed class AdoNetDatastoreFixture : IAsyncLifetime
 {
-    private readonly PostgreSqlContainer _container =
-        new PostgreSqlBuilder("postgres:17-alpine").WithCleanUp(true).Build();
+    private PostgreSqlContainer? _container;
 
     /// <summary>True when the container started and the Orleans schema was applied; false if Docker is absent.</summary>
     public bool Available { get; private set; }
@@ -29,14 +28,22 @@ public sealed class AdoNetDatastoreFixture : IAsyncLifetime
     {
         try
         {
-            await _container.StartAsync();
+            // Both BUILDING and STARTING the container happen inside this try: Testcontainers' Docker
+            // endpoint resolution can throw as early as `.Build()` (not only `.StartAsync()`), and a field
+            // initializer runs before this method (i.e. outside any try/catch here) and would let that
+            // exception escape the fixture's constructor entirely -- xUnit would then FAIL every test in
+            // the collection instead of skipping them. Keeping construction in here is what makes the
+            // documented "skips when Docker is unavailable" behavior actually true.
+            var container = new PostgreSqlBuilder("postgres:17-alpine").WithCleanUp(true).Build();
+            await container.StartAsync();
+            _container = container;
         }
         catch (Exception ex)
         {
-            // ONLY container start is skip-worthy: Docker absent / image pull failure means the test cannot
-            // run, so it SKIPS rather than failing the fast suite (the Postgres-backed suite has the same
-            // Docker requirement). Anything AFTER the container is up (schema apply) is a real defect and
-            // must FAIL the test, so it is deliberately outside this catch.
+            // ONLY container build/start is skip-worthy: Docker absent / image pull failure means the test
+            // cannot run, so it SKIPS rather than failing the fast suite (the Postgres-backed suite has the
+            // same Docker requirement). Anything AFTER the container is up (schema apply) is a real defect
+            // and must FAIL the test, so it is deliberately outside this catch.
             Available = false;
             SkipReason = $"Docker/Testcontainers unavailable: {ex.GetType().Name}: {ex.Message}";
             return;
@@ -47,7 +54,11 @@ public sealed class AdoNetDatastoreFixture : IAsyncLifetime
         Available = true;
     }
 
-    public async Task DisposeAsync() => await _container.DisposeAsync();
+    public async Task DisposeAsync()
+    {
+        if (_container is not null)
+            await _container.DisposeAsync();
+    }
 
     private static async Task ApplyOrleansSchema(string connectionString)
     {
