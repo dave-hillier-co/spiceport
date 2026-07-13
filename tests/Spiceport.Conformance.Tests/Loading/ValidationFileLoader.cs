@@ -1,5 +1,6 @@
 using System.Collections.Immutable;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using Spiceport.Core;
 using YamlDotNet.Serialization;
 using YamlDotNet.Serialization.NamingConventions;
@@ -35,8 +36,9 @@ public static class ValidationFileLoader
 
         var relationships = ParseRelationships(raw.Relationships ?? string.Empty);
         var assertions = ParseAssertions(raw.Assertions);
+        var validations = ParseValidations(raw.Validation);
 
-        return new ValidationFile(schemaText, relationships, assertions);
+        return new ValidationFile(schemaText, relationships, assertions, validations);
     }
 
     /// <summary>
@@ -84,7 +86,8 @@ public static class ValidationFileLoader
 
         var relationships = ParseRelationships(raw.Relationships ?? string.Empty);
         var assertions = ParseAssertions(raw.Assertions);
-        return new ValidationFile(schemaText, relationships, assertions);
+        var validations = ParseValidations(raw.Validation);
+        return new ValidationFile(schemaText, relationships, assertions, validations);
     }
 
     private static ImmutableList<Relationship> ParseRelationships(string block)
@@ -151,6 +154,100 @@ public static class ValidationFileLoader
             source);
     }
 
+    // ---- validation: block (SpiceDB's pkg/validationfile/blocks grammar) ----
+
+    // Extracts the bracketed subject term: everything between the first '[' and the LAST
+    // ']' in the entry (matching SpiceDB's `(.*?)\[(.*)](.*?)` — greedy inside the brackets),
+    // so a caveat marker `[...]` nested inside the outer brackets doesn't truncate the match.
+    // The `is <...>` resource-path suffix (if any) trails outside the brackets and is discarded.
+    private static readonly Regex BracketedSubjectRegex =
+        new(@"^.*?\[(.*)\].*$", RegexOptions.Singleline | RegexOptions.Compiled);
+
+    // Subject term grammar: `SUBJECT_ONR ['[...]'] [' - {' EXCEPTIONS '}']`, e.g.
+    // `user:tom`, `user:tom[...]`, `user:*[...] - {user:a, user:b[...]}`.
+    private static readonly Regex SubjectWithExceptionsRegex = new(
+        @"^(?<subject>[^\]\s]+)(?<caveat>\[\.\.\.\])?(\s*-\s*\{(?<exceptions>[^}]*)\})?$",
+        RegexOptions.Compiled);
+
+    private static ImmutableList<ValidationEntry> ParseValidations(Dictionary<string, List<string>>? raw)
+    {
+        var builder = ImmutableList.CreateBuilder<ValidationEntry>();
+        if (raw is null)
+        {
+            return builder.ToImmutable();
+        }
+
+        foreach (var (key, values) in raw)
+        {
+            var onr = TupleStrings.ParseObjectAndRelation(key.Trim());
+            var subjects = (values ?? []).Select(ParseExpectedSubject).ToImmutableList();
+            builder.Add(new ValidationEntry(onr, subjects));
+        }
+
+        return builder.ToImmutable();
+    }
+
+    private static ExpectedSubject ParseExpectedSubject(string source)
+    {
+        var bracketMatch = BracketedSubjectRegex.Match(source.Trim());
+        if (!bracketMatch.Success)
+        {
+            throw new FormatException($"invalid validation subject entry: '{source}'");
+        }
+
+        var userStr = bracketMatch.Groups[1].Value.Trim();
+        var subjectMatch = SubjectWithExceptionsRegex.Match(userStr);
+        if (!subjectMatch.Success)
+        {
+            throw new FormatException($"invalid validation subject: '{userStr}'");
+        }
+
+        var term = new ExpectedSubjectTerm(
+            ParseSubjectOnr(subjectMatch.Groups["subject"].Value),
+            subjectMatch.Groups["caveat"].Success);
+
+        var exceptions = ImmutableList.CreateBuilder<ExpectedSubjectTerm>();
+        var exceptionsGroup = subjectMatch.Groups["exceptions"];
+        if (exceptionsGroup.Success && exceptionsGroup.Value.Trim().Length > 0)
+        {
+            foreach (var rawException in exceptionsGroup.Value.Split(','))
+            {
+                var trimmed = rawException.Trim();
+                var isCaveated = trimmed.EndsWith("[...]", StringComparison.Ordinal);
+                if (isCaveated)
+                {
+                    trimmed = trimmed[..^"[...]".Length];
+                }
+
+                exceptions.Add(new ExpectedSubjectTerm(ParseSubjectOnr(trimmed), isCaveated));
+            }
+        }
+
+        return new ExpectedSubject(term, exceptions.ToImmutable());
+    }
+
+    /// <summary>
+    /// Parses a bare subject ONR (no resource part): <c>type:id</c>, <c>type:id#relation</c>
+    /// or the wildcard <c>type:*</c>. Absent relation normalises to the ellipsis, matching
+    /// <see cref="TupleStrings"/>'s convention for a subject with no explicit sub-relation.
+    /// </summary>
+    private static ObjectAndRelation ParseSubjectOnr(string value)
+    {
+        var hashIndex = value.IndexOf('#');
+        var typeAndId = hashIndex >= 0 ? value[..hashIndex] : value;
+        var relation = hashIndex >= 0 ? value[(hashIndex + 1)..] : CoreConstants.Ellipsis;
+
+        var colonIndex = typeAndId.IndexOf(':');
+        if (colonIndex < 0)
+        {
+            throw new FormatException($"invalid subject ONR: '{value}'");
+        }
+
+        var type = typeAndId[..colonIndex];
+        var id = typeAndId[(colonIndex + 1)..];
+        return new ObjectAndRelation(type, id, relation);
+    }
+
     private static (string Tuple, IReadOnlyDictionary<string, object?>? Context) SplitWithContext(string source)
     {
         var trimmed = source.Trim();
@@ -201,6 +298,7 @@ public static class ValidationFileLoader
         public string? SchemaFile { get; set; }
         public string? Relationships { get; set; }
         public RawAssertions? Assertions { get; set; }
+        public Dictionary<string, List<string>>? Validation { get; set; }
     }
 
     private sealed class RawAssertions

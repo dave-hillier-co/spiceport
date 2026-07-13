@@ -55,7 +55,14 @@ public sealed class SpiceDbContainerFixture : IAsyncLifetime
             // StartAsync hangs forever. Wait on the startup log line instead — emitted once the gRPC
             // server is accepting connections — which needs nothing inside the container.
             var container = new ContainerBuilder(Image)
-                .WithCommand("serve", "--grpc-preshared-key", PresharedKey)
+                .WithCommand(
+                    "serve", "--grpc-preshared-key", PresharedKey,
+                    // The corpus's expiration fixtures (`use expiration` + `with expiration`) are gated
+                    // behind this experimental flag on real SpiceDB v1.44.2 -- without it, WriteSchema
+                    // rejects any schema using the trait with "expiration trait is not allowed". Spiceport
+                    // supports expiration unconditionally (no server-side feature flag), so enabling it
+                    // here is what makes the corpus's expiration files an apples-to-apples comparison.
+                    "--enable-experimental-relationship-expiration")
                 .WithPortBinding(GrpcPort, true)
                 .WithWaitStrategy(Wait.ForUnixContainer().UntilMessageIsLogged("grpc server started serving"))
                 .Build();

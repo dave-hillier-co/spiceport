@@ -45,7 +45,7 @@ public class ConformanceTests
             $"{fileName}: {reason}");
 
         var path = Path.Combine(AppContext.BaseDirectory, "TestData", fileName);
-        var file = ValidationFileLoader.LoadFromFile(path);
+        var file = ValidationFileLoader.LoadResolved(path);
 
         var compiled = SchemaCompiler.CompileSchema(file.SchemaText);
         var engine = new CheckEngine(compiled.Namespaces, compiled.Caveats);

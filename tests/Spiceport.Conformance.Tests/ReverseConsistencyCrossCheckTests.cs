@@ -380,7 +380,7 @@ public class ReverseConsistencyCrossCheckTests
     private static async Task<CorpusContext> LoadCorpus(string fileName)
     {
         var path = Path.Combine(AppContext.BaseDirectory, "TestData", fileName);
-        var file = ValidationFileLoader.LoadFromFile(path);
+        var file = ValidationFileLoader.LoadResolved(path);
 
         var compiled = SchemaCompiler.CompileSchema(file.SchemaText);
 
