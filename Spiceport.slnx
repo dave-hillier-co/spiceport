@@ -11,6 +11,7 @@
     <Project Path="tests/Spiceport.Conformance.Tests/Spiceport.Conformance.Tests.csproj" />
     <Project Path="tests/Spiceport.Core.Tests/Spiceport.Core.Tests.csproj" />
     <Project Path="tests/Spiceport.Datastore.Tests/Spiceport.Datastore.Tests.csproj" />
+    <Project Path="tests/Spiceport.Differential.Tests/Spiceport.Differential.Tests.csproj" />
     <Project Path="tests/Spiceport.Engine.Tests/Spiceport.Engine.Tests.csproj" />
     <Project Path="tests/Spiceport.Grains.Tests/Spiceport.Grains.Tests.csproj" />
     <Project Path="tests/Spiceport.Schema.Tests/Spiceport.Schema.Tests.csproj" />

@@ -99,7 +99,10 @@ dotnet test tests/Spiceport.Conformance.Tests  # the SpiceDB conformance corpus 
   pass. Know its limits: it covers only the shapes its cases exercise, both sides of the "two-way"
   run share the same engine (agreement proves the distribution layer, not engine semantics), and it
   tests one static snapshot (no MVCC/revision/write-race behavior). Correctness beyond it rests on
-  the property-based, metamorphic, and differential gates.
+  the property-based, metamorphic, and differential gates. `tests/Spiceport.Differential.Tests` is
+  the genuinely external one — it runs seeded random worlds through both a real `authzed/spicedb`
+  container and Spiceport's in-process grain mesh and asserts Check/Lookup verdicts agree; it needs
+  Docker and skips (not fails) without it.
 - **Verify grains via the Orleans `TestingHost`** (in-process `TestCluster`), not by booting a
   host. For server/client-streaming gRPC, drive the service in-process with a fake
   `IServerStreamWriter`/`IAsyncStreamReader` + a fake `ServerCallContext`. Do **not** start a

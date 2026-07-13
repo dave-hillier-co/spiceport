@@ -11,7 +11,8 @@ namespace Spiceport.Engine.Tests;
 /// </summary>
 /// <remarks>
 /// SCHEMA SHAPE: the relation structure (user / group / folder / document, with group nesting via
-/// <c>group#member</c>, a <c>user:*</c> wildcard option on group membership, and a folder/document
+/// <c>group#member</c>, a <c>user:*</c> wildcard option on document.viewer (directly used only —
+/// real SpiceDB rejects wildcards reachable through a userset reference), and a folder/document
 /// <c>parent</c> arrow) is fixed across every seed so the generated worlds are always compilable and
 /// share one query universe shape. What varies per seed is <c>document.view</c>'s permission expression,
 /// chosen from <see cref="DocumentViewTemplates"/> -- a set of shapes that between them cover union,
@@ -80,10 +81,19 @@ internal static class RandomAuthzWorlds
         var templateIndex = rng.Next(DocumentViewTemplates.Length);
         var schema = BuildSchema(DocumentViewTemplates[templateIndex]);
 
-        var rowCount = 30 + rng.Next(91); // 30..120 relationship rows.
+        var rowCount = 30 + rng.Next(91); // up to 30..120 relationship rows, deduplicated below.
         var rels = new List<Relationship>(rowCount);
+        var seen = new HashSet<string>();
         for (var i = 0; i < rowCount; i++)
-            rels.Add(RandomRelationship(rng, users, groups, folders, documents));
+        {
+            var rel = RandomRelationship(rng, users, groups, folders, documents);
+            // Distinct rows only: duplicates are Touch-no-ops in the reference model, but real SpiceDB
+            // rejects a duplicate update within one WriteRelationships request ("a relationship can only
+            // be specified in an update once...") -- the differential gate found this, so every gate's
+            // worlds are deduplicated at the source.
+            if (seen.Add($"{rel.Resource.ObjectType}:{rel.Resource.ObjectId}#{rel.Resource.Relation}@{rel.Subject.ObjectType}:{rel.Subject.ObjectId}#{rel.Subject.Relation}"))
+                rels.Add(rel);
+        }
 
         return new World(schema, rels, users, groups, folders, documents, templateIndex);
     }
@@ -102,7 +112,11 @@ internal static class RandomAuthzWorlds
         return category switch
         {
             0 => Rel("group", Pick(rng, groups), "member", Onr("user", Pick(rng, users))),
-            1 => Rel("group", Pick(rng, groups), "member", Onr("user", CoreConstants.PublicWildcard)),
+            // The wildcard lives on document.viewer (a DIRECTLY-used relation), never on group.member:
+            // real SpiceDB rejects a schema where a wildcard is reachable through a userset reference
+            // ("wildcard relations cannot be transitively included") -- the differential gate found the
+            // original group.member placement was a world SpiceDB would refuse to accept at WriteSchema.
+            1 => Rel("document", Pick(rng, documents), "viewer", Onr("user", CoreConstants.PublicWildcard)),
             // Acyclic by construction: the child (subject) group always has a strictly lower alphabet
             // index than the parent (resource) group -- see the DAG remarks on this class.
             2 => AcyclicNestedEdge(rng, groups, "group", "member", "member", resourceIsHigherIndex: true),
@@ -142,7 +156,7 @@ internal static class RandomAuthzWorlds
         definition user {}
 
         definition group {
-            relation member: user | user:* | group#member
+            relation member: user | group#member
         }
 
         definition folder {
@@ -153,7 +167,7 @@ internal static class RandomAuthzWorlds
         }
 
         definition document {
-            relation viewer: user | group#member
+            relation viewer: user | user:* | group#member
             relation editor: user
             relation banned: user
             relation parent: folder

@@ -1,0 +1,48 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="coverlet.collector" Version="6.0.4" />
+    <PackageReference Include="Google.Protobuf" Version="3.35.0" />
+    <PackageReference Include="Grpc.Net.Client" Version="2.80.0" />
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.14.1" />
+    <PackageReference Include="Microsoft.Orleans.Persistence.Memory" Version="10.1.0" />
+    <PackageReference Include="Microsoft.Orleans.Sdk" Version="10.1.0" />
+    <PackageReference Include="Microsoft.Orleans.TestingHost" Version="10.1.0" />
+    <PackageReference Include="Testcontainers" Version="4.12.0" />
+    <PackageReference Include="xunit" Version="2.9.3" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="3.1.4" />
+    <PackageReference Include="Xunit.SkippableFact" Version="1.5.61" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Using Include="Xunit" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\Spiceport.Server\Spiceport.Server.csproj" />
+    <ProjectReference Include="..\..\src\Spiceport.Datastore\Spiceport.Datastore.csproj" />
+    <ProjectReference Include="..\..\src\Spiceport.Core\Spiceport.Core.csproj" />
+    <ProjectReference Include="..\..\src\Spiceport.Api\Spiceport.Api.csproj" />
+    <ProjectReference Include="..\..\src\Spiceport.Protos\Spiceport.Protos.csproj" />
+  </ItemGroup>
+
+  <!-- Reuse the seeded random-world generator (tests/Spiceport.Engine.Tests/RandomAuthzWorlds.cs) and the
+       in-process Orleans mesh test harness (tests/Spiceport.Grains.Tests/MeshTestCluster.cs) by linking
+       their source files in, exactly the mechanism Spiceport.Grains.Tests already uses to reuse
+       Spiceport.Conformance.Tests' YAML loader (see that project's own such ItemGroup). Both types are
+       `internal`/plain classes with no external visibility requirement, so a source link is strictly less
+       invasive than adding a ProjectReference to a sibling *.Tests project (which would also drag in that
+       project's own test-only PackageReferences) or making the generator public. -->
+  <ItemGroup>
+    <Compile Include="..\Spiceport.Engine.Tests\RandomAuthzWorlds.cs" Link="RandomAuthzWorlds.cs" />
+    <Compile Include="..\Spiceport.Grains.Tests\MeshTestCluster.cs" Link="MeshTestCluster.cs" />
+  </ItemGroup>
+
+</Project>
