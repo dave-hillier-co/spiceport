@@ -153,4 +153,164 @@ public class ValidationFileLoaderTests
         var falseAssertion = file.Assertions.First(a => a.Expectation == AssertionExpectation.False);
         Assert.Equal(Spiceport.Engine.Membership.NotMember, falseAssertion.ExpectedMembership);
     }
+
+    // ---- validation: block parsing (mirrors SpiceDB's pkg/validationfile/blocks grammar) ----
+
+    private static ValidationFile ParseWithValidation(string validationYaml)
+    {
+        var yaml = $$"""
+            schema: |
+              definition user {}
+              definition document {
+                relation viewer: user
+                permission view = viewer
+              }
+            relationships: |
+              document:firstdoc#viewer@user:tom
+            validation:
+            {{validationYaml}}
+            """;
+        return ValidationFileLoader.Parse(yaml);
+    }
+
+    [Fact]
+    public void Validation_block_absent_yields_no_entries()
+    {
+        var file = ValidationFileLoader.Parse("""
+            schema: |
+              definition user {}
+            relationships: ""
+            """);
+
+        Assert.Empty(file.Validations);
+    }
+
+    [Fact]
+    public void Validation_entry_key_parses_as_object_and_relation()
+    {
+        var file = ParseWithValidation("""
+              document:firstdoc#view:
+              - "[user:tom] is <document:firstdoc#viewer>"
+            """);
+
+        var entry = Assert.Single(file.Validations);
+        Assert.Equal("document", entry.ObjectAndRelation.ObjectType);
+        Assert.Equal("firstdoc", entry.ObjectAndRelation.ObjectId);
+        Assert.Equal("view", entry.ObjectAndRelation.Relation);
+    }
+
+    [Fact]
+    public void Terminal_subject_without_ellipsis_normalises_to_ellipsis()
+    {
+        var file = ParseWithValidation("""
+              document:firstdoc#view:
+              - "[user:tom] is <document:firstdoc#viewer>"
+            """);
+
+        var subject = Assert.Single(Assert.Single(file.Validations).ExpectedSubjects);
+        Assert.Equal("user", subject.Subject.ObjectType);
+        Assert.Equal("tom", subject.Subject.ObjectId);
+        Assert.Equal(CoreConstants.Ellipsis, subject.Subject.Relation);
+        Assert.False(subject.IsCaveated);
+        Assert.Empty(subject.Exceptions);
+    }
+
+    [Fact]
+    public void Subject_with_explicit_ellipsis_parses_same_as_bare_id()
+    {
+        var file = ParseWithValidation("""
+              document:firstdoc#view:
+              - "[user:tom#...] is <document:firstdoc#viewer>"
+            """);
+
+        var subject = Assert.Single(Assert.Single(file.Validations).ExpectedSubjects);
+        Assert.Equal("tom", subject.Subject.ObjectId);
+        Assert.Equal(CoreConstants.Ellipsis, subject.Subject.Relation);
+    }
+
+    [Fact]
+    public void Subject_with_relation_parses_as_subject_relation_not_ellipsis()
+    {
+        var file = ParseWithValidation("""
+              document:firstdoc#view:
+              - "[group:eng#member] is <document:firstdoc#viewer>"
+            """);
+
+        var subject = Assert.Single(Assert.Single(file.Validations).ExpectedSubjects);
+        Assert.Equal("group", subject.Subject.ObjectType);
+        Assert.Equal("eng", subject.Subject.ObjectId);
+        Assert.Equal("member", subject.Subject.Relation);
+    }
+
+    [Fact]
+    public void Wildcard_subject_parses_with_public_wildcard_id()
+    {
+        var file = ParseWithValidation("""
+              document:firstdoc#view:
+              - "[user:*] is <document:firstdoc#viewer>"
+            """);
+
+        var subject = Assert.Single(Assert.Single(file.Validations).ExpectedSubjects);
+        Assert.True(subject.Subject.IsPublicWildcard);
+        Assert.False(subject.IsCaveated);
+    }
+
+    [Fact]
+    public void Caveated_subject_marked_via_bracket_ellipsis_suffix()
+    {
+        var file = ParseWithValidation("""
+              document:firstdoc#view:
+              - "[user:tom[...]] is <document:firstdoc#viewer>"
+            """);
+
+        var subject = Assert.Single(Assert.Single(file.Validations).ExpectedSubjects);
+        Assert.Equal("tom", subject.Subject.ObjectId);
+        Assert.True(subject.IsCaveated);
+    }
+
+    [Fact]
+    public void Wildcard_with_exceptions_parses_excluded_subjects_with_own_caveat_flags()
+    {
+        var file = ParseWithValidation("""
+              document:firstdoc#view:
+              - "[user:*[...] - {user:a, user:b[...]}] is <document:firstdoc#viewer>"
+            """);
+
+        var subject = Assert.Single(Assert.Single(file.Validations).ExpectedSubjects);
+        Assert.True(subject.Subject.IsPublicWildcard);
+        Assert.True(subject.IsCaveated);
+        Assert.Equal(2, subject.Exceptions.Count);
+
+        var a = subject.Exceptions.Single(e => e.Subject.ObjectId == "a");
+        Assert.False(a.IsCaveated);
+        var b = subject.Exceptions.Single(e => e.Subject.ObjectId == "b");
+        Assert.True(b.IsCaveated);
+    }
+
+    [Fact]
+    public void Multiple_resource_path_suffix_is_ignored_only_subject_is_asserted()
+    {
+        var file = ParseWithValidation("""
+              document:firstdoc#view:
+              - "[user:tom] is <document:firstdoc#viewer>/<document:firstdoc#builder>"
+            """);
+
+        var subject = Assert.Single(Assert.Single(file.Validations).ExpectedSubjects);
+        Assert.Equal("tom", subject.Subject.ObjectId);
+    }
+
+    [Fact]
+    public void Multiple_expected_subjects_for_same_entry_all_parsed()
+    {
+        var file = ParseWithValidation("""
+              document:firstdoc#view:
+              - "[user:tom] is <document:firstdoc#viewer>"
+              - "[user:fred] is <document:firstdoc#viewer>"
+            """);
+
+        var entry = Assert.Single(file.Validations);
+        Assert.Equal(2, entry.ExpectedSubjects.Count);
+        Assert.Contains(entry.ExpectedSubjects, s => s.Subject.ObjectId == "tom");
+        Assert.Contains(entry.ExpectedSubjects, s => s.Subject.ObjectId == "fred");
+    }
 }

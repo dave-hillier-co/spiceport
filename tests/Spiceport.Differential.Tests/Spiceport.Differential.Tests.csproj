@@ -19,6 +19,7 @@
     <PackageReference Include="xunit" Version="2.9.3" />
     <PackageReference Include="xunit.runner.visualstudio" Version="3.1.4" />
     <PackageReference Include="Xunit.SkippableFact" Version="1.5.61" />
+    <PackageReference Include="YamlDotNet" Version="18.0.0" />
   </ItemGroup>
 
   <ItemGroup>
@@ -43,6 +44,21 @@
   <ItemGroup>
     <Compile Include="..\Spiceport.Engine.Tests\RandomAuthzWorlds.cs" Link="RandomAuthzWorlds.cs" />
     <Compile Include="..\Spiceport.Grains.Tests\MeshTestCluster.cs" Link="MeshTestCluster.cs" />
+  </ItemGroup>
+
+  <!-- Reuse the conformance YAML loader (CorpusDifferentialTests replays the vendored corpus), exactly the
+       mechanism Spiceport.Grains.Tests already uses for the same loader (see that project's own such
+       ItemGroup); it lives in a sibling *.Tests project and is not referenceable as a package. -->
+  <ItemGroup>
+    <Compile Include="..\Spiceport.Conformance.Tests\Loading\ValidationFileLoader.cs" Link="Loading\ValidationFileLoader.cs" />
+    <Compile Include="..\Spiceport.Conformance.Tests\Loading\ValidationModel.cs" Link="Loading\ValidationModel.cs" />
+  </ItemGroup>
+
+  <!-- Link the MAIN corpus only (non-recursive glob; Quarantine/ is a subdirectory and is never matched),
+       copied to output, so CorpusDifferentialTests can enumerate/load it exactly like ConformanceTests
+       does from its own TestData folder. -->
+  <ItemGroup>
+    <None Include="..\Spiceport.Conformance.Tests\TestData\*.yaml" Link="TestData\%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
 </Project>
