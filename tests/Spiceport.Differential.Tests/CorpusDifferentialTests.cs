@@ -62,19 +62,14 @@ public sealed class CorpusDifferentialTests
     /// observed. Kept empty unless empirical verification turns up a genuine SpiceDB-rejects-what-we-accept
     /// (or vice versa) case; a file only lands here with the exact failure recorded, never silently.
     /// </summary>
+    // HISTORY: against v1.44.2 this list carried arrowsublr.yaml — a genuine LookupResources divergence
+    // (spicedb=[] while its own Check and Spiceport both said Member for the arrow-over-computed-userset
+    // shape). Root-caused upstream: SpiceDB's reachability graph skipped entrypoints for a relation reused
+    // by an arrow in the same permission; fixed in spicedb 8c2edbe1 ("fix entrypoints over relations that
+    // are reused for arrows", first released in v1.47.0), the very commit that ADDED arrowsublr.yaml as its
+    // regression fixture. Bumping the pinned image past the fix emptied this list.
     private static readonly IReadOnlyDictionary<string, string> SkippedFiles =
-        new Dictionary<string, string>(StringComparer.Ordinal)
-        {
-            ["arrowsublr.yaml"] =
-                "genuine LookupResources divergence, not a rejection: system#view = viewer + viewer->special_user, " +
-                "where viewer itself unions a direct `user` relation with a computed `group#membership` userset " +
-                "(group#membership = member + member->special_user). CheckPermission agrees on all three sides " +
-                "(yaml/real SpiceDB/Spiceport all say system:somesystem#view@special_user:specialuser is Member), " +
-                "but LookupResources(\"system\", \"view\", special_user:specialuser) returns spicedb=[] vs " +
-                "spiceport=[somesystem] -- real SpiceDB's reachability/reverse-index analysis appears to " +
-                "under-produce for this doubly-nested arrow-over-a-computed-userset shape even though its own " +
-                "forward Check is correct. Filed as a real cross-system finding, not weakened/hidden.",
-        };
+        new Dictionary<string, string>(StringComparer.Ordinal);
 
     private readonly SpiceDbContainerFixture _spiceDb;
     private readonly ITestOutputHelper _output;
