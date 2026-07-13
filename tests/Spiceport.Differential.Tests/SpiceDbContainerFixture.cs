@@ -28,7 +28,7 @@ public sealed class SpiceDbContainerFixture : IAsyncLifetime
 {
     // Pinned (not `latest`) so the suite doesn't flake when upstream publishes a breaking image; bump
     // deliberately. Reported in the class header alongside the differential suite's other CI notes.
-    private const string Image = "authzed/spicedb:v1.44.2";
+    private const string Image = "authzed/spicedb:v1.49.2";
     private const int GrpcPort = 50051;
     private const string PresharedKey = "testkey";
 
@@ -58,7 +58,7 @@ public sealed class SpiceDbContainerFixture : IAsyncLifetime
                 .WithCommand(
                     "serve", "--grpc-preshared-key", PresharedKey,
                     // The corpus's expiration fixtures (`use expiration` + `with expiration`) are gated
-                    // behind this experimental flag on real SpiceDB v1.44.2 -- without it, WriteSchema
+                    // behind this experimental flag on older real SpiceDB releases (pre-graduation) -- without it, WriteSchema
                     // rejects any schema using the trait with "expiration trait is not allowed". Spiceport
                     // supports expiration unconditionally (no server-side feature flag), so enabling it
                     // here is what makes the corpus's expiration files an apples-to-apples comparison.
