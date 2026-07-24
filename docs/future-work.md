@@ -202,7 +202,21 @@ retry on the compaction race (DatastoreGrain clears the old snapshot right after
 commit); deferred because bootstrap ReadState is now the ONLY ReadState call in production
 (GrainBackedDatastore.ReadWriteTx derives its write base from the local SiloProjection instead of a
 per-write ReadState) and it is once-per-silo pre-traffic; build only if multi-silo cold-start
-contention is observed.
+contention is observed. The graph-sharded datastore direction (1.13) dissolves this problem rather
+than optimizing it: with per-key shard grains there is no whole-snapshot bootstrap for a new silo
+to perform.
+
+### 1.13 Graph-sharded datastore: dissolve `IDatastore` into grains (design document)
+
+The deepest remaining lean-into-Orleans move: retire the whole-graph storage shape — the
+singleton `DatastoreGrain` fold plus per-silo `SiloProjection` — in favor of a thin commit
+sequencer (the total order, unchanged) plus two grain-sharded adjacency families
+(`ObjectShardGrain` by resource, `SubjectShardGrain` by subject key), each a per-key
+restriction of the same log fold, co-locatable with the compute family that consumes it
+(`CheckGrain` / the walk grains). Eliminates the state ceiling (the graph no longer fits in
+RAM on every silo) and the silo bootstrap; deliberately retains the single-writer ceiling.
+Analyzed in full — interfaces, commit protocol, the §3.1 objections, migration gates — in
+[`graph-sharded-datastore.md`](graph-sharded-datastore.md).
 
 ---
 
@@ -302,9 +316,11 @@ Recorded so they are not relitigated by accident:
 - **Sharded / per-namespace logs within a tenant.** Reintroduces cross-shard ordering. (2.1 is
   not an exception: tenant isolation removes cross-shard *edges*, which is what makes per-tenant
   logs sound.)
-- **Per-object state grains.** Ruled out in `architecture-analysis.md` §3.1: too large/cold to
-  activate economically; zookie point-in-time reads are incompatible with "the grain's latest
-  value".
+- **Per-object *current-state* entity grains.** Ruled out in `architecture-analysis.md` §3.1:
+  too large/cold to activate economically; zookie point-in-time reads are incompatible with
+  "the grain's latest value". The ruling does not extend to per-key grains holding *versioned
+  slices of the MVCC fold* — that direction is a candidate, not a non-goal, and is analyzed in
+  [`graph-sharded-datastore.md`](graph-sharded-datastore.md) (see 1.13).
 - **Built-in multi-tenancy / per-tenant log sharding.** Discounted (see 2.1). The
   `authzed.api.v1` surface has no tenant field and this project supports only that protocol, so a
   tenant could enter only out-of-band and isolation would become a permanent security boundary —
@@ -330,7 +346,10 @@ Recorded so they are not relitigated by accident:
 1. **1.1–1.7** — all completed. Cross-cutting infrastructure (filters, RequestContext) is now
    in place and the dispatcher seam is clean: error mapping and depth enforcement are native,
    and the wire contract is minimal (sub-problem + cancellation).
-2. **1.8 / 1.11** — the remaining optional Orleans-native refinements (GrainService, broadcast channel)
-   — low leverage, deferred. (1.9 and 1.10 are done.)
+2. **1.11 / 1.12** — the remaining deferred refinements (broadcast channel, snapshot segment
+   grains) — low leverage on their own, and both dissolve if 1.13 is taken. (1.8, 1.9, and
+   1.10 are done.)
 3. **2.3 / 2.4 / 2.5** — cheap, immediately differentiating product capabilities.
-4. **2.1 per-tenant** and **2.2 materialized reachability** — each behind its own design document.
+4. **1.13 graph-sharded datastore** — the scalability move; its design document exists
+   (`graph-sharded-datastore.md`) and its migration is staged behind fold-equivalence gates.
+5. **2.1 per-tenant** and **2.2 materialized reachability** — each behind its own design document.

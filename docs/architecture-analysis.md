@@ -1,8 +1,11 @@
 # SpiceDB → Orleans/.NET: Architecture Analysis
 
-A port of [SpiceDB](https://github.com/authzed/spicedb) (a Zanzibar implementation) to
-.NET (latest) and Microsoft Orleans (virtual actors). This document analyses the source
-architecture, then maps it onto an actor model and proposes a porting workflow.
+A SpiceDB-compatible rearchitecture of [SpiceDB](https://github.com/authzed/spicedb) (a
+Zanzibar implementation) on .NET (latest) and Microsoft Orleans (virtual actors): the
+graph-evaluation engine and schema compiler are ported faithfully, and the system around them
+is re-founded on the actor runtime. This document analyses the source architecture, then maps
+it onto an actor model and lays out the workflow that built the engine port inside that
+rearchitecture.
 
 > Scope note: this is an evergreen design document. It describes *what the systems are*
 > and *how the mapping works*, not project status.
@@ -81,8 +84,8 @@ decrements per hop.
 
 ### 3.1 What a grain should *not* be
 
-The tempting mapping — **one stateful grain per object** (`document:doc1` holds its tuples) —
-is wrong for Zanzibar:
+The tempting mapping — **one entity grain per object** (`document:doc1` holds its *current*
+tuples) — is wrong for Zanzibar:
 
 - Data is too large and too cold (billions of tuples, most touched rarely) to economically
   activate per-object.
@@ -94,6 +97,11 @@ is wrong for Zanzibar:
 **Conclusion: relationship storage stays in a real MVCC datastore, read at a revision. It is not
 *dispatch*-grain state.** Orleans then realizes that datastore *itself* natively, as a single
 event-sourced grain with per-silo read projections — see §3.5.
+
+Note the precise scope of the ruling: it is against *current-state entity grains*. Grains
+holding **versioned slices of the MVCC fold** — per-key shards that serve point-in-time reads
+and activate on demand — are a different mapping that none of the bullets above refute; that
+direction is analyzed in [`graph-sharded-datastore.md`](graph-sharded-datastore.md).
 
 ### 3.2 What a grain *should* be — dispatch as virtual actors
 
@@ -211,7 +219,8 @@ know.
 
 ### 3.5 Storage as an event-sourced grain (the log is the storage/compute seam)
 
-§3.1 ruled out per-object grains and concluded storage is an MVCC datastore read at a revision.
+§3.1 ruled out per-object *entity* grains and concluded storage is an MVCC datastore read at a
+revision.
 Orleans realizes that datastore natively — as one event-sourced grain — without an external SQL
 schema of its own:
 
@@ -328,7 +337,7 @@ through the public Check/Lookup surface against real schema+data, not mocks.
 
 ---
 
-## 6. Proposed porting workflow (phased, each phase shippable & tested)
+## 6. The engine-porting workflow (phased, each phase shippable & tested)
 
 **Phase 0 — Foundations (no actors).**
 v1 proto compiled to .NET; core data types (`ObjectAndRelation`, `RelationReference`,
@@ -380,4 +389,7 @@ compatible, reuse SpiceDB's YAML conformance corpus as the compatibility anchor 
 runtime replace the entire `remote`/`cluster`/hashring distribution layer.
 
 Candidate directions beyond this design — further Orleans-native consolidation and deliberate
-relaxations of Google-contingent Zanzibar details — are analyzed in [`future-work.md`](future-work.md).
+relaxations of Google-contingent Zanzibar details — are analyzed in [`future-work.md`](future-work.md);
+the deepest of them, dissolving `IDatastore` into a thin commit sequencer plus grain-sharded
+adjacency families, has its own design document in
+[`graph-sharded-datastore.md`](graph-sharded-datastore.md).

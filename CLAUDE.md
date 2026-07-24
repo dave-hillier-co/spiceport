@@ -6,9 +6,12 @@ candidate directions that are analyzed but not committed.
 
 ## What this is
 
-A port of [SpiceDB](https://github.com/authzed/spicedb) (Google Zanzibar) to .NET 10 +
-Microsoft Orleans. The recursive permission-check dispatch runs on Orleans virtual actors; the
-gRPC surface is `authzed.api.v1`-compatible (the real `zed` CLI works against it).
+A SpiceDB-compatible **rearchitecture** of [SpiceDB](https://github.com/authzed/spicedb)
+(Google Zanzibar) on .NET 10 + Microsoft Orleans — the graph-evaluation engine and schema
+compiler are ported faithfully; the system around them (dispatch, caching, storage,
+distribution) is re-founded on virtual actors rather than translated mechanism-for-mechanism.
+The recursive permission-check dispatch runs on Orleans virtual actors; the gRPC surface is
+`authzed.api.v1`-compatible (the real `zed` CLI works against it).
 
 ## Build & test
 

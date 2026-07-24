@@ -1,8 +1,11 @@
 # Spiceport
 
-A port of [SpiceDB](https://github.com/authzed/spicedb) — the open-source implementation of
-Google's [Zanzibar](https://authzed.com/zanzibar) authorization system — to **.NET 10** and
-**Microsoft Orleans** (virtual actors).
+A SpiceDB-compatible **rearchitecture** of [SpiceDB](https://github.com/authzed/spicedb) —
+the open-source implementation of Google's [Zanzibar](https://authzed.com/zanzibar)
+authorization system — on **.NET 10** and **Microsoft Orleans** (virtual actors). The
+graph-evaluation engine and schema compiler are ported faithfully; the system around them —
+dispatch, caching, storage, distribution — is re-founded on a virtual-actor runtime rather
+than translated mechanism-for-mechanism.
 
 Spiceport answers the Zanzibar question — *"can subject X perform action Y on resource Z?"* —
 from a relationship graph defined by a schema, and it does so by running the recursive
@@ -18,13 +21,14 @@ Spiceport keeps the part that is genuinely hard — the graph-evaluation engine 
 compiler — and lets Orleans replace the distribution plumbing:
 
 - The recursive Check decomposes into pure, cacheable **sub-problems**. Each sub-problem is a
-  grain identity. Grain placement gives consistent-hash routing; single activation gives
-  singleflight; inter-silo calls replace SpiceDB's remote-dispatch RPC layer.
+  grain identity. The grain directory gives the cache locality consistent-hash routing bought;
+  single activation gives singleflight; inter-silo calls replace SpiceDB's remote-dispatch RPC
+  layer.
 - A **dispatcher seam** (`IDispatcher`) mediates every sub-problem, so the same engine runs
   unchanged whether a sub-problem resolves in-process or hops to another silo.
-- A consistent-hash **placement director** plus a **local-recurse** shortcut means a sub-problem
-  owned by the local silo is computed in-process and only cross-shard sub-problems hop a grain —
-  mirroring how SpiceDB only RPCs across nodes.
+- Every sub-problem is a grain call and the **grain directory** owns location — there is no
+  hand-rolled ownership computation or consistent-hash ring; identical concurrent sub-problems
+  coalesce on the single activation the directory finds or creates.
 
 The full design rationale is in [`docs/architecture-analysis.md`](docs/architecture-analysis.md).
 
