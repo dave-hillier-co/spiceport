@@ -31,6 +31,19 @@ public interface IDatastoreGrain : IGrainWithIntegerKey, IDatastoreLog
     Task<DatastoreHeadWire> GetHead();
 
     /// <summary>
+    /// The once-per-shard hydration read: the per-key restriction of <see cref="ReadState"/>. Returns
+    /// only the relationship rows whose forward/reverse slice matches <paramref name="key"/>
+    /// (<see cref="GraphShardKeyWire.Matches"/>), with <see cref="GraphShardState.AppliedRevision"/> set
+    /// to the state's head and <see cref="GraphShardState.GcFloor"/> carried over — a shard hydrated from
+    /// this snapshot is exactly the per-key fold at that head (the sharding lemma). Marked
+    /// <see cref="AlwaysInterleaveAttribute"/> — a pure read, interleaving exactly like
+    /// <see cref="ReadState"/>; never <c>[ReadOnly]</c>, which would not interleave past the
+    /// non-read-only <see cref="AppendCommit"/> (the lesson documented on <see cref="IDatastoreLog.ReadFrom"/>).
+    /// </summary>
+    [AlwaysInterleave]
+    Task<GraphShardState> ReadShard(GraphShardKeyWire key);
+
+    /// <summary>
     /// Appends a commit to the event log. The grain is the single serialization point: if its current head
     /// still equals <paramref name="expectedHead"/> it mints the new (timestamp) revision, builds the
     /// canonical <see cref="LogEvent"/> stamping that revision, raises + confirms it (an append to durable

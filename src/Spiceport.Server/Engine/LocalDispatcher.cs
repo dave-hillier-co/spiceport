@@ -33,7 +33,7 @@ namespace Spiceport.Engine;
 public sealed class LocalDispatcher : IDispatcher
 {
     private readonly ImmutableDictionary<string, NamespaceDefinition> _namespaces;
-    private readonly Func<IRevision, IDatastoreReader> _readerFor;
+    private readonly Func<IRevision, IGraphReader> _readerFor;
     private readonly DateTimeOffset _now;
 
     /// <summary>
@@ -44,7 +44,7 @@ public sealed class LocalDispatcher : IDispatcher
     /// <param name="now">The pinned evaluation "now" used to filter expired relationships.</param>
     public LocalDispatcher(
         ImmutableDictionary<string, NamespaceDefinition> namespaces,
-        Func<IRevision, IDatastoreReader> readerFor,
+        Func<IRevision, IGraphReader> readerFor,
         DateTimeOffset now)
     {
         ArgumentNullException.ThrowIfNull(namespaces);
@@ -118,7 +118,7 @@ public sealed class LocalDispatcher : IDispatcher
 
     /// <summary>Matches a base relation's directly-written tuples, walking non-terminal subjects.</summary>
     private async Task<DispatchCheckResult> CheckDirect(
-        IDatastoreReader reader,
+        IGraphReader reader,
         ObjectAndRelation resource,
         ObjectAndRelation subject,
         ResolverMeta meta,
@@ -192,7 +192,7 @@ public sealed class LocalDispatcher : IDispatcher
 
     /// <summary>Evaluates a set operation (union / intersection / exclusion).</summary>
     private async Task<DispatchCheckResult> CheckRewrite(
-        IDatastoreReader reader,
+        IGraphReader reader,
         ObjectAndRelation resource,
         ObjectAndRelation subject,
         SetOperation operation,
@@ -267,7 +267,7 @@ public sealed class LocalDispatcher : IDispatcher
 
     /// <summary>Evaluates a single set-operation operand.</summary>
     private async Task<DispatchCheckResult> CheckChild(
-        IDatastoreReader reader,
+        IGraphReader reader,
         ObjectAndRelation resource,
         ObjectAndRelation subject,
         SetOperationChild child,
@@ -315,7 +315,7 @@ public sealed class LocalDispatcher : IDispatcher
     /// reached object compute the userset relation, dispatching each as a sub-problem.
     /// </summary>
     private async Task<DispatchCheckResult> CheckTupleToUserset(
-        IDatastoreReader reader,
+        IGraphReader reader,
         ObjectAndRelation resource,
         ObjectAndRelation subject,
         string tuplesetRelation,

@@ -14,8 +14,9 @@ namespace Spiceport.Grains;
 /// addressable replacement for the retired per-silo <c>MembershipIndexCache</c> replica.
 /// </summary>
 /// <remarks>
-/// Flow: memo check (serve <see cref="_memo"/> when set and enabled) — parse the key — resolve a reader
-/// pinned at the key's exact revision — resolve the schema at that revision — read its lazily-built
+/// Flow: memo check (serve <see cref="_memo"/> when set and enabled) — parse the key — resolve a graph
+/// reader pinned at the key's exact revision through the <see cref="IGraphReaderSource"/> seam (schema
+/// resolution keeps the projection-pinned reader) — resolve the schema at that revision — read its lazily-built
 /// <see cref="Spiceport.Grains.SchemaSnapshot.MembershipCoverage"/> — compute this subject's direct parents
 /// — if <see cref="MembershipWalkArgs.DepthRemaining"/> is exhausted, return an <see cref="MembershipClosureReply.Incomplete"/>
 /// reply with no recursion — otherwise, for each parent whose OWN subject key (its (type, id, relation) as
@@ -60,6 +61,7 @@ public sealed class MembershipWalkGrain(
     ISchemaProvider schemaProvider,
     SchemaResolver schemaResolver,
     IGrainFactory grainFactory,
+    IGraphReaderSource readerSource,
     MembershipWalkOptions? options = null) : Grain, IMembershipWalkGrain
 {
     private readonly MembershipWalkOptions _options = options ?? new MembershipWalkOptions();
@@ -85,8 +87,11 @@ public sealed class MembershipWalkGrain(
         var coverage = schema.MembershipCoverage;
 
         var subject = new MembershipWalk.SubjectKey(parts.SubjectType, parts.SubjectId, parts.SubjectRelation);
+        // The reverse-adjacency hop reads through the IGraphReaderSource seam (projection or shard mesh,
+        // per GraphReaderOptions) at the same pinned revision; schema resolution above keeps the
+        // projection-pinned reader — see IGraphReaderSource.
         var directParents = await MembershipWalk
-            .DirectParents(reader, coverage, subject, cancellationToken)
+            .DirectParents(readerSource.GraphReaderAt(revision), coverage, subject, cancellationToken)
             .ConfigureAwait(true);
 
         var nodes = new List<ResourceNodeWire>(directParents.Count);

@@ -63,6 +63,17 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<IOutgoingGrainCallFilter, CheckDispatchOutgoingCallFilter>();
         services.AddSingleton<IIncomingGrainCallFilter, CheckDispatchIncomingCallFilter>();
 
+        // Graph-sharded read-path toggle (default OFF — the step-3 shadow flag; opt in via a registered
+        // options override, exactly the MembershipWalkOptions override pattern) and the reader-source
+        // seam it switches. IDatastore is host-owned and not registered here (see the remarks above);
+        // resolving it lazily inside the factory is fine because the source is only resolved after the
+        // host completes its own DI setup, same as ReverseOps below.
+        services.AddSingleton<GraphReaderOptions>();
+        services.AddSingleton<IGraphReaderSource>(sp =>
+            sp.GetRequiredService<GraphReaderOptions>().UseShardedReader
+                ? new ShardedGraphReaderSource(sp.GetRequiredService<IGrainFactory>())
+                : new ProjectionGraphReaderSource(sp.GetRequiredService<IDatastore>()));
+
         // Leopard membership-walk accelerator toggle (default ON; opt out via a registered options override).
         // The accelerator itself has no per-silo singleton to register: it is the addressable
         // IMembershipWalkGrain mesh (see MembershipWalkGrain), resolved on demand via IGrainFactory exactly
@@ -115,6 +126,7 @@ public static class ServiceCollectionExtensions
             sp.GetRequiredService<SchemaResolver>(),
             sp.GetRequiredService<IGrainFactory>(),
             sp.GetRequiredService<MembershipWalkOptions>(),
+            sp.GetRequiredService<IGraphReaderSource>(),
             sp.GetRequiredService<SubjectFrontierMemoOptions>()));
 
         services.AddSingleton<RelationshipReads>(sp => new RelationshipReads(

@@ -39,6 +39,7 @@ public sealed class SubjectFrontierGrain(
     IDatastore datastore,
     ISchemaProvider schemaProvider,
     SchemaResolver schemaResolver,
+    IGraphReaderSource readerSource,
     SubjectFrontierMemoOptions? memoOptions = null,
     IDispatchMetrics? metrics = null) : Grain, ISubjectFrontierGrain
 {
@@ -74,10 +75,13 @@ public sealed class SubjectFrontierGrain(
             schemaProvider.Current,
             cancellationToken);
 
+        // The engine walk reads through the IGraphReaderSource seam (projection or shard mesh, per
+        // GraphReaderOptions) at the same pinned revision; schema resolution above keeps the
+        // projection-pinned reader — see IGraphReaderSource.
         var engine = new LookupSubjectsEngine(schema.Namespaces);
         var subjects = new List<FrontierSubjectWire>();
         await foreach (var found in engine.LookupSubjects(
-            reader, parts.Resource, parts.SubjectType, parts.SubjectRelation, now,
+            readerSource.GraphReaderAt(revision), parts.Resource, parts.SubjectType, parts.SubjectRelation, now,
             cancellationToken))
         {
             subjects.Add(FrontierWire.ToWire(found));

@@ -19,7 +19,7 @@ namespace Spiceport.Engine;
 /// <para>
 /// CANDIDATE SEMANTICS mirror the retired index's <c>Build</c> scan exactly: <see cref="DirectParents"/>
 /// ignores caveats entirely (a candidate is confirmed by <c>CheckEngine</c>, which resolves the caveat), and
-/// expired rows are excluded automatically because <see cref="IDatastoreReader.ReverseQueryRelationships"/>
+/// expired rows are excluded automatically because <see cref="IGraphReader.ReverseQueryRelationships"/>
 /// (like <c>QueryRelationships</c>) already filters expiration at read time — there is nothing extra to do
 /// here for either.
 /// </para>
@@ -42,7 +42,7 @@ public static class MembershipWalk
     /// row on a relation outside the scan set cannot contribute to any covered target, so it is discarded).
     /// </summary>
     public static async Task<IReadOnlyList<ResourceNode>> DirectParents(
-        IDatastoreReader reader,
+        IGraphReader reader,
         MembershipCoverage coverage,
         SubjectKey subject,
         CancellationToken cancellationToken = default)
@@ -85,7 +85,7 @@ public static class MembershipWalk
     /// subject-key string.
     /// </summary>
     public static async Task<IReadOnlyList<ResourceNode>> LocalClosure(
-        IDatastoreReader reader,
+        IGraphReader reader,
         MembershipCoverage coverage,
         SubjectKey subject,
         CancellationToken cancellationToken = default)

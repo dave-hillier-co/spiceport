@@ -237,5 +237,8 @@ public sealed class GrainBackedDatastoreWriteBaseTests
         public Task<DatastoreHeadWire> SubscribeWatch(IDatastoreWatcher watcher) => GetHead();
         public Task UnsubscribeWatch(IDatastoreWatcher watcher) => Task.CompletedTask;
         public Task<long?> RunGc() => Task.FromResult<long?>(null);
+
+        // The write path under test never hydrates shards; a call here would be a routing bug.
+        public Task<GraphShardState> ReadShard(GraphShardKeyWire key) => throw new NotSupportedException();
     }
 }

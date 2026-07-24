@@ -36,13 +36,13 @@ public sealed class ExpandEngine
     /// <summary>
     /// Expands <paramref name="resource"/> into a permission tree as of the given reader's snapshot.
     /// </summary>
-    /// <param name="reader">A datastore reader pinned to the revision to evaluate against.</param>
+    /// <param name="reader">A graph reader pinned to the revision to evaluate against.</param>
     /// <param name="resource">The resource ONR (object type, id and relation/permission) to expand.</param>
     /// <param name="mode">Shallow (one level) or Recursive (expand non-terminal usersets).</param>
     /// <param name="evaluationTime">Optional pinned "now" for expiration filtering; defaults to system UTC.</param>
     /// <param name="cancellationToken">A cancellation token.</param>
     public Task<PermissionTreeNode> ExpandPermissionTree(
-        IDatastoreReader reader,
+        IGraphReader reader,
         ObjectAndRelation resource,
         ExpandMode mode = ExpandMode.Shallow,
         DateTimeOffset? evaluationTime = null,
@@ -55,7 +55,7 @@ public sealed class ExpandEngine
     }
 
     private async Task<PermissionTreeNode> Expand(
-        IDatastoreReader reader,
+        IGraphReader reader,
         ObjectAndRelation resource,
         ExpandMode mode,
         DateTimeOffset now,
@@ -81,7 +81,7 @@ public sealed class ExpandEngine
 
     /// <summary>Expands a base relation's directly-written tuples (port of <c>expandDirect</c>).</summary>
     private async Task<PermissionTreeNode> ExpandDirect(
-        IDatastoreReader reader,
+        IGraphReader reader,
         ObjectAndRelation resource,
         ExpandMode mode,
         DateTimeOffset now,
@@ -130,7 +130,7 @@ public sealed class ExpandEngine
 
     /// <summary>Expands a rewrite set operation (port of <c>expandUsersetRewrite</c>/<c>expandSetOperation</c>).</summary>
     private async Task<PermissionTreeNode> ExpandRewrite(
-        IDatastoreReader reader,
+        IGraphReader reader,
         ObjectAndRelation resource,
         SetOperation operation,
         ExpandMode mode,
@@ -148,7 +148,7 @@ public sealed class ExpandEngine
 
     /// <summary>Expands a single set-operation operand.</summary>
     private async Task<PermissionTreeNode> ExpandChild(
-        IDatastoreReader reader,
+        IGraphReader reader,
         ObjectAndRelation resource,
         SetOperationChild child,
         ExpandMode mode,
@@ -199,7 +199,7 @@ public sealed class ExpandEngine
     /// per-target children; <c>.any()</c> a union.
     /// </summary>
     private async Task<PermissionTreeNode> ExpandTupleToUserset(
-        IDatastoreReader reader,
+        IGraphReader reader,
         ObjectAndRelation resource,
         string tuplesetRelation,
         ComputedUserset computed,

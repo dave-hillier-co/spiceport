@@ -42,14 +42,14 @@ public sealed class LookupSubjectsEngine
     /// <paramref name="subjectRelation"/>) that hold <paramref name="resource"/>'s relation, as of the
     /// reader's snapshot.
     /// </summary>
-    /// <param name="reader">A datastore reader pinned to the revision to evaluate against.</param>
+    /// <param name="reader">A graph reader pinned to the revision to evaluate against.</param>
     /// <param name="resource">The resource ONR (object type, id and relation/permission).</param>
     /// <param name="subjectType">The requested subject namespace.</param>
     /// <param name="subjectRelation">The requested subject relation; ellipsis for terminal subjects.</param>
     /// <param name="evaluationTime">Optional pinned "now" for expiration filtering; defaults to system UTC.</param>
     /// <param name="cancellationToken">A cancellation token.</param>
     public IAsyncEnumerable<FoundSubject> LookupSubjects(
-        IDatastoreReader reader,
+        IGraphReader reader,
         ObjectAndRelation resource,
         string subjectType,
         string subjectRelation = CoreConstants.Ellipsis,
@@ -64,7 +64,7 @@ public sealed class LookupSubjectsEngine
     }
 
     private async IAsyncEnumerable<FoundSubject> LookupAsync(
-        IDatastoreReader reader,
+        IGraphReader reader,
         ObjectAndRelation resource,
         string subjectType,
         string subjectRelation,
@@ -85,7 +85,7 @@ public sealed class LookupSubjectsEngine
     // whole child set before combining (intersection/exclusion), so collection is materialized rather
     // than streamed internally; the public surface still streams the final result.
     private async Task<SubjectSet> Collect(
-        IDatastoreReader reader,
+        IGraphReader reader,
         ObjectAndRelation resource,
         string subjectType,
         string subjectRelation,
@@ -127,7 +127,7 @@ public sealed class LookupSubjectsEngine
 
     /// <summary>Reverse-walks a base relation's tuples (port of <c>lookupDirectSubjects</c>).</summary>
     private async Task<SubjectSet> CollectDirect(
-        IDatastoreReader reader,
+        IGraphReader reader,
         ObjectAndRelation resource,
         string relation,
         string subjectType,
@@ -174,7 +174,7 @@ public sealed class LookupSubjectsEngine
 
     /// <summary>Reverse-walks a rewrite set operation (port of <c>lookupViaRewrite</c>/<c>lookupSetOperation</c>).</summary>
     private async Task<SubjectSet> CollectRewrite(
-        IDatastoreReader reader,
+        IGraphReader reader,
         ObjectAndRelation resource,
         SetOperation operation,
         string subjectType,
@@ -199,7 +199,7 @@ public sealed class LookupSubjectsEngine
 
     /// <summary>Reverse-walks a single set-operation operand.</summary>
     private async Task<SubjectSet> CollectChild(
-        IDatastoreReader reader,
+        IGraphReader reader,
         ObjectAndRelation resource,
         SetOperationChild child,
         string subjectType,
@@ -254,7 +254,7 @@ public sealed class LookupSubjectsEngine
     /// intersect (<c>.all()</c>) across reached objects. An empty <c>.all()</c> tupleset yields nothing.
     /// </summary>
     private async Task<SubjectSet> CollectTupleToUserset(
-        IDatastoreReader reader,
+        IGraphReader reader,
         ObjectAndRelation resource,
         string tuplesetRelation,
         ComputedUserset computed,

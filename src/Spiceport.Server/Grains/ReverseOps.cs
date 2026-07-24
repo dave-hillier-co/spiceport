@@ -18,6 +18,9 @@ namespace Spiceport.Grains;
 /// <remarks>
 /// The pinning / index-acquisition / caveat-collapse logic is the same as before the retired grains: see
 /// <see cref="ReverseOpsSupport"/> for the shared PinReader / AcquireCoveredCandidates / TryCollapse helpers.
+/// The reader handed to each ENGINE comes from the <see cref="IGraphReaderSource"/> seam (projection or
+/// shard mesh, per <see cref="GraphReaderOptions"/>) at the pinned revision; everything else about
+/// PinReader — token mint, schema resolution, cursor handling — keeps the pinned <c>IDatastoreReader</c>.
 /// Since this is no longer grain code, the streaming ops take the caller's plain <see cref="CancellationToken"/>
 /// with no Orleans grain-method plumbing — simpler than the retired grain's per-stream-activation scheme,
 /// with identical per-item cancellation behavior.
@@ -28,6 +31,7 @@ public sealed class ReverseOps(
     SchemaResolver schemaResolver,
     IGrainFactory grainFactory,
     MembershipWalkOptions membershipWalkOptions,
+    IGraphReaderSource readerSource,
     SubjectFrontierMemoOptions? frontierMemoOptions = null)
 {
     private readonly SubjectFrontierMemoOptions _frontierMemoOptions = frontierMemoOptions ?? new SubjectFrontierMemoOptions();
@@ -43,7 +47,7 @@ public sealed class ReverseOps(
     public async Task<ExpandTreeReply> ExpandPermissionTree(ExpandTreeArgs args)
     {
         ArgumentNullException.ThrowIfNull(args);
-        var (reader, now, token, _, schemaHash) = await ReverseOpsSupport
+        var (reader, now, token, revision, schemaHash) = await ReverseOpsSupport
             .PinReader(datastore, args.Consistency, CancellationToken.None);
 
         var schema = await ResolveSchema(schemaHash, reader, CancellationToken.None);
@@ -51,7 +55,10 @@ public sealed class ReverseOps(
         var mode = args.Mode == ExpandModeWire.Recursive ? ExpandMode.Recursive : ExpandMode.Shallow;
         var resource = new ObjectAndRelation(args.ResourceType, args.ResourceId, args.Permission);
 
-        var tree = await engine.ExpandPermissionTree(reader, resource, mode, now, CancellationToken.None);
+        // The engine walk reads through the IGraphReaderSource seam at the same pinned revision; the
+        // pinned IDatastoreReader above keeps token minting and schema resolution — see IGraphReaderSource.
+        var tree = await engine.ExpandPermissionTree(
+            readerSource.GraphReaderAt(revision), resource, mode, now, CancellationToken.None);
 
         // Expand carries verbatim caveat expressions; with no request context we collapse each against
         // an empty context so caveated nodes/subjects surface their missing parameter names.
@@ -124,7 +131,9 @@ public sealed class ReverseOps(
         var walk = _frontierMemoOptions.Enabled
             ? await MemoizedFrontier(resource, args, revision, schemaHash, cancellationToken)
             : new LookupSubjectsEngine(schema.Namespaces)
-                .LookupSubjects(reader, resource, args.SubjectType, args.SubjectRelation, now, cancellationToken);
+                .LookupSubjects(
+                    readerSource.GraphReaderAt(revision), resource, args.SubjectType, args.SubjectRelation,
+                    now, cancellationToken);
 
         await foreach (var found in walk.WithCancellation(cancellationToken))
         {
@@ -218,8 +227,10 @@ public sealed class ReverseOps(
             args.SubjectType, args.SubjectId, args.SubjectRelation, args.ResourceType, args.Permission,
             revision, hasCursorOrLimit: args.Cursor is not null || limit is not null, cancellationToken);
 
+        // The engine traversal reads through the IGraphReaderSource seam at the same pinned revision;
+        // the pinned IDatastoreReader above keeps token minting, schema resolution and cursor handling.
         await foreach (var found in engine.LookupResources(
-                reader, args.SubjectType, args.SubjectId, args.SubjectRelation,
+                readerSource.GraphReaderAt(revision), args.SubjectType, args.SubjectId, args.SubjectRelation,
                 args.ResourceType, args.Permission, candidates, args.Context, now, startCursor, limit, cancellationToken)
             .WithCancellation(cancellationToken))
         {

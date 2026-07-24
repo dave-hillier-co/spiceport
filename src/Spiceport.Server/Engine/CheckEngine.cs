@@ -67,7 +67,7 @@ public sealed class CheckEngine
     /// <paramref name="resourceType"/>:<paramref name="resourceId"/>#<paramref name="relation"/>
     /// as of the given <paramref name="reader"/>'s snapshot.
     /// </summary>
-    /// <param name="reader">A datastore reader pinned to the revision to evaluate against.</param>
+    /// <param name="reader">A graph reader pinned to the revision to evaluate against.</param>
     /// <param name="resourceType">The resource namespace.</param>
     /// <param name="resourceId">The resource object id.</param>
     /// <param name="relation">The relation or permission to check.</param>
@@ -78,7 +78,7 @@ public sealed class CheckEngine
     /// </param>
     /// <param name="cancellationToken">A cancellation token.</param>
     public Task<CheckResult> Check(
-        IDatastoreReader reader,
+        IGraphReader reader,
         string resourceType,
         string resourceId,
         string relation,
@@ -97,7 +97,7 @@ public sealed class CheckEngine
     /// <summary>
     /// Checks whether <paramref name="subject"/> is a member of the given <paramref name="resource"/> ONR.
     /// </summary>
-    /// <param name="reader">A datastore reader pinned to the revision to evaluate against.</param>
+    /// <param name="reader">A graph reader pinned to the revision to evaluate against.</param>
     /// <param name="resource">The resource ONR (object type, id and relation/permission).</param>
     /// <param name="subject">The subject ONR.</param>
     /// <param name="caveatContext">Optional request-time caveat context (overrides relationship context).</param>
@@ -106,7 +106,7 @@ public sealed class CheckEngine
     /// </param>
     /// <param name="cancellationToken">A cancellation token.</param>
     public async Task<CheckResult> Check(
-        IDatastoreReader reader,
+        IGraphReader reader,
         ObjectAndRelation resource,
         ObjectAndRelation subject,
         IReadOnlyDictionary<string, object?>? caveatContext = null,

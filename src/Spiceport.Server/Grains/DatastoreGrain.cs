@@ -1,3 +1,4 @@
+using System.Collections.Immutable;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -187,6 +188,28 @@ public sealed class DatastoreGrain :
     {
         var s = State.Value;
         return Task.FromResult(new DatastoreHeadWire(s.HeadRevision, s.SchemaHashAt(s.HeadRevision), s.GcFloor));
+    }
+
+    /// <inheritdoc />
+    /// <remarks>
+    /// [AlwaysInterleave]. Sources from <c>State.Value</c> exactly like <see cref="ReadState"/> (the
+    /// JournaledGrain-confirmed fold, an immutable snapshot that only ever changes at a confirm boundary),
+    /// so the filtered rows, the head and the GC floor all come from ONE snapshot — at worst the previous
+    /// commit, never a write's in-flight intermediate state.
+    /// </remarks>
+    public Task<GraphShardState> ReadShard(GraphShardKeyWire key)
+    {
+        ArgumentNullException.ThrowIfNull(key);
+
+        var s = State.Value;
+        var rows = ImmutableList.CreateBuilder<StoredRelationshipWire>();
+        foreach (var row in s.Relationships)
+        {
+            if (key.Matches(row.Relationship))
+                rows.Add(row);
+        }
+
+        return Task.FromResult(new GraphShardState(s.HeadRevision, s.GcFloor, rows.ToImmutable()));
     }
 
     /// <inheritdoc />
@@ -449,11 +472,25 @@ public sealed class DatastoreGrain :
         // never changes what's already been published as committed.
         if (newSnapshotVersion > oldSnapshotVersion)
         {
-            for (var v = oldSnapshotVersion + 1; v <= newSnapshotVersion; v++)
-                await ClearLogEntry(v).ConfigureAwait(ContinueOnCapturedContext);
-            await ClearSnapshot(oldSnapshotVersion).ConfigureAwait(ContinueOnCapturedContext);
+            // BEST-EFFORT, same stance as the post-commit watch notify in AppendCommit: the head entry
+            // written above already references the new snapshot version, so a failed clear only leaks a
+            // storage row — it must NEVER surface as a failed append. An exception escaping here would
+            // make the log-consistency adaptor retry ApplyUpdatesToStorage, hit the version guard, and
+            // report the (fully committed) conditional event as failed — the caller would then re-run its
+            // whole transaction against a base that already contains its own write.
+            try
+            {
+                for (var v = oldSnapshotVersion + 1; v <= newSnapshotVersion; v++)
+                    await ClearLogEntry(v).ConfigureAwait(ContinueOnCapturedContext);
+                await ClearSnapshot(oldSnapshotVersion).ConfigureAwait(ContinueOnCapturedContext);
+            }
+            catch
+            {
+                // A leaked entry/snapshot is unreferenced by the committed head and harmless to recovery.
+            }
 
-            // Its own contiguous synchronous field group.
+            // Its own contiguous synchronous field group. Unconditional: the committed head already points
+            // at the new snapshot, so in-memory retention advances whether or not the clears succeeded.
             _snapshotVersion = newSnapshotVersion;
             // Retention now starts at the snapshot boundary (consistent with the post-reactivation rebuild,
             // which can only replay the post-snapshot tail).
@@ -498,12 +535,29 @@ public sealed class DatastoreGrain :
         return entry.RecordExists ? entry.State : null;
     }
 
-    private Task ClearSnapshot(int version) =>
-        _storage.ClearStateAsync($"{SnapshotStatePrefix}{version}", this.GetGrainId(),
-            new GrainState<DatastoreGrainState>());
+    // Clears go through a read-then-clear so the wrapper carries the CURRENT storage ETag: providers
+    // enforce the etag on delete too (MemoryStorage throws MemoryStorageEtagMismatchException for a
+    // null-etag delete of an existing row), and these version-qualified entries were written through
+    // transient wrappers whose minted etags were discarded. Reading a missing/already-cleared entry
+    // yields a null etag, which every provider accepts for a no-op clear.
 
-    private Task ClearLogEntry(int version) =>
-        _storage.ClearStateAsync($"{LogStatePrefix}{version}", this.GetGrainId(), new GrainState<LogEvent>());
+    private async Task ClearSnapshot(int version)
+    {
+        var entry = new GrainState<DatastoreGrainState>();
+        await _storage.ReadStateAsync($"{SnapshotStatePrefix}{version}", this.GetGrainId(), entry)
+            .ConfigureAwait(ContinueOnCapturedContext);
+        await _storage.ClearStateAsync($"{SnapshotStatePrefix}{version}", this.GetGrainId(), entry)
+            .ConfigureAwait(ContinueOnCapturedContext);
+    }
+
+    private async Task ClearLogEntry(int version)
+    {
+        var entry = new GrainState<LogEvent>();
+        await _storage.ReadStateAsync($"{LogStatePrefix}{version}", this.GetGrainId(), entry)
+            .ConfigureAwait(ContinueOnCapturedContext);
+        await _storage.ClearStateAsync($"{LogStatePrefix}{version}", this.GetGrainId(), entry)
+            .ConfigureAwait(ContinueOnCapturedContext);
+    }
 
     // --- recent-events window ---
 

@@ -14,8 +14,9 @@ namespace Spiceport.Grains;
 /// </summary>
 /// <remarks>
 /// On <see cref="DispatchCheck"/> the grain decodes its identity from its string key (resource,
-/// subject, revision, schema hash), resolves a snapshot reader at that revision from the injected
-/// <see cref="IDatastore"/> singleton, and runs a <see cref="LocalDispatcher"/> whose onward
+/// subject, revision, schema hash), resolves a graph reader at that revision through the
+/// <see cref="IGraphReaderSource"/> seam (schema resolution stays on the injected
+/// <see cref="IDatastore"/> singleton's snapshot reader), and runs a <see cref="LocalDispatcher"/> whose onward
 /// <see cref="LocalDispatcher.Dispatcher"/> is the silo-wide <see cref="OrleansDispatcher"/> singleton.
 /// The local dispatcher performs the one step; children flow through Orleans as further grain calls.
 /// <para>
@@ -63,6 +64,7 @@ public sealed class CheckGrain(
     ISchemaProvider schemaProvider,
     SchemaResolver schemaResolver,
     IDispatcher onward,
+    IGraphReaderSource readerSource,
     ActivationMemoOptions? memoOptions = null,
     IDispatchMetrics? metrics = null) : Grain, ICheckGrain
 {
@@ -120,11 +122,14 @@ public sealed class CheckGrain(
             cancellationToken);
 
         // A LocalDispatcher does ONE expansion step; its onward Dispatcher (the silo-wide
-        // Caching-over-Orleans dispatcher) turns each child sub-problem into a further grain call.
+        // Caching-over-Orleans dispatcher) turns each child sub-problem into a further grain call. The
+        // graph reads flow through the IGraphReaderSource seam (projection or shard mesh, per
+        // GraphReaderOptions); schema resolution above deliberately stays on the projection's snapshot
+        // reader — see IGraphReaderSource.
         var namespaces = schema.Namespaces.ToImmutableDictionary(ns => ns.Name);
         var local = new LocalDispatcher(
             namespaces,
-            datastore.SnapshotReader,
+            readerSource.GraphReaderAt,
             now)
         {
             Dispatcher = onward,

@@ -1,4 +1,5 @@
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Options;
 using Orleans.Hosting;
 using Orleans.TestingHost;
 using Spiceport.Datastore;
@@ -94,13 +95,21 @@ public sealed class MeshTestCluster : IAsyncDisposable
     /// The bounded fan-out width for <see cref="IPermissionChecker.BatchCheck"/>; pass 1 to serialize the
     /// fan-out so the shared-branch cache behaviour is deterministic (no concurrent-miss races).
     /// </param>
+    /// <param name="gcWindow">
+    /// When set, overrides <see cref="DatastoreGcOptions.Window"/> for the cluster (with the GC
+    /// reminder disabled, so <c>RunGc</c> only ever runs when a test invokes it directly). A test
+    /// that needs a GC floor near head (e.g. <see cref="TimeSpan.Zero"/>, where the floor becomes
+    /// <c>min(head, now) == head</c>) opts in here; null keeps the production default (24h window).
+    /// </param>
     public static async Task<MeshTestCluster> CreateAsync(
         string schemaText,
         int batchConcurrency = PermissionChecker.DefaultBatchConcurrency,
         bool useMembershipWalk = true,
         bool useActivationMemo = true,
         bool useSubjectFrontierMemo = true,
-        int? subjectFrontierMaxMemoSubjects = null)
+        int? subjectFrontierMaxMemoSubjects = null,
+        bool useShardedGraphReader = false,
+        TimeSpan? gcWindow = null)
     {
         SchemaHolder.SchemaText = schemaText;
         SchemaHolder.BatchConcurrency = batchConcurrency;
@@ -110,6 +119,8 @@ public sealed class MeshTestCluster : IAsyncDisposable
         SchemaHolder.SubjectFrontierMaxMemoSubjects =
             subjectFrontierMaxMemoSubjects ?? new SubjectFrontierMemoOptions().MaxMemoSubjects;
         SchemaHolder.UseRandomPlacement = false;
+        SchemaHolder.UseShardedGraphReader = useShardedGraphReader;
+        SchemaHolder.GcWindow = gcWindow;
 
         var builder = new TestClusterBuilder(initialSilosCount: 1);
         builder.AddSiloBuilderConfigurator<SiloConfigurator>();
@@ -146,7 +157,8 @@ public sealed class MeshTestCluster : IAsyncDisposable
         bool useMembershipWalk = true,
         bool useActivationMemo = true,
         bool useSubjectFrontierMemo = true,
-        bool useRandomPlacement = false)
+        bool useRandomPlacement = false,
+        bool useShardedGraphReader = false)
     {
         if (siloCount < 1)
             throw new ArgumentOutOfRangeException(nameof(siloCount), "Need at least one silo.");
@@ -157,6 +169,8 @@ public sealed class MeshTestCluster : IAsyncDisposable
         SchemaHolder.UseActivationMemo = useActivationMemo;
         SchemaHolder.UseSubjectFrontierMemo = useSubjectFrontierMemo;
         SchemaHolder.UseRandomPlacement = useRandomPlacement;
+        SchemaHolder.UseShardedGraphReader = useShardedGraphReader;
+        SchemaHolder.GcWindow = null; // statics persist across tests; multi-silo always uses the default window
 
         var builder = new TestClusterBuilder(initialSilosCount: (short)siloCount);
         builder.AddSiloBuilderConfigurator<MultiSiloConfigurator>();
@@ -184,7 +198,37 @@ public sealed class MeshTestCluster : IAsyncDisposable
         public static bool UseSubjectFrontierMemo = true;
         public static int SubjectFrontierMaxMemoSubjects = new SubjectFrontierMemoOptions().MaxMemoSubjects;
         public static bool UseRandomPlacement;
+        public static bool UseShardedGraphReader;
+        public static TimeSpan? GcWindow;
     }
+
+    /// <summary>
+    /// Applies the optional <see cref="DatastoreGcOptions"/> override (same last-registration-wins
+    /// pattern as <see cref="OverrideGraphReader"/>): the datastore grain resolves
+    /// <c>IOptions&lt;DatastoreGcOptions&gt;</c> from silo DI, so registering here reconfigures its GC
+    /// window. The reminder is always disabled under an override — GC must run only when the test
+    /// invokes <c>RunGc</c> itself.
+    /// </summary>
+    private static void OverrideGcOptions(IServiceCollection services)
+    {
+        if (SchemaHolder.GcWindow is { } window)
+        {
+            services.AddSingleton<IOptions<DatastoreGcOptions>>(Options.Create(
+                new DatastoreGcOptions { Window = window, ReminderEnabled = false }));
+        }
+    }
+
+    /// <summary>
+    /// Re-registers the graph-reader flag AFTER <c>AddSpiceportGrainServices</c> (last registration
+    /// wins on resolve), matching the options-override pattern the other toggles use, so a test
+    /// cluster can opt into the sharded read path while production defaults stay OFF. The
+    /// <c>IGraphReaderSource</c> registration itself needs no override: its factory reads the
+    /// options from the container at resolve time, so it picks up this override — and its concrete
+    /// source classes are internal to <c>Spiceport.Server</c>, out of reach of the projects that
+    /// source-link this file without InternalsVisibleTo.
+    /// </summary>
+    private static void OverrideGraphReader(IServiceCollection services) =>
+        services.AddSingleton(new GraphReaderOptions { UseShardedReader = SchemaHolder.UseShardedGraphReader });
 
     private sealed class SiloConfigurator : ISiloConfigurator
     {
@@ -213,6 +257,8 @@ public sealed class MeshTestCluster : IAsyncDisposable
                     Enabled = SchemaHolder.UseSubjectFrontierMemo,
                     MaxMemoSubjects = SchemaHolder.SubjectFrontierMaxMemoSubjects,
                 });
+                OverrideGraphReader(services);
+                OverrideGcOptions(services);
             });
         }
     }
@@ -246,6 +292,7 @@ public sealed class MeshTestCluster : IAsyncDisposable
                     Enabled = SchemaHolder.UseSubjectFrontierMemo,
                     MaxMemoSubjects = SchemaHolder.SubjectFrontierMaxMemoSubjects,
                 });
+                OverrideGraphReader(services);
 
                 // See CreateMultiSiloAsync's useRandomPlacement doc: an opt-in override of the cluster's
                 // DEFAULT placement (Orleans 10's ResourceOptimizedPlacement makes no spread guarantee) for

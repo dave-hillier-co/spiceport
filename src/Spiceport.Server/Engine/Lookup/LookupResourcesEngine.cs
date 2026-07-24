@@ -11,7 +11,7 @@ namespace Spiceport.Engine;
 /// </summary>
 /// <remarks>
 /// Port of SpiceDB's <c>internal/graph/lookupresources3.go</c>. This is the only API that consults the
-/// reachability graph and <see cref="IDatastoreReader.ReverseQueryRelationships"/>. Results stream as
+/// reachability graph and <see cref="IGraphReader.ReverseQueryRelationships"/>. Results stream as
 /// an <see cref="IAsyncEnumerable{T}"/>; a caller applies a limit simply by stopping enumeration.
 /// <para>
 /// Correctness for intersection / exclusion is achieved the way SpiceDB does it: compute a candidate
@@ -100,7 +100,7 @@ public sealed class LookupResourcesEngine
     /// <paramref name="subjectType"/>:<paramref name="subjectId"/>(#<paramref name="subjectRelation"/>)
     /// holds <paramref name="permission"/>, as of the reader's snapshot.
     /// </summary>
-    /// <param name="reader">A datastore reader pinned to the revision to evaluate against.</param>
+    /// <param name="reader">A graph reader pinned to the revision to evaluate against.</param>
     /// <param name="subjectType">The subject namespace.</param>
     /// <param name="subjectId">The subject object id.</param>
     /// <param name="subjectRelation">The subject relation; ellipsis for terminal subjects.</param>
@@ -112,7 +112,7 @@ public sealed class LookupResourcesEngine
     /// <param name="limit">Optional soft limit; the caller may also simply stop enumerating.</param>
     /// <param name="cancellationToken">A cancellation token.</param>
     public IAsyncEnumerable<FoundResource> LookupResources(
-        IDatastoreReader reader,
+        IGraphReader reader,
         string subjectType,
         string subjectId,
         string subjectRelation,
@@ -127,7 +127,7 @@ public sealed class LookupResourcesEngine
             coveredCandidateIds: null, caveatContext, evaluationTime, cursor, limit, cancellationToken);
 
     /// <summary>
-    /// As <see cref="LookupResources(IDatastoreReader,string,string,string,string,string,IReadOnlyDictionary{string,object}?,DateTimeOffset?,LookupResourcesCursor?,int?,CancellationToken)"/>,
+    /// As <see cref="LookupResources(IGraphReader,string,string,string,string,string,IReadOnlyDictionary{string,object}?,DateTimeOffset?,LookupResourcesCursor?,int?,CancellationToken)"/>,
     /// but offered an optional pre-computed COMPLETE candidate set (the Leopard membership-walk accelerator's
     /// output — see <c>Spiceport.Grains.ReverseOpsSupport.AcquireCoveredCandidates</c>, which is the only
     /// legitimate producer: it dispatches the walk grains, confirms the reply is not partial, and filters to
@@ -139,7 +139,7 @@ public sealed class LookupResourcesEngine
     /// not re-check them: passing a non-null <paramref name="coveredCandidateIds"/> always takes this path.
     /// </summary>
     public async IAsyncEnumerable<FoundResource> LookupResources(
-        IDatastoreReader reader,
+        IGraphReader reader,
         string subjectType,
         string subjectId,
         string subjectRelation,
@@ -213,7 +213,7 @@ public sealed class LookupResourcesEngine
 
     // Finds resources of `target` reachable from the given subjects (keyed by id with back-mapping).
     private async IAsyncEnumerable<FoundResource> LookupRec(
-        IDatastoreReader reader,
+        IGraphReader reader,
         RelationReference subjectRel,
         IReadOnlyDictionary<string, ResourceState> subjects,
         RelationReference target,
@@ -376,7 +376,7 @@ public sealed class LookupResourcesEngine
     /// after it continues exactly where the chunk ended. Port of SpiceDB's <c>relationshipsChunk</c> stream.
     /// </summary>
     private async IAsyncEnumerable<CandidateChunk> StreamCandidateChunks(
-        IDatastoreReader reader,
+        IGraphReader reader,
         ReachabilityEntrypoint entrypoint,
         RelationReference subjectRel,
         IReadOnlyList<string> subjectIds,
@@ -434,7 +434,7 @@ public sealed class LookupResourcesEngine
 
     /// <summary>Confirms candidates via Check against the terminal subject, keeping Member/Caveated.</summary>
     private async Task<Dictionary<string, ResourceState>> FilterByCheck(
-        IDatastoreReader reader,
+        IGraphReader reader,
         RelationReference containingRelation,
         Dictionary<string, ResourceState> candidates,
         ObjectAndRelation terminalSubject,

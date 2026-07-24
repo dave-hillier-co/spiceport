@@ -143,5 +143,6 @@ public sealed class DatastoreGcFoldTests
         public Task<DatastoreHeadWire> SubscribeWatch(IDatastoreWatcher watcher) => throw new NotSupportedException();
         public Task UnsubscribeWatch(IDatastoreWatcher watcher) => throw new NotSupportedException();
         public Task<long?> RunGc() => throw new NotSupportedException();
+        public Task<GraphShardState> ReadShard(GraphShardKeyWire key) => throw new NotSupportedException();
     }
 }
