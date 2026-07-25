@@ -283,6 +283,60 @@ public sealed class DatastoreInterleavedReadTests
     }
 
     /// <summary>
+    /// Gate 3b: the same one-shot head-write fault as Gate 3, landed exactly ON a FLUSH BOUNDARY (the
+    /// 64th commit). The failed attempt has already written its shard rows, the rotated index-bucket
+    /// pair, the delta row and the meta row — all orphans at versioned names — and the adaptor's retry
+    /// re-runs the SAME boundary: same log slot, same flush version, same rotated bucket, overwriting
+    /// its own orphans via the read-then-write discipline. Pins that the boundary commit succeeds and
+    /// that the index the retried flush committed is CORRECT: after a forced deactivation, recovery
+    /// reconstructs the store THROUGH that index, and every pre-boundary key must still be served (a
+    /// referenced-but-wrong bucket/delta/shard row would lose keys or fail the recovery loudly).
+    /// </summary>
+    [Fact]
+    public async Task Failed_head_write_at_a_flush_boundary_retries_the_same_bucket_and_commits_a_correct_index()
+    {
+        await using var scope = new Scope(await NewClusterAsync());
+        var grain = Grain(scope.Cluster);
+        var head = (await grain.GetHead()).Head;
+
+        // 63 commits bring the contiguous log to version 63 — the next commit is the flush boundary.
+        for (var i = 0; i < 63; i++)
+        {
+            var reply = await grain.Commit(TouchCommit($"k{i}", $"u{i}", head));
+            Assert.Null(reply.Failure);
+            head = reply.Revision!.Value;
+        }
+
+        Gate.ThrowOnceOnHeadWrite = true;
+        var boundary = await grain.Commit(TouchCommit("k63", "u63", head)).WaitAsync(Timeout);
+        Assert.Null(boundary.Failure);
+        Assert.NotNull(boundary.Revision);
+
+        // The flush really committed on the retry: the durable head names the boundary as its flush.
+        var storage = ((InProcessSiloHandle)scope.Cluster.Primary!).SiloHost.Services
+            .GetRequiredKeyedService<IGrainStorage>("datastore");
+        var grainId = ((GrainReference)grain).GrainId;
+        var headRow = new GrainState<LogHeadEntry>();
+        await storage.ReadStateAsync("head", grainId, headRow);
+        Assert.True(headRow.RecordExists);
+        Assert.Equal(64, headRow.State!.LogVersion);
+        Assert.Equal(64, headRow.State.SnapshotVersion);
+
+        // Recovery THROUGH the retried flush's index: drop the activation and re-read every key.
+        var management = scope.Cluster.GrainFactory.GetGrain<IManagementGrain>(0);
+        await management.ForceActivationCollection(TimeSpan.Zero);
+
+        var headAfter = await grain.GetHead();
+        Assert.Equal(boundary.Revision, headAfter.Head);
+        for (var i = 0; i < 64; i++)
+        {
+            var shard = await grain.ReadShard(GraphShardKeyWire.ForResource("doc", $"k{i}"));
+            var live = Assert.Single(shard.Rows, r => r.DeletedRevision is null);
+            Assert.Equal($"u{i}", live.Relationship.SubjectId);
+        }
+    }
+
+    /// <summary>
     /// Gate 4: the CAS remains exact under concurrent writers even while reads hammer the activation
     /// concurrently — exactly one of two same-<c>expectedHead</c> commits succeeds.
     /// </summary>

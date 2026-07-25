@@ -1,3 +1,4 @@
+using System.Collections.Immutable;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -139,6 +140,8 @@ public sealed class NewLayoutRestartDurabilityTests
     private static bool LiveSnapshot(GrainState<DatastoreGrainState> e) => e.RecordExists && e.State is { HeadRevision: > 0 };
     private static bool LiveLogEvent(GrainState<LogEvent> e) => e.RecordExists && e.State is { Revision: > 0 };
     private static bool LiveShard(GrainState<GraphShardState> e) => e.RecordExists && e.State is { AppliedRevision: > 0 };
+    private static bool LiveBucket(GrainState<KeyIndexBucketEntry> e) => e.RecordExists && e.State?.Entries is not null;
+    private static bool LiveDelta(GrainState<KeyIndexDeltaEntry> e) => e.RecordExists && e.State?.ForwardEntries is not null;
 
     [SkippableFact]
     public async Task NewLayout_FullFidelity_Survives_TrueReactivation_PastAFlushBoundary()
@@ -289,6 +292,28 @@ public sealed class NewLayoutRestartDurabilityTests
                 LiveShard(await ReadRow<GraphShardState>(clusterB,
                     $"shard/{flushVersion}/" + GraphShardGrainKey.Build(GraphShardKeyWire.ForResource("doc", "plain")))),
                 "the flushed forward shard row for doc:plain is missing");
+
+            // Durable layout v2: the meta row is SLIM (no inline key maps — cardinality-independent)
+            // and what cluster B recovered the index from really was the chunked rows: the flush's
+            // delta row plus the rotated bucket pair (the rotation cursor starts at 0, and exactly one
+            // flush happened, so bucket 0 of each direction lives at the flush version).
+            var metaRowB = await ReadRow<DatastoreMetaEntry>(clusterB, $"meta/{flushVersion}");
+            Assert.True(LiveMeta(metaRowB));
+            Assert.NotNull(metaRowB.State!.IndexLayout);
+            Assert.Empty(metaRowB.State.Meta.ForwardKeys);
+            Assert.Empty(metaRowB.State.Meta.ReverseKeys);
+            Assert.Contains(flushVersion, metaRowB.State.IndexLayout!.DeltaVersions);
+            var deltaRowB = await ReadRow<KeyIndexDeltaEntry>(clusterB, $"indexd/{flushVersion}");
+            Assert.True(LiveDelta(deltaRowB), "the flush's indexd/{v} delta row is missing");
+            Assert.Equal(
+                flushVersion,
+                deltaRowB.State!.ForwardEntries[GraphShardGrainKey.Build(GraphShardKeyWire.ForResource("doc", "plain"))]);
+            Assert.True(
+                LiveBucket(await ReadRow<KeyIndexBucketEntry>(clusterB, $"indexb/{flushVersion}/f/0")),
+                "the rotated forward bucket row is missing");
+            Assert.True(
+                LiveBucket(await ReadRow<KeyIndexBucketEntry>(clusterB, $"indexb/{flushVersion}/r/0")),
+                "the rotated reverse bucket row is missing");
         }
         finally
         {
@@ -399,6 +424,8 @@ public sealed class LegacyMigrationDurabilityTests
     private static bool LiveMeta(GrainState<DatastoreMetaEntry> e) => e.RecordExists && e.State?.Meta is not null;
     private static bool LiveSnapshot(GrainState<DatastoreGrainState> e) => e.RecordExists && e.State is { HeadRevision: > 0 };
     private static bool LiveShard(GrainState<GraphShardState> e) => e.RecordExists && e.State is { AppliedRevision: > 0 };
+    private static bool LiveBucket(GrainState<KeyIndexBucketEntry> e) => e.RecordExists && e.State?.Entries is not null;
+    private static bool LiveDelta(GrainState<KeyIndexDeltaEntry> e) => e.RecordExists && e.State?.ForwardEntries is not null;
 
     // Version-qualified row name: the migration writes every split row under its own meta version.
     private static string ShardRowKey(int rowVersion, GraphShardKeyWire key) =>
@@ -523,6 +550,34 @@ public sealed class LegacyMigrationDurabilityTests
             var metaRow = await ReadRow<DatastoreMetaEntry>(cluster, $"meta/{legacyVersion}");
             Assert.True(LiveMeta(metaRow), "migration did not write the meta/{v} row");
             Assert.Equal(legacyVersion, metaRow.State!.FlushedThroughLogVersion);
+
+            // The v0 migration lands DIRECTLY on durable layout v2: the meta row is slim (no inline
+            // key maps), carries the chunked-index layout with FULL bucket coverage at the migration
+            // version (DeltaFloorVersion starts there; no pending deltas), and the bucket holding
+            // doc:legacy-plain's forward key maps it to the migration version. Full coverage means
+            // even a bucket holding NO migrated key has an (empty) row.
+            Assert.NotNull(metaRow.State.IndexLayout);
+            Assert.Empty(metaRow.State.Meta.ForwardKeys);
+            Assert.Empty(metaRow.State.Meta.ReverseKeys);
+            var layout = metaRow.State.IndexLayout!;
+            Assert.Equal(legacyVersion, layout.DeltaFloorVersion);
+            Assert.Empty(layout.DeltaVersions);
+            Assert.All(layout.ForwardBucketVersions, v => Assert.Equal(legacyVersion, v));
+            var plainForwardKey = GraphShardGrainKey.Build(GraphShardKeyWire.ForResource("doc", "legacy-plain"));
+            var plainBucket = KeyIndexLayout.BucketOf(plainForwardKey, layout.BucketCount);
+            var plainBucketRow = await ReadRow<KeyIndexBucketEntry>(
+                cluster, $"indexb/{legacyVersion}/f/{plainBucket}");
+            Assert.True(LiveBucket(plainBucketRow), "migration did not write the forward bucket row");
+            Assert.Equal(legacyVersion, plainBucketRow.State!.Entries[plainForwardKey]);
+            var occupiedForwardBuckets = new[] { "legacy-plain", "legacy-caveated", "legacy-dead" }
+                .Select(id => KeyIndexLayout.BucketOf(
+                    GraphShardGrainKey.Build(GraphShardKeyWire.ForResource("doc", id)), layout.BucketCount))
+                .ToHashSet();
+            var emptyBucket = Enumerable.Range(0, layout.BucketCount).First(b => !occupiedForwardBuckets.Contains(b));
+            var emptyBucketRow = await ReadRow<KeyIndexBucketEntry>(
+                cluster, $"indexb/{legacyVersion}/f/{emptyBucket}");
+            Assert.True(LiveBucket(emptyBucketRow), "migration did not write full bucket coverage");
+            Assert.Empty(emptyBucketRow.State!.Entries);
             Assert.True(
                 LiveShard(await ReadRow<GraphShardState>(cluster, ShardRowKey(legacyVersion, GraphShardKeyWire.ForResource("doc", "legacy-plain")))),
                 "migration did not split out the forward shard row");
@@ -582,6 +637,18 @@ public sealed class LegacyMigrationDurabilityTests
                 LiveMeta(await ReadRow<DatastoreMetaEntry>(cluster, $"meta/{legacyVersion}")),
                 "the superseded migration meta row was not cleared by the flush");
 
+            // Post-migration flushes speak the v2 protocol: the flush wrote its delta row and rotated
+            // bucket 0 in both directions (the migration resets the rotation cursor to 0).
+            Assert.True(
+                LiveDelta(await ReadRow<KeyIndexDeltaEntry>(cluster, $"indexd/{headRow.State.SnapshotVersion}")),
+                "the post-migration flush wrote no indexd/{v} delta row");
+            Assert.True(
+                LiveBucket(await ReadRow<KeyIndexBucketEntry>(cluster, $"indexb/{headRow.State.SnapshotVersion}/f/0")),
+                "the post-migration flush wrote no rotated forward bucket row");
+            Assert.True(
+                LiveBucket(await ReadRow<KeyIndexBucketEntry>(cluster, $"indexb/{headRow.State.SnapshotVersion}/r/0")),
+                "the post-migration flush wrote no rotated reverse bucket row");
+
             var newHead = await ds.HeadRevision();
             var finalReader = ds.SnapshotReader(newHead.Revision);
             var finalCount = 0;
@@ -600,6 +667,288 @@ public sealed class LegacyMigrationDurabilityTests
             Assert.Equal(
                 "\"eu\"",
                 ((JsonElement)Assert.Single(caveatedAfter).OptionalCaveat!.Context!["region"]!).GetRawText());
+        }
+        finally
+        {
+            await cluster.DisposeAsync();
+        }
+    }
+}
+
+/// <summary>
+/// The v1-to-v2 MIGRATION gate: a database seeded in the RETIRED v1 thin-sequencer layout — per-key
+/// shard rows plus a <c>meta/{v}</c> row carrying the key-index maps INLINE (the old-shape
+/// <see cref="DatastoreMetaEntry"/> with no <see cref="DatastoreMetaEntry.IndexLayout"/>), written
+/// directly through the same keyed storage provider the grain uses — must be migrated in place by the
+/// reworked grain's first activation: reads serve the migrated data exactly (including MVCC time travel
+/// over a dead row), the meta row is rewritten SLIM with full bucket-row coverage at the migration
+/// version, shard rows are untouched (row-level content equality), and subsequent commits flush through
+/// the v2 protocol (delta + rotated bucket rows).
+/// </summary>
+[Collection(AdoNetDurabilityCollection.Name)]
+public sealed class InlineIndexMigrationDurabilityTests
+{
+    private const string SchemaText = """
+        definition user {}
+
+        definition doc {
+          relation viewer: user
+        }
+        """;
+
+    private readonly AdoNetDatastoreFixture _fixture;
+
+    public InlineIndexMigrationDurabilityTests(AdoNetDatastoreFixture fixture) => _fixture = fixture;
+
+    private static class ConnHolder
+    {
+        public static string ConnectionString = string.Empty;
+    }
+
+    private sealed class InlineMigrationSiloConfigurator : ISiloConfigurator
+    {
+        public void Configure(ISiloBuilder siloBuilder)
+        {
+            var config = new ConfigurationBuilder()
+                .AddInMemoryCollection(new Dictionary<string, string?>
+                {
+                    [DatastoreStorageConfig.ConnectionStringKey] = ConnHolder.ConnectionString,
+                })
+                .Build();
+            siloBuilder.AddDatastoreGrainStorage(config);
+            siloBuilder.AddCustomStorageBasedLogConsistencyProvider("CustomStorage");
+            siloBuilder.ConfigureServices(services =>
+            {
+                services.AddSpiceportGrainServices(SchemaText);
+                services.AddSingleton<IDatastore>(sp =>
+                    new GrainBackedDatastore(
+                        sp.GetRequiredService<IGrainFactory>(), sp.GetRequiredService<LogWatchHub>()));
+            });
+        }
+    }
+
+    private static async Task<TestCluster> BuildClusterAsync(string connectionString)
+    {
+        ConnHolder.ConnectionString = connectionString;
+        var builder = new TestClusterBuilder(initialSilosCount: 1);
+        builder.Options.ServiceId = "spiceport-durability-thin-v1-migration";
+        builder.AddSiloBuilderConfigurator<InlineMigrationSiloConfigurator>();
+        var cluster = builder.Build();
+        await cluster.DeployAsync();
+        return cluster;
+    }
+
+    private static IDatastore Datastore(TestCluster cluster) =>
+        ((InProcessSiloHandle)cluster.Primary!).SiloHost.Services.GetRequiredService<IDatastore>();
+
+    private static IDatastoreGrain Grain(TestCluster cluster) =>
+        cluster.GrainFactory.GetGrain<IDatastoreGrain>(IDatastoreGrain.Key);
+
+    private static IGrainStorage Storage(TestCluster cluster) =>
+        ((InProcessSiloHandle)cluster.Primary!).SiloHost.Services
+            .GetRequiredKeyedService<IGrainStorage>(DatastoreStorageConfig.ProviderName);
+
+    private static GrainId DatastoreGrainId(TestCluster cluster) =>
+        ((GrainReference)Grain(cluster)).GrainId;
+
+    private static async Task WriteRow<T>(IGrainStorage storage, GrainId grainId, string stateName, T value)
+    {
+        var entry = new GrainState<T>();
+        await storage.ReadStateAsync(stateName, grainId, entry);
+        entry.State = value;
+        await storage.WriteStateAsync(stateName, grainId, entry);
+    }
+
+    private static async Task<GrainState<T>> ReadRow<T>(TestCluster cluster, string stateName)
+    {
+        var entry = new GrainState<T>();
+        await Storage(cluster).ReadStateAsync(stateName, DatastoreGrainId(cluster), entry);
+        return entry;
+    }
+
+    // See NewLayoutRestartDurabilityTests for the AdoNet null-payload sentinel rationale.
+    private static bool LiveMeta(GrainState<DatastoreMetaEntry> e) => e.RecordExists && e.State?.Meta is not null;
+    private static bool LiveBucket(GrainState<KeyIndexBucketEntry> e) => e.RecordExists && e.State?.Entries is not null;
+    private static bool LiveDelta(GrainState<KeyIndexDeltaEntry> e) => e.RecordExists && e.State?.ForwardEntries is not null;
+
+    private static string ShardRowKey(int rowVersion, GraphShardKeyWire key) =>
+        $"shard/{rowVersion}/" + GraphShardGrainKey.Build(key);
+
+    private static List<string> RowMultiset(IEnumerable<StoredRelationshipWire> rows) => rows
+        .Select(r => $"{r.Relationship.ResourceType}:{r.Relationship.ResourceId}#{r.Relationship.ResourceRelation}"
+            + $"@{r.Relationship.SubjectType}:{r.Relationship.SubjectId}#{r.Relationship.SubjectRelation}"
+            + $"|created={r.CreatedRevision}|deleted={r.DeletedRevision?.ToString() ?? "live"}")
+        .OrderBy(s => s, StringComparer.Ordinal)
+        .ToList();
+
+    [SkippableFact]
+    public async Task V1InlineIndexMeta_IsChunkedInPlace_AndCommitsFlushThroughV2()
+    {
+        Skip.IfNot(_fixture.Available, _fixture.SkipReason ?? "Postgres fixture unavailable");
+
+        // The v1 state: one live row, one DEAD row (created then deleted — MVCC history the migration
+        // must preserve), a schema version hashed exactly as the write path hashes it, and the inline
+        // key-index maps pointing every key at the shard rows' version.
+        var head = (DateTimeOffset.UtcNow - DateTimeOffset.UnixEpoch).Ticks * 100L;
+        var createdAt = head - 2_000_000L;
+        var deletedAt = head - 1_000_000L;
+        var schemaBytes = Encoding.UTF8.GetBytes(SchemaText);
+        var schemaHash = Convert.ToHexStringLower(SHA256.HashData(schemaBytes));
+
+        var plain = Relationship.Create(
+            new ObjectAndRelation("doc", "v1-plain", "viewer"),
+            new ObjectAndRelation("user", "alice", CoreConstants.Ellipsis));
+        var dead = Relationship.Create(
+            new ObjectAndRelation("doc", "v1-dead", "viewer"),
+            new ObjectAndRelation("user", "eve", CoreConstants.Ellipsis));
+        var plainStored = new StoredRelationshipWire(WireConvert.ToWire(plain), createdAt, null);
+        var deadStored = new StoredRelationshipWire(WireConvert.ToWire(dead), createdAt, deletedAt);
+
+        const int v1Version = 5; // v1 layout: head names meta/{v} with LogVersion == v, maps inline
+
+        var shardRows = new Dictionary<GraphShardKeyWire, StoredRelationshipWire>
+        {
+            [GraphShardKeyWire.ForResource("doc", "v1-plain")] = plainStored,
+            [GraphShardKeyWire.ForResource("doc", "v1-dead")] = deadStored,
+            [GraphShardKeyWire.ForSubject("user", "alice")] = plainStored,
+            [GraphShardKeyWire.ForSubject("user", "eve")] = deadStored,
+        };
+        var forward = ImmutableDictionary.CreateBuilder<string, int>(StringComparer.Ordinal);
+        var reverse = ImmutableDictionary.CreateBuilder<string, int>(StringComparer.Ordinal);
+        foreach (var key in shardRows.Keys)
+        {
+            var keyString = GraphShardGrainKey.Build(key);
+            if (keyString.StartsWith("f/", StringComparison.Ordinal))
+                forward[keyString] = v1Version;
+            else
+                reverse[keyString] = v1Version;
+        }
+        var v1Meta = new DatastoreMetaState
+        {
+            HeadRevision = head,
+            Schemas = [new SchemaVersionWire(createdAt, schemaBytes, schemaHash)],
+            Counters = [],
+            GcFloor = 0,
+            ForwardKeys = forward.ToImmutable(),
+            ReverseKeys = reverse.ToImmutable(),
+        };
+
+        // --- Phase 1: seed the database in the v1 layout through the storage provider directly (the
+        // old-shape meta entry: inline maps, no IndexLayout), WITHOUT activating the grain. ---
+        var seedCluster = await BuildClusterAsync(_fixture.ConnectionString);
+        try
+        {
+            var storage = Storage(seedCluster);
+            var grainId = DatastoreGrainId(seedCluster);
+            foreach (var (key, row) in shardRows)
+            {
+                await WriteRow(storage, grainId, ShardRowKey(v1Version, key),
+                    new GraphShardState(head, 0, ImmutableList.Create(row)));
+            }
+            await WriteRow(storage, grainId, $"meta/{v1Version}", new DatastoreMetaEntry(v1Meta, v1Version));
+            await WriteRow(storage, grainId, "head", new LogHeadEntry(v1Version, head, v1Version));
+        }
+        finally
+        {
+            await seedCluster.DisposeAsync();
+        }
+
+        // --- Phase 2: activate the grain against the v1 store (a brand-new cluster). ---
+        var cluster = await BuildClusterAsync(_fixture.ConnectionString);
+        try
+        {
+            var ds = Datastore(cluster);
+
+            // Migrated head/schema-hash exactly the seeded ones (not a re-seeded empty state).
+            var headRead = await ds.HeadRevision();
+            Assert.Equal(head, ((TimestampRevision)headRead.Revision).TimestampNanosSinceEpoch);
+            Assert.Equal(schemaHash, headRead.SchemaHash);
+
+            // Reads serve the migrated data exactly: the live row at head, the dead row only via
+            // MVCC time travel between its create and delete.
+            var reader = ds.SnapshotReader(headRead.Revision);
+            var ids = new List<string>();
+            await foreach (var rel in reader.QueryRelationships(new RelationshipsFilter { OptionalResourceType = "doc" }))
+                ids.Add(rel.Resource.ObjectId);
+            Assert.Equal(["v1-plain"], ids);
+            var timeTravel = ds.SnapshotReader(new TimestampRevision(head - 1_500_000L));
+            var atPast = new List<string>();
+            await foreach (var rel in timeTravel.QueryRelationships(new RelationshipsFilter { OptionalResourceType = "doc" }))
+                atPast.Add(rel.Resource.ObjectId);
+            atPast.Sort(StringComparer.Ordinal);
+            Assert.Equal(["v1-dead", "v1-plain"], atPast);
+
+            // The meta row was rewritten SLIM in place: no inline maps, a layout with full bucket
+            // coverage at the migration version (DeltaFloorVersion there, no pending deltas), and the
+            // bucket holding the live row's forward key maps it to the shard rows' UNCHANGED version.
+            var metaRow = await ReadRow<DatastoreMetaEntry>(cluster, $"meta/{v1Version}");
+            Assert.True(LiveMeta(metaRow), "the migrated meta/{v} row is missing");
+            Assert.Equal(v1Version, metaRow.State!.FlushedThroughLogVersion);
+            Assert.NotNull(metaRow.State.IndexLayout);
+            Assert.Empty(metaRow.State.Meta.ForwardKeys);
+            Assert.Empty(metaRow.State.Meta.ReverseKeys);
+            var layout = metaRow.State.IndexLayout!;
+            Assert.Equal(v1Version, layout.DeltaFloorVersion);
+            Assert.Empty(layout.DeltaVersions);
+            Assert.All(layout.ForwardBucketVersions, v => Assert.Equal(v1Version, v));
+            Assert.All(layout.ReverseBucketVersions, v => Assert.Equal(v1Version, v));
+            var plainForwardKey = GraphShardGrainKey.Build(GraphShardKeyWire.ForResource("doc", "v1-plain"));
+            var plainBucketRow = await ReadRow<KeyIndexBucketEntry>(
+                cluster, $"indexb/{v1Version}/f/{KeyIndexLayout.BucketOf(plainForwardKey, layout.BucketCount)}");
+            Assert.True(LiveBucket(plainBucketRow), "the migration wrote no forward bucket row");
+            Assert.Equal(v1Version, plainBucketRow.State!.Entries[plainForwardKey]);
+
+            // Shard rows are UNTOUCHED by the index migration: row-level content equality against the
+            // seeded rows, forward and reverse, dead-row stamps included.
+            foreach (var (key, row) in shardRows)
+            {
+                var shardRow = await ReadRow<GraphShardState>(cluster, ShardRowKey(v1Version, key));
+                Assert.True(shardRow.RecordExists, $"seeded shard row for {GraphShardGrainKey.Build(key)} vanished");
+                Assert.Equal(RowMultiset([row]), RowMultiset(shardRow.State!.Rows));
+            }
+
+            // Subsequent commits flush through the v2 protocol: cross the next 64-boundary, then the
+            // head names a new slim meta, the migration meta is cleared, and the flush wrote its delta
+            // row plus the rotated bucket pair (cursor reset to 0 by the migration).
+            for (var i = 0; i < 64; i++)
+            {
+                await ds.ReadWriteTx(tx => tx.WriteRelationships(
+                [
+                    new RelationshipUpdate(
+                        Relationship.Create(
+                            new ObjectAndRelation("doc", $"post-{i}", "viewer"),
+                            new ObjectAndRelation("user", $"u{i}", CoreConstants.Ellipsis)),
+                        UpdateOperation.Create),
+                ]));
+            }
+
+            var headRow = await ReadRow<LogHeadEntry>(cluster, "head");
+            Assert.True(headRow.RecordExists);
+            var flushVersion = headRow.State!.SnapshotVersion;
+            Assert.True(flushVersion > v1Version, $"no post-migration flush happened: SnapshotVersion {flushVersion}");
+            var flushedMeta = await ReadRow<DatastoreMetaEntry>(cluster, $"meta/{flushVersion}");
+            Assert.True(LiveMeta(flushedMeta));
+            Assert.NotNull(flushedMeta.State!.IndexLayout);
+            Assert.Empty(flushedMeta.State.Meta.ForwardKeys);
+            Assert.False(
+                LiveMeta(await ReadRow<DatastoreMetaEntry>(cluster, $"meta/{v1Version}")),
+                "the superseded migration meta row was not cleared by the flush");
+            Assert.True(
+                LiveDelta(await ReadRow<KeyIndexDeltaEntry>(cluster, $"indexd/{flushVersion}")),
+                "the post-migration flush wrote no indexd/{v} delta row");
+            Assert.True(
+                LiveBucket(await ReadRow<KeyIndexBucketEntry>(cluster, $"indexb/{flushVersion}/f/0")),
+                "the post-migration flush wrote no rotated forward bucket row");
+            Assert.True(
+                LiveBucket(await ReadRow<KeyIndexBucketEntry>(cluster, $"indexb/{flushVersion}/r/0")),
+                "the post-migration flush wrote no rotated reverse bucket row");
+
+            // Reads stay exact across the whole cycle: the live migrated row plus every post row.
+            var finalReader = ds.SnapshotReader((await ds.HeadRevision()).Revision);
+            var finalCount = 0;
+            await foreach (var _ in finalReader.QueryRelationships(new RelationshipsFilter { OptionalResourceType = "doc" }))
+                finalCount++;
+            Assert.Equal(1 + 64, finalCount);
         }
         finally
         {

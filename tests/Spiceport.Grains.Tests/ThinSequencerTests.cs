@@ -166,6 +166,27 @@ public class ThinSequencerTests
         Assert.True(metaRow.RecordExists, "the flush's meta/{version} row is missing");
         Assert.Equal(flushVersion, metaRow.State!.FlushedThroughLogVersion);
 
+        // Durable layout v2 (docs/scalability-program.md 3.4): the meta row is SLIM — no inline key
+        // maps (the cardinality-independence tripwire) — and carries the chunked-index layout; the
+        // flush wrote its delta row and rotated bucket 0 in both directions (the rotation cursor
+        // starts at 0, and this store has seen exactly one flush).
+        Assert.NotNull(metaRow.State.IndexLayout);
+        Assert.Empty(metaRow.State.Meta.ForwardKeys);
+        Assert.Empty(metaRow.State.Meta.ReverseKeys);
+        Assert.Equal(KeyIndexLayout.DefaultBucketCount, metaRow.State.IndexLayout!.BucketCount);
+        Assert.Contains(flushVersion, metaRow.State.IndexLayout.DeltaVersions);
+        var deltaRow = await ReadRow<KeyIndexDeltaEntry>(cluster, $"indexd/{flushVersion}");
+        Assert.True(deltaRow.RecordExists, "the flush's indexd/{version} delta row is missing");
+        // Every key flushed in the window rides the delta at the flush version (k0..k4 were all dirty).
+        var k0Forward = GraphShardGrainKey.Build(GraphShardKeyWire.ForResource("doc", "k0"));
+        Assert.Equal(flushVersion, deltaRow.State!.ForwardEntries[k0Forward]);
+        Assert.True(
+            (await ReadRow<KeyIndexBucketEntry>(cluster, $"indexb/{flushVersion}/f/0")).RecordExists,
+            "the rotated forward bucket row is missing");
+        Assert.True(
+            (await ReadRow<KeyIndexBucketEntry>(cluster, $"indexb/{flushVersion}/r/0")).RecordExists,
+            "the rotated reverse bucket row is missing");
+
         // Log trim: entries at or below the boundary cleared; the post-flush tail retained; the seed
         // meta/0 row cleared once superseded.
         Assert.False((await ReadRow<LogEvent>(cluster, "log/1")).RecordExists, "log/1 survived compaction");
@@ -176,6 +197,248 @@ public class ThinSequencerTests
             (await ReadRow<LogEvent>(cluster, $"log/{flushVersion + 1}")).RecordExists,
             "the first post-flush log entry is missing — the tail was over-trimmed");
         Assert.False((await ReadRow<DatastoreMetaEntry>(cluster, "meta/0")).RecordExists, "meta/0 survived compaction");
+    }
+
+    /// <summary>
+    /// The TOMBSTONE path of the chunked key index (durable layout v2): a key whose shard state
+    /// EMPTIES at a flush (its rows GC-collected) is dropped from the index with an explicit tombstone
+    /// entry in that flush's <c>indexd/{version}</c> delta row — and a recovery that reconstructs the
+    /// index must REPLAY that tombstone, or the dropped key would resurrect from the earlier delta
+    /// that added it. The probed keys are chosen so their buckets are NOT among the ones the two
+    /// flushes rotate (buckets 0 and 1), making the delta overlay the ONLY durable carrier of both the
+    /// key's addition and its removal — the reconstruction path this test pins deterministically.
+    /// </summary>
+    [Fact]
+    public async Task Key_removed_at_flush_disappears_from_the_index_after_recovery_replays_its_tombstone_delta()
+    {
+        // Window=Zero lets RunGc advance the floor to the current head, so dead rows below it are
+        // physically collected at the key's next flush — the only way a key's shard state empties.
+        await using var cluster = await MeshTestCluster.CreateAsync(Schema, gcWindow: TimeSpan.Zero);
+        var ds = cluster.Datastore;
+        var grain = Sequencer(cluster);
+
+        static int Bucket(string key) => KeyIndexLayout.BucketOf(key, KeyIndexLayout.DefaultBucketCount);
+        var goneId = Enumerable.Range(0, 10_000).Select(i => $"gone{i}").First(id =>
+            Bucket(GraphShardGrainKey.Build(GraphShardKeyWire.ForResource("doc", id))) > 1);
+        var victimId = Enumerable.Range(0, 10_000).Select(i => $"victim{i}").First(id =>
+            Bucket(GraphShardGrainKey.Build(GraphShardKeyWire.ForSubject("user", id))) > 1);
+        var goneForwardKey = GraphShardGrainKey.Build(GraphShardKeyWire.ForResource("doc", goneId));
+        var victimReverseKey = GraphShardGrainKey.Build(GraphShardKeyWire.ForSubject("user", victimId));
+
+        // Commits 1-2: create and delete a first row on the key, then 62 fillers cross the first flush
+        // boundary (64): the key's row (a retained tombstoned MVCC row — the floor is still 0) becomes
+        // durable and the key enters the durable index ONLY via delta 64 (its bucket is never rotated).
+        await Write(ds, Row(goneId, "seed"));
+        await Write(ds, Row(goneId, "seed"), UpdateOperation.Delete);
+        for (var i = 0; i < 62; i++)
+            await Write(ds, Row($"tf{i}", "filler"));
+
+        // Commits 65-66 re-dirty the key (create+delete the probed victim subject), then a GC puts the
+        // floor above every delete: at the SECOND flush the key's collected state is EMPTY, so the
+        // flush drops it from the index and records tombstones in delta 128 — for the forward key AND
+        // the victim's reverse key (also dirtied to empty in this window, also in an unrotated bucket).
+        await Write(ds, Row(goneId, victimId));
+        await Write(ds, Row(goneId, victimId), UpdateOperation.Delete);
+        Assert.NotNull(await grain.RunGc());
+        for (var i = 0; i < 61; i++)
+            await Write(ds, Row($"tg{i}", "filler"));
+
+        // The second flush really ran and its delta carries the explicit tombstones.
+        var headRow = await ReadRow<LogHeadEntry>(cluster, "head");
+        Assert.True(headRow.RecordExists);
+        var flushVersion = headRow.State!.SnapshotVersion;
+        Assert.True(flushVersion >= 128, $"expected the second flush boundary, saw SnapshotVersion {flushVersion}");
+        var deltaRow = await ReadRow<KeyIndexDeltaEntry>(cluster, $"indexd/{flushVersion}");
+        Assert.True(deltaRow.RecordExists, "the second flush's delta row is missing");
+        Assert.Equal(KeyIndexDeltaEntry.Tombstone, deltaRow.State!.ForwardEntries[goneForwardKey]);
+        Assert.Equal(KeyIndexDeltaEntry.Tombstone, deltaRow.State.ReverseEntries[victimReverseKey]);
+
+        var headBefore = await grain.GetHead();
+
+        // Drop every activation so recovery reconstructs the index from bucket rows + deltas.
+        var management = cluster.GrainFactory.GetGrain<IManagementGrain>(0);
+        await management.ForceActivationCollection(TimeSpan.Zero);
+        var stats = await management.GetDetailedGrainStatistics();
+        Assert.DoesNotContain(stats, s =>
+            s.GrainType.ToString()!.Contains("datastoregrain", StringComparison.OrdinalIgnoreCase));
+
+        // Negative control (lost state re-seeds a different head), then the tombstone's observable:
+        // the removed key resolves to EMPTY through the reconstructed index — forward and reverse.
+        var headAfter = await grain.GetHead();
+        Assert.Equal(headBefore.Head, headAfter.Head);
+        Assert.Empty((await grain.ReadShard(GraphShardKeyWire.ForResource("doc", goneId))).Rows);
+        Assert.Empty((await grain.ReadShard(GraphShardKeyWire.ForSubject("user", victimId))).Rows);
+        IGraphReader sharded = new ShardedGraphReader(cluster.GrainFactory, headAfter.Head);
+        Assert.Empty(await Collect(sharded.QueryRelationships(new RelationshipsFilter
+        {
+            OptionalResourceType = "doc",
+            OptionalResourceIds = [goneId],
+        })));
+        Assert.Empty(await Collect(sharded.ReverseQueryRelationships(
+            new SubjectsFilter("user", OptionalSubjectIds: [victimId]))));
+    }
+
+    /// <summary>
+    /// The REPLAY-ORDER discriminator for the pending-delta overlay: a key is deleted so flush A
+    /// records its TOMBSTONE in delta A, then RECREATED so flush B records a LIVE entry in delta B —
+    /// and after recovery the key must be SERVED at head. Ascending replay applies the tombstone
+    /// first and the live entry last (correct); a descending or otherwise disordered replay would
+    /// apply the tombstone LAST and visibly lose the recreated key. The key's bucket is chosen
+    /// provably UNROTATED across both flushes (only buckets 0 and 1 are rotated), so the two delta
+    /// rows are the only durable carriers of both facts — the ordering is the whole story.
+    /// </summary>
+    [Fact]
+    public async Task Recreated_key_survives_recovery_because_delta_replay_is_ascending()
+    {
+        // Window=Zero lets RunGc put the floor at head, so the pre-flush delete's rows physically
+        // collect at flush A and the key's state EMPTIES there (the tombstone-producing condition).
+        await using var cluster = await MeshTestCluster.CreateAsync(Schema, gcWindow: TimeSpan.Zero);
+        var ds = cluster.Datastore;
+        var grain = Sequencer(cluster);
+
+        static int Bucket(string key) => KeyIndexLayout.BucketOf(key, KeyIndexLayout.DefaultBucketCount);
+        var phoenixId = Enumerable.Range(0, 10_000).Select(i => $"phoenix{i}").First(id =>
+            Bucket(GraphShardGrainKey.Build(GraphShardKeyWire.ForResource("doc", id))) > 1);
+        var phoenixForwardKey = GraphShardGrainKey.Build(GraphShardKeyWire.ForResource("doc", phoenixId));
+
+        // Window 1 (commits 1..64): create + delete the key, GC the floor past the delete, fill to
+        // the boundary. Flush A (version 64) collects the key to empty and tombstones it in delta 64.
+        await Write(ds, Row(phoenixId, "seed"));
+        await Write(ds, Row(phoenixId, "seed"), UpdateOperation.Delete);
+        Assert.NotNull(await grain.RunGc());
+        for (var i = 0; i < 61; i++)
+            await Write(ds, Row($"ra{i}", "filler"));
+
+        // Window 2 (commits 65..128): RECREATE the key, fill to the next boundary. Flush B (version
+        // 128) records the live entry in delta 128.
+        await Write(ds, Row(phoenixId, "back"));
+        for (var i = 0; i < 63; i++)
+            await Write(ds, Row($"rb{i}", "filler"));
+
+        // Both flushes ran, and the two deltas carry tombstone-then-live for the SAME key.
+        var headRow = await ReadRow<LogHeadEntry>(cluster, "head");
+        Assert.True(headRow.RecordExists);
+        Assert.Equal(128, headRow.State!.SnapshotVersion);
+        var deltaA = await ReadRow<KeyIndexDeltaEntry>(cluster, "indexd/64");
+        Assert.True(deltaA.RecordExists, "flush A's delta row is missing");
+        Assert.Equal(KeyIndexDeltaEntry.Tombstone, deltaA.State!.ForwardEntries[phoenixForwardKey]);
+        var deltaB = await ReadRow<KeyIndexDeltaEntry>(cluster, "indexd/128");
+        Assert.True(deltaB.RecordExists, "flush B's delta row is missing");
+        Assert.Equal(128, deltaB.State!.ForwardEntries[phoenixForwardKey]);
+
+        var headBefore = await grain.GetHead();
+
+        // Drop every activation so recovery reconstructs the index from bucket rows + delta overlay.
+        var management = cluster.GrainFactory.GetGrain<IManagementGrain>(0);
+        await management.ForceActivationCollection(TimeSpan.Zero);
+        var stats = await management.GetDetailedGrainStatistics();
+        Assert.DoesNotContain(stats, s =>
+            s.GrainType.ToString()!.Contains("datastoregrain", StringComparison.OrdinalIgnoreCase));
+
+        // The recreated key is SERVED at head: delta 128's live entry was applied after delta 64's
+        // tombstone. Descending replay would resolve the key to empty here.
+        var headAfter = await grain.GetHead();
+        Assert.Equal(headBefore.Head, headAfter.Head);
+        var shard = await grain.ReadShard(GraphShardKeyWire.ForResource("doc", phoenixId));
+        Assert.Equal(
+            "back",
+            Assert.Single(shard.Rows, r => r.DeletedRevision is null).Relationship.SubjectId);
+        IGraphReader sharded = new ShardedGraphReader(cluster.GrainFactory, headAfter.Head);
+        Assert.Equal(
+            [Canonical(Row(phoenixId, "back"))],
+            await Collect(sharded.QueryRelationships(new RelationshipsFilter
+            {
+                OptionalResourceType = "doc",
+                OptionalResourceIds = [phoenixId],
+            })));
+    }
+
+    /// <summary>
+    /// Delta PRUNING made test-reachable: with the creation bucket count lowered to 2 (the count is
+    /// stored in the layout, so this store honors B=2 for its whole life; changing it for an existing
+    /// store is forbidden), three flush boundaries drive the rotation over every bucket twice —
+    /// DeltaFloorVersion advances (the MIN over both directions' bucket versions) and the deltas at or
+    /// below it are pruned from the layout and cleared from storage. Pins, across a genuine
+    /// deactivation: a key tombstoned in a since-PRUNED delta stays gone (its absence carried by the
+    /// post-tombstone bucket rows alone), a key whose index entry survives ONLY via bucket rows (its
+    /// delta pruned) is still served, and keys from every window survive. A Max-instead-of-Min floor
+    /// or an over-eager prune loses one of these observably — this is the only test path that reaches
+    /// the floor computation at all.
+    /// </summary>
+    [Fact]
+    public async Task Full_rotation_prunes_deltas_and_recovery_still_serves_exactly()
+    {
+        var originalBucketCount = DatastoreGrain.CreationBucketCount;
+        DatastoreGrain.CreationBucketCount = 2;
+        try
+        {
+            await using var cluster = await MeshTestCluster.CreateAsync(Schema, gcWindow: TimeSpan.Zero);
+            var ds = cluster.Datastore;
+            var grain = Sequencer(cluster);
+
+            // Window 1 (commits 1..64): a key that tombstones at the first flush (create + delete
+            // below the GC floor), a keeper whose only index carriers after pruning are bucket rows,
+            // the GC, and fillers to the boundary. Flush 64 rewrites bucket 0.
+            await Write(ds, Row("gone", "seed"));
+            await Write(ds, Row("gone", "seed"), UpdateOperation.Delete);
+            await Write(ds, Row("keeper", "keep"));
+            Assert.NotNull(await grain.RunGc());
+            for (var i = 0; i < 60; i++)
+                await Write(ds, Row($"w1-{i}", "filler"));
+
+            // Windows 2 and 3 (commits 65..192): flush 128 rewrites bucket 1 — the rotation is FULL,
+            // the floor advances to min(64, 128) = 64 and delta 64 is pruned. Flush 192 rewrites
+            // bucket 0 again — floor min(192, 128) = 128, delta 128 pruned.
+            for (var i = 0; i < 64; i++)
+                await Write(ds, Row($"w2-{i}", "filler"));
+            for (var i = 0; i < 64; i++)
+                await Write(ds, Row($"w3-{i}", "filler"));
+
+            // Storage-level: the layout really rotated fully and pruned both early deltas.
+            var headRow = await ReadRow<LogHeadEntry>(cluster, "head");
+            Assert.True(headRow.RecordExists);
+            Assert.Equal(192, headRow.State!.SnapshotVersion);
+            var metaRow = await ReadRow<DatastoreMetaEntry>(cluster, "meta/192");
+            Assert.True(metaRow.RecordExists, "the third flush's meta row is missing");
+            var layout = metaRow.State!.IndexLayout;
+            Assert.NotNull(layout);
+            Assert.Equal(2, layout!.BucketCount);
+            Assert.Equal(128, layout.DeltaFloorVersion);
+            Assert.Equal(new[] { 192 }, layout.DeltaVersions);
+            Assert.False(
+                (await ReadRow<KeyIndexDeltaEntry>(cluster, "indexd/64")).RecordExists,
+                "delta 64 survived pruning");
+            Assert.False(
+                (await ReadRow<KeyIndexDeltaEntry>(cluster, "indexd/128")).RecordExists,
+                "delta 128 survived pruning");
+
+            var headBefore = await grain.GetHead();
+
+            // Deactivate + reactivate: recovery must reconstruct the index from the two bucket rows
+            // (versions 192 and 128) plus the single pending delta 192 — deltas 64/128 are gone.
+            var management = cluster.GrainFactory.GetGrain<IManagementGrain>(0);
+            await management.ForceActivationCollection(TimeSpan.Zero);
+            var stats = await management.GetDetailedGrainStatistics();
+            Assert.DoesNotContain(stats, s =>
+                s.GrainType.ToString()!.Contains("datastoregrain", StringComparison.OrdinalIgnoreCase));
+
+            var headAfter = await grain.GetHead();
+            Assert.Equal(headBefore.Head, headAfter.Head);
+
+            // The key tombstoned in the pruned delta stays gone; the bucket-carried keys — one per
+            // window — are all still served.
+            Assert.Empty((await grain.ReadShard(GraphShardKeyWire.ForResource("doc", "gone"))).Rows);
+            static string LiveSubject(GraphShardState shard) =>
+                Assert.Single(shard.Rows, r => r.DeletedRevision is null).Relationship.SubjectId;
+            Assert.Equal("keep", LiveSubject(await grain.ReadShard(GraphShardKeyWire.ForResource("doc", "keeper"))));
+            Assert.Equal("filler", LiveSubject(await grain.ReadShard(GraphShardKeyWire.ForResource("doc", "w1-0"))));
+            Assert.Equal("filler", LiveSubject(await grain.ReadShard(GraphShardKeyWire.ForResource("doc", "w2-0"))));
+            Assert.Equal("filler", LiveSubject(await grain.ReadShard(GraphShardKeyWire.ForResource("doc", "w3-0"))));
+        }
+        finally
+        {
+            DatastoreGrain.CreationBucketCount = originalBucketCount;
+        }
     }
 
     // ---- (b) The memory ceiling: no relationship rows in the journaled state; the relabel rule. ----
@@ -574,18 +837,23 @@ public class ThinSequencerTests
             });
         });
 
-        // Cross the flush boundary, capturing doc:m0's create revision for the row-level gate below.
+        // Cross TWO flush boundaries (64 and 128), capturing doc:m0's create revision for the
+        // row-level gate below. Two flushes leave the store genuinely MID-ROTATION for the chunked
+        // key index: buckets 0 and 1 hold rows (at different versions), every other bucket has none,
+        // and TWO delta rows are pending — so the recovery below must reconstruct the index almost
+        // entirely from the delta overlay (m0's own entry rides delta 64 unless its bucket happens to
+        // be a rotated one).
         IRevision? m0CreateRev = null;
-        for (var i = 0; i < 66; i++)
+        for (var i = 0; i < 130; i++)
         {
             var rev = await Write(ds, Row($"m{i}", $"w{i}"));
             if (i == 0)
                 m0CreateRev = rev;
         }
 
-        // A delete and a real GC event. The delete lands ABOVE the 64-event flush boundary, making
-        // doc:m0's forward key TAIL-RESIDENT: recovery must seed it from its flushed row (the create)
-        // and replay the tail's delete on top.
+        // A delete and a real GC event. The delete lands ABOVE the second (128-event) flush boundary,
+        // making doc:m0's forward key TAIL-RESIDENT: recovery must seed it from its flushed row (the
+        // create) and replay the tail's delete on top.
         var m0DeleteRev = await Write(ds, Row("m0", "w0"), UpdateOperation.Delete);
         var floor = await grain.RunGc();
         Assert.NotNull(floor);

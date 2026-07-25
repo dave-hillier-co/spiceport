@@ -72,7 +72,7 @@ internal sealed class GraphLocalityPlacementDirector(GraphPlacementOptions? opti
         // makes no ordering promise); the modulus then names one silo cluster-wide for this key.
         var sorted = (SiloAddress[])silos.Clone();
         Array.Sort(sorted);
-        return Task.FromResult(sorted[(int)(Fnv1a64(localityKey) % (ulong)sorted.Length)]);
+        return Task.FromResult(sorted[(int)(StableHash.Fnv1a64(localityKey) % (ulong)sorted.Length)]);
     }
 
     /// <summary>
@@ -93,26 +93,4 @@ internal sealed class GraphLocalityPlacementDirector(GraphPlacementOptions? opti
         };
     }
 
-    /// <summary>
-    /// FNV-1a 64-bit over the string's UTF-16 code units: a stable, process-independent,
-    /// non-cryptographic hash. <see cref="string.GetHashCode()"/> is deliberately NOT used — it is
-    /// randomized per process, and every silo must compute the same silo index for the same key.
-    /// </summary>
-    internal static ulong Fnv1a64(string value)
-    {
-        const ulong offsetBasis = 14695981039346656037UL;
-        const ulong prime = 1099511628211UL;
-
-        var hash = offsetBasis;
-        foreach (var ch in value)
-        {
-            unchecked
-            {
-                hash ^= ch;
-                hash *= prime;
-            }
-        }
-
-        return hash;
-    }
 }

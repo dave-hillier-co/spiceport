@@ -69,11 +69,13 @@ public class GraphLocalityPlacementTests
     public void Fnv1a64_matches_the_published_test_vectors()
     {
         // The FNV-1a 64-bit reference vectors (over one byte per char, which for these ASCII inputs
-        // equals the UTF-16 code-unit fold the director uses). string.GetHashCode is per-process
-        // randomized; these constants prove the replacement is process-independent.
-        Assert.Equal(14695981039346656037UL, GraphLocalityPlacementDirector.Fnv1a64(""));
-        Assert.Equal(0xaf63dc4c8601ec8cUL, GraphLocalityPlacementDirector.Fnv1a64("a"));
-        Assert.Equal(0x85944171f73967e8UL, GraphLocalityPlacementDirector.Fnv1a64("foobar"));
+        // equals the UTF-16 code-unit fold the shared helper uses). string.GetHashCode is per-process
+        // randomized; these constants prove the replacement is process-independent. The helper is
+        // shared with the datastore grain's durable key-index bucketing, so these vectors also pin
+        // the bucket assignment as part of the durable layout.
+        Assert.Equal(14695981039346656037UL, StableHash.Fnv1a64(""));
+        Assert.Equal(0xaf63dc4c8601ec8cUL, StableHash.Fnv1a64("a"));
+        Assert.Equal(0x85944171f73967e8UL, StableHash.Fnv1a64("foobar"));
     }
 
     [Fact]

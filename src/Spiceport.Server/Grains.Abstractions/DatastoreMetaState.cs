@@ -1,4 +1,5 @@
 using System.Collections.Immutable;
+using Spiceport.Grains;
 
 namespace Spiceport.Grains.Abstractions;
 
@@ -96,6 +97,88 @@ public sealed record DatastoreMetaState
 }
 
 /// <summary>
+/// The durable layout descriptor of the CHUNKED key index (durable layout v2,
+/// docs/scalability-program.md 3.4): the in-memory <see cref="DatastoreMetaState.ForwardKeys"/>/
+/// <see cref="DatastoreMetaState.ReverseKeys"/> maps are NOT serialized into the meta row; instead each
+/// direction's index is split across <see cref="BucketCount"/> buckets
+/// (<c>bucket = FNV-1a-64(key) % BucketCount</c>, fixed at store creation — the bucket of a key is part
+/// of the durable layout and must never change), persisted as write-once
+/// <c>indexb/{version}/{dir}/{bucket}</c> rows (<see cref="KeyIndexBucketEntry"/>) rewritten one bucket
+/// per direction per flush in round-robin rotation, plus per-flush <c>indexd/{version}</c> DELTA rows
+/// (<see cref="KeyIndexDeltaEntry"/>) carrying exactly the entries that flush dirtied. Recovery
+/// reconstructs the full maps as (all bucket rows at their recorded versions) overlaid with (the
+/// pending delta rows in ascending version order). The meta row's size is therefore
+/// CARDINALITY-INDEPENDENT: this descriptor is O(BucketCount), never O(keys).
+/// </summary>
+[GenerateSerializer, Immutable]
+public sealed record KeyIndexLayout(
+    [property: Id(0)] int BucketCount,
+    [property: Id(1)] ImmutableArray<int> ForwardBucketVersions,
+    [property: Id(2)] ImmutableArray<int> ReverseBucketVersions,
+    [property: Id(3)] int NextBucket,
+    [property: Id(4)] int DeltaFloorVersion,
+    [property: Id(5)] ImmutableList<int> DeltaVersions)
+{
+    /// <summary>The bucket count of a newly created (or migrated) store.</summary>
+    public const int DefaultBucketCount = 256;
+
+    /// <summary>
+    /// The sentinel version of a bucket that has never had a row written (a young store before the
+    /// rotation first reaches it): recovery reads no row for it and treats it as empty.
+    /// </summary>
+    public const int NoBucketRow = 0;
+
+    /// <summary>
+    /// The bucket a key string belongs to: <c>FNV-1a-64(key) % bucketCount</c>. Depends only on the
+    /// stable, process-independent hash and the store's fixed bucket count, so the assignment is part
+    /// of the durable contract (a changed bucket function would strand every stored bucket row).
+    /// </summary>
+    public static int BucketOf(string key, int bucketCount) =>
+        (int)(StableHash.Fnv1a64(key) % (ulong)bucketCount);
+
+    /// <summary>A fresh layout with no bucket rows written and no pending deltas.</summary>
+    public static KeyIndexLayout CreateEmpty(int bucketCount)
+    {
+        ArgumentOutOfRangeException.ThrowIfLessThan(bucketCount, 1);
+        var none = Enumerable.Repeat(NoBucketRow, bucketCount).ToImmutableArray();
+        return new KeyIndexLayout(bucketCount, none, none, NextBucket: 0, DeltaFloorVersion: 0,
+            ImmutableList<int>.Empty);
+    }
+}
+
+/// <summary>
+/// One durable <c>indexb/{version}/{dir}/{bucket}</c> row: the FULL current key->rowVersion entries of
+/// one bucket of one direction's key index, as of the flush at <c>{version}</c>. Write-once per version
+/// with the same ETag-tolerant read-then-write discipline the shard rows use (a boundary retry
+/// overwrites its own crashed attempt's orphan). Entries are ABSOLUTE (each value is the key's current
+/// shard-row version), which is what makes the recovery overlay idempotent.
+/// </summary>
+[GenerateSerializer, Immutable]
+public sealed record KeyIndexBucketEntry(
+    [property: Id(0)] ImmutableDictionary<string, int> Entries);
+
+/// <summary>
+/// One durable <c>indexd/{version}</c> row: the key-index entries DIRTIED by the flush at
+/// <c>{version}</c>, both directions. A key whose row was (re)written maps to that flush version; a key
+/// DROPPED at the flush (its shard state emptied) is recorded as an explicit <see cref="Tombstone"/>
+/// entry — replaying the delta at recovery must delete it from the reconstructed index, because the
+/// bucket row still carrying it may be many rotations old. Like bucket entries, values are ABSOLUTE, so
+/// overlaying deltas in ascending version order is idempotent last-wins.
+/// </summary>
+[GenerateSerializer, Immutable]
+public sealed record KeyIndexDeltaEntry(
+    [property: Id(0)] ImmutableDictionary<string, int> ForwardEntries,
+    [property: Id(1)] ImmutableDictionary<string, int> ReverseEntries)
+{
+    /// <summary>
+    /// The delta-entry value marking a key REMOVED from the index at this flush. Distinct from
+    /// <see cref="DatastoreMetaState.NoRowVersion"/> (-1, "indexed but no durable row yet"), which never
+    /// appears in a durable row.
+    /// </summary>
+    public const int Tombstone = -2;
+}
+
+/// <summary>
 /// The durable <c>meta/{version}</c> row of the thin-sequencer layout (write-once per version, like the
 /// retired whole-state snapshots): the <see cref="DatastoreMetaState"/> as of the flush at
 /// <see cref="FlushedThroughLogVersion"/>. The version in the row key equals
@@ -104,10 +187,21 @@ public sealed record DatastoreMetaState
 /// Every shard row on disk is complete through this log version: recovery replays only the log tail
 /// above it, seeding touched keys from their stored rows.
 /// </summary>
+/// <remarks>
+/// LAYOUT VERSIONS. Under the current (v2) layout <see cref="IndexLayout"/> is non-null and
+/// <see cref="Meta"/> is persisted with EMPTY <see cref="DatastoreMetaState.ForwardKeys"/>/
+/// <see cref="DatastoreMetaState.ReverseKeys"/> maps — the index lives in the bucket/delta rows the
+/// layout describes, making the meta row's size independent of graph cardinality. A row written by the
+/// retired v1 layout carries the full maps INLINE and has a null <see cref="IndexLayout"/> (the field
+/// did not exist; Orleans deserializes the absent field as null) — activation detects that shape and
+/// migrates in place. The in-memory <see cref="DatastoreMetaState"/> always holds the full maps
+/// regardless; only the durable representation changed.
+/// </remarks>
 [GenerateSerializer, Immutable]
 public sealed record DatastoreMetaEntry(
     [property: Id(0)] DatastoreMetaState Meta,
-    [property: Id(1)] int FlushedThroughLogVersion);
+    [property: Id(1)] int FlushedThroughLogVersion,
+    [property: Id(2)] KeyIndexLayout? IndexLayout = null);
 
 /// <summary>
 /// A mutable holder for the immutable <see cref="DatastoreMetaState"/>, required because

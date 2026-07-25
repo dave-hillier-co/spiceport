@@ -291,6 +291,16 @@ Realized (the built system):
    whole-state assembly. A legacy whole-state `snapshot/{version}` store migrates in place
    on first activation.
 
+   The key index's own durable form is chunked (per-direction bucket rows rewritten one per
+   flush in rotation, plus per-flush delta rows; the meta row carries only the layout
+   descriptor, never the maps inline), and stores written by the earlier inline-map layout
+   migrate to it in place on first activation. **That migration is ONE-WAY — rollback across
+   it is forbidden.** A binary predating the chunked index, activated against a migrated
+   store, deserializes the meta row without the layout field it does not know, sees the
+   (deliberately empty) inline maps, and silently reads the store as EMPTY — every
+   relationship unreachable — and its first flush persists that emptiness durably. Roll
+   forward only; recover a wrongly rolled-back store from backup, not by re-upgrading.
+
 7. **The co-placement director** (§5) — built as `GraphLocalityPlacement`, default OFF:
    the locality hint is proven by a multi-silo co-location gate, and ENABLING it in a
    deployment remains gated by measurement, per the simplicity-over-performance stance.

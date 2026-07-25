@@ -99,6 +99,16 @@ permanently; the harness and any future profiling read the same seam.
 crashed-then-retried append can ETag-clash on an orphan log row. Convert to the ETag-tolerant
 read-then-write the shard rows use.
 
+**The regression set** (a standing practice, not a CI job): after every change this program
+lands — and before declaring any goal met — run the four standard scenarios
+(`userset-sweep`, `sequencer-decomposition`, `commit-breadth`, `consistency-sweep`) at the
+standard world and durations, with `--json` output kept OUTSIDE the repo, and compare
+against the previous run's output. A change is judged on its goal metric AND on the absence
+of regression in the scenarios it did not target; "shouldn't affect the read path" is a
+hypothesis the set exists to test, not a reason to skip it. Results are still never
+committed — the baseline is whatever the previous run produced, and a missing baseline
+means running the set twice, before and after.
+
 **The real-network rig** (built when either decision below needs it, not before): an
 attended run against genuinely separate silo processes on a real network — the follow-up
 instrument for the questions the in-process cluster structurally cannot answer, because they
@@ -204,9 +214,13 @@ construct their keys and probe the index maps directly — O(#ids) — on both t
 reverse sides; the scan survives only for the shapes that cannot name their keys (type-only,
 prefix). Post-fix, the cardinality sweep is flat and an exact-key precondition sits within
 ~1.3× of a bare commit (the honest residual: one candidate load + filter evaluation).
-Whether items 1–2 (parallel loads, clean-state LRU) still pay is a question for the
-re-baseline; the flush sawtooth is observed (see 3.4, the shared cause) and item 3 rides
-with 3.4 when that lands.
+The re-baseline answered the items-1–2 question: NOT triggered in-process. Realistic
+commits resolve one-to-few candidates (nothing to parallelize) and candidate loads against
+in-memory storage are far below the turn's other costs; an exact-key precondition's
+steady-state residual is sub-millisecond. Both items stay sketched, re-gated on evidence
+from durable-backend or real-network runs where a candidate load is a genuine RTT. The
+flush sawtooth is the write path's dominant remaining cost (see 3.4) and item 3 rides with
+3.4 when that lands.
 
 ### 3.4 Key-index chunking (answers P5)
 
@@ -224,11 +238,23 @@ migration, meta-v1 to meta-v2).
 **Trigger.** Meta-row serialization visible in flush latency, or meta row size beyond
 storage-row comfort at the deployment's object cardinality.
 
-**Trigger status: fires on growth.** Harness runs at modest object cardinality (tens of
-thousands of keys) already show the flush boundary spiking commit latency well above the
-steady-state mean, consistent with whole-index serialization per flush. The cost scales with
-object cardinality, so this is scheduled after the cheap fixes rather than awaiting further
-evidence; flush write batching (3.3 item 3) lands adjacent to it.
+**Trigger status: FIRED, then BUILT — goal substantially met.** The re-baseline's
+cardinality sweep showed bare-commit p50 flat but throughput collapsing severalfold and p99
+growing linearly with object cardinality, the entire excess being the flush turn serializing
+the whole index. As built, the durable index is delta rows (O(dirty) per flush, dropped keys
+as explicit tombstones) plus a round-robin bucket rotation (one bucket per direction per
+flush; bucket assignment = stable hash % BucketCount is part of the durable contract), a
+cardinality-independent slim meta, and batched parallel flush writes (3.3 item 3). Post-build
+the sweep's throughput degradation across a 30x cardinality range collapsed from severalfold
+to a modest residual — the documented O(N/BucketCount) bucket-rewrite term plus a CPU-only
+bucket-selection scan — and absolute throughput ROSE at every cardinality (the write
+batching pays everywhere). Recovery is bounded (all buckets + one rotation of deltas) with a
+fail-loud ascending-order guard; migrations from both legacy layouts are in-place and
+one-way (rollback across the index migration is forbidden — see
+`graph-sharded-datastore.md`); the crash-window analysis was adversarially reviewed with no
+blockers, and the pruned-delta and tombstone-then-recreate paths are test-reachable via a
+test-injectable bucket count. Tighten the residual (larger BucketCount, per-bucket dirty
+tracking) only if a deployment's cardinality demands it.
 
 ### 3.5 Enablement decisions (answers P4 — decisions, not code)
 
@@ -276,10 +302,13 @@ cheap wins, and a better instrument before the two judgment calls:
    cardinality sweep is flat.
 2. **Subject-filter pushdown (3.2)** — BUILT, goal met: point-membership is flat in userset
    cardinality (pushdown + shard-side subject index; see 3.2's status note).
-3. **Re-baseline** — re-run the userset, commit-breadth, and decomposition sweeps. Fixes
-   demonstrably dominate each other's signal; nothing further is decided on stale numbers.
-4. **Key-index chunking (3.4)**, with flush write batching (3.3 item 3) adjacent — the one
-   structural storage change, scheduled because its cost scales with object cardinality.
+3. **Re-baseline** — DONE: steps 1–2 hold and compose in the standard configuration
+   (userset flat, seed-window schema hops zero); 3.3 items 1–2 are not triggered in-process
+   (re-gated on durable-backend/real-network evidence); the flush is confirmed as the
+   dominant remaining write-path cost and 3.4's goal is quantified in its status note.
+4. **Key-index chunking (3.4)**, with flush write batching (3.3 item 3) adjacent — BUILT,
+   goal substantially met (see 3.4's status note): flush cost is O(dirty + N/BucketCount),
+   the cardinality sweep flattened, and absolute commit throughput rose at every point.
 5. **The real-network rig (§2)** — the prerequisite instrument for the two open decisions:
    the co-placement default (3.5) and whether the tail cache (3.1) fires at all.
 6. **Only on evidence:** the tail cache (3.1) if the real-network numbers fire it; the
