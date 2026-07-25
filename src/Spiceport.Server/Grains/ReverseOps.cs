@@ -7,26 +7,28 @@ using Spiceport.Grains.Abstractions;
 namespace Spiceport.Grains;
 
 /// <summary>
-/// The reverse engine ops (LookupSubjects, LookupResources, ExpandPermissionTree) served IN-PROCESS over
-/// the local silo's <see cref="IDatastore"/> projection — the same pattern <see cref="Spiceport.Api.AuthzedWatchV1Service"/>
-/// uses deliberately for Watch (see its remarks). Every read these ops perform is served from the per-silo
-/// <c>SiloProjection</c> (local memory), so an Orleans grain hop bought only compute placement, not a
-/// consistency or caching benefit — unlike <see cref="CheckGrain"/>, <see cref="ISubjectFrontierGrain"/>,
-/// and <see cref="IMembershipWalkGrain"/>, which memoize state across calls and so stay real grains, called
-/// from these in-process walks exactly as they were called from the retired stream grains.
+/// The reverse engine ops (LookupSubjects, LookupResources, ExpandPermissionTree) served IN-PROCESS —
+/// the same pattern <see cref="Spiceport.Api.AuthzedWatchV1Service"/> uses deliberately for Watch (see
+/// its remarks). These ops are pure per-request walks with nothing to memoize, so an Orleans grain hop
+/// would buy only compute placement, not a consistency or caching benefit — unlike
+/// <see cref="CheckGrain"/>, <see cref="ISubjectFrontierGrain"/>, and <see cref="IMembershipWalkGrain"/>,
+/// which memoize state across calls and so stay real grains, called from these in-process walks exactly
+/// as they were called from the retired stream grains.
 /// </summary>
 /// <remarks>
 /// The pinning / index-acquisition / caveat-collapse logic is the same as before the retired grains: see
-/// <see cref="ReverseOpsSupport"/> for the shared PinReader / AcquireCoveredCandidates / TryCollapse helpers.
-/// The reader handed to each ENGINE comes from the <see cref="IGraphReaderSource"/> seam (projection or
-/// shard mesh, per <see cref="GraphReaderOptions"/>) at the pinned revision; everything else about
-/// PinReader — token mint, schema resolution, cursor handling — keeps the pinned <c>IDatastoreReader</c>.
-/// Since this is no longer grain code, the streaming ops take the caller's plain <see cref="CancellationToken"/>
-/// with no Orleans grain-method plumbing — simpler than the retired grain's per-stream-activation scheme,
-/// with identical per-item cancellation behavior.
+/// <see cref="ReverseOpsSupport"/> for the shared PinRevision / AcquireCoveredCandidates / TryCollapse helpers.
+/// The reader handed to each ENGINE comes from the <see cref="IGraphReaderSource"/> seam (the shard
+/// mesh) at the pinned revision; schema resolution goes
+/// through the <see cref="ISchemaSource"/> seam (a sequencer read once per hash per silo, cached by
+/// <see cref="SchemaResolver"/>); <see cref="IDatastore"/> remains only for revision resolution and
+/// token minting (PinRevision). Since this is no longer grain code, the streaming ops take the caller's
+/// plain <see cref="CancellationToken"/> with no Orleans grain-method plumbing — simpler than the
+/// retired grain's per-stream-activation scheme, with identical per-item cancellation behavior.
 /// </remarks>
 public sealed class ReverseOps(
     IDatastore datastore,
+    ISchemaSource schemaSource,
     ISchemaProvider schemaProvider,
     SchemaResolver schemaResolver,
     IGrainFactory grainFactory,
@@ -40,23 +42,23 @@ public sealed class ReverseOps(
     /// Resolves the compiled schema effective at the pinned revision (the same schema the confirming Check
     /// mesh evaluates under), rather than the possibly-stale ambient current schema on a non-writer silo.
     /// </summary>
-    private Task<SchemaSnapshot> ResolveSchema(string? schemaHash, IDatastoreReader reader, CancellationToken ct) =>
-        schemaResolver.ResolveAsync(schemaHash, reader, schemaProvider.Current, ct);
+    private Task<SchemaSnapshot> ResolveSchema(string? schemaHash, IRevision revision, CancellationToken ct) =>
+        schemaResolver.ResolveAsync(schemaHash, schemaSource, revision, schemaProvider.Current, ct);
 
     /// <summary>Expands the resource's permission into a structural permission tree.</summary>
     public async Task<ExpandTreeReply> ExpandPermissionTree(ExpandTreeArgs args)
     {
         ArgumentNullException.ThrowIfNull(args);
-        var (reader, now, token, revision, schemaHash) = await ReverseOpsSupport
-            .PinReader(datastore, args.Consistency, CancellationToken.None);
+        var (now, token, revision, schemaHash) = await ReverseOpsSupport
+            .PinRevision(datastore, args.Consistency, CancellationToken.None);
 
-        var schema = await ResolveSchema(schemaHash, reader, CancellationToken.None);
+        var schema = await ResolveSchema(schemaHash, revision, CancellationToken.None);
         var engine = new ExpandEngine(schema.Namespaces);
         var mode = args.Mode == ExpandModeWire.Recursive ? ExpandMode.Recursive : ExpandMode.Shallow;
         var resource = new ObjectAndRelation(args.ResourceType, args.ResourceId, args.Permission);
 
-        // The engine walk reads through the IGraphReaderSource seam at the same pinned revision; the
-        // pinned IDatastoreReader above keeps token minting and schema resolution — see IGraphReaderSource.
+        // The engine walk reads through the IGraphReaderSource seam at the same pinned revision; token
+        // minting stays on PinRevision and schema resolution on the ISchemaSource seam.
         var tree = await engine.ExpandPermissionTree(
             readerSource.GraphReaderAt(revision), resource, mode, now, CancellationToken.None);
 
@@ -116,10 +118,10 @@ public sealed class ReverseOps(
     {
         ArgumentNullException.ThrowIfNull(args);
         cancellationToken.ThrowIfCancellationRequested();
-        var (reader, now, token, revision, schemaHash) = await ReverseOpsSupport
-            .PinReader(datastore, args.Consistency, cancellationToken);
+        var (now, token, revision, schemaHash) = await ReverseOpsSupport
+            .PinRevision(datastore, args.Consistency, cancellationToken);
 
-        var schema = await ResolveSchema(schemaHash, reader, cancellationToken);
+        var schema = await ResolveSchema(schemaHash, revision, cancellationToken);
         var evaluator = new CaveatEvaluator(schema.Caveats);
         var resource = new ObjectAndRelation(args.ResourceType, args.ResourceId, args.Permission);
         var after = ReverseOpsCursorCodec.DecodeSubjectId(args.Cursor);
@@ -201,15 +203,15 @@ public sealed class ReverseOps(
     {
         ArgumentNullException.ThrowIfNull(args);
         cancellationToken.ThrowIfCancellationRequested();
-        var (reader, now, token, revision, schemaHash) = await ReverseOpsSupport
-            .PinReader(datastore, args.Consistency, cancellationToken);
+        var (now, token, revision, schemaHash) = await ReverseOpsSupport
+            .PinRevision(datastore, args.Consistency, cancellationToken);
 
         // Resolve the schema effective at the pinned revision (the same schema the confirming Check mesh
         // evaluates under), so the candidate superset and the verdicts that confirm it are schema-consistent
         // and cluster-consistent — never the possibly-stale ambient current schema on a non-writer silo. The
         // snapshot is captured once so the engine's namespaces/caveats and its pre-built reachability graph
         // all come from the same schema, even if a concurrent write swaps the ambient current mid-call.
-        var snapshot = await ResolveSchema(schemaHash, reader, cancellationToken);
+        var snapshot = await ResolveSchema(schemaHash, revision, cancellationToken);
         var engine = new LookupResourcesEngine(snapshot.Namespaces, snapshot.Caveats, snapshot.ReachabilityFirst);
         var startCursor = ReverseOpsCursorCodec.DecodeResources(args.Cursor);
 
@@ -228,7 +230,8 @@ public sealed class ReverseOps(
             revision, hasCursorOrLimit: args.Cursor is not null || limit is not null, cancellationToken);
 
         // The engine traversal reads through the IGraphReaderSource seam at the same pinned revision;
-        // the pinned IDatastoreReader above keeps token minting, schema resolution and cursor handling.
+        // token minting stays on PinRevision, schema resolution on the ISchemaSource seam, and cursor
+        // handling on the codec above.
         await foreach (var found in engine.LookupResources(
                 readerSource.GraphReaderAt(revision), args.SubjectType, args.SubjectId, args.SubjectRelation,
                 args.ResourceType, args.Permission, candidates, args.Context, now, startCursor, limit, cancellationToken)

@@ -9,7 +9,7 @@ namespace Spiceport.Grains;
 /// <see cref="DatastoreState"/>, reusing the existing per-revision diff logic
 /// (<c>DatastoreState.ChangesAt</c> / <c>SchemaChangedAt</c>) so the event-log feed is byte-equivalent to
 /// the Watch changefeed. This is the single definition of "what changed at revision R"; Watch and the
-/// per-silo projection both consume the resulting events.
+/// graph shard grains' log-tail folds both consume the resulting events.
 /// </summary>
 internal static class LogEventFactory
 {

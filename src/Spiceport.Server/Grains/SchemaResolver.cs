@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Text;
+using Spiceport.Core;
 using Spiceport.Datastore;
 using Spiceport.Schema;
 
@@ -33,8 +34,7 @@ public sealed class SchemaResolver
     /// <summary>
     /// Resolves the compiled schema named by <paramref name="schemaHash"/> at the revision
     /// <paramref name="reader"/> is pinned to: a cache hit is a pure lookup; a miss reads the schema bytes
-    /// persisted at the revision (via <paramref name="reader"/>, whose per-silo projection is gated to that
-    /// revision) and compiles-and-caches them. Returns <paramref name="fallback"/> when the revision pins no
+    /// persisted at the revision (via <paramref name="reader"/>) and compiles-and-caches them. Returns <paramref name="fallback"/> when the revision pins no
     /// schema hash, or holds no persisted schema (the seed-only window) — the seed is the identical embedded
     /// constant on every silo, so the fallback does not diverge across the cluster.
     /// </summary>
@@ -50,8 +50,45 @@ public sealed class SchemaResolver
             return cached;
 
         var bytes = await reader.ReadStoredSchema(ct).ConfigureAwait(false);
-        return bytes is null ? fallback : GetOrCompile(schemaHash, bytes);
+        return bytes is null ? fallback : CompileFetched(bytes);
     }
+
+    /// <summary>
+    /// Resolves the compiled schema named by <paramref name="schemaHash"/> at the pinned
+    /// <paramref name="revision"/> through the <see cref="ISchemaSource"/> seam: a cache hit is a pure
+    /// lookup; a miss reads the schema bytes persisted at the revision straight from the sequencer's fold
+    /// (so the hop happens once per hash per silo) and compiles-and-caches them. Returns
+    /// <paramref name="fallback"/> when the revision pins no schema hash, or holds no persisted schema
+    /// (the seed-only window) — the seed is the identical embedded constant on every silo, so the fallback
+    /// does not diverge across the cluster.
+    /// </summary>
+    public async Task<SchemaSnapshot> ResolveAsync(
+        string? schemaHash, ISchemaSource source, IRevision revision, SchemaSnapshot fallback, CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(source);
+        ArgumentNullException.ThrowIfNull(revision);
+        ArgumentNullException.ThrowIfNull(fallback);
+
+        if (string.IsNullOrEmpty(schemaHash))
+            return fallback;
+        if (_byHash.TryGetValue(schemaHash, out var cached))
+            return cached;
+
+        var bytes = await source.ReadSchemaAt(revision, ct).ConfigureAwait(false);
+        return bytes is null ? fallback : CompileFetched(bytes);
+    }
+
+    /// <summary>
+    /// Compiles-and-caches bytes fetched on a cache miss under their ACTUAL computed hash — never under
+    /// the requested hash. A token can pair a fresh revision with a stale silo-local hash; caching the
+    /// fetched bytes under that mismatched requested hash would poison the cache PERMANENTLY (every later
+    /// lookup of the stale hash would serve the wrong compiled schema, and the fresh hash would never get
+    /// an entry). Returning the compiled schema-at-revision regardless of the requested label is the
+    /// correct MVCC behavior: evaluation is a pure function of schema@rev, and the requested hash was
+    /// only a (possibly stale) label for it.
+    /// </summary>
+    private SchemaSnapshot CompileFetched(byte[] bytes) =>
+        GetOrCompile(StoredSchemaHash.Compute(bytes), bytes);
 
     /// <summary>
     /// Returns the compiled snapshot for <paramref name="schemaHash"/>, compiling <paramref name="schemaBytes"/>

@@ -19,9 +19,6 @@ builder.UseOrleans(silo =>
     // The event-sourced datastore grain owns its persistence via ICustomStorageInterface over the
     // "datastore" grain-storage provider above.
     silo.AddCustomStorageBasedLogConsistencyProvider("CustomStorage");
-    // The per-silo SiloProjection + LogWatchHub pair, silo-lifecycle-managed: bootstraps before this silo
-    // accepts traffic and tears its hub down cleanly on shutdown (see docs/future-work.md §1.8).
-    silo.AddDatastoreProjectionService();
     // Backs the datastore grain's periodic MVCC-GC reminder ("mvcc-gc"). In-memory is fine even for a
     // durable deployment: losing a reminder registration is safe because the singleton grain re-registers
     // it on every activation (see DatastoreGrain.OnActivateAsync) — a production cluster that wants the
@@ -33,14 +30,15 @@ builder.UseOrleans(silo =>
 // Schema + dispatch mesh (Caching over Orleans) + check-engine singletons.
 builder.Services.AddSpiceportGrainServices(SiloSchema.SchemaText);
 
-// The datastore delegates to the cluster-singleton datastore grain. Reads serve from the per-silo
-// materialized projection (folded incrementally from the event log) instead of a per-Check full fetch.
-// Pass the SAME DatastoreGcOptions the datastore grain is configured with (if any is registered), so this
-// datastore's nominal GC window never drifts from the grain's real GcFloor policy.
+// The datastore facade delegates to the cluster-singleton datastore grain (engine graph reads go
+// through the IGraphShardGrain mesh, not this facade). The Watch hub is the DI singleton
+// AddSpiceportGrainServices registered; the container disposes it on shutdown. Pass the SAME
+// DatastoreGcOptions the datastore grain is configured with (if any is registered), so this datastore's
+// nominal GC window never drifts from the grain's real GcFloor policy.
 builder.Services.AddSingleton<IDatastore>(sp =>
     new GrainBackedDatastore(
         sp.GetRequiredService<IGrainFactory>(),
-        sp.GetRequiredService<IDatastoreProjectionHost>(),
+        sp.GetRequiredService<LogWatchHub>(),
         gcOptions: sp.GetService<IOptions<DatastoreGcOptions>>()));
 
 var host = builder.Build();

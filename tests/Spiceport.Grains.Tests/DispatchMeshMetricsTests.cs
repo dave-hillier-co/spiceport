@@ -93,8 +93,9 @@ public class DispatchMeshMetricsTests
             "group", "g0", "member", new ObjectAndRelation("user", "u", CoreConstants.Ellipsis), null);
         Assert.Equal(Membership.Member, result.Verdict);
 
-        // With no custom placement director, Orleans' own placement + the grain directory decide where
-        // each of the chain's many distinct grain keys activates. Anti-hollow: on a real 3-silo cluster
+        // With shard co-location OFF (the default), the graph grains' placement director is a uniform
+        // random pick, so Orleans' placement + the grain directory decide where each of the chain's many
+        // distinct grain keys activates. Anti-hollow: on a real 3-silo cluster
         // that routing must genuinely land activations on more than one silo's own process, not collapse
         // the whole chain onto a single silo.
         var perSiloDispatches = cluster.AllSiloServices

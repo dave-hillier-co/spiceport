@@ -16,6 +16,8 @@ using WireRelationship = Spiceport.Grains.Abstractions.RelationshipWire;
 using WireUpdate = Spiceport.Grains.Abstractions.RelationshipUpdateWire;
 using WireOp = Spiceport.Grains.Abstractions.RelationshipUpdateOpWire;
 using WireWriteArgs = Spiceport.Grains.Abstractions.WriteRelationshipsArgs;
+using Microsoft.Extensions.Configuration;
+using Spiceport.Server.Hosting;
 
 namespace Spiceport.Grains.Tests;
 
@@ -141,8 +143,8 @@ public class WatchGrpcServiceTests
         var schemaProvider = services.GetRequiredService<ISchemaProvider>();
         var grain = gf.GetGrain<IDatastoreGrain>(IDatastoreGrain.Key);
 
-        await using var host = new PrivateProjectionHost(gf);
-        IDatastore datastore = new GrainBackedDatastore(gf, host, gcOptions: gcOptions);
+        await using var hub = IsolatedWatchHub.Create(gf);
+        IDatastore datastore = new GrainBackedDatastore(gf, hub, gcOptions: gcOptions);
         var service = new WatchGrpcService(datastore, schemaProvider);
 
         // Capture a cursor, then write past it and collect everything at/below that cursor via GC (Window
@@ -179,7 +181,11 @@ public class WatchGrpcServiceTests
     {
         public void Configure(ISiloBuilder b)
         {
-            b.AddMemoryGrainStorage("datastore");
+            // The PRODUCTION "datastore" registration (in-memory branch): forces the binary grain-storage
+            // serializer. The provider's Newtonsoft-JSON default cannot round-trip the meta state's
+            // ImmutableDictionary key index (and silently corrupts boxed-JsonElement caveat context) —
+            // see AddDatastoreGrainStorage.
+            b.AddDatastoreGrainStorage(new ConfigurationBuilder().Build());
             b.AddCustomStorageBasedLogConsistencyProvider("CustomStorage");
             b.ConfigureServices(services =>
             {

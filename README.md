@@ -45,8 +45,8 @@ The full design rationale is in [`docs/architecture-analysis.md`](docs/architect
   at-exact-snapshot semantics (read-your-writes).
 - **Write safety**: preconditions (must-match / must-not-match) and schema-change validation.
 - **Storage**: the datastore is an **event-sourced cluster-singleton Orleans grain** — an
-  append-only log of changes is the source of truth, each silo reads from a projection folded from
-  that log, and the same feed drives Watch. Durable via Orleans grain storage (in-memory for dev,
+  append-only log of changes is the source of truth, engine reads go through per-key graph-shard
+  grains folded from that log, and the same feed drives Watch. Durable via Orleans grain storage (in-memory for dev,
   **PostgreSQL** via AdoNet) with no application SQL schema. SpiceDB's consistency conformance
   corpus passes against both the reference datastore oracle and the grain mesh.
 - **Relationship counters** (ExperimentalService): register/unregister a named counter over a
@@ -66,7 +66,7 @@ src/
                               Schema/  schema DSL compiler (lexer -> parser -> compiler) + reachability graph
                               Engine/  Check/Expand/Lookup engine + the IDispatcher seam + caching dispatcher
                               Grains/  dispatch mesh, placement, schema/relationships, the event-sourced
-                                       datastore grain + per-silo projection, Watch, Leopard index
+                                       datastore grain + graph-shard grains, Watch, Leopard index
                               Grains.Abstractions/  grain interfaces + serializable DTOs
   Spiceport.Silo              standalone Orleans silo host
   Spiceport.Api               co-hosted silo + ASP.NET Core gRPC (authzed.api.v1 + internal)
@@ -110,8 +110,8 @@ gRPC requires the HTTP/2 (https) endpoint.
 The whole datastore (relationships, schema, counters) lives behind a single cluster-singleton Orleans
 grain. It is **event-sourced**: an append-only log of changes is the source of truth and the
 materialized state is the fold, so a write is a cheap version-checked append rather than a whole-state
-rewrite, the log offset is the global revision, and each silo reads from a projection folded from the
-log (no per-Check full fetch). By default the grain uses in-memory grain storage, so the localhost dev
+rewrite, the log offset is the global revision, and engine reads go through per-key graph-shard
+grains folded from the log (no per-Check full fetch). By default the grain uses in-memory grain storage, so the localhost dev
 host needs no external dependency but the state is lost on restart. To make it durable, point the silo
 at a Postgres database via the `ConnectionStrings:OrleansStorage` configuration key (env form
 `ConnectionStrings__OrleansStorage`, fallback key `Storage:ConnectionString`):

@@ -10,18 +10,21 @@ namespace Spiceport.Grains;
 /// An <see cref="IDatastore"/> that delegates all state to the cluster-singleton
 /// <see cref="IDatastoreGrain"/> (the single source of truth) and reuses the in-memory MVCC mechanics
 /// (<see cref="MvccReadWriteTransaction"/>, <see cref="MvccSnapshotReader"/>, the
-/// <c>DatastoreState</c> fold) by converting the grain wire state to/from the in-memory state. Reads
-/// serve from the per-silo <see cref="SiloProjection"/> (incremental log-tail fold), gated by the
-/// closed-timestamp watermark so pinned reads are never stale. Writes use an optimistic
+/// <c>DatastoreState</c> fold) by converting the grain wire state to/from the in-memory state. Snapshot
+/// reads fetch the sequencer's materialized state (<see cref="IDatastoreGrain.ReadState"/>) once per
+/// reader; the engines' per-Check graph reads do NOT come through here — they go through the
+/// <see cref="IGraphReaderSource"/> shard mesh (<see cref="ShardedGraphReader"/>). What remains on this
+/// facade is revision resolution (head/optimized/check), token minting, Watch, and the compatibility
+/// write path (<see cref="ReadWriteTx"/>) that tests/BulkImport/SeedData drive. Writes use an optimistic
 /// compare-and-swap retry loop. This is a DI service, not a grain, so <c>ConfigureAwait(false)</c> is
 /// correct here.
 /// </summary>
 /// <remarks>
-/// This instance never owns the shared <see cref="SiloProjection"/>/<see cref="LogWatchHub"/> pair it
-/// reads and pulses through <paramref name="projectionHost"/> (see the constructor); their lifecycle is
-/// entirely the host contract's responsibility (<see cref="IDatastoreProjectionHost"/>) — production's
-/// silo-lifecycle-managed <see cref="DatastoreProjectionService"/>, or a test fixture's own host. This
-/// type therefore has nothing of its own to dispose.
+/// This instance never owns the per-silo <see cref="LogWatchHub"/> it pulses and parks Watch streams on;
+/// the hub is a DI singleton (registered by
+/// <see cref="ServiceCollectionExtensions.AddSpiceportGrainServices"/>) whose lifetime belongs to the
+/// container, which disposes it (<see cref="LogWatchHub.DisposeAsync"/>) on silo teardown. This type
+/// therefore has nothing of its own to dispose.
 /// </remarks>
 public sealed class GrainBackedDatastore : IDatastore
 {
@@ -42,14 +45,9 @@ public sealed class GrainBackedDatastore : IDatastore
     private readonly long _quantizationNanos;
     private readonly long _gcWindowNanos;
 
-    // Per-silo materialized read projection (see IDatastoreProjectionHost.Projection): reads serve from the
-    // incrementally-folded local projection (one ReadState bootstrap + log-tail catch-up), never a per-Check
-    // full-state fetch. Shared with every other GrainBackedDatastore on this silo — the host owns it.
-    private readonly SiloProjection _projection;
-
-    // Per-silo Watch notifier (see IDatastoreProjectionHost.Hub). The local write path pulses it on commit
-    // for instant same-silo Watch latency; cross-silo commits arrive by observer push from the datastore
-    // grain, with the hub's slow heartbeat as the missed-push backstop. The host owns its lifecycle.
+    // Per-silo Watch notifier. The local write path pulses it on commit for instant same-silo Watch
+    // latency; cross-silo commits arrive by observer push from the datastore grain, with the hub's slow
+    // heartbeat as the missed-push backstop. The DI container owns its lifecycle (see the class remarks).
     private readonly LogWatchHub _hub;
 
     // Cached optimized-revision candidate (mirrors ReferenceDatastore's CachedOptimizedRevisions): a real
@@ -64,18 +62,20 @@ public sealed class GrainBackedDatastore : IDatastore
     private RevisionWithSchemaHash? _optimizedCache;
     private long _optimizedValidThroughNanos;
 
+    // The freshest committed head THIS instance has observed (its own successful commits). A stale
+    // duplicate activation of the sequencer during membership churn can serve a ReadState below it,
+    // and a write base folded from such a state would violate read-your-writes (the lambda would stage
+    // against a snapshot missing this instance's own committed writes). The base fetch gates on it via
+    // SequencerStateFetch — the closed-timestamp gate, formerly the projection watermark wait.
+    private long _observedCommittedHead;
+
     /// <summary>
-    /// Creates a grain-backed datastore. Reads and Watch use the per-silo SHARED <see cref="SiloProjection"/>/
-    /// <see cref="LogWatchHub"/> owned by <paramref name="projectionHost"/> — in production, the same
-    /// instances the silo-lifecycle-managed <see cref="DatastoreProjectionService"/> bootstraps before the
-    /// silo accepts traffic and disposes on silo shutdown; in tests, a fixture-owned host (e.g.
-    /// <c>PrivateProjectionHost</c> in <c>Spiceport.Grains.Tests</c>) when a genuinely isolated hub is needed
-    /// (e.g. proving PUSH-driven Watch is real — see <c>Stage3WatchPushMeshTests</c> — rather than a shared
-    /// in-process shortcut). This <see cref="GrainBackedDatastore"/> instance never owns the projection/hub
-    /// lifetime; see the class remarks.
+    /// Creates a grain-backed datastore over the cluster-singleton datastore grain, sharing the per-silo
+    /// <paramref name="hub"/> for Watch wake-ups. This instance never owns the hub's lifetime; see the
+    /// class remarks.
     /// </summary>
     /// <param name="grainFactory">The Orleans grain factory used to reach the singleton datastore grain.</param>
-    /// <param name="projectionHost">The shared projection/hub pair (see <see cref="IDatastoreProjectionHost"/>).</param>
+    /// <param name="hub">The per-silo Watch notifier (a DI singleton the container disposes).</param>
     /// <param name="quantization">Quantization window for <see cref="OptimizedRevision"/> (default 5s).</param>
     /// <param name="gcWindow">
     /// How long old revisions remain valid. Takes priority over <paramref name="gcOptions"/> when supplied
@@ -96,15 +96,15 @@ public sealed class GrainBackedDatastore : IDatastore
     /// pattern.
     /// </param>
     public GrainBackedDatastore(
-        IGrainFactory grainFactory, IDatastoreProjectionHost projectionHost, TimeSpan? quantization = null,
+        IGrainFactory grainFactory, LogWatchHub hub, TimeSpan? quantization = null,
         TimeSpan? gcWindow = null, IOptions<DatastoreGcOptions>? gcOptions = null)
     {
-        ArgumentNullException.ThrowIfNull(projectionHost);
+        ArgumentNullException.ThrowIfNull(grainFactory);
+        ArgumentNullException.ThrowIfNull(hub);
         _grainFactory = grainFactory;
         _quantizationNanos = ComputeQuantizationNanos(quantization);
         _gcWindowNanos = ComputeGcWindowNanos(gcWindow, gcOptions);
-        _projection = projectionHost.Projection;
-        _hub = projectionHost.Hub;
+        _hub = hub;
     }
 
     private static long ComputeQuantizationNanos(TimeSpan? quantization) =>
@@ -122,21 +122,29 @@ public sealed class GrainBackedDatastore : IDatastore
     {
         var rev = ToNanos(revision);
         // The (async) state acquisition defers to the first read; every subsequent query is served
-        // in-process via one MvccSnapshotReader. The projection catches up on demand (and blocks
-        // until watermark >= rev, the closed-timestamp gate).
+        // in-process via one MvccSnapshotReader over the sequencer's materialized state
+        // (IDatastoreGrain.ReadState — a full-state fetch, deliberately: this reader serves snapshot-wide
+        // reads such as the fold-equivalence oracle and BulkExport, never the per-Check hot path, which
+        // goes through the IGraphShardGrain mesh). The state is at the grain's confirmed head, which is
+        // at or past any resolvable pinned revision (revisions are minted by the grain and confirmed
+        // before their token exists), and MVCC row visibility (IsVisibleAt) makes the head state exact
+        // for any retained pinned revision.
         //
-        // The GC-floor rejection (MvccSnapshotReader's guard) is enforced from the projection's OWN folded
-        // floor — deliberately LOCAL, never probed from the singleton (a per-reader GetHead would put a
-        // cluster-wide hop back on the very read path the projection exists to keep singleton-free). A GC
-        // event is itself a log entry, so a projection whose watermark sits between a pinned revision and a
-        // LATER GC event serves that reader instead of rejecting it — and that is safe by construction: a
-        // state that has not folded the GC event still RETAINS every row live at the pinned revision (the
-        // data served is MVCC-correct; only the stale-zookie ERROR is deferred), while any state that has
-        // collected those rows necessarily carries the advanced floor and throws. Floor enforcement is
-        // therefore bounded-lag (it lands when the GC event is folded, at the latest on the next catch-up
-        // past it) against a retention boundary measured in hours — never a wrong-data window.
+        // GC-floor rejection (MvccSnapshotReader's ctor guard) is enforced from the FETCHED state's own
+        // floor. Unlike the retired per-silo projection (whose locally-folded floor could lag the
+        // singleton by a bounded catch-up window), the fetched state always carries the sequencer's
+        // current floor, so a below-floor pin is rejected on the reader's first query.
+        //
+        // Closed-timestamp gate on the fetch itself: a stale duplicate activation during membership
+        // churn can serve an old head, and a reader pinned at R must never be built over state whose
+        // head < R (rows committed at or below R could be silently missing). SequencerStateFetch
+        // refetches until the head covers the pin — the successor of the retired projection's
+        // watermark wait.
         return new DeferredReader(async ct =>
-            new MvccSnapshotReader(await _projection.StateAtLeast(rev, ct).ConfigureAwait(false), rev, _ => true));
+            new MvccSnapshotReader(
+                DatastoreStateConverters.ToMemory(
+                    await SequencerStateFetch.StateCovering(Grain, rev, ct).ConfigureAwait(false)),
+                rev, _ => true));
     }
 
     public async Task<RevisionWithSchemaHash> HeadRevision(CancellationToken cancellationToken = default)
@@ -182,25 +190,26 @@ public sealed class GrainBackedDatastore : IDatastore
     {
         ArgumentNullException.ThrowIfNull(transaction);
 
+        // COMPATIBILITY PATH — honest cost note: each attempt fetches the sequencer's FULL materialized
+        // state (ReadState) as its write base. That is acceptable because production writes are
+        // declarative through IDatastoreGrain.Commit (preconditions/updates/deleteByFilter evaluated at
+        // the sequencer); this lambda-shaped path survives only for tests, BulkImport and SeedData, where
+        // per-write cost is not a scaling concern. The grain's CAS append remains the sole serialization
+        // point.
         for (var attempt = 0; ; attempt++)
         {
-            // 1. Sample a light head probe (no state blob), then take the write base from the per-silo
-            //    SiloProjection rather than a grain ReadState — the projection already holds the same
-            //    memory-form DatastoreState locally (see SiloProjection._memoryState), so this makes the
-            //    write path free of full-state transfers; ReadState is now used only for the projection's
-            //    one-time bootstrap (see SiloProjection.Bootstrap). GetHead reads the grain's confirmed fold
-            //    (State.Value, post-C6) and is at worst one commit behind an in-flight write; that is fine —
-            //    the CAS below is still the sole serialization point, so a stale sample just loses the CAS it
-            //    would have lost anyway and retries with a fresher one. StateAtLeast blocks (closed-timestamp
-            //    gate) until the local projection watermark covers the sampled head, then returns its
-            //    snapshot; the projection may already be AHEAD (another commit folded in the meantime), which
-            //    is fine and even fresher — so expectedHead is taken from baseState.HeadRevision (NOT the
-            //    sampled head) to keep the CAS and the diff base exactly in agreement. Read-your-writes across
-            //    successive calls on this same instance holds because AppendCommit only returns after the
-            //    grain has confirmed the new head (see DatastoreGrain), so the next attempt's GetHead observes
-            //    it.
-            var head = (await Grain.GetHead().ConfigureAwait(false)).Head;
-            var baseState = await _projection.StateAtLeast(head, cancellationToken).ConfigureAwait(false);
+            // 1. Fetch the write base. ReadState returns the grain's confirmed fold, so its HeadRevision
+            //    is the freshest committed head this attempt can observe; taking expectedHead from the
+            //    SAME state keeps the CAS and the diff base exactly in agreement. Read-your-writes across
+            //    successive calls on this same instance holds because the grain's Commit only returns
+            //    after it has confirmed the new head (see DatastoreGrain), so the next attempt's
+            //    ReadState observes it. The fetch is gated on the freshest head this instance has itself
+            //    committed (see _observedCommittedHead): a stale duplicate activation during membership
+            //    churn must not hand us a base missing our own writes.
+            var baseState = DatastoreStateConverters.ToMemory(
+                await SequencerStateFetch
+                    .StateCovering(Grain, Volatile.Read(ref _observedCommittedHead), cancellationToken)
+                    .ConfigureAwait(false));
             var expectedHead = baseState.HeadRevision;
 
             // 2. Mint a provisional revision monotonically over the observed head (mirrors ReferenceDatastore).
@@ -216,21 +225,33 @@ public sealed class GrainBackedDatastore : IDatastore
             var tx = new MvccReadWriteTransaction(baseState, newRevision);
             await transaction(tx).ConfigureAwait(false);
 
-            // 4. Derive the proposed change from the committed state: the net relationship/schema/counter
+            // 4. Derive the declarative commit from the committed state: the net relationship/schema/counter
             //    diff at this revision (reusing the single per-revision diff definition). The grain re-mints
-            //    the revision and stamps it, so the proposal carries no final revision.
+            //    the revision and stamps it, so the request carries no final revision.
             var committed = tx.Commit();
-            var proposal = ProposalFromCommit(committed, newRevision);
+            var request = CommitFromState(committed, newRevision, expectedHead);
 
-            // 5. Append into the grain: applies only if the grain head still equals expectedHead. Returns the
-            //    AUTHORITATIVE revision the grain minted, or null if the head moved.
-            var minted = await Grain.AppendCommit(expectedHead, proposal).ConfigureAwait(false);
-            if (minted is { } revision)
+            // 5. Submit to the sequencer's Commit with the compatibility CAS (ExpectedHead): applies only if
+            //    the grain head still equals expectedHead. No preconditions ride along — the lambda already
+            //    evaluated its own reads client-side against this exact base, and the ExpectedHead compare
+            //    keeps them race-free. Returns the AUTHORITATIVE revision the grain minted.
+            var reply = await Grain.Commit(request).ConfigureAwait(false);
+            if (reply.Revision is { } revision)
             {
+                // Record our own committed head so the next call's base fetch cannot be served below it
+                // (read-your-writes across calls on this instance). Monotonic max under contention.
+                InterlockedMax(ref _observedCommittedHead, revision);
                 // Wake any local Watch stream immediately (same-silo commits skip the poll latency).
-                _hub?.Pulse(revision);
+                _hub.Pulse(revision);
                 return new TimestampRevision(revision);
             }
+
+            // Anything other than a lost CAS is unexpected on this path: the lambda staged every guarded
+            // operation client-side against the very base the ExpectedHead pins, so the grain's re-execution
+            // can only reach the same outcome. Surface it loudly rather than retry.
+            if (reply.Failure is { Kind: not CommitFailureKind.HeadMoved } failure)
+                throw new InvalidOperationException(
+                    $"unexpected commit failure on the compatibility write path: {failure.Kind}: {failure.Detail}");
 
             // 6. Head moved under us. Reload and re-run the WHOLE lambda (so preconditions and validation
             //    re-evaluate against the new base — race-free). Bounded retries; on exhaustion surface the
@@ -315,8 +336,8 @@ public sealed class GrainBackedDatastore : IDatastore
         Task.FromResult<IRevisionParser>(new TimestampRevisionParser(UniqueId));
 
     /// <summary>
-    /// A no-op: this instance owns no lifetime of its own (see the class remarks) — the shared projection/hub
-    /// belongs entirely to the <see cref="IDatastoreProjectionHost"/> it was constructed with.
+    /// A no-op: this instance owns no lifetime of its own (see the class remarks) — the shared hub belongs
+    /// entirely to the DI container it was registered in.
     /// </summary>
     public Task Close() => Task.CompletedTask;
 
@@ -345,17 +366,25 @@ public sealed class GrainBackedDatastore : IDatastore
     }
 
     /// <summary>
-    /// Builds the <see cref="ProposedWrite"/> for a committed transaction by reusing the single per-revision
-    /// diff (<see cref="LogEventFactory.EventFromState"/>) over the committed state: the resolved
-    /// relationship Touch/Delete changes, the schema bytes written at this revision (if any), and the
-    /// counter deltas. The grain re-mints the authoritative revision, so the proposal carries no revision —
-    /// only the net diff. This is the inverse of the grain's <c>ApplyEvent</c> fold, keeping the write path
-    /// and the fold provably equal.
+    /// Builds the compatibility-path <see cref="CommitRequest"/> for a committed transaction by reusing the
+    /// single per-revision diff (<see cref="LogEventFactory.EventFromState"/>) over the committed state: the
+    /// resolved relationship Touch/Delete changes, the schema bytes written at this revision (if any), and
+    /// the counter deltas — with <paramref name="expectedHead"/> as the CAS and no preconditions (the
+    /// lambda already evaluated its own reads against this base). The grain re-mints the authoritative
+    /// revision, so the request carries no revision — only the net diff. This is the inverse of the grain's
+    /// <c>ApplyEvent</c> fold, keeping the write path and the fold provably equal.
     /// </summary>
-    private static ProposedWrite ProposalFromCommit(DatastoreState committed, long revision)
+    private static CommitRequest CommitFromState(DatastoreState committed, long revision, long expectedHead)
     {
         var ev = LogEventFactory.EventFromState(committed, revision);
-        return new ProposedWrite(ev.RelationshipChanges, ev.SchemaChange?.Bytes, ev.CounterChanges);
+        return new CommitRequest(
+            Array.Empty<CommitPreconditionWire>(),
+            ev.RelationshipChanges,
+            DeleteByFilter: null,
+            ev.SchemaChange?.Bytes,
+            ExpectedSchemaHash: null,
+            ev.CounterChanges,
+            expectedHead);
     }
 
     private static long ToNanos(IRevision revision) => revision switch
@@ -366,15 +395,28 @@ public sealed class GrainBackedDatastore : IDatastore
 
     private static long NowNanos() => (DateTimeOffset.UtcNow - DateTimeOffset.UnixEpoch).Ticks * 100L;
 
+    /// <summary>Lock-free monotonic max: never lets a concurrent smaller value regress the field.</summary>
+    private static void InterlockedMax(ref long location, long value)
+    {
+        var current = Volatile.Read(ref location);
+        while (value > current)
+        {
+            var seen = Interlocked.CompareExchange(ref location, value, current);
+            if (seen == current)
+                return;
+            current = seen;
+        }
+    }
+
     /// <summary>
     /// An <see cref="IDatastoreReader"/> that acquires its inner <see cref="MvccSnapshotReader"/> ONCE,
     /// lazily on the first query (via <paramref name="acquire"/>), then serves all subsequent reads in-process.
     /// Because <see cref="IDatastore.SnapshotReader"/> is synchronous but acquiring the state is async, the
-    /// acquisition is deferred to the first (async) read. The local dispatcher pins one reader per Check and
-    /// queries it many times, so the acquisition happens exactly once per Check. The acquire delegate
-    /// catches up the per-silo projection; the MVCC fold via <c>IsVisibleAt</c> is exact for any revision
-    /// AT OR ABOVE the projection's collected floor, and <c>MvccSnapshotReader</c>'s own constructor guard
-    /// rejects (<see cref="RevisionNotFoundException"/>) a revision below it, so a permissive <c>isValid</c>
+    /// acquisition is deferred to the first (async) read. Callers pin one reader per operation and query it
+    /// many times, so the acquisition (one sequencer full-state fetch) happens exactly once per reader. The
+    /// MVCC fold via <c>IsVisibleAt</c> is exact for any revision AT OR ABOVE the fetched state's collected
+    /// floor, and <c>MvccSnapshotReader</c>'s own constructor guard rejects
+    /// (<see cref="RevisionNotFoundException"/>) a revision below it, so a permissive <c>isValid</c>
     /// delegate here is sound — the hard floor check lives in the reader itself, not this wrapper.
     /// </summary>
     private sealed class DeferredReader(Func<CancellationToken, ValueTask<MvccSnapshotReader>> acquire)

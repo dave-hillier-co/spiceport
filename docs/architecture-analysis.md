@@ -96,12 +96,13 @@ tuples) — is wrong for Zanzibar:
 
 **Conclusion: relationship storage stays in a real MVCC datastore, read at a revision. It is not
 *dispatch*-grain state.** Orleans then realizes that datastore *itself* natively, as a single
-event-sourced grain with per-silo read projections — see §3.5.
+event-sourced grain read through per-key graph-shard grains — see §3.5.
 
 Note the precise scope of the ruling: it is against *current-state entity grains*. Grains
 holding **versioned slices of the MVCC fold** — per-key shards that serve point-in-time reads
 and activate on demand — are a different mapping that none of the bullets above refute; that
-direction is analyzed in [`graph-sharded-datastore.md`](graph-sharded-datastore.md).
+is exactly the built shard shape, analyzed in
+[`graph-sharded-datastore.md`](graph-sharded-datastore.md).
 
 ### 3.2 What a grain *should* be — dispatch as virtual actors
 
@@ -203,11 +204,10 @@ know.
 - **Watch / changefeed** → a consumer of the datastore's own event log (§3.5): a per-silo
   notifier registers a grain observer on the datastore grain and fans out `RevisionChange`s to
   subscribers, rather than a separate replication tap.
-- **Per-silo components** (the read projection and the Watch notifier) → owned by an Orleans
-  **`GrainService`**, which is silo-lifecycle-managed: it bootstraps the projection *before* the
-  silo accepts traffic (so the first request never pays the bootstrap) and tears the Watch
-  observer down cleanly on shutdown. Their identity lives in a plain DI singleton so the per-Check
-  read path reaches them in-process, with no grain hop.
+- **Per-silo components** (the Watch notifier, `LogWatchHub`) → plain DI singletons owned by the
+  container, which disposes them (bounded observer unsubscribe) on silo teardown. There is
+  nothing to bootstrap pre-traffic: graph shards hydrate on first touch (§3.5), so no
+  silo-lifecycle-managed projection service exists.
 - **Fan-out concurrency** → `Task.WhenAll` over sub-problem grain calls, bounded by a semaphore
   mirroring SpiceDB's `ConcurrencyLimits`. Orleans turn-based execution is not a bottleneck: each
   distinct sub-problem is its own grain, so a fan-out spreads across activations (and silos), and
@@ -242,26 +242,34 @@ schema of its own:
   defeats Zanzibar's "new enemy" problem — the global-order point Spanner provides in the original.*
 
 - **The log is the seam between storage and compute.** Reads do not fetch the whole state per Check.
-  Each silo keeps a **materialized projection** folded incrementally from the log: it bootstraps once
-  from a snapshot, then advances by pulling only the log tail (`ReadFrom(afterRevision)`). A Check
-  reads its silo's local projection in-process — no grain hop, and no per-Check full-state fetch.
+  Engine reads resolve to **per-key `GraphShardGrain`s** — forward shards keyed by object, reverse
+  shards keyed by subject — each holding the fold *restricted to its key*, hydrated once from a
+  per-key snapshot read and thereafter advanced by pulling only the log tail
+  (`ReadFrom(afterRevision)`). Activation is the hot-set cache: cold keys never activate, and silo
+  memory is O(hot shards), not O(graph). (An earlier realization kept a whole-graph per-silo
+  projection; it is retired — the design and its staging live in
+  [`graph-sharded-datastore.md`](graph-sharded-datastore.md).) Broad scans and schema-at-revision
+  bypass the shard mesh and read the sequencer's snapshot directly.
 
-- **Closed-timestamp consistency.** The projection carries an *applied watermark* (the highest
-  revision folded). A read pinned at revision `rev` blocks until `watermark ≥ rev` (catch-up-on-demand
-  over the log) before serving. Because the log is a single total order, once the watermark reaches
-  `rev` every commit `≤ rev` is present — read-your-writes / no new enemy — and `rev ≤ head`
-  guarantees the wait terminates. This gate sits *below* the reader seam and combines with the
-  pinned-revision grain key (§3.3): a sub-problem is identified and served at exactly its pinned
-  revision, so an exact or fresh read blocks until that revision is visible and the activation memo
-  keyed to it is never derived from a stale prefix.
+- **Closed-timestamp consistency.** Each shard carries an *applied watermark* (the highest
+  revision folded — it advances on every log event, matching or not). A read pinned at revision
+  `rev` blocks until `watermark ≥ rev` (catch-up-on-demand over the log) before serving. Because
+  the log is a single total order, once the watermark reaches `rev` every commit `≤ rev` is present
+  in that shard's slice — read-your-writes / no new enemy — and `rev ≤ head` guarantees the wait
+  terminates. This gate sits *below* the reader seam and combines with the pinned-revision grain
+  key (§3.3): a sub-problem is identified and served at exactly its pinned revision, so an exact or
+  fresh read blocks until that revision is visible and the activation memo keyed to it is never
+  derived from a stale prefix.
 
 - **Single-writer ceiling is intentional.** All writes serialize through the one ordered log (the
-  global-order point). The design scales *reads* (per-silo projections) and cheapens *writes*
-  (appends, not whole-blob rewrites), but does not raise the single-writer ceiling. Sharded
-  per-namespace logs are out of scope — they would reintroduce the cross-shard global-order problem.
+  global-order point), submitted as declarative `Commit` requests the sequencer evaluates and
+  executes on its single non-reentrant activation. The design scales *reads* (on-demand shard
+  grains) and cheapens *writes* (appends, not whole-blob rewrites), but does not raise the
+  single-writer ceiling. Sharded per-namespace logs are out of scope — they would reintroduce the
+  cross-shard global-order problem.
 
 The evaluation contract is unchanged: a Check is still a pure function of `(schema@rev, tuples@rev,
-request)`. The grain never holds *dispatch* state; it holds the *log*, and the projections, Watch
+request)`. The grain never holds *dispatch* state; it holds the *log*, and the graph shards, Watch
 feed, and Leopard index below are all pure folds of that one log.
 
 **Two consumers ride the same log feed:**
@@ -312,7 +320,7 @@ These are pure CPU and must be ported faithfully; they carry the real porting ri
 - **Datastore + revision model** — the in-memory MVCC mechanics (visibility at a revision, the
   per-revision diff, ZedToken encode/decode) are a straight port and stay the reusable core: the
   same `MvccSnapshotReader` fold serves both the `ReferenceDatastore` reference model and the
-  silo projections.
+  snapshot-scan seam, and the graph-shard fold is the same fold restricted to one key.
   Durability is *not* a hand-rolled SQL datastore but the event-sourced grain's own storage (§3.5) —
   the log + snapshots persist via an Orleans grain-storage provider (AdoNet/Postgres), so there is no
   bespoke `xid8`/tuple SQL schema to maintain.
@@ -376,8 +384,9 @@ policy and concurrency limits. Exit: durable-storage tests + load test.
 Storage and consistency stay exactly as Zanzibar designed them: MVCC, revision-scoped reads —
 *not* dispatch-grain state. But Orleans realizes the datastore itself too, as a single
 **event-sourced grain** whose append-only log is the source of truth: the log offset is the global
-revision (the total order that defeats "new enemy"), commits are cheap appends, per-silo projections
-fold the log for local reads, and the same feed powers Watch and an optional Leopard index — with no
+revision (the total order that defeats "new enemy"), commits are cheap appends, per-key graph-shard
+grains fold the log for on-demand reads (silo memory is the hot set, not the graph), and the same
+feed powers Watch and an optional Leopard index — with no
 bespoke SQL datastore (durability rides Orleans grain storage). The other win from Orleans is in the
 **dispatch layer**:
 SpiceDB's recursive Check decomposes into pure, cacheable sub-problems that it routes by
@@ -390,6 +399,5 @@ runtime replace the entire `remote`/`cluster`/hashring distribution layer.
 
 Candidate directions beyond this design — further Orleans-native consolidation and deliberate
 relaxations of Google-contingent Zanzibar details — are analyzed in [`future-work.md`](future-work.md);
-the deepest of them, dissolving `IDatastore` into a thin commit sequencer plus grain-sharded
-adjacency families, has its own design document in
-[`graph-sharded-datastore.md`](graph-sharded-datastore.md).
+the deepest of them, the graph-sharded datastore, is realized (its design and the remaining
+thin-sequencer step are in [`graph-sharded-datastore.md`](graph-sharded-datastore.md)).

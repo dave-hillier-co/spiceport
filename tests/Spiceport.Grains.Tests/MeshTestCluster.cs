@@ -1,9 +1,11 @@
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Options;
 using Orleans.Hosting;
 using Orleans.TestingHost;
 using Spiceport.Datastore;
 using Spiceport.Grains;
+using Spiceport.Server.Hosting;
 
 namespace Spiceport.Grains.Tests;
 
@@ -14,7 +16,8 @@ namespace Spiceport.Grains.Tests;
 /// — schema, schema hash, the Orleans root dispatcher and the top-level <see cref="IPermissionChecker"/>),
 /// so checks run THROUGH the real grain mesh (every sub-problem is a grain call — there is no in-process
 /// local-recurse shortcut and no caller-side branch cache; the one cache is each CheckGrain activation's
-/// own reply memo).
+/// own reply memo). Engine graph reads are always served by the <c>IGraphShardGrain</c> mesh (the only
+/// read path — the per-silo whole-graph projection is gone).
 /// </summary>
 /// <remarks>
 /// One cluster is built per conformance schema because each file declares its own schema, and the silo
@@ -108,8 +111,8 @@ public sealed class MeshTestCluster : IAsyncDisposable
         bool useActivationMemo = true,
         bool useSubjectFrontierMemo = true,
         int? subjectFrontierMaxMemoSubjects = null,
-        bool useShardedGraphReader = false,
-        TimeSpan? gcWindow = null)
+        TimeSpan? gcWindow = null,
+        bool coLocateWithShards = false)
     {
         SchemaHolder.SchemaText = schemaText;
         SchemaHolder.BatchConcurrency = batchConcurrency;
@@ -119,7 +122,7 @@ public sealed class MeshTestCluster : IAsyncDisposable
         SchemaHolder.SubjectFrontierMaxMemoSubjects =
             subjectFrontierMaxMemoSubjects ?? new SubjectFrontierMemoOptions().MaxMemoSubjects;
         SchemaHolder.UseRandomPlacement = false;
-        SchemaHolder.UseShardedGraphReader = useShardedGraphReader;
+        SchemaHolder.CoLocateWithShards = coLocateWithShards;
         SchemaHolder.GcWindow = gcWindow;
 
         var builder = new TestClusterBuilder(initialSilosCount: 1);
@@ -148,7 +151,17 @@ public sealed class MeshTestCluster : IAsyncDisposable
     /// when the silos' load scores are close — it makes NO spread guarantee. A test whose ASSERTION is that
     /// activations land on multiple silos (the anti-hollow spread proof) must opt into random placement,
     /// which does guarantee spread statistically; leave false everywhere else to keep exactly the
-    /// production default.
+    /// production default. NOTE: this overrides the cluster's DEFAULT strategy only — the four graph
+    /// grain families (CheckGrain, GraphShardGrain, MembershipWalkGrain, SubjectFrontierGrain) carry a
+    /// class-specific <see cref="GraphLocalityPlacement"/> strategy whose director, with
+    /// <paramref name="coLocateWithShards"/> false, IS a uniform random pick — so those grains spread
+    /// under random placement in both settings, and this flag keeps governing every other grain class.
+    /// </param>
+    /// <param name="coLocateWithShards">
+    /// Overrides <see cref="GraphPlacementOptions.CoLocateWithShards"/> for the cluster: when true, the
+    /// graph grain families' FIRST activations are steered onto the silo of their object's shard (a pure
+    /// locality hint; identity/dedup stay with the grain directory). Default false, the production
+    /// default — the placement director then mirrors random placement.
     /// </param>
     public static async Task<MeshTestCluster> CreateMultiSiloAsync(
         string schemaText,
@@ -158,7 +171,7 @@ public sealed class MeshTestCluster : IAsyncDisposable
         bool useActivationMemo = true,
         bool useSubjectFrontierMemo = true,
         bool useRandomPlacement = false,
-        bool useShardedGraphReader = false)
+        bool coLocateWithShards = false)
     {
         if (siloCount < 1)
             throw new ArgumentOutOfRangeException(nameof(siloCount), "Need at least one silo.");
@@ -169,7 +182,7 @@ public sealed class MeshTestCluster : IAsyncDisposable
         SchemaHolder.UseActivationMemo = useActivationMemo;
         SchemaHolder.UseSubjectFrontierMemo = useSubjectFrontierMemo;
         SchemaHolder.UseRandomPlacement = useRandomPlacement;
-        SchemaHolder.UseShardedGraphReader = useShardedGraphReader;
+        SchemaHolder.CoLocateWithShards = coLocateWithShards;
         SchemaHolder.GcWindow = null; // statics persist across tests; multi-silo always uses the default window
 
         var builder = new TestClusterBuilder(initialSilosCount: (short)siloCount);
@@ -198,13 +211,13 @@ public sealed class MeshTestCluster : IAsyncDisposable
         public static bool UseSubjectFrontierMemo = true;
         public static int SubjectFrontierMaxMemoSubjects = new SubjectFrontierMemoOptions().MaxMemoSubjects;
         public static bool UseRandomPlacement;
-        public static bool UseShardedGraphReader;
+        public static bool CoLocateWithShards;
         public static TimeSpan? GcWindow;
     }
 
     /// <summary>
-    /// Applies the optional <see cref="DatastoreGcOptions"/> override (same last-registration-wins
-    /// pattern as <see cref="OverrideGraphReader"/>): the datastore grain resolves
+    /// Applies the optional <see cref="DatastoreGcOptions"/> override (the last-registration-wins
+    /// options-override pattern the other toggles use): the datastore grain resolves
     /// <c>IOptions&lt;DatastoreGcOptions&gt;</c> from silo DI, so registering here reconfigures its GC
     /// window. The reminder is always disabled under an override — GC must run only when the test
     /// invokes <c>RunGc</c> itself.
@@ -218,38 +231,35 @@ public sealed class MeshTestCluster : IAsyncDisposable
         }
     }
 
-    /// <summary>
-    /// Re-registers the graph-reader flag AFTER <c>AddSpiceportGrainServices</c> (last registration
-    /// wins on resolve), matching the options-override pattern the other toggles use, so a test
-    /// cluster can opt into the sharded read path while production defaults stay OFF. The
-    /// <c>IGraphReaderSource</c> registration itself needs no override: its factory reads the
-    /// options from the container at resolve time, so it picks up this override — and its concrete
-    /// source classes are internal to <c>Spiceport.Server</c>, out of reach of the projects that
-    /// source-link this file without InternalsVisibleTo.
-    /// </summary>
-    private static void OverrideGraphReader(IServiceCollection services) =>
-        services.AddSingleton(new GraphReaderOptions { UseShardedReader = SchemaHolder.UseShardedGraphReader });
-
     private sealed class SiloConfigurator : ISiloConfigurator
     {
         public void Configure(ISiloBuilder siloBuilder)
         {
             // Exactly the silo's DI: grain mesh services + the grain-backed datastore over the
-            // cluster-singleton datastore grain. CheckGrain uses Orleans' default placement (no custom
-            // placement director), so there is nothing to register beyond the memo collection age.
+            // cluster-singleton datastore grain. Placement goes through the PUBLIC deployment opt-in
+            // (AddGraphLocalityPlacement), deliberately BEFORE AddSpiceportGrainServices runs below:
+            // that ordering pins the TryAdd contract that keeps an early opt-in from being silently
+            // reverted by the mesh registration.
             siloBuilder.AddActivationMemoCollectionAge();
-            siloBuilder.AddMemoryGrainStorage("datastore");
+            // The PRODUCTION storage registration with no connection string configured: the in-memory
+            // "datastore" provider with the binary grain-storage serializer forced (the provider's JSON
+            // default silently corrupts boxed-JsonElement caveat context on the flushed-shard-row read
+            // path — see AddDatastoreGrainStorage).
+            siloBuilder.AddDatastoreGrainStorage(new ConfigurationBuilder().Build());
             siloBuilder.AddCustomStorageBasedLogConsistencyProvider("CustomStorage");
-            // Exactly the production silo-lifecycle wiring: the shared per-silo projection/hub, bootstrapped
-            // before the silo accepts traffic (see docs/future-work.md §1.8).
-            siloBuilder.AddDatastoreProjectionService();
+            siloBuilder.AddGraphLocalityPlacement(new GraphPlacementOptions
+            {
+                CoLocateWithShards = SchemaHolder.CoLocateWithShards,
+            });
             siloBuilder.ConfigureServices(services =>
             {
                 services.AddSpiceportGrainServices(
                     SchemaHolder.SchemaText, batchConcurrency: SchemaHolder.BatchConcurrency);
+                // Exactly the production wiring: the Watch hub is the DI singleton
+                // AddSpiceportGrainServices registered; the container disposes it on silo teardown.
                 services.AddSingleton<IDatastore>(sp =>
                     new GrainBackedDatastore(
-                        sp.GetRequiredService<IGrainFactory>(), sp.GetRequiredService<IDatastoreProjectionHost>()));
+                        sp.GetRequiredService<IGrainFactory>(), sp.GetRequiredService<LogWatchHub>()));
                 services.AddSingleton(new MembershipWalkOptions { Enabled = SchemaHolder.UseMembershipWalk });
                 services.AddSingleton(new ActivationMemoOptions { Enabled = SchemaHolder.UseActivationMemo });
                 services.AddSingleton(new SubjectFrontierMemoOptions
@@ -257,7 +267,6 @@ public sealed class MeshTestCluster : IAsyncDisposable
                     Enabled = SchemaHolder.UseSubjectFrontierMemo,
                     MaxMemoSubjects = SchemaHolder.SubjectFrontierMaxMemoSubjects,
                 });
-                OverrideGraphReader(services);
                 OverrideGcOptions(services);
             });
         }
@@ -270,21 +279,26 @@ public sealed class MeshTestCluster : IAsyncDisposable
             // Exactly the production silo's DI; every silo delegates to the ONE cluster-singleton
             // datastore grain so they all see identical data. The grain's persistent state lives on
             // whichever silo holds its single activation; all silos route to it via the grain directory,
-            // so it is shared by construction (no process-static instance). CheckGrain uses Orleans'
-            // default placement — no custom placement director to register.
+            // so it is shared by construction (no process-static instance). Placement goes through the
+            // PUBLIC deployment opt-in (AddGraphLocalityPlacement) before AddSpiceportGrainServices,
+            // pinning the TryAdd ordering contract (see SiloConfigurator).
             siloBuilder.AddActivationMemoCollectionAge();
-            siloBuilder.AddMemoryGrainStorage("datastore");
+            // See SiloConfigurator: the production in-memory registration, binary serializer forced.
+            siloBuilder.AddDatastoreGrainStorage(new ConfigurationBuilder().Build());
             siloBuilder.AddCustomStorageBasedLogConsistencyProvider("CustomStorage");
-            // Exactly the production silo-lifecycle wiring: the shared per-silo projection/hub, bootstrapped
-            // before the silo accepts traffic (see docs/future-work.md §1.8).
-            siloBuilder.AddDatastoreProjectionService();
+            siloBuilder.AddGraphLocalityPlacement(new GraphPlacementOptions
+            {
+                CoLocateWithShards = SchemaHolder.CoLocateWithShards,
+            });
             siloBuilder.ConfigureServices(services =>
             {
                 services.AddSpiceportGrainServices(
                     SchemaHolder.SchemaText, batchConcurrency: SchemaHolder.BatchConcurrency);
+                // Exactly the production wiring: the Watch hub is the DI singleton
+                // AddSpiceportGrainServices registered; the container disposes it on silo teardown.
                 services.AddSingleton<IDatastore>(sp =>
                     new GrainBackedDatastore(
-                        sp.GetRequiredService<IGrainFactory>(), sp.GetRequiredService<IDatastoreProjectionHost>()));
+                        sp.GetRequiredService<IGrainFactory>(), sp.GetRequiredService<LogWatchHub>()));
                 services.AddSingleton(new MembershipWalkOptions { Enabled = SchemaHolder.UseMembershipWalk });
                 services.AddSingleton(new ActivationMemoOptions { Enabled = SchemaHolder.UseActivationMemo });
                 services.AddSingleton(new SubjectFrontierMemoOptions
@@ -292,12 +306,12 @@ public sealed class MeshTestCluster : IAsyncDisposable
                     Enabled = SchemaHolder.UseSubjectFrontierMemo,
                     MaxMemoSubjects = SchemaHolder.SubjectFrontierMaxMemoSubjects,
                 });
-                OverrideGraphReader(services);
-
                 // See CreateMultiSiloAsync's useRandomPlacement doc: an opt-in override of the cluster's
                 // DEFAULT placement (Orleans 10's ResourceOptimizedPlacement makes no spread guarantee) for
                 // tests that ASSERT activation spread. Registered last, so GetService<PlacementStrategy>
-                // (how Orleans resolves the default strategy) returns it.
+                // (how Orleans resolves the default strategy) returns it. The four graph grain families are
+                // unaffected either way: their class-specific GraphLocalityPlacement director already makes
+                // a uniform random pick whenever CoLocateWithShards is off.
                 if (SchemaHolder.UseRandomPlacement)
                     services.AddSingleton<Orleans.Runtime.PlacementStrategy, Orleans.Runtime.RandomPlacement>();
             });

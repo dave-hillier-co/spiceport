@@ -4,8 +4,11 @@ namespace Spiceport.Grains.Abstractions;
 
 /// <summary>
 /// The Orleans-serializable mirror of the in-memory MVCC <c>DatastoreState</c>: the full committed
-/// state of the datastore at a head revision. The <see cref="DatastoreGrain"/> persists this as its
-/// grain state and the <c>GrainBackedDatastore</c> converts it to/from the in-memory state to reuse the
+/// state of the datastore at a head revision. Under the thin-sequencer layout this is no longer what
+/// the datastore grain persists (rows live per key in <see cref="GraphShardState"/> rows, the rest in
+/// <see cref="DatastoreMetaState"/>); it survives as the ASSEMBLED whole-state reply of
+/// <c>IDatastoreGrain.ReadState</c> — small state plus every indexed forward key's current rows — which
+/// the <c>GrainBackedDatastore</c>/scan seam convert to the in-memory state to reuse the
 /// fold/transaction mechanics. Every relationship row carries its created/deleted revision stamps so
 /// snapshot reads at any past revision are exact.
 /// </summary>
@@ -39,17 +42,24 @@ public sealed record DatastoreGrainState
     /// <summary>An empty state seeded at the given initial revision.</summary>
     public static DatastoreGrainState Empty(long initialRevision) => new() { HeadRevision = initialRevision };
 
-    /// <summary>Returns the schema hash effective at the given revision, or null if none.</summary>
-    public string? SchemaHashAt(long atRevision)
+    /// <summary>
+    /// Returns the schema version effective at the given revision (the last version with
+    /// <c>Revision &lt;= atRevision</c>, the write-order fold), or null if none was persisted at or
+    /// before it. Mirrors the in-memory <c>DatastoreState.SchemaAt</c> scan.
+    /// </summary>
+    public SchemaVersionWire? SchemaVersionAt(long atRevision)
     {
-        string? result = null;
+        SchemaVersionWire? result = null;
         foreach (var schema in Schemas)
         {
             if (schema.Revision <= atRevision)
-                result = schema.Hash;
+                result = schema;
             else
                 break;
         }
         return result;
     }
+
+    /// <summary>Returns the schema hash effective at the given revision, or null if none.</summary>
+    public string? SchemaHashAt(long atRevision) => SchemaVersionAt(atRevision)?.Hash;
 }

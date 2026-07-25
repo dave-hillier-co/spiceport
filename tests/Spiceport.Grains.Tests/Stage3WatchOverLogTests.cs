@@ -101,6 +101,44 @@ public class Stage3WatchOverLogTests
         Assert.True(sw.Elapsed < TimeSpan.FromSeconds(1), $"observed after {sw.ElapsedMilliseconds}ms (expected event-driven, sub-second)");
     }
 
+    /// <summary>
+    /// Clean-teardown gate for the DI-owned hub (adapted from the retired GrainService lifecycle test —
+    /// the invariant transfers): the per-silo <see cref="LogWatchHub"/> is an <see cref="IAsyncDisposable"/>
+    /// DI singleton, so cluster/silo disposal must dispose it (a bounded, timeout-guarded unsubscribe from
+    /// the DatastoreGrain's observer set) without hanging or throwing, even after a Watch stream started
+    /// its observer subscription and heartbeat. (The DatastoreGrain's own watcher-registration expiry is a
+    /// backstop against a leak either way; this test is about clean, bounded teardown.)
+    /// </summary>
+    [Fact]
+    public async Task Cluster_shutdown_disposes_the_shared_hub_without_hanging_or_throwing()
+    {
+        var cluster = await MeshTestCluster.CreateAsync(Schema);
+
+        // Exercise the hub: park a Watch stream so the hub's signal path (observer subscription +
+        // heartbeat, lazily started by the stream's EnsureStarted) is genuinely live.
+        var head = (await cluster.Datastore.HeadRevision()).Revision;
+        using var watchCts = new CancellationTokenSource();
+        var watchTask = Task.Run(async () =>
+        {
+            await foreach (var _ in cluster.Datastore.Watch(head, new WatchOptions(WatchContent.Relationships), watchCts.Token))
+            {
+            }
+        });
+        await Task.Delay(250);
+
+        // Drain the consumer while the cluster is still alive (a background task left running past cluster
+        // disposal would leak into and perturb later tests). The hub's observer subscription on the
+        // datastore grain remains registered — container disposal, not this stream's lifetime, owns
+        // tearing that down.
+        await watchCts.CancelAsync();
+        try { await watchTask; } catch (OperationCanceledException) { }
+
+        var disposeTask = cluster.DisposeAsync().AsTask();
+        var completed = await Task.WhenAny(disposeTask, Task.Delay(TimeSpan.FromSeconds(30)));
+        Assert.Same(disposeTask, completed);
+        await disposeTask; // rethrows if disposal itself faulted
+    }
+
     private static async Task<List<RevisionChange>> Collect(
         IAsyncEnumerable<RevisionChange> stream, int count, CancellationTokenSource cts)
     {

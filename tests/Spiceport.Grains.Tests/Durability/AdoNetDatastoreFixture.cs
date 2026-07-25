@@ -1,3 +1,4 @@
+using DotNet.Testcontainers.Builders;
 using Npgsql;
 using Testcontainers.PostgreSql;
 
@@ -38,16 +39,21 @@ public sealed class AdoNetDatastoreFixture : IAsyncLifetime
             await container.StartAsync();
             _container = container;
         }
-        catch (Exception ex)
+        catch (DockerUnavailableException ex)
         {
-            // ONLY container build/start is skip-worthy: Docker absent / image pull failure means the test
-            // cannot run, so it SKIPS rather than failing the fast suite (the Postgres-backed suite has the
-            // same Docker requirement). Anything AFTER the container is up (schema apply) is a real defect
-            // and must FAIL the test, so it is deliberately outside this catch.
+            // ONLY Docker-unavailable is skip-worthy: DockerUnavailableException is Testcontainers'
+            // no-reachable-Docker-endpoint signal ("Docker is either not running or misconfigured"),
+            // raised by Build()/StartAsync() when endpoint resolution fails — the one situation where
+            // the durability gates genuinely cannot run (CLAUDE.md's skip-without-Docker contract).
             Available = false;
             SkipReason = $"Docker/Testcontainers unavailable: {ex.GetType().Name}: {ex.Message}";
             return;
         }
+        // Any OTHER build/start exception (image pull failure, container startup crash, resource
+        // exhaustion, ...) means Docker IS present but the infrastructure broke: deliberately NOT
+        // caught, so it escapes InitializeAsync and xUnit FAILS every test in the collection — a
+        // Docker-enabled machine must never silently skip the durability gates. Schema apply below is
+        // outside the try for the same reason.
 
         ConnectionString = _container.GetConnectionString();
         await ApplyOrleansSchema(ConnectionString);

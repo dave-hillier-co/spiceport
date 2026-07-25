@@ -6,18 +6,20 @@ using Spiceport.Grains.Abstractions;
 namespace Spiceport.Grains;
 
 /// <summary>
-/// The data-plane READ ops (ReadRelationships, BulkExportRelationships) served IN-PROCESS over the local
-/// silo's <see cref="IDatastore"/> projection — the same pattern <see cref="Spiceport.Api.AuthzedWatchV1Service"/>
-/// uses deliberately for Watch (see its remarks). The write side and all other data-plane ops stay on the
-/// stateless-worker <see cref="IRelationshipsGrain"/>.
+/// The data-plane READ ops (ReadRelationships, BulkExportRelationships) served IN-PROCESS over the
+/// storage-direct <see cref="ISnapshotScanner"/> seam — broad, loose-filter scans are exactly the
+/// workload that seam exists for (<c>docs/graph-sharded-datastore.md</c> §3), deliberately OFF the
+/// shard-grain mesh and the per-Check hot path. The write side and all other data-plane ops stay on the
+/// stateless-worker <see cref="IRelationshipsGrain"/>; <see cref="IDatastore"/> remains only for
+/// revision resolution and token minting.
 /// </summary>
 /// <remarks>
-/// The datastore's <see cref="IDatastoreReader.QueryRelationships"/> does not guarantee canonical-tuple
+/// The scanner's <see cref="ISnapshotScanner.Scan"/> does not guarantee canonical-tuple
 /// order, so each read materializes its matches once and sorts before yielding — the deterministic order
 /// the client cursor depends on. This is no longer grain code, so the streaming ops take the caller's plain
 /// <see cref="CancellationToken"/> directly, with no Orleans grain-method plumbing.
 /// </remarks>
-public sealed class RelationshipReads(IDatastore datastore, ISchemaProvider schemaProvider)
+public sealed class RelationshipReads(IDatastore datastore, ISchemaProvider schemaProvider, ISnapshotScanner scanner)
 {
     /// <summary>
     /// Streams relationships matching the filter, in ascending canonical-tuple order, over one revision
@@ -36,7 +38,6 @@ public sealed class RelationshipReads(IDatastore datastore, ISchemaProvider sche
         // optimized revision. The read-at token is minted from the revision actually evaluated.
         var requirement = (args.Consistency ?? ConsistencyWire.MinimizeLatency).ToRequirement();
         var resolved = await RevisionResolver.Resolve(datastore, requirement, cancellationToken: cancellationToken);
-        var reader = datastore.SnapshotReader(resolved.Revision);
         var filter = ToFilter(args.Filter);
         var after = args.Cursor;
         var token = await MintToken(resolved.Revision, resolved.SchemaHash ?? schemaProvider.Current.SchemaHash);
@@ -44,7 +45,7 @@ public sealed class RelationshipReads(IDatastore datastore, ISchemaProvider sche
         // Materialize and order deterministically by canonical tuple string so the stream (and any client
         // resume from a per-item cursor) is stable, skipping rows at or before the cursor.
         var matched = new List<(string Tuple, Relationship Rel)>();
-        await foreach (var rel in reader.QueryRelationships(filter, cancellationToken)
+        await foreach (var rel in scanner.Scan(filter, resolved.Revision, cancellationToken)
             .WithCancellation(cancellationToken))
         {
             var tuple = TupleStrings.FormatRelationship(rel);
@@ -91,11 +92,10 @@ public sealed class RelationshipReads(IDatastore datastore, ISchemaProvider sche
             after = null;
         }
 
-        var reader = datastore.SnapshotReader(pinned);
         var filter = ToFilter(args.Filter);
 
         var matched = new List<(string Tuple, Relationship Rel)>();
-        await foreach (var rel in reader.QueryRelationships(filter, cancellationToken)
+        await foreach (var rel in scanner.Scan(filter, pinned, cancellationToken)
             .WithCancellation(cancellationToken))
         {
             var tuple = TupleStrings.FormatRelationship(rel);

@@ -24,7 +24,7 @@ public interface IGraphShardGrain : IGrainWithStringKey
     /// <summary>
     /// Returns the shard's rows VISIBLE at <paramref name="revision"/> (half-open MVCC window
     /// <c>[created, deleted)</c>), catching the shard up on demand until its watermark covers the
-    /// revision — the same closed-timestamp gate the per-silo projection applies, restricted to one key.
+    /// revision — the closed-timestamp gate, enforced per shard key.
     /// Visibility is filtered shard-side; EXPIRATION deliberately is NOT — it is a query-time concern of
     /// the caller (the evaluation "now"), mirroring <c>MvccSnapshotReader</c>, so the same shard reply
     /// serves callers with different clocks. Throws <c>RevisionNotFoundException</c> when the revision

@@ -8,8 +8,8 @@ namespace Spiceport.Grains;
 /// <summary>
 /// An <see cref="IGraphReader"/> pinned at a revision that resolves each read to the matching
 /// <see cref="IGraphShardGrain"/> — forward shards for resource-pinned queries, reverse shards for
-/// subject-pinned queries — instead of the whole-graph silo projection
-/// (<c>docs/graph-sharded-datastore.md</c> §2/§3, migration step 3).
+/// subject-pinned queries — so no silo ever holds the whole graph
+/// (<c>docs/graph-sharded-datastore.md</c> §2/§3).
 /// </summary>
 /// <remarks>
 /// Deliberately NARROW: it serves only the two pinned call shapes the evaluation engines actually

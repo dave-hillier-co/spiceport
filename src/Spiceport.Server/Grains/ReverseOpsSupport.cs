@@ -18,11 +18,13 @@ internal static class ReverseOpsSupport
     public const ConfigureAwaitOptions ContinueOnCapturedContext = ConfigureAwaitOptions.ContinueOnCapturedContext;
 
     /// <summary>
-    /// Resolves the consistency requirement to the revision actually evaluated and returns a snapshot reader,
-    /// the evaluation "now", the read-at token, and the revision. Null consistency (the default) is
-    /// MinimizeLatency → the optimized revision, identical to the prior unary behaviour.
+    /// Resolves the consistency requirement to the revision actually evaluated and returns the evaluation
+    /// "now", the read-at token, and the pinned revision + schema hash. Null consistency (the default) is
+    /// MinimizeLatency → the optimized revision, identical to the prior unary behaviour. Data reads flow
+    /// through <see cref="IGraphReaderSource"/>/<see cref="ISnapshotScanner"/> at the pinned revision and
+    /// schema resolution through <see cref="ISchemaSource"/>, so no snapshot reader is minted here.
     /// </summary>
-    public static async Task<(IDatastoreReader Reader, DateTimeOffset Now, string Token, IRevision Revision, string? SchemaHash)> PinReader(
+    public static async Task<(DateTimeOffset Now, string Token, IRevision Revision, string? SchemaHash)> PinRevision(
         IDatastore datastore, ConsistencyWire? consistency, CancellationToken cancellationToken)
     {
         var requirement = (consistency ?? ConsistencyWire.MinimizeLatency).ToRequirement();
@@ -30,11 +32,10 @@ internal static class ReverseOpsSupport
             .Resolve(datastore, requirement, cancellationToken: cancellationToken)
             .ConfigureAwait(ContinueOnCapturedContext);
 
-        var reader = datastore.SnapshotReader(resolved.Revision);
         var datastoreId = await datastore.GetUniqueId(cancellationToken)
             .ConfigureAwait(ContinueOnCapturedContext);
         var token = ZedTokens.FromRevision(resolved.Revision, resolved.SchemaHash, datastoreId).Token;
-        return (reader, DateTimeOffset.UtcNow, token, resolved.Revision, resolved.SchemaHash);
+        return (DateTimeOffset.UtcNow, token, resolved.Revision, resolved.SchemaHash);
     }
 
     /// <summary>

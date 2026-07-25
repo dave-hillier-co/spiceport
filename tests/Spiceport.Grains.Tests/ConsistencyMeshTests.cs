@@ -237,6 +237,37 @@ public class ConsistencyMeshTests
         Assert.True(secondRev.CompareTo(firstRev) >= 0, "the chained check must not go backwards in revision");
     }
 
+    // ---- 8. The closed-timestamp gate across silos. ----
+
+    /// <summary>
+    /// On a two-silo mesh, a write is observed by a FullyConsistent and an AtLeastAsFresh(token) Check
+    /// IMMEDIATELY — the shard grain serving the sub-problem's graph reads blocks until its watermark
+    /// covers the pinned revision (the per-shard closed-timestamp gate) rather than serving a stale
+    /// snapshot. Repeated to shake out any catch-up race. (Adapted from the retired projection-mesh
+    /// suite: the invariant — fresh reads never serve a stale prefix, on whichever silo the sub-problem
+    /// lands — transfers unchanged to the sharded read path.)
+    /// </summary>
+    [Fact]
+    public async Task ExactReads_SeeWritesImmediately_AcrossSilos()
+    {
+        await using var cluster = await MeshTestCluster.CreateMultiSiloAsync(ViewerSchema, siloCount: 2);
+        var service = Service(cluster);
+
+        for (var i = 0; i < 12; i++)
+        {
+            var doc = $"doc{i}";
+            var token = await WriteViewer(service, doc, "alice");
+
+            var fully = await service.CheckPermission(
+                Check(doc, "alice", new Consistency { FullyConsistent = true }), FakeContext.Instance);
+            Assert.Equal(CheckPermissionResponse.Types.Permissionship.HasPermission, fully.Permissionship);
+
+            var fresh = await service.CheckPermission(
+                Check(doc, "alice", new Consistency { AtLeastAsFresh = token }), FakeContext.Instance);
+            Assert.Equal(CheckPermissionResponse.Types.Permissionship.HasPermission, fresh.Permissionship);
+        }
+    }
+
     /// <summary>A no-op <see cref="ServerCallContext"/>; the service only reads CancellationToken.</summary>
     private sealed class FakeContext : ServerCallContext
     {

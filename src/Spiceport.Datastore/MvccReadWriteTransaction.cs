@@ -82,6 +82,13 @@ internal sealed class MvccReadWriteTransaction : IReadWriteTransaction
         var toRemove = matched;
         if (limit is { } lim && (ulong)matched.Count > lim)
         {
+            // The subset a truncating limit removes must be a pure function of the MATCHED SET, never of
+            // the base state's internal row order: the thin-sequencer write path assembles its base from
+            // per-key shard states (whose concatenation order differs from the reference model's
+            // insertion order), and the fold-equivalence gates require both backends to delete the SAME
+            // rows. Order canonically by the full six-tuple identity before truncating. When the limit
+            // is not reached every match dies, so ordering is irrelevant and skipped.
+            matched.Sort(static (a, b) => CompareKeys(a, b));
             toRemove = matched.GetRange(0, (int)lim);
             reachedLimit = true;
         }
@@ -90,6 +97,21 @@ internal sealed class MvccReadWriteTransaction : IReadWriteTransaction
             Remove(key);
 
         return Task.FromResult(((ulong)toRemove.Count, reachedLimit));
+
+        static int CompareKeys(RelationshipKey a, RelationshipKey b)
+        {
+            var c = string.CompareOrdinal(a.ResourceType, b.ResourceType);
+            if (c != 0) return c;
+            c = string.CompareOrdinal(a.ResourceId, b.ResourceId);
+            if (c != 0) return c;
+            c = string.CompareOrdinal(a.ResourceRelation, b.ResourceRelation);
+            if (c != 0) return c;
+            c = string.CompareOrdinal(a.SubjectType, b.SubjectType);
+            if (c != 0) return c;
+            c = string.CompareOrdinal(a.SubjectId, b.SubjectId);
+            if (c != 0) return c;
+            return string.CompareOrdinal(a.SubjectRelation, b.SubjectRelation);
+        }
     }
 
     public Task WriteStoredSchema(byte[] schemaBytes, CancellationToken cancellationToken = default)

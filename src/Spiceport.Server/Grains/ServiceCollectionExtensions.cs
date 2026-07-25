@@ -1,7 +1,10 @@
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
 using Orleans;
+using Orleans.Hosting;
 using Spiceport.Datastore;
 using Spiceport.Engine;
+using Spiceport.Grains.Abstractions;
 using Spiceport.Schema;
 
 namespace Spiceport.Grains;
@@ -63,16 +66,43 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<IOutgoingGrainCallFilter, CheckDispatchOutgoingCallFilter>();
         services.AddSingleton<IIncomingGrainCallFilter, CheckDispatchIncomingCallFilter>();
 
-        // Graph-sharded read-path toggle (default OFF — the step-3 shadow flag; opt in via a registered
-        // options override, exactly the MembershipWalkOptions override pattern) and the reader-source
-        // seam it switches. IDatastore is host-owned and not registered here (see the remarks above);
-        // resolving it lazily inside the factory is fine because the source is only resolved after the
-        // host completes its own DI setup, same as ReverseOps below.
-        services.AddSingleton<GraphReaderOptions>();
+        // The engines' graph-read seam: always the IGraphShardGrain mesh (the retired per-silo
+        // whole-graph projection alternative — and the flag that switched to it — is gone).
         services.AddSingleton<IGraphReaderSource>(sp =>
-            sp.GetRequiredService<GraphReaderOptions>().UseShardedReader
-                ? new ShardedGraphReaderSource(sp.GetRequiredService<IGrainFactory>())
-                : new ProjectionGraphReaderSource(sp.GetRequiredService<IDatastore>()));
+            new ShardedGraphReaderSource(sp.GetRequiredService<IGrainFactory>()));
+
+        // The per-silo Watch notifier. One hub per silo container: GrainBackedDatastore pulses it on
+        // local commits and parks Watch streams on it; it lazily starts its observer subscription +
+        // heartbeat on first use (LogWatchHub.EnsureStarted) and the CONTAINER owns its lifetime — it is
+        // an IAsyncDisposable singleton created by this factory, so silo teardown disposes it (a bounded,
+        // timeout-guarded unsubscribe from the datastore grain's observer set).
+        services.AddSingleton<LogWatchHub>(sp =>
+        {
+            var grainFactory = sp.GetRequiredService<IGrainFactory>();
+            return new LogWatchHub(grainFactory.GetGrain<IDatastoreGrain>(IDatastoreGrain.Key), grainFactory);
+        });
+
+        // The two storage-direct seams of the graph-sharded design (docs/graph-sharded-datastore.md
+        // section 3), both resolved against the cluster-singleton sequencer grain via IGrainFactory:
+        // schema-at-revision (consulted only on a SchemaResolver hash miss — once per hash per silo) and
+        // the broad/admin scan seam (one snapshot fetch per scan; deliberately OFF the per-Check hot
+        // path). Neither needs the per-silo projection.
+        services.AddSingleton<ISchemaSource>(sp => new GrainSchemaSource(sp.GetRequiredService<IGrainFactory>()));
+        services.AddSingleton<ISnapshotScanner>(sp => new GrainSnapshotScanner(sp.GetRequiredService<IGrainFactory>()));
+
+        // The graph co-placement director (docs/graph-sharded-datastore.md section 5). The strategy
+        // attribute is UNCONDITIONAL on the four graph grain classes (Orleans placement attributes attach
+        // per class and cannot be conditional), so the director must be registered wherever those grains
+        // can activate — i.e. wherever this mesh is wired — and the on/off decision lives in
+        // GraphPlacementOptions (default OFF: the director then mirrors random placement, a pure inert
+        // pass-through). Enabling co-location is a deployment opt-in via
+        // SiloBuilderExtensions.AddGraphLocalityPlacement (or an options override), gated on measurement.
+        services.AddPlacementDirector<GraphLocalityPlacement, GraphLocalityPlacementDirector>();
+        // TryAdd, not Add: the deployment opt-in (SiloBuilderExtensions.AddGraphLocalityPlacement) may
+        // legitimately run BEFORE this method (host builders configure the silo before the service
+        // mesh), and an unconditional Add here would supersede that opt-in under DI last-wins,
+        // silently reverting co-location to OFF with no error.
+        services.TryAddSingleton<GraphPlacementOptions>();
 
         // Leopard membership-walk accelerator toggle (default ON; opt out via a registered options override).
         // The accelerator itself has no per-silo singleton to register: it is the addressable
@@ -108,6 +138,7 @@ public static class ServiceCollectionExtensions
         // collapses with request context against the CURRENT schema's caveats (read per call).
         services.AddSingleton<IPermissionChecker>(sp => new PermissionChecker(
             sp.GetRequiredService<IDatastore>(),
+            sp.GetRequiredService<ISchemaSource>(),
             sp.GetRequiredService<IDispatcher>(),
             sp.GetRequiredService<ISchemaProvider>(),
             sp.GetRequiredService<SchemaResolver>(),
@@ -115,13 +146,16 @@ public static class ServiceCollectionExtensions
             batchConcurrency));
 
         // The reverse-ops (LookupSubjects/LookupResources/ExpandPermissionTree) and relationship-read
-        // (ReadRelationships/BulkExportRelationships) in-process helpers: they read straight off the local
-        // silo's IDatastore projection (the same pattern AuthzedWatchV1Service uses for Watch), dispatching
-        // onward to SubjectFrontierGrain/MembershipWalkGrain/the check mesh exactly as the retired stream
-        // grains did. IDatastore is host-owned and not registered here (see the remarks above), but that is
-        // fine — these are lazy factory registrations resolved after the host completes its own DI setup.
+        // (ReadRelationships/BulkExportRelationships) in-process helpers (the same pattern
+        // AuthzedWatchV1Service uses for Watch): engine reads flow through IGraphReaderSource, broad scans
+        // through ISnapshotScanner and schema resolution through ISchemaSource, dispatching onward to
+        // SubjectFrontierGrain/MembershipWalkGrain/the check mesh exactly as the retired stream grains
+        // did; IDatastore remains only for revision resolution and token minting. It is host-owned and not
+        // registered here (see the remarks above), but that is fine — these are lazy factory registrations
+        // resolved after the host completes its own DI setup.
         services.AddSingleton<ReverseOps>(sp => new ReverseOps(
             sp.GetRequiredService<IDatastore>(),
+            sp.GetRequiredService<ISchemaSource>(),
             sp.GetRequiredService<ISchemaProvider>(),
             sp.GetRequiredService<SchemaResolver>(),
             sp.GetRequiredService<IGrainFactory>(),
@@ -131,7 +165,8 @@ public static class ServiceCollectionExtensions
 
         services.AddSingleton<RelationshipReads>(sp => new RelationshipReads(
             sp.GetRequiredService<IDatastore>(),
-            sp.GetRequiredService<ISchemaProvider>()));
+            sp.GetRequiredService<ISchemaProvider>(),
+            sp.GetRequiredService<ISnapshotScanner>()));
 
         return services;
     }

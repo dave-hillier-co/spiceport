@@ -15,7 +15,7 @@ public sealed record CounterDeltaWire(
 /// One entry in the datastore's append-only event log: everything that changed at a single committed
 /// revision. The revision IS the log offset (the global order); folding the ordered sequence of
 /// <see cref="LogEvent"/>s reproduces the datastore state, and the same feed powers Watch and the
-/// per-silo read projections.
+/// graph shard grains' log-tail folds.
 /// </summary>
 /// <remarks>
 /// The event is SELF-CONTAINED / FOLDABLE: every payload needed to reproduce the committed state is
@@ -46,7 +46,7 @@ public sealed record LogSegment(
 
 /// <summary>
 /// The read side of the datastore's event log: an ordered feed of committed changes by revision (= the
-/// global offset), consumed by per-silo projections and the Watch API.
+/// global offset), consumed by the graph shard grains' log-tail folds and the Watch API.
 /// </summary>
 public interface IDatastoreLog
 {
@@ -59,12 +59,12 @@ public interface IDatastoreLog
     /// <remarks>
     /// VERIFIED Orleans 10.1 semantics (do not swap this for <c>[ReadOnly]</c> — that attribute only
     /// interleaves a blocking request when BOTH the blocking request and the incoming one are read-only,
-    /// so it does nothing here since <c>AppendCommit</c> carries no such attribute). <see cref="AlwaysInterleaveAttribute"/>,
+    /// so it does nothing here since <c>Commit</c> carries no such attribute). <see cref="AlwaysInterleaveAttribute"/>,
     /// applied on the grain-INTERFACE method declaration, interleaves with anything: while an in-flight
     /// write is parked at an await on the single-threaded activation scheduler, an interleaved call to this
     /// method runs to completion in that gap before the write's turn resumes. Only pure reads carry this
     /// attribute; mutating members never do, so writes still never interleave writes and the
-    /// <c>AppendCommit</c> head-compare-and-append stays atomic.
+    /// <c>Commit</c> head-read-and-append stays atomic.
     /// </remarks>
     [AlwaysInterleave]
     Task<LogSegment> ReadFrom(long afterRevision, int maxCount);

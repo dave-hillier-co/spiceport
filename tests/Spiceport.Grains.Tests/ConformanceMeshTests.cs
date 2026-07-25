@@ -14,7 +14,10 @@ namespace Spiceport.Grains.Tests;
 /// </summary>
 /// <remarks>
 /// This is the distributed == local proof: the exact same fixtures the in-process conformance suite
-/// asserts are replayed, but each Check recurses across grain boundaries.
+/// asserts are replayed, but each Check recurses across grain boundaries. Engine graph reads are served
+/// by the <c>IGraphShardGrain</c> mesh (the only read path), so this suite is also the sharded-read
+/// conformance gate; <see cref="ShardedReaderCorpusMeshTests"/> adds only what this suite does not cover
+/// (the expiration file, the shard-activation positive control, the multi-silo composition case).
 /// </remarks>
 [Collection(MeshClusterCollection.Name)]
 public class ConformanceMeshTests

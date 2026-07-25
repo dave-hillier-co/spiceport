@@ -8,7 +8,7 @@ namespace Spiceport.Grains.Abstractions;
 /// <see cref="GraphShardKeyWire"/>), folded from the datastore's event log restricted to that key.
 /// <see cref="AppliedRevision"/> is the shard's watermark — the revision of the last log event folded,
 /// which advances on EVERY event (matching or not), so "watermark covers the pinned revision" is the
-/// same closed-timestamp gate the whole-state projection uses. <see cref="GcFloor"/> mirrors the
+/// closed-timestamp gate. <see cref="GcFloor"/> mirrors the
 /// whole state's floor: reads pinned strictly below it are invalid.
 /// </summary>
 [GenerateSerializer, Immutable]

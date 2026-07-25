@@ -1,6 +1,5 @@
 using Orleans.Concurrency;
 using Spiceport.Core;
-using Spiceport.Datastore;
 using Spiceport.Engine;
 using Spiceport.Grains.Abstractions;
 
@@ -16,7 +15,7 @@ namespace Spiceport.Grains;
 /// <remarks>
 /// Flow: memo check (serve <see cref="_memo"/> when set and enabled) — parse the key — resolve a graph
 /// reader pinned at the key's exact revision through the <see cref="IGraphReaderSource"/> seam (schema
-/// resolution keeps the projection-pinned reader) — resolve the schema at that revision — read its lazily-built
+/// resolution goes through the <see cref="ISchemaSource"/> seam) — resolve the schema at that revision — read its lazily-built
 /// <see cref="Spiceport.Grains.SchemaSnapshot.MembershipCoverage"/> — compute this subject's direct parents
 /// — if <see cref="MembershipWalkArgs.DepthRemaining"/> is exhausted, return an <see cref="MembershipClosureReply.Incomplete"/>
 /// reply with no recursion — otherwise, for each parent whose OWN subject key (its (type, id, relation) as
@@ -54,10 +53,13 @@ namespace Spiceport.Grains;
 /// <see cref="SiloBuilderExtensions.AddActivationMemoCollectionAge"/>) IS the memo's eviction policy.
 /// </para>
 /// </remarks>
+[GraphLocalityPlacement] // First-activation locality hint only (director no-ops to a random pick unless
+                         // GraphPlacementOptions.CoLocateWithShards is enabled); the grain directory
+                         // stays the sole authority for identity/dedup. See GraphLocalityPlacement.
 [Reentrant] // A genuine data cycle (group A contains group B contains group A) re-enters the activation that
             // started the walk; without reentrancy that would deadlock exactly as CheckGrain's remarks explain.
 public sealed class MembershipWalkGrain(
-    IDatastore datastore,
+    ISchemaSource schemaSource,
     ISchemaProvider schemaProvider,
     SchemaResolver schemaResolver,
     IGrainFactory grainFactory,
@@ -80,16 +82,15 @@ public sealed class MembershipWalkGrain(
         var ownKey = this.GetPrimaryKeyString();
         var parts = MembershipWalkKey.Parse(ownKey);
         var revision = RevisionCodec.Parse(parts.Revision);
-        var reader = datastore.SnapshotReader(revision);
 
         var schema = await schemaResolver.ResolveAsync(
-            parts.SchemaHash, reader, schemaProvider.Current, cancellationToken);
+            parts.SchemaHash, schemaSource, revision, schemaProvider.Current, cancellationToken);
         var coverage = schema.MembershipCoverage;
 
         var subject = new MembershipWalk.SubjectKey(parts.SubjectType, parts.SubjectId, parts.SubjectRelation);
-        // The reverse-adjacency hop reads through the IGraphReaderSource seam (projection or shard mesh,
-        // per GraphReaderOptions) at the same pinned revision; schema resolution above keeps the
-        // projection-pinned reader — see IGraphReaderSource.
+        // The reverse-adjacency hop reads through the IGraphReaderSource seam (the shard mesh) at the
+        // same pinned revision; schema resolution above goes through the ISchemaSource seam (a sequencer
+        // read once per hash per silo, cached by SchemaResolver).
         var directParents = await MembershipWalk
             .DirectParents(readerSource.GraphReaderAt(revision), coverage, subject, cancellationToken)
             .ConfigureAwait(true);

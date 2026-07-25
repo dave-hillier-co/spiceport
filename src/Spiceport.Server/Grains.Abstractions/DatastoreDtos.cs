@@ -73,11 +73,12 @@ public sealed record DatastoreHeadWire(
     [property: Id(2)] long GcFloor = 0);
 
 /// <summary>
-/// A proposed commit submitted to the event-sourced datastore grain WITHOUT a final revision: the
-/// resolved relationship changes (Touch / Delete on full payloads), an optional new schema (bytes), and
-/// the counter deltas (a null <see cref="CounterDeltaWire.Filter"/> being a tombstone). The grain — the
-/// single serialization point — mints the revision and stamps it onto a canonical <c>LogEvent</c>.
-/// Preconditions and create-conflicts are already resolved caller-side; this carries only the net diff.
+/// A revision-less net commit diff: the resolved relationship changes (Touch / Delete on full
+/// payloads), an optional new schema (bytes), and the counter deltas (a null
+/// <see cref="CounterDeltaWire.Filter"/> being a tombstone). Once the wire shape of the retired
+/// two-step propose/append write path, it survives as the input of the log-fold helper that stamps a
+/// minted revision onto a canonical <c>LogEvent</c> (<c>LogFold.EventFromProposal</c>) — the same net
+/// diff a <see cref="CommitRequest"/> carries field-by-field.
 /// </summary>
 [GenerateSerializer]
 public sealed record ProposedWrite(
@@ -89,26 +90,15 @@ public sealed record ProposedWrite(
 /// The durable "head" pointer entry for the event-sourced datastore grain (a single grain-storage row).
 /// It records the two distinct counters: the contiguous append-only log <see cref="LogVersion"/> (the
 /// CustomStorage optimistic-concurrency version, = the number of confirmed events), and the latest
-/// timestamp <see cref="HeadRevision"/> (the MVCC / zedtoken revision carried in the events). It also
-/// records the <see cref="SnapshotVersion"/> at which the latest periodic snapshot was taken, so a cold
-/// read replays only the log tail above the snapshot.
+/// timestamp <see cref="HeadRevision"/> (the MVCC / zedtoken revision carried in the events).
+/// <see cref="SnapshotVersion"/> names the current flush boundary: under the thin-sequencer layout it is
+/// the version of the current <c>meta/{version}</c> row (see <see cref="DatastoreMetaEntry"/>), so a
+/// cold read loads the small state plus per-key shard rows and replays only the log tail above it. On a
+/// store written by the retired whole-state layout the same field named the <c>snapshot/{version}</c>
+/// row; activation migrates such a store in place (split into per-key rows + meta) on first read.
 /// </summary>
 [GenerateSerializer]
 public sealed record LogHeadEntry(
     [property: Id(0)] int LogVersion,
     [property: Id(1)] long HeadRevision,
     [property: Id(2)] int SnapshotVersion);
-
-/// <summary>
-/// A mutable holder for the immutable <see cref="DatastoreGrainState"/>, required because
-/// <c>JournaledGrain&lt;TState,TEvent&gt;</c> mutates its state object in place via
-/// <c>TransitionState</c>, whereas <see cref="DatastoreGrainState"/> is an immutable record. The fold
-/// replaces <see cref="Value"/> with a new immutable state per applied event.
-/// </summary>
-[GenerateSerializer]
-public sealed class DatastoreStateHolder
-{
-    /// <summary>The current confirmed datastore state.</summary>
-    [Id(0)]
-    public DatastoreGrainState Value { get; set; } = new();
-}

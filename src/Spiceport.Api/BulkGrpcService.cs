@@ -20,7 +20,7 @@ namespace Spiceport.Api;
 /// gRPC front door for streaming bulk import / export of relationships. Both RPCs are streaming but the
 /// data-plane grain stays request/response: this service consumes the client import stream and calls the
 /// grain ONCE PER inbound batch (one write transaction per batch), and drives the server export stream by
-/// reading in-process over the local silo's projection via <see cref="Grains.RelationshipReads"/>. Mirrors
+/// reading in-process via <see cref="Grains.RelationshipReads"/>. Mirrors
 /// authzed.api.v1 ImportBulk / ExportBulk.
 /// </summary>
 public sealed class BulkGrpcService(IGrainFactory grains, Grains.RelationshipReads relationshipReads)

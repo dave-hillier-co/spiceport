@@ -9,22 +9,42 @@ namespace Spiceport.Grains;
 /// <summary>
 /// Stateless-worker implementation of <see cref="IRelationshipsGrain"/>: the data-plane write side.
 /// Schema writes compile-and-swap the live <see cref="ISchemaProvider"/> and persist to the datastore;
-/// relationship writes/deletes run a single read-write transaction; reads pin the optimized revision and
-/// page over a snapshot. Replies carry opaque revision tokens minted by <see cref="ZedTokens"/>.
+/// relationship writes/deletes are DECLARATIVE commits executed inside the sequencer grain
+/// (<see cref="IDatastoreGrain.Commit"/> — one hop, no client retry loop, the single-threaded activation
+/// is the serialization point); reads pin the optimized revision and page over a snapshot. Replies carry
+/// opaque revision tokens minted by <see cref="ZedTokens"/>.
 /// </summary>
 /// <remarks>
 /// The grain is <c>[StatelessWorker]</c> so the silo scales activations with load; it carries no per-key
 /// identity, so callers always use <see cref="IRelationshipsGrain.Key"/>. Read paging is deterministic
 /// by the canonical tuple string and resumes strictly after the cursor's tuple, requesting one extra row
-/// to set the continuation cursor (the same convention as the reverse-ops grain).
+/// to set the continuation cursor (the same convention as the reverse-ops grain). Commit rejections
+/// arrive as STRUCTURED REPLY DATA (<see cref="CommitReply.Failure"/>), and this grain rethrows exactly
+/// the typed exceptions the inline write path historically threw — same types, same messages — so every
+/// gRPC status mapping in the front door is preserved unchanged.
 /// </remarks>
 [StatelessWorker]
 public sealed class RelationshipsGrain(
     IDatastore datastore,
-    ISchemaProvider schemaProvider) : Grain, IRelationshipsGrain
+    ISchemaProvider schemaProvider,
+    ISchemaSource schemaSource,
+    ISnapshotScanner scanner,
+    LogWatchHub hub) : Grain, IRelationshipsGrain
 {
     // Orleans grain code must not ConfigureAwait(false); keep the captured context.
     private const ConfigureAwaitOptions ContinueOnCapturedContext = ConfigureAwaitOptions.ContinueOnCapturedContext;
+
+    /// <summary>
+    /// Bound on schema-write validate-and-commit retries (a retry happens only when the schema hash or
+    /// the guarded data moved under the validation — both grain-detected races) AND on the declarative
+    /// commit paths' HeadMoved retries (<see cref="CommitDeclarative"/>). Mirrors the compatibility
+    /// write path's CAS bound (<c>GrainBackedDatastore.MaxCasAttempts</c>); on exhaustion the same
+    /// retryable serialization conflict surfaces.
+    /// </summary>
+    private const int MaxCommitAttempts = 50;
+
+    /// <summary>The cluster-singleton sequencer grain every declarative commit executes inside.</summary>
+    private IDatastoreGrain Sequencer => GrainFactory.GetGrain<IDatastoreGrain>(IDatastoreGrain.Key);
 
     /// <inheritdoc />
     public async Task<WriteSchemaReply> WriteSchema(WriteSchemaArgs args)
@@ -59,28 +79,108 @@ public sealed class RelationshipsGrain(
             throw new SchemaWriteValidationException(ex.Message);
         }
 
-        var current = schemaProvider.Current.Schema;
+        var schemaBytes = Encoding.UTF8.GetBytes(args.SchemaText);
 
-        // Validate the diff against existing data and persist in ONE transaction: the change-validation
-        // reads run against the transaction reader (the snapshot the swap commits at), so a concurrent
-        // write either is seen here or fails the serialization check on commit. A removal that would
-        // orphan an existing relationship throws SchemaWriteValidationException, abandoning the tx — the
-        // datastore is unchanged and (because the swap happens only AFTER commit) the live schema too.
-        var committed = await datastore.ReadWriteTx(async tx =>
+        // Validate-and-commit loop. The change validation (compile + diff) stays CLIENT-SIDE against a
+        // pinned snapshot — it produces the descriptive SchemaWriteValidationException messages and the
+        // unconditional caveat rejections — while its data-existence guards ALSO ride the commit as
+        // MUST_NOT_MATCH preconditions, and the commit carries ExpectedSchemaHash (the stored-schema hash
+        // the diff base was read at). The sequencer therefore re-proves, atomically at the commit
+        // snapshot, both that no other schema landed (SchemaHashMoved) and that no conflicting data
+        // landed (PreconditionFailed) since validation; either race re-runs the whole loop against a
+        // fresh base, where the client-side pass rethrows the descriptive rejection if the conflict is
+        // real, or passes and retries the commit if it receded.
+        for (var attempt = 0; ; attempt++)
         {
-            await SchemaChangeValidator
-                .ValidateAsync(current, nextCompiled, tx, CancellationToken.None)
-                .ConfigureAwait(ContinueOnCapturedContext);
-            await tx.WriteStoredSchema(Encoding.UTF8.GetBytes(args.SchemaText))
-                .ConfigureAwait(ContinueOnCapturedContext);
-        }).ConfigureAwait(ContinueOnCapturedContext);
+            // Pin the validation base: the head revision and the stored-schema hash effective at it (the
+            // grain's own SHA-256-of-bytes hash — the same value the ExpectedSchemaHash gate compares).
+            var head = await datastore.HeadRevision(CancellationToken.None).ConfigureAwait(ContinueOnCapturedContext);
 
-        // The persist committed: only now swap the live snapshot so the datastore and the live snapshot
-        // never diverge and a rejected change leaves the live schema intact.
-        var snapshot = schemaProvider.Update(args.SchemaText);
+            // The CURRENT schema for the diff must be the one the pinned hash represents, so the gate and
+            // the validation can never disagree: compile the stored bytes at the pinned revision (they
+            // always compile — they were validated when written), read through the ISchemaSource seam.
+            // Pre-first-schema (nothing stored yet) falls back to the host-seeded live snapshot, matching
+            // the historical behavior; the gate then expects the empty hash (which is what a null stored
+            // hash matches).
+            var storedBytes = await schemaSource.ReadSchemaAt(head.Revision, CancellationToken.None)
+                .ConfigureAwait(ContinueOnCapturedContext);
+            Spiceport.Schema.CompiledSchema current;
+            if (storedBytes is null)
+            {
+                current = schemaProvider.Current.Schema;
+            }
+            else
+            {
+                // This compile is of the STORED schema (the diff base), never the caller's input: those
+                // bytes were validated when written, so a compile failure here is server-side corruption.
+                // It must surface as InvalidOperationException (gRPC Internal) — the ArgumentException
+                // mapping to InvalidArgument at the top of this method is reserved for the caller's NEW
+                // schema, and blaming the caller for a corrupt stored schema would be wrong.
+                try
+                {
+                    current = Spiceport.Schema.SchemaCompiler.CompileSchema(Encoding.UTF8.GetString(storedBytes));
+                }
+                catch (Spiceport.Schema.SchemaCompileException ex)
+                {
+                    throw new InvalidOperationException(
+                        $"stored schema failed to compile; the persisted schema at the pinned revision is corrupt: {ex.Message}",
+                        ex);
+                }
+            }
 
-        var token = await MintToken(committed, snapshot.SchemaHash).ConfigureAwait(ContinueOnCapturedContext);
-        return new WriteSchemaReply(token);
+            var checks = SchemaChangeValidator.ComputeChecks(current, nextCompiled);
+            await SchemaChangeValidator.EvaluateAsync(checks, scanner, head.Revision, CancellationToken.None)
+                .ConfigureAwait(ContinueOnCapturedContext);
+
+            var preconditions = checks
+                .OfType<SchemaChangeCheck.NoOrphans>()
+                .Select(c => new CommitPreconditionWire(WireConvert.ToFullFilter(c.Filter), MustMatch: false))
+                .ToList();
+
+            var reply = await Sequencer.Commit(new CommitRequest(
+                preconditions,
+                Array.Empty<RelationshipUpdateWire>(),
+                DeleteByFilter: null,
+                SchemaBytes: schemaBytes,
+                ExpectedSchemaHash: head.SchemaHash ?? string.Empty,
+                CounterChanges: Array.Empty<CounterDeltaWire>(),
+                ExpectedHead: null)).ConfigureAwait(ContinueOnCapturedContext);
+
+            if (reply.Revision is { } revision)
+            {
+                // Same-silo Watch pulse parity with the ReadWriteTx path: the sequencer's observer push
+                // is best-effort (a missed push costs a full heartbeat of latency, the only backstop),
+                // so a local commit wakes this silo's parked Watch streams directly.
+                hub.Pulse(revision);
+
+                // The persist committed: only now swap the live snapshot so the datastore and the live
+                // schema never diverge and a rejected change leaves the live schema intact.
+                var snapshot = schemaProvider.Update(args.SchemaText);
+                var token = await MintToken(new TimestampRevision(revision), snapshot.SchemaHash)
+                    .ConfigureAwait(ContinueOnCapturedContext);
+                return new WriteSchemaReply(token);
+            }
+
+            switch (reply.Failure!.Kind)
+            {
+                case CommitFailureKind.SchemaHashMoved:
+                case CommitFailureKind.PreconditionFailed:
+                    break; // a grain-detected race with another schema/data write: re-validate and retry.
+                case CommitFailureKind.HeadMoved:
+                    // Near-impossible on this path (no ExpectedHead rides the request; the sequencer's
+                    // single-writer activation cannot lose its own CAS) — it exists only for
+                    // duplicate-activation churn during cluster membership changes, when a second
+                    // activation of the singleton briefly races the storage version check. Retryable,
+                    // like the pre-declarative write loop treated it.
+                    break;
+                default:
+                    throw new InvalidOperationException(
+                        $"unexpected schema-commit failure {reply.Failure.Kind}: {reply.Failure.Detail}");
+            }
+
+            if (attempt + 1 >= MaxCommitAttempts)
+                throw new SerializationException();
+        }
     }
 
     /// <inheritdoc />
@@ -98,31 +198,22 @@ public sealed class RelationshipsGrain(
     {
         ArgumentNullException.ThrowIfNull(args);
 
-        var updates = args.Updates.Select(ToUpdate).ToList();
-        IRevision committed;
-        try
-        {
-            committed = await datastore.ReadWriteTx(async tx =>
-            {
-                // Preconditions are evaluated INSIDE the write transaction, against the same snapshot the
-                // writes commit at: the tx reader sees prior committed state and any staged mutations. If a
-                // precondition fails we throw, which abandons the transaction so nothing commits.
-                await CheckPreconditions(tx, args.Preconditions).ConfigureAwait(ContinueOnCapturedContext);
-                await tx.WriteRelationships(updates).ConfigureAwait(ContinueOnCapturedContext);
-            }).ConfigureAwait(ContinueOnCapturedContext);
-        }
-        catch (CreateRelationshipExistsException ex)
-        {
-            // The datastore exceptions are not Orleans-serializable across the grain boundary; re-wrap
-            // in a [GenerateSerializer] exception that preserves the conflict kind for the gRPC mapping.
-            throw new WriteConflictException(WriteConflictKind.CreateExisting, ex.Message);
-        }
-        catch (SerializationException ex)
-        {
-            throw new WriteConflictException(WriteConflictKind.Serialization, ex.Message);
-        }
+        // One declarative commit: the sequencer evaluates the preconditions against the same snapshot
+        // the updates commit at (the semantics the inline transaction had) and applies the updates with
+        // Create preserved, so a duplicate create is rejected there and nothing commits.
+        var reply = await CommitDeclarative(new CommitRequest(
+            ToCommitPreconditions(args.Preconditions),
+            args.Updates,
+            DeleteByFilter: null,
+            SchemaBytes: null,
+            ExpectedSchemaHash: null,
+            CounterChanges: Array.Empty<CounterDeltaWire>(),
+            ExpectedHead: null)).ConfigureAwait(ContinueOnCapturedContext);
 
-        var token = await MintToken(committed, schemaProvider.Current.SchemaHash)
+        if (reply.Failure is { } failure)
+            throw RelationshipWriteFailure(failure);
+
+        var token = await MintToken(new TimestampRevision(reply.Revision!.Value), schemaProvider.Current.SchemaHash)
             .ConfigureAwait(ContinueOnCapturedContext);
         return new WriteRelationshipsReply(token);
     }
@@ -132,19 +223,21 @@ public sealed class RelationshipsGrain(
     {
         ArgumentNullException.ThrowIfNull(args);
 
-        var filter = ToFilter(args.Filter);
-        var count = 0UL;
-        var reachedLimit = false;
-        var committed = await datastore.ReadWriteTx(async tx =>
-        {
-            await CheckPreconditions(tx, args.Preconditions).ConfigureAwait(ContinueOnCapturedContext);
-            (count, reachedLimit) = await tx.DeleteRelationships(filter, args.OptionalLimit)
-                .ConfigureAwait(ContinueOnCapturedContext);
-        }).ConfigureAwait(ContinueOnCapturedContext);
+        var reply = await CommitDeclarative(new CommitRequest(
+            ToCommitPreconditions(args.Preconditions),
+            Array.Empty<RelationshipUpdateWire>(),
+            new DeleteByFilterWire(WireConvert.ToFullFilter(ToFilter(args.Filter)), args.OptionalLimit),
+            SchemaBytes: null,
+            ExpectedSchemaHash: null,
+            CounterChanges: Array.Empty<CounterDeltaWire>(),
+            ExpectedHead: null)).ConfigureAwait(ContinueOnCapturedContext);
 
-        var token = await MintToken(committed, schemaProvider.Current.SchemaHash)
+        if (reply.Failure is { } failure)
+            throw RelationshipWriteFailure(failure);
+
+        var token = await MintToken(new TimestampRevision(reply.Revision!.Value), schemaProvider.Current.SchemaHash)
             .ConfigureAwait(ContinueOnCapturedContext);
-        return new DeleteRelationshipsReply(count, reachedLimit, token);
+        return new DeleteRelationshipsReply(reply.DeletedCount, reply.ReachedLimit, token);
     }
 
     /// <inheritdoc />
@@ -153,38 +246,38 @@ public sealed class RelationshipsGrain(
         ArgumentNullException.ThrowIfNull(args);
 
         // Efficient-insert semantics (create-or-overwrite, NO per-row already-exists check), matching
-        // SpiceDB ImportBulk. The whole batch loads in ONE write transaction: all-or-nothing per batch.
-        // The gRPC service drives the client stream and calls this once per inbound batch, so the grain
-        // itself stays request/response.
-        var relationships = args.Relationships.Select(ToRelationship).ToList();
-        ulong loaded = 0;
-        IRevision committed;
-        try
-        {
-            committed = await datastore.ReadWriteTx(async tx =>
-            {
-                loaded = await tx.BulkLoad(ToAsync(relationships)).ConfigureAwait(ContinueOnCapturedContext);
-            }).ConfigureAwait(ContinueOnCapturedContext);
-        }
-        catch (CreateRelationshipExistsException ex)
-        {
-            throw new WriteConflictException(WriteConflictKind.CreateExisting, ex.Message);
-        }
-        catch (SerializationException ex)
-        {
-            throw new WriteConflictException(WriteConflictKind.Serialization, ex.Message);
-        }
+        // SpiceDB ImportBulk. The whole batch loads in ONE declarative commit: all-or-nothing per batch,
+        // executed inside the sequencer like every other production write — no per-batch full-state
+        // ReadState fetch (the cost the retired ReadWriteTx compatibility path paid per attempt). The
+        // gRPC service drives the client stream and calls this once per inbound batch, so the grain
+        // itself stays request/response. Touch-op updates preserve BulkLoad's contract exactly: the
+        // sequencer validates each row and applies it create-or-overwrite (a Create op would instead
+        // reject an already-present row — a semantics change), and the loaded count is the batch's
+        // update count, exactly what BulkLoad counted per streamed row (within-batch duplicates
+        // included, last write wins on both paths).
+        var updates = args.Relationships
+            .Select(r => new RelationshipUpdateWire(RelationshipUpdateOpWire.Touch, r))
+            .ToList();
 
-        var token = await MintToken(committed, schemaProvider.Current.SchemaHash)
+        var reply = await CommitDeclarative(new CommitRequest(
+            Array.Empty<CommitPreconditionWire>(),
+            updates,
+            DeleteByFilter: null,
+            SchemaBytes: null,
+            ExpectedSchemaHash: null,
+            CounterChanges: Array.Empty<CounterDeltaWire>(),
+            ExpectedHead: null)).ConfigureAwait(ContinueOnCapturedContext);
+
+        // Touch ops cannot lose the create-conflict check, and HeadMoved is retried inside
+        // CommitDeclarative (exhaustion throws the same Serialization WriteConflictException the
+        // ReadWriteTx path surfaced) — but map any rejection through the shared mapper so a
+        // CreateAlreadyExists would still surface as the identical typed exception/gRPC code.
+        if (reply.Failure is { } failure)
+            throw RelationshipWriteFailure(failure);
+
+        var token = await MintToken(new TimestampRevision(reply.Revision!.Value), schemaProvider.Current.SchemaHash)
             .ConfigureAwait(ContinueOnCapturedContext);
-        return new BulkImportRelationshipsReply(loaded, token);
-
-        static async IAsyncEnumerable<Relationship> ToAsync(IReadOnlyList<Relationship> rels)
-        {
-            foreach (var rel in rels)
-                yield return rel;
-            await Task.CompletedTask;
-        }
+        return new BulkImportRelationshipsReply((ulong)updates.Count, token);
     }
 
     /// <inheritdoc />
@@ -192,18 +285,12 @@ public sealed class RelationshipsGrain(
     {
         ArgumentNullException.ThrowIfNull(args);
 
-        var filter = ToFilter(args.Filter);
-        try
-        {
-            await datastore.ReadWriteTx(tx => tx.WriteCounter(args.Name, filter))
-                .ConfigureAwait(ContinueOnCapturedContext);
-        }
-        catch (CounterAlreadyRegisteredException ex)
-        {
-            // The datastore exception is not Orleans-serializable across the grain boundary; rethrow a
-            // serializable carrier the gRPC front door maps to the right status code.
-            throw new CounterOperationException(CounterErrorKind.AlreadyRegistered, ex.Message);
-        }
+        var reply = await CommitDeclarative(CounterCommit(
+            new CounterDeltaWire(args.Name, WireConvert.ToFullFilter(ToFilter(args.Filter)))))
+            .ConfigureAwait(ContinueOnCapturedContext);
+
+        if (reply.Failure is { } failure)
+            throw CounterFailure(failure);
 
         return new RegisterCounterReply();
     }
@@ -213,15 +300,12 @@ public sealed class RelationshipsGrain(
     {
         ArgumentNullException.ThrowIfNull(args);
 
-        try
-        {
-            await datastore.ReadWriteTx(tx => tx.DeleteCounter(args.Name))
-                .ConfigureAwait(ContinueOnCapturedContext);
-        }
-        catch (CounterNotRegisteredException ex)
-        {
-            throw new CounterOperationException(CounterErrorKind.NotRegistered, ex.Message);
-        }
+        // A null filter is the unregister tombstone (the guarded DeleteCounter op grain-side).
+        var reply = await CommitDeclarative(CounterCommit(new CounterDeltaWire(args.Name, null)))
+            .ConfigureAwait(ContinueOnCapturedContext);
+
+        if (reply.Failure is { } failure)
+            throw CounterFailure(failure);
 
         return new UnregisterCounterReply();
     }
@@ -236,12 +320,14 @@ public sealed class RelationshipsGrain(
         var resolved = await RevisionResolver
             .Resolve(datastore, ConsistencyRequirement.FullyConsistent, cancellationToken: CancellationToken.None)
             .ConfigureAwait(ContinueOnCapturedContext);
-        var reader = datastore.SnapshotReader(resolved.Revision);
 
         ulong count;
         try
         {
-            count = await reader.CountRelationships(args.Name).ConfigureAwait(ContinueOnCapturedContext);
+            // The count is a broad filter scan at the pinned revision — the storage-direct scan seam's
+            // workload, not the shard mesh's (see ISnapshotScanner).
+            count = await scanner.CountRelationships(args.Name, resolved.Revision, CancellationToken.None)
+                .ConfigureAwait(ContinueOnCapturedContext);
         }
         catch (CounterNotRegisteredException ex)
         {
@@ -253,60 +339,123 @@ public sealed class RelationshipsGrain(
         return new CountRelationshipsReply(count, token);
     }
 
+    // --- declarative commit submission ---
+
     /// <summary>
-    /// Evaluates each precondition against the transaction reader (the snapshot the writes will commit
-    /// at). A MUST_MATCH that finds nothing, or a MUST_NOT_MATCH that finds something, throws
-    /// <see cref="PreconditionFailedException"/>, which abandons the transaction so nothing commits.
+    /// Submits a declarative commit (null <c>ExpectedHead</c>) with a bounded retry on
+    /// <see cref="CommitFailureKind.HeadMoved"/> ONLY; every other outcome (success or failure) returns
+    /// to the caller for its own mapping. HeadMoved is near-impossible here — a declarative commit
+    /// carries no head CAS and the sequencer's single-writer, non-reentrant activation cannot lose its
+    /// own conditional append — it exists only for duplicate-activation churn during cluster membership
+    /// changes, when a second activation of the singleton briefly races the storage version check. That
+    /// is a transient condition the pre-declarative write path retried (its ReadWriteTx CAS loop), so
+    /// the declarative path must stay retryable too: bounded by <see cref="MaxCommitAttempts"/> (the
+    /// same bound as <c>GrainBackedDatastore.MaxCasAttempts</c>), and on exhaustion it throws the same
+    /// retryable exception the old path surfaced — <see cref="WriteConflictException"/> with
+    /// <see cref="WriteConflictKind.Serialization"/>, which the gRPC front door maps to Aborted so the
+    /// client retries the whole transaction.
     /// </summary>
-    private static async Task CheckPreconditions(
-        IReadWriteTransaction tx,
-        IReadOnlyList<PreconditionWire>? preconditions)
+    private async Task<CommitReply> CommitDeclarative(CommitRequest request)
     {
-        if (preconditions is not { Count: > 0 })
-            return;
-
-        for (var i = 0; i < preconditions.Count; i++)
+        for (var attempt = 0; ; attempt++)
         {
-            var precond = preconditions[i];
-            var filter = ToFilter(precond.Filter);
-
-            var matched = false;
-            await foreach (var _ in tx.QueryRelationships(filter))
+            var reply = await Sequencer.Commit(request).ConfigureAwait(ContinueOnCapturedContext);
+            if (reply.Failure is not { Kind: CommitFailureKind.HeadMoved })
             {
-                matched = true;
-                break; // existence check only; one row is enough.
+                // Same-silo Watch pulse parity with GrainBackedDatastore.ReadWriteTx: the sequencer's
+                // observer push is best-effort (missed pushes are recovered only by the hub's slow
+                // heartbeat), so a successful local commit wakes this silo's parked Watch streams
+                // immediately instead of costing up to one heartbeat of latency.
+                if (reply.Revision is { } revision)
+                    hub.Pulse(revision);
+                return reply;
             }
 
-            switch (precond.Operation)
-            {
-                case PreconditionOpWire.MustMatch when !matched:
-                    throw new PreconditionFailedException(
-                        PreconditionFailureKind.MustMatchFoundNone, i,
-                        $"precondition {i} failed: MUST_MATCH filter [{DescribeFilter(filter)}] matched no relationships");
-                case PreconditionOpWire.MustNotMatch when matched:
-                    throw new PreconditionFailedException(
-                        PreconditionFailureKind.MustNotMatchFoundOne, i,
-                        $"precondition {i} failed: MUST_NOT_MATCH filter [{DescribeFilter(filter)}] matched at least one relationship");
-            }
+            if (attempt + 1 >= MaxCommitAttempts)
+                throw new WriteConflictException(
+                    WriteConflictKind.Serialization, new SerializationException().Message);
         }
     }
 
-    private static string DescribeFilter(RelationshipsFilter f)
+    // --- commit failure mapping (reply data -> the exact historical typed exceptions) ---
+
+    /// <summary>
+    /// Maps a relationship-write commit rejection back to the exact exception the inline write path threw:
+    /// a precondition failure rethrows <see cref="PreconditionFailedException"/> (kind/index recovered from
+    /// the shared message text — see <see cref="PreconditionMessages.TryParseFailure"/>), and a duplicate
+    /// create rethrows <see cref="WriteConflictException"/> with
+    /// <see cref="WriteConflictKind.CreateExisting"/> carrying the message
+    /// <see cref="CreateRelationshipExistsException"/> derives from the conflicting relationship (the
+    /// reply Detail). HeadMoved never reaches this mapper — <see cref="CommitDeclarative"/> retries it —
+    /// and no other kind can occur on a declarative relationship commit (there is no
+    /// ExpectedHead/ExpectedSchemaHash and no counter delta), so anything else is surfaced loudly.
+    /// </summary>
+    private static Exception RelationshipWriteFailure(CommitFailureWire failure) => failure.Kind switch
     {
-        var sb = new StringBuilder();
-        if (f.OptionalResourceType is { } rt) sb.Append("resource_type=").Append(rt).Append(' ');
-        if (f.OptionalResourceIds is { Count: > 0 } ids) sb.Append("resource_ids=").Append(string.Join(",", ids)).Append(' ');
-        if (f.OptionalResourceIdPrefix is { Length: > 0 } p) sb.Append("resource_id_prefix=").Append(p).Append(' ');
-        if (f.OptionalResourceRelation is { } rr) sb.Append("relation=").Append(rr).Append(' ');
-        if (f.OptionalSubjectsSelectors is { Count: > 0 } sels)
-        {
-            foreach (var s in sels)
-            {
-                if (s.OptionalSubjectType is { } st) sb.Append("subject_type=").Append(st).Append(' ');
-                if (s.OptionalSubjectIds is { Count: > 0 } sids) sb.Append("subject_ids=").Append(string.Join(",", sids)).Append(' ');
-            }
-        }
-        return sb.ToString().TrimEnd();
+        CommitFailureKind.PreconditionFailed => PreconditionFailure(failure.Detail),
+        CommitFailureKind.CreateAlreadyExists => new WriteConflictException(
+            WriteConflictKind.CreateExisting,
+            new CreateRelationshipExistsException(failure.Detail ?? string.Empty).Message),
+        _ => new InvalidOperationException(
+            $"unexpected relationship-commit failure {failure.Kind}: {failure.Detail}"),
+    };
+
+    private static PreconditionFailedException PreconditionFailure(string? detail)
+    {
+        var message = detail ?? string.Empty;
+        // The Detail is always a PreconditionMessages-formatted text (the single shared copy), so the
+        // parse recovers the exact kind and index the inline evaluation stamped on the exception.
+        return PreconditionMessages.TryParseFailure(message, out var kind, out var index)
+            ? new PreconditionFailedException(kind, index, message)
+            : new PreconditionFailedException(PreconditionFailureKind.MustMatchFoundNone, 0, message);
+    }
+
+    /// <summary>A commit carrying exactly one counter register/unregister delta and nothing else.</summary>
+    private static CommitRequest CounterCommit(CounterDeltaWire delta) => new(
+        Array.Empty<CommitPreconditionWire>(),
+        Array.Empty<RelationshipUpdateWire>(),
+        DeleteByFilter: null,
+        SchemaBytes: null,
+        ExpectedSchemaHash: null,
+        CounterChanges: new[] { delta },
+        ExpectedHead: null);
+
+    /// <summary>
+    /// Maps a counter commit rejection back to the serializable
+    /// <see cref="CounterOperationException"/> the counter RPCs have always thrown, with the message the
+    /// underlying datastore exception derives from the counter name (the reply Detail) — so the gRPC
+    /// front door's FailedPrecondition mapping and message are byte-identical to the inline path.
+    /// </summary>
+    private static Exception CounterFailure(CommitFailureWire failure) => failure.Kind switch
+    {
+        CommitFailureKind.CounterAlreadyRegistered => new CounterOperationException(
+            CounterErrorKind.AlreadyRegistered,
+            new CounterAlreadyRegisteredException(failure.Detail ?? string.Empty).Message),
+        CommitFailureKind.CounterNotRegistered => new CounterOperationException(
+            CounterErrorKind.NotRegistered,
+            new CounterNotRegisteredException(failure.Detail ?? string.Empty).Message),
+        _ => new InvalidOperationException(
+            $"unexpected counter-commit failure {failure.Kind}: {failure.Detail}"),
+    };
+
+    // --- wire conversions ---
+
+    /// <summary>
+    /// Converts the RPC-surface preconditions to the commit contract's form: the lossless full filter
+    /// (round-tripping the same core <see cref="RelationshipsFilter"/> the inline evaluation built via
+    /// <see cref="ToFilter"/>) plus the MUST_MATCH/MUST_NOT_MATCH flag.
+    /// </summary>
+    private static IReadOnlyList<CommitPreconditionWire> ToCommitPreconditions(
+        IReadOnlyList<PreconditionWire>? preconditions)
+    {
+        if (preconditions is not { Count: > 0 })
+            return Array.Empty<CommitPreconditionWire>();
+
+        return preconditions
+            .Select(p => new CommitPreconditionWire(
+                WireConvert.ToFullFilter(ToFilter(p.Filter)),
+                MustMatch: p.Operation == PreconditionOpWire.MustMatch))
+            .ToList();
     }
 
     private async Task<string> MintToken(IRevision revision, string schemaHash)
@@ -315,19 +464,6 @@ public sealed class RelationshipsGrain(
             .ConfigureAwait(ContinueOnCapturedContext);
         return ZedTokens.FromRevision(revision, schemaHash, datastoreId).Token;
     }
-
-    private static RelationshipUpdate ToUpdate(RelationshipUpdateWire wire)
-    {
-        var op = wire.Operation switch
-        {
-            RelationshipUpdateOpWire.Create => UpdateOperation.Create,
-            RelationshipUpdateOpWire.Delete => UpdateOperation.Delete,
-            _ => UpdateOperation.Touch,
-        };
-        return new RelationshipUpdate(ToRelationship(wire.Relationship), op);
-    }
-
-    private static Relationship ToRelationship(RelationshipWire wire) => WireConvert.ToRelationship(wire);
 
     private static RelationshipsFilter ToFilter(RelationshipsFilterWire wire)
     {

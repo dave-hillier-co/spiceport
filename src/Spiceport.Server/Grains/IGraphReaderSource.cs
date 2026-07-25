@@ -4,11 +4,13 @@ using Spiceport.Datastore;
 namespace Spiceport.Grains;
 
 /// <summary>
-/// The seam that hands the evaluation engines their revision-pinned <see cref="IGraphReader"/> — the
-/// ONLY reader choice the <see cref="GraphReaderOptions.UseShardedReader"/> flag switches. Schema
-/// resolution, token minting and every other snapshot-wide read deliberately stay on the
-/// <c>IDatastoreReader</c>/projection path regardless of the flag: only the graph-shaped reads the
-/// engines perform move to the shard mesh (<c>docs/graph-sharded-datastore.md</c>, migration step 3).
+/// The seam that hands the evaluation engines their revision-pinned <see cref="IGraphReader"/> — always
+/// the <c>IGraphShardGrain</c> mesh (<see cref="ShardedGraphReader"/>); the retired per-silo whole-graph
+/// projection alternative is gone. Schema resolution, token minting and every other snapshot-wide read
+/// deliberately stay OFF this seam: only the graph-shaped reads the engines perform go to the shard mesh
+/// (<c>docs/graph-sharded-datastore.md</c>). The fold-equivalence gates compare the shard mesh against a
+/// sequencer-snapshot reader (<see cref="GrainBackedDatastore.SnapshotReader"/>, one full-state fetch per
+/// reader) — see <c>ShardedReaderEquivalenceTests</c>.
 /// </summary>
 public interface IGraphReaderSource
 {
@@ -17,27 +19,8 @@ public interface IGraphReaderSource
 }
 
 /// <summary>
-/// The projection-backed source (the default): the pinned snapshot reader over the per-silo
-/// projection, exactly the reader the engines consumed before the seam existed — flag OFF is
-/// behavior-identical by construction.
-/// </summary>
-internal sealed class ProjectionGraphReaderSource : IGraphReaderSource
-{
-    private readonly IDatastore _datastore;
-
-    public ProjectionGraphReaderSource(IDatastore datastore)
-    {
-        ArgumentNullException.ThrowIfNull(datastore);
-        _datastore = datastore;
-    }
-
-    /// <inheritdoc />
-    public IGraphReader GraphReaderAt(IRevision revision) => _datastore.SnapshotReader(revision);
-}
-
-/// <summary>
-/// The shard-mesh source (the step-3 shadow path): a <see cref="ShardedGraphReader"/> resolving each
-/// pinned read to the matching <c>IGraphShardGrain</c>.
+/// The shard-mesh source: a <see cref="ShardedGraphReader"/> resolving each pinned read to the matching
+/// <c>IGraphShardGrain</c>.
 /// </summary>
 internal sealed class ShardedGraphReaderSource : IGraphReaderSource
 {

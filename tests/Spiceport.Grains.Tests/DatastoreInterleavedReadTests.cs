@@ -1,6 +1,7 @@
 using Microsoft.Extensions.DependencyInjection;
 using Orleans.Hosting;
 using Orleans.Runtime;
+using Orleans.Serialization;
 using Orleans.Storage;
 using Orleans.TestingHost;
 using Spiceport.Core;
@@ -12,7 +13,7 @@ namespace Spiceport.Grains.Tests;
 /// <summary>
 /// Grain-level gates for interleaving pure reads (<see cref="IDatastoreGrain.GetHead"/>,
 /// <see cref="IDatastoreGrain.ReadState"/>, <see cref="IDatastoreLog.ReadFrom"/>) past an in-flight
-/// <see cref="IDatastoreGrain.AppendCommit"/> on the cluster-singleton <see cref="DatastoreGrain"/>. Drives
+/// <see cref="IDatastoreGrain.Commit"/> on the cluster-singleton <see cref="DatastoreGrain"/>. Drives
 /// the REAL grain through an Orleans <see cref="TestCluster"/>, with the keyed "datastore" storage provider
 /// swapped for <see cref="PausableGrainStorage"/> so a write can be parked mid-flight (at the <c>head</c>
 /// write, or at a <c>log/{n}</c> write) while a read is issued concurrently.
@@ -25,9 +26,16 @@ public sealed class DatastoreInterleavedReadTests
     private static Relationship Rel(string rid, string sid) =>
         Relationship.Create(new ObjectAndRelation("doc", rid, "viewer"), new ObjectAndRelation("user", sid, CoreConstants.Ellipsis));
 
-    private static ProposedWrite TouchWrite(string rid, string sid) =>
-        new(new[] { new RelationshipUpdateWire(RelationshipUpdateOpWire.Touch, WireConvert.ToWire(Rel(rid, sid))) },
-            null, Array.Empty<CounterDeltaWire>());
+    /// <summary>
+    /// A compatibility-shape commit (ExpectedHead CAS, one resolved Touch, nothing else) — the same
+    /// wire request <c>GrainBackedDatastore.ReadWriteTx</c> submits, so these gates exercise exactly
+    /// the CAS-carrying write turn the production write path parks on.
+    /// </summary>
+    private static CommitRequest TouchCommit(string rid, string sid, long expectedHead) =>
+        new(Array.Empty<CommitPreconditionWire>(),
+            new[] { new RelationshipUpdateWire(RelationshipUpdateOpWire.Touch, WireConvert.ToWire(Rel(rid, sid))) },
+            DeleteByFilter: null, SchemaBytes: null, ExpectedSchemaHash: null,
+            Array.Empty<CounterDeltaWire>(), expectedHead);
 
     private static IDatastoreGrain Grain(TestCluster cluster) =>
         cluster.GrainFactory.GetGrain<IDatastoreGrain>(IDatastoreGrain.Key);
@@ -115,7 +123,12 @@ public sealed class DatastoreInterleavedReadTests
     {
         public void Configure(ISiloBuilder b)
         {
-            b.AddMemoryGrainStorage("datastore-inner");
+            // The pausable wrapper must sit over a provider with the binary grain-storage serializer
+            // (production parity — the memory provider's Newtonsoft-JSON default cannot round-trip the
+            // meta state's ImmutableDictionary key index; see AddDatastoreGrainStorage).
+            b.AddMemoryGrainStorage("datastore-inner", optionsBuilder =>
+                optionsBuilder.Configure<Serializer>((options, serializer) =>
+                    options.GrainStorageSerializer = new OrleansGrainStorageSerializer(serializer)));
             b.AddCustomStorageBasedLogConsistencyProvider("CustomStorage");
             b.ConfigureServices(services => services.AddKeyedSingleton<IGrainStorage>(
                 "datastore",
@@ -140,7 +153,7 @@ public sealed class DatastoreInterleavedReadTests
         Gate.HeadWriteBlock = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
         Gate.HeadWriteParked = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
 
-        var appendTask = grain.AppendCommit(oldHead, TouchWrite("a", "alice"));
+        var appendTask = grain.Commit(TouchCommit("a", "alice", oldHead));
         try
         {
             await Gate.HeadWriteParked.Task.WaitAsync(Timeout);
@@ -177,7 +190,7 @@ public sealed class DatastoreInterleavedReadTests
         // Phase 1: park at the head write itself.
         Gate.HeadWriteBlock = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
         Gate.HeadWriteParked = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
-        var append1 = grain.AppendCommit(oldHead, TouchWrite("a", "alice"));
+        var append1 = grain.Commit(TouchCommit("a", "alice", oldHead));
         long? newHead1;
         try
         {
@@ -193,7 +206,7 @@ public sealed class DatastoreInterleavedReadTests
         finally
         {
             Gate.HeadWriteBlock.TrySetResult(true);
-            newHead1 = await append1;
+            newHead1 = (await append1).Revision;
         }
 
         Assert.NotNull(newHead1);
@@ -207,7 +220,7 @@ public sealed class DatastoreInterleavedReadTests
         Gate.HeadWriteParked = null;
         Gate.LogWriteBlock = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
         Gate.LogWriteParked = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
-        var append2 = grain.AppendCommit(newHead1!.Value, TouchWrite("b", "bob"));
+        var append2 = grain.Commit(TouchCommit("b", "bob", newHead1!.Value));
         long? newHead2;
         try
         {
@@ -222,7 +235,7 @@ public sealed class DatastoreInterleavedReadTests
         finally
         {
             Gate.LogWriteBlock.TrySetResult(true);
-            newHead2 = await append2;
+            newHead2 = (await append2).Revision;
         }
 
         Assert.NotNull(newHead2);
@@ -244,7 +257,7 @@ public sealed class DatastoreInterleavedReadTests
         var oldHead = (await grain.GetHead()).Head;
 
         Gate.ThrowOnceOnHeadWrite = true;
-        await Assert.ThrowsAnyAsync<Exception>(() => grain.AppendCommit(oldHead, TouchWrite("a", "alice")));
+        await Assert.ThrowsAnyAsync<Exception>(() => grain.Commit(TouchCommit("a", "alice", oldHead)));
 
         // Whether this call lands on a reactivated grain (a faulted activation deactivates) or the same one,
         // the orphaned log entry must never surface.
@@ -279,14 +292,16 @@ public sealed class DatastoreInterleavedReadTests
                 await grain.GetHead();
         });
 
-        var t1 = grain.AppendCommit(head, TouchWrite("a", "alice"));
-        var t2 = grain.AppendCommit(head, TouchWrite("b", "bob"));
+        var t1 = grain.Commit(TouchCommit("a", "alice", head));
+        var t2 = grain.Commit(TouchCommit("b", "bob", head));
         var results = await Task.WhenAll(t1, t2).WaitAsync(Timeout);
 
         await cts.CancelAsync();
         await hammer;
 
-        Assert.Single(results, r => r is not null);
-        Assert.Single(results, r => r is null);
+        // Exactly one same-expectedHead commit wins; the loser is rejected as reply data (HeadMoved),
+        // the same CAS invariant the retired two-step append surfaced as a null revision.
+        Assert.Single(results, r => r.Revision is not null);
+        Assert.Single(results, r => r.Failure is { Kind: CommitFailureKind.HeadMoved });
     }
 }

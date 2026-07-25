@@ -147,7 +147,18 @@ public sealed class LogWatchHub : IDatastoreWatcher, IAsyncDisposable
             {
                 // The registration expires on its own; never let teardown fail on it.
             }
-            _grainFactory.DeleteObjectReference<IDatastoreWatcher>(selfRef);
+
+            try
+            {
+                _grainFactory.DeleteObjectReference<IDatastoreWatcher>(selfRef);
+            }
+            catch
+            {
+                // DisposeAsync runs at container disposal, possibly AFTER the Orleans runtime has already
+                // stopped — deleting an object reference against a stopped runtime can throw. The
+                // reference dies with the runtime anyway, so this stays inside the same bounded
+                // best-effort teardown discipline as the unsubscribe above: never throw, never stall.
+            }
         }
 
         // Release any stragglers so their WaitAsync observes cancellation via their own token.

@@ -118,6 +118,19 @@ internal static class ShardFold
     /// <summary>True if a read pinned at <paramref name="revision"/> is still exact on this shard.</summary>
     public static bool IsReadableAt(GraphShardState state, long revision) => revision >= state.GcFloor;
 
+    /// <summary>
+    /// Collects the shard's rows below <paramref name="floor"/> and stamps the watermark to
+    /// <paramref name="revision"/> — the GC branch of the fold, exposed for the thin sequencer's lazy
+    /// row GC: stored rows are only compacted when next dirtied and flushed, so every serve path
+    /// re-applies the current floor through this method (a floor at or below the shard's own is a pure
+    /// relabel). Applying the LATEST floor once is equivalent to applying every intermediate GC event's
+    /// floor in sequence: a row is dropped iff it is fully dead or expired at/below the final floor,
+    /// which subsumes every lower floor's collection (the same monotonicity
+    /// <c>DatastoreState.CollectBelow</c> relies on).
+    /// </summary>
+    public static GraphShardState CollectBelow(GraphShardState state, long revision, long floor) =>
+        ApplyGc(state, revision, floor);
+
     // Mirrors DatastoreState.CollectBelow's relationship rules exactly: drop a row when it is fully
     // dead below the floor (DeletedRevision <= floor) OR expired at/before the floor (the expiration
     // sweep — see CollectBelow's remarks for why that cannot change any still-servable read). A floor

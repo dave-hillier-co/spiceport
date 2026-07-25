@@ -1,4 +1,3 @@
-using System.Security.Cryptography;
 using Spiceport.Core;
 using Spiceport.Datastore;
 using Spiceport.Grains.Abstractions;
@@ -76,11 +75,8 @@ internal static class LogFold
     public static LogEvent EventFromProposal(ProposedWrite write, long revision)
     {
         var schemaChange = write.SchemaBytes is { } bytes
-            ? new SchemaVersionWire(revision, bytes, ComputeHash(bytes))
+            ? new SchemaVersionWire(revision, bytes, StoredSchemaHash.Compute(bytes))
             : null;
         return new LogEvent(revision, write.RelationshipChanges, schemaChange, write.CounterChanges, GcFloor: null);
     }
-
-    private static string ComputeHash(byte[] bytes) =>
-        Convert.ToHexStringLower(SHA256.HashData(bytes));
 }

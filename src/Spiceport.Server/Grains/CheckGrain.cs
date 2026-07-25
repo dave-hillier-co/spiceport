@@ -1,7 +1,6 @@
 using System.Collections.Immutable;
 using Orleans.Concurrency;
 using Spiceport.Core;
-using Spiceport.Datastore;
 using Spiceport.Engine;
 using Spiceport.Grains.Abstractions;
 
@@ -15,8 +14,8 @@ namespace Spiceport.Grains;
 /// <remarks>
 /// On <see cref="DispatchCheck"/> the grain decodes its identity from its string key (resource,
 /// subject, revision, schema hash), resolves a graph reader at that revision through the
-/// <see cref="IGraphReaderSource"/> seam (schema resolution stays on the injected
-/// <see cref="IDatastore"/> singleton's snapshot reader), and runs a <see cref="LocalDispatcher"/> whose onward
+/// <see cref="IGraphReaderSource"/> seam (schema resolution goes through the
+/// <see cref="ISchemaSource"/> seam on a hash miss), and runs a <see cref="LocalDispatcher"/> whose onward
 /// <see cref="LocalDispatcher.Dispatcher"/> is the silo-wide <see cref="OrleansDispatcher"/> singleton.
 /// The local dispatcher performs the one step; children flow through Orleans as further grain calls.
 /// <para>
@@ -53,6 +52,9 @@ namespace Spiceport.Grains;
 /// identical result.
 /// </para>
 /// </remarks>
+[GraphLocalityPlacement] // First-activation locality hint only (director no-ops to a random pick unless
+                         // GraphPlacementOptions.CoLocateWithShards is enabled); the grain directory
+                         // stays the sole authority for identity/dedup. See GraphLocalityPlacement.
 [Reentrant] // Accepts a same-key re-entry (a genuine cycle) rather than blocking it. The memo field below
             // is per-activation mutable state, but it is read-then-written with plain (non-atomic)
             // assignments deliberately: Orleans single-threads turn-based execution even for a reentrant
@@ -60,7 +62,7 @@ namespace Spiceport.Grains;
             // only concurrency hazard reentrancy introduces is the singleflight deadlock this class avoids
             // by never sharing an in-flight Task (see the CACHING remarks above).
 public sealed class CheckGrain(
-    IDatastore datastore,
+    ISchemaSource schemaSource,
     ISchemaProvider schemaProvider,
     SchemaResolver schemaResolver,
     IDispatcher onward,
@@ -117,15 +119,16 @@ public sealed class CheckGrain(
         // which is the identical embedded seed on every silo.
         var schema = await schemaResolver.ResolveAsync(
             parts.SchemaHash,
-            datastore.SnapshotReader(revision),
+            schemaSource,
+            revision,
             schemaProvider.Current,
             cancellationToken);
 
         // A LocalDispatcher does ONE expansion step; its onward Dispatcher (the silo-wide
         // Caching-over-Orleans dispatcher) turns each child sub-problem into a further grain call. The
-        // graph reads flow through the IGraphReaderSource seam (projection or shard mesh, per
-        // GraphReaderOptions); schema resolution above deliberately stays on the projection's snapshot
-        // reader — see IGraphReaderSource.
+        // graph reads flow through the IGraphReaderSource seam (the shard mesh); schema resolution above
+        // goes through the ISchemaSource seam (a sequencer read once per hash per silo, cached by
+        // SchemaResolver).
         var namespaces = schema.Namespaces.ToImmutableDictionary(ns => ns.Name);
         var local = new LocalDispatcher(
             namespaces,

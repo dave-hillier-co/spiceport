@@ -11,10 +11,9 @@ namespace Spiceport.Grains.Abstractions;
 /// fragmenting any keyspace. Writes persist through the host-owned
 /// <see cref="Spiceport.Datastore.IDatastore"/> and (for schema) swap the live schema snapshot; replies
 /// carry an opaque revision token. The relationship READ ops (ReadRelationships, BulkExportRelationships)
-/// and the reverse-ops reads (ExpandPermissionTree, LookupSubjects, LookupResources) run in-process over
-/// the local <see cref="Spiceport.Datastore.IDatastore"/> projection via <see cref="RelationshipReads"/>
-/// and <see cref="ReverseOps"/> respectively; this grain keeps the write side and the on-demand
-/// counter/schema ops.
+/// and the reverse-ops reads (ExpandPermissionTree, LookupSubjects, LookupResources) run in-process via
+/// <see cref="RelationshipReads"/> and <see cref="ReverseOps"/> respectively; this grain keeps the write
+/// side and the on-demand counter/schema ops.
 /// </remarks>
 public interface IRelationshipsGrain : IGrainWithIntegerKey
 {

@@ -30,7 +30,7 @@ namespace Spiceport.Api;
 /// gRPC front door: translates the proto <see cref="CheckPermissionRequest"/> into a top-level
 /// permission check, dispatches it through the silo-wide Caching-over-Orleans root dispatcher (so the
 /// recursion runs across the grain mesh), and maps the verdict back to the proto permissionship.
-/// The reverse / tree ops run in-process over the local silo's projection via <see cref="Grains.ReverseOps"/>
+/// The reverse / tree ops run in-process via <see cref="Grains.ReverseOps"/>
 /// and their replies are mapped back to proto.
 /// </summary>
 public sealed class PermissionsGrpcService(

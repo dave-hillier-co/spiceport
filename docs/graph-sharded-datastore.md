@@ -1,143 +1,138 @@
 # Graph-sharded datastore: dissolving `IDatastore` into grains
 
-A candidate architectural direction, analyzed but not committed (the same status as the
-directions in `future-work.md`, which links here). It proposes replacing the whole-graph
-storage shape — the singleton `DatastoreGrain` fold plus per-silo `SiloProjection` — with a
-thin commit sequencer and two grain-sharded adjacency families, and retiring `IDatastore`
-from the production path.
+The design for the built storage shape (`future-work.md` §1.13 links here). It replaces the
+whole-graph read shape — the per-silo `SiloProjection` replica, now retired — with a commit
+sequencer and grain-sharded adjacency shards: engine reads resolve to per-key
+`GraphShardGrain`s, writes are declarative `DatastoreGrain.Commit` requests, and broad scans
+go storage-direct. The realized steps are in the present tense below; §7 records the staging,
+including the one piece that is built but off by default (the co-placement director, whose
+enablement is gated on measurement).
 
 > Relationship to `architecture-analysis.md` §3.1: that section rules out **per-object
 > *entity* grains** — grains whose state is an object's *current* tuples — and that ruling
-> stands. This document proposes something §3.1 does not address: per-key grains holding
+> stands. This design builds something §3.1 does not address: per-key grains holding
 > **versioned slices of the MVCC fold**, activated on demand. The distinction is load-bearing
 > and is argued in §4 below.
 
 ---
 
-## 1. Diagnosis: `IDatastore` is SpiceDB's shape, not the domain's
+## 1. Diagnosis: `IDatastore` was SpiceDB's shape, not the domain's
 
 `IDatastoreReader` promises a snapshot of *everything* at a revision. No consumer wants
 that. The engines (`CheckEngine`, the Lookup engines, `ExpandEngine`) consume exactly two
 call shapes — `QueryRelationships` pinned to a resource (forward adjacency) and
 `ReverseQueryRelationships` pinned to a subject (reverse adjacency) — plus
-schema-at-revision. Four genuinely distinct roles are fused into one database-shaped
+schema-at-revision. Four genuinely distinct roles were fused into one database-shaped
 abstraction because that is the shape SpiceDB's `pkg/datastore` handed over:
 
-| Role | Carrier today | Actual access pattern |
+| Role | Carrier before the reshape | Actual access pattern |
 |---|---|---|
 | Graph reads (Check/Expand/Lookup) | `IDatastoreReader` over the whole-graph `SiloProjection` | Point reads keyed by **object** (forward) or **subject** (reverse) |
 | Commit + revision minting | `ReadWriteTx` → CAS append on the singleton | Serialized, singular by necessity (the total order) |
 | Bulk scans (ReadRelationships, export, counters, preconditions) | The same reader, filter-scanning the whole fold | Enumeration — the anti-actor workload |
 | Changefeed | `Watch` tailing the log | Log tail |
 
-The whole-graph reader is the leaked abstraction: it forces every silo to materialize the
-entire fold so a point read can be a dictionary hit, which is what caps state at
+The whole-graph reader was the leaked abstraction: it forced every silo to materialize the
+entire fold so a point read could be a dictionary hit, which is what capped state at
 "the graph fits in RAM on every silo". The graph's two natural keys — object and subject —
-are actor keys. The mesh already half-concedes this: `MembershipWalkGrain` *is* the reverse
+are actor keys. The mesh already half-conceded this: `MembershipWalkGrain` *is* the reverse
 graph modelled as on-demand grains, and `CheckGrain`'s key begins with the resource.
 
-**The reshape: `IDatastore` dissolves into a thin sequencer plus two grain-sharded adjacency
-families, with scans served from storage rather than grains.**
+**The reshape, as built: `IDatastore`'s production roles split across a sequencer, two
+grain-sharded adjacency families, and a storage-direct scan seam.**
 
 ---
 
-## 2. Target architecture
+## 2. Architecture as realized
 
 ```
-                ICommitSequencer (grain, cluster singleton, THIN)
-                 - CAS append; mints revisions (the one total order)
-                 - holds only the unflushed log tail + head
+                DatastoreGrain (grain, cluster singleton — the THIN sequencer)
+                 - Commit: declarative wire contract; mints revisions (the one total order)
+                 - holds only the small state (head/schemas/counters/floor/key index)
+                   plus a dirty buffer of keys touched since their rows last flushed
                  - Watch feed (unchanged: grain observer + heartbeat backstop)
+                 - ReadShard: per-key snapshot for shard hydration; ReadFrom: log tail
                         |
-          durable log + per-shard snapshots (stock Orleans grain storage)
+        durable log + per-key shard rows + meta rows (stock Orleans grain storage)
                         |
         +---------------+----------------------+
         |                                      |
-  ObjectShardGrain                      SubjectShardGrain
-  key: (objectType, objectId)           key: subject key (type:id[#rel])
+  GraphShardGrain (forward key)         GraphShardGrain (reverse key)
+  key: (objectType, objectId)           key: (subjectType, subjectId)
   versioned usersets of ONE object      versioned back-references of ONE subject
-  serves: ReadUserset(relation, rev)    serves: ReverseEdges(rev)
+  serves: RowsAt(rev)                   serves: RowsAt(rev)
   consumers: CheckGrain, Expand,        consumers: MembershipWalkGrain,
   LookupSubjects                        LookupResources, SubjectFrontierGrain
 ```
 
-This is a distributed LSM expressed in grains: the sequencer is the memtable + WAL (bounded —
-only the tail not yet folded into shards), shard grains are the sorted runs (each holds its
-key's MVCC history within the GC window), and "flush" is shards advancing their watermarks by
-folding the tail. The fold is reused, not rewritten: a shard's state is the existing
-`LogFold`/`MvccSnapshotReader` fold **restricted to one key**. Because the fold is already a
-pure function of the log, sharding it is a filter — this is the deep reason the refactor is
-tractable, and it yields a checkable lemma (§7 step 2).
+This is a distributed LSM expressed in grains: the sequencer is the WAL owner, shard grains
+are the sorted runs (each holds its key's MVCC history within the GC window), and "flush" is
+shards advancing their watermarks by folding the tail. The fold is reused, not rewritten: a
+shard's state is the existing `LogFold`/`MvccSnapshotReader` fold **restricted to one key**
+(`ShardFold`). Because the fold is already a pure function of the log, sharding it is a
+filter — this is the deep reason the refactor was tractable, and it yields the checkable
+sharding lemma (§7 step 2): `fold(log) == merge(fold(log | key) for all keys)`.
 
-**Reads.** A read pinned at `rev` goes to the shard. If the shard's watermark ≥ `rev` it
-serves from local state — the same closed-timestamp gate as today, per-shard instead of
-per-silo. If not, the shard pulls the filtered tail (catch-up-on-demand, the existing
-mechanism). The evaluation contract is untouched: a Check remains a pure function of
-`(schema@rev, tuples@rev, request)`; only *who holds the tuples* changes.
+**Reads.** A read pinned at `rev` goes to the shard (`ShardedGraphReader` resolves the grain;
+`IGraphReaderSource` hands the engines the pinned reader). If the shard's watermark ≥ `rev`
+it serves from local state — the closed-timestamp gate, per-shard instead of per-silo. If
+not, the shard pulls the log tail (catch-up-on-demand); a cold shard always hydrates via the
+sequencer's per-key `ReadShard` snapshot first, never a from-zero log replay (the retained
+tail starts at the compaction floor). The evaluation contract is untouched: a Check remains a
+pure function of `(schema@rev, tuples@rev, request)`; only *who holds the tuples* changed.
 
-**Writes.** The sequencer stays the sole serialization point; the single ordered log and the
-new-enemy defence are unchanged. Preconditions are the subtle part — they need a read at
-head, and the sequencer no longer holds the fold. The LSM shape solves it:
-state-at-head = shard-state-at-watermark + tail replay, and the sequencer *owns the tail*.
-During a commit (single-threaded, non-reentrant — nothing else can move head) it evaluates
-preconditions by querying the affected shards at their watermarks and overlaying its
-in-memory tail delta. Exact, no locks, no two-phase commit. A broad precondition filter means
-a scatter and therefore a slow write — the correct place to pay.
+**Writes.** The sequencer is the sole serialization point; the single ordered log and the
+new-enemy defence are unchanged. `DatastoreGrain.Commit` is the declarative wire contract:
+preconditions, updates, delete-by-filter, schema writes (guarded by `ExpectedSchemaHash`),
+and counter changes are evaluated and executed inside the single-threaded, non-reentrant
+activation. The single-writer activation makes head-moved conflicts near-impossible — it
+cannot lose its own conditional append — but the client still carries a bounded `HeadMoved`
+retry, because a stale duplicate activation during cluster-membership churn can briefly race
+the storage version check. Every rejection returns as a typed `CommitReply` failure with
+nothing applied. The fold has left the grain: a commit assembles a PARTIAL base from exactly
+the shard keys its updates/preconditions/delete filter can read (candidate-key resolution
+over the key index — sound by the sharding lemma; the argument is inline at the assembly
+site in `DatastoreGrain.Commit`), evaluates against it, and pre-seeds the dirty buffer for
+every key the resulting event touches before the append. `ReadWriteTx`
+survives only as the `ExpectedHead` compatibility path — the caller-evaluated CAS shape —
+over the same `Commit` contract.
 
-**Activation state = the hot set.** Cold objects' shards deactivate; their history sits in
-their snapshot row until touched. Silo memory becomes O(hot working set), not O(graph).
+**Activation state = the hot set.** Cold keys' shards deactivate under Orleans idle
+collection; cold keys never activate at all until touched. Silo memory is O(hot working
+set), not O(graph).
 
 ---
 
-## 3. The three interfaces that replace `IDatastore`
+## 3. The seams that replace the whole-graph reader
 
-```csharp
-// The engine seam — grain-shaped; replaces IDatastoreReader for Check/Expand/Lookup.
-// Constructed pinned at a revision, as the reader is today.
-public interface IGraphReader
-{
-    IAsyncEnumerable<Relationship> ReadUserset(
-        ObjectRef resource, string? relation, CancellationToken ct);
-    IAsyncEnumerable<Relationship> ReadBackReferences(
-        SubjectRef subject, ReverseQueryOptions? options, CancellationToken ct);
-}
-
-// The write/consistency seam — the sequencer grain's face.
-public interface ICommitSequencer
-{
-    Task<RevisionWithSchemaHash> HeadRevision(CancellationToken ct);
-    Task<RevisionWithSchemaHash> OptimizedRevision(CancellationToken ct);
-    Task<IRevision> Commit(CommitRequest request, CancellationToken ct);
-    IAsyncEnumerable<RevisionChange> Watch(
-        IRevision after, WatchOptions options, CancellationToken ct);
-}
-
-// The scan seam — storage-direct, no grains.
-public interface ISnapshotScanner
-{
-    IAsyncEnumerable<Relationship> Scan(
-        RelationshipsFilter filter, IRevision rev, CancellationToken ct);
-}
-```
-
-- **`IGraphReader`** is what the engines already use in practice: every engine call site is
-  one of these two shapes (`RelationshipsFilter` with a pinned resource, or a
-  `SubjectsFilter`). The implementation resolves the shard grain and calls it; replies are
-  `[Immutable]` so same-silo calls do not copy. Schema-at-revision moves fully to
-  `ISchemaProvider`, where it already effectively lives.
-- **`ReadWriteTx`'s lambda shape dies.** `Func<IReadWriteTransaction, Task>` pretends the
-  caller interactively reads-and-writes inside a transaction; in reality
-  `GrainBackedDatastore` stages mutations and CAS-appends once. `Commit(mutations,
-  preconditions)` as a plain request is honest and makes the wire contract to the sequencer
-  explicit. The transaction *object* was another piece of SpiceDB's shape that never fit.
-- **`ISnapshotScanner`** takes bulk export, loose-filter ReadRelationships, counter
-  evaluation, and the precondition scatter off the actor mesh: it reads the durable shard
-  snapshots + tail replay directly. Scans are the workload actors are worst at; routing them
-  through storage keeps shard activations for graph work. Client-facing cursors (keyset,
+- **`IGraphReader`** (in `Spiceport.Datastore`) is the engine seam — the two pinned call
+  shapes the engines actually produce: `QueryRelationships` with explicit resource ids and
+  `ReverseQueryRelationships` with explicit subject ids. `ShardedGraphReader` implements it
+  by resolving the matching `GraphShardGrain` per key; anything scan-shaped throws
+  `NotSupportedException` — broad scans belong on the scan seam, not the shard mesh. Replies
+  are `[Immutable]` so same-silo calls do not copy. The engines receive their pinned reader
+  through `IGraphReaderSource`.
+- **`DatastoreGrain.Commit` is the write wire contract.** The `ReadWriteTx` lambda shape
+  (`Func<IReadWriteTransaction, Task>`) pretended the caller interactively read-and-wrote
+  inside a transaction; in reality the client staged mutations and CAS-appended once.
+  `Commit(preconditions, updates, deleteByFilter, schema + ExpectedSchemaHash, counters)` as
+  a plain declarative request is honest, executes on the sequencer's serialization point
+  (no caller-evaluated CAS loop; only the bounded duplicate-activation `HeadMoved` retry
+  remains client-side), and reports every rejection as a typed `CommitReply` failure with
+  nothing applied. `ReadWriteTx` remains as the `ExpectedHead` compatibility path over the
+  same contract.
+- **`ISnapshotScanner`** is the scan seam: bulk export, loose-filter ReadRelationships, and
+  counter evaluation fetch a sequencer snapshot per scan and serve it through the same
+  `MvccSnapshotReader` the reference model uses — scan semantics cannot drift from the
+  reference reader. Scans are the workload actors are worst at; routing them around the
+  shard mesh keeps shard activations for graph work. Client-facing cursors (keyset,
   revision-pinned bulk export) are unchanged API contract.
+- **`ISchemaSource`** is the schema-at-revision seam: one sequencer read per schema hash per
+  silo (the compiled snapshot is cached by hash), never per check.
 
-`ReferenceDatastore` and the `IDatastore` family survive **in tests only**, as the
-implementation-independent reference model the conformance corpus runs against.
+`ReferenceDatastore` and the `IDatastore` reader family survive as the
+implementation-independent reference model the conformance corpus and equivalence gates run
+against.
 
 ---
 
@@ -162,8 +157,8 @@ covered revision. `GcApplied(floor)` remains a log event; every shard applies it
 identically — that invariant survives untouched.
 
 **"Writes need a global monotonic revision and cross-object snapshot consistency."**
-Unchanged: the sequencer is that global-order point, exactly as the `DatastoreGrain` is
-today. Nothing in this design shards the *log* — only the *fold*.
+Unchanged: the sequencer — the `DatastoreGrain` itself — is that global-order point. Nothing
+in this design shards the *log* — only the *fold*.
 
 **The hot-object problem** (a group with a million members read by thousands of concurrent
 checks): one shard activation serializes reads. Mitigations, in order: reads over the
@@ -171,24 +166,33 @@ immutable folded structure are `[AlwaysInterleave]`-safe (the same lesson alread
 the `DatastoreGrain`'s pure reads — `[ReadOnly]` alone does not interleave past writes); the
 reply for a large userset is an immutable snapshot reference, cheap to hand out repeatedly;
 and if a single activation still saturates, a `[StatelessWorker]` read-replica face hydrated
-from the shard is the escape hatch. The current design has the same data hot — it is just
-pre-replicated to every silo. Shards replicate *on demand* instead of *always, everywhere*.
+from the shard is the escape hatch. The retired projection design had the same data hot — it
+was just pre-replicated to every silo. Shards replicate *on demand* instead of *always,
+everywhere*.
 
 ---
 
 ## 5. The alignment prize: compute lands on its data
 
-This is where the design stops being a storage refactor and becomes the actor-native
-completion of the rearchitecture's founding thesis:
+This part is built but OFF by default (see §7): enabling it is pure performance, gated on
+measurement per the simplicity-over-performance stance. `GraphLocalityPlacement` (a pluggable
+placement director, the extension `future-work.md` §1.4 anticipated when the hash ring was
+deleted) biases the FIRST activation of the four graph grain families onto the silo a stable
+hash of their locality key names — a hint only; the grain directory remains the sole authority
+for identity and dedup, and on membership change existing activations stay put while locality
+degrades gracefully. The opt-in is `GraphPlacementOptions.CoLocateWithShards` via
+`AddGraphLocalityPlacement`. It is where the design stops being a storage refactor and becomes
+the actor-native completion of the rearchitecture's founding thesis:
 
-- `CheckGrain`'s key begins with `(resourceType, resourceId, …)`; `ObjectShardGrain`'s key
-  *is* `(resourceType, resourceId)`. A custom placement director — pluggable, the extension
-  `future-work.md` §1.4 anticipated when the hash ring was deleted — places check grains on
-  the silo of their object's shard. The first data read is then a same-silo call against an
-  `[Immutable]` reply: function shipping and data shipping become the same ship.
+- `CheckGrain`'s key begins with `(resourceType, resourceId, …)`; the forward-keyed
+  `GraphShardGrain`'s key *is* `(resourceType, resourceId)`. A custom placement director —
+  pluggable, the extension `future-work.md` §1.4 anticipated when the hash ring was deleted —
+  places check grains on the silo of their object's shard. The first data read is then a
+  same-silo call against an `[Immutable]` reply: function shipping and data shipping become
+  the same ship.
 - `MembershipWalkGrain` and `SubjectFrontierGrain` are keyed by subject key — the same key as
-  `SubjectShardGrain`. They co-place the same way, or eventually merge: the walk grain is
-  naturally the compute face of the reverse shard.
+  the reverse-keyed `GraphShardGrain`. They co-place the same way, or eventually merge: the
+  walk grain is naturally the compute face of the reverse shard.
 
 The end state is symmetrical and legible: **the graph is stored as two grain-sharded
 adjacency indexes — forward by object, reverse by subject — each co-located with the compute
@@ -197,32 +201,42 @@ component left is the sequencer, and it is thin.
 
 ---
 
-## 6. What dissolves, and which ceilings move
+## 6. What dissolved, and which ceilings moved
 
 Deleted or dissolved:
 
-- `SiloProjection` as a whole-graph structure, and with it the per-silo bootstrap.
+- `SiloProjection` as a whole-graph structure, and with it the per-silo bootstrap. The
+  bootstrap-then-tail-fold pattern it carried survives, restricted to one key, inside
+  `GraphShardGrain`.
 - `DatastoreProjectionService` / `IDatastoreProjectionHost` — nothing to bootstrap
   pre-traffic; shards self-hydrate on activation.
-- The multi-silo cold-start problem `future-work.md` §1.12 defers (`ISnapshotSegmentGrain`)
-  — dissolved rather than optimized: no silo ever fetches the whole snapshot.
-- `GrainBackedDatastore` — its write path becomes the sequencer client, its read path
-  becomes `IGraphReader`.
-- `IDatastore` / `IDatastoreReader` / `IReadWriteTransaction` from the production path
-  (they remain under `tests/` with the reference model).
-- `DatastoreGrain` slims to the sequencer: append + tail-serve + Watch feed, no fold
-  maintenance.
+- The multi-silo cold-start problem `future-work.md` §1.12 deferred (`ISnapshotSegmentGrain`)
+  — dissolved rather than optimized: no silo ever fetches the whole snapshot pre-traffic.
+- The engines' dependency on the wide reader: per-Check graph reads go through
+  `IGraphReaderSource`/`ShardedGraphReader`, never `IDatastoreReader`.
 
-Ceilings:
+Deliberately retained:
 
-- **State ceiling — eliminated.** The graph no longer needs to fit in RAM on every silo.
-  This is the scalability win, and the one that mattered.
-- **Bootstrap/failover ceiling — eliminated.** Sequencer recovery = read head + bounded
-  tail; silo start = nothing.
+- `GrainBackedDatastore` as a narrow facade: revision resolution, token minting, Watch, and
+  the `ReadWriteTx` compatibility write path (tests/BulkImport/SeedData) — submitted over
+  the same `Commit` wire contract with `ExpectedHead`.
+- `ReferenceDatastore` and the `IDatastore` reader family as the reference model for the
+  conformance corpus and the fold-equivalence gates.
+
+Ceilings, honestly stated:
+
+- **Per-silo read-fleet state ceiling — gone.** The graph no longer needs to fit in RAM on
+  every silo; silo memory is O(hot shards). This is the scalability win, and the one that
+  mattered.
+- **Silo cold-start warmup — gone.** Silo start hydrates nothing; shards hydrate on first
+  touch.
+- **Sequencer state ceiling — gone.** The thin-sequencer flush protocol (§7 step 6) removed
+  the materialized fold from the `DatastoreGrain`: its memory is the small state plus a
+  dirty buffer bounded by write rate x the flush interval, and its recovery is O(log tail +
+  touched keys), never O(graph). The one deliberately O(graph) surface left is the
+  admin-plane `ReadState` assembly (scan seam, compatibility writes, equivalence gates).
 - **Write ceiling — deliberately retained.** One sequencer, one total order: the new-enemy
-  invariant and the recorded non-goal. Thinning the sequencer raises its practical
-  throughput anyway (it no longer maintains the fold), but the ceiling is a design stance,
-  not a casualty.
+  invariant and the recorded non-goal. The ceiling is a design stance, not a casualty.
 
 Honest costs:
 
@@ -237,7 +251,7 @@ Honest costs:
 
 ---
 
-## 7. Migration, in the repository's own discipline
+## 7. The staging, in the repository's own discipline: what is realized, what remains
 
 Every step lands with the conformance corpus green two ways and the differential suite
 against real SpiceDB as the external gate. Shards serve *data*, not candidates, so the
@@ -245,22 +259,41 @@ applicable instrument is the **fold-correctness equivalence gate** (the stronger
 `future-work.md` invariants reserve for anything that would serve verdicts), not
 candidates-plus-Check-confirmation.
 
-1. **Narrow the engine seam first, with no behavior change.** Introduce `IGraphReader`,
-   implement it trivially over the existing `SiloProjection`, and move
-   `CheckEngine`/Expand/Lookup onto it. A pure refactor that proves the engines never needed
-   the wide reader.
-2. **Extract the keyed fold.** Parameterize `LogFold` by a key predicate and property-test
-   the sharding lemma: `fold(log) == merge(fold(log | key) for all keys)`, checked in-memory
+Realized (the built system):
+
+1. **The engine seam is narrow.** `IGraphReader` carries the two pinned call shapes, and
+   `CheckEngine`/Expand/Lookup read only through it — the engines never needed the wide
+   reader.
+2. **The keyed fold is extracted.** `ShardFold` is the log fold restricted to one key; the
+   sharding lemma — `fold(log) == merge(fold(log | key) for all keys)` — is property-tested
    against `ReferenceDatastore`.
-3. **Stand up the shard grain families behind `IGraphReader`** under a shadow flag, running
-   the fold-equivalence gate: every read answered by both projection and shards must agree
-   exactly.
-4. **Slim the sequencer.** Move precondition evaluation to tail-overlay + shard-base, make
-   `Commit` the explicit wire contract, stop maintaining the whole fold in the grain.
-5. **Move scans to `ISnapshotScanner`**, flip the default, delete the projection, and retire
-   `IDatastore` from `src/`.
-6. **Co-placement director last** — pure performance, gated by measurement, per the
-   simplicity-over-performance stance.
+3. **The shard grain families serve `IGraphReader`.** `GraphShardGrain` (forward by object,
+   reverse by subject) behind `ShardedGraphReader`, with the fold-equivalence gate asserting
+   shard reads agree row-for-row with a sequencer-snapshot reader.
+4. **`Commit` is the explicit wire contract.** Declarative
+   preconditions/updates/deleteByFilter/schema/counters execute on the sequencer with typed
+   `CommitReply` failures; `ReadWriteTx` survives as the `ExpectedHead` compatibility path.
+5. **Scans go through `ISnapshotScanner`**, schema-at-revision through `ISchemaSource`, and
+   the per-silo whole-graph projection is deleted — sharded reads are the only engine path.
+6. **The thin-sequencer flush protocol.** The fold has left the grain. The sequencer's
+   journaled state is only the small `DatastoreMetaState` (head, schemas, counters, GC
+   floor, and the key index of populated forward/reverse keys); rows persist per adjacency
+   key as `shard/f|r/{type}/{id}` `GraphShardState` rows in the same stock grain storage,
+   rewritten from an in-memory dirty buffer at the same 64-event cadence the whole-state
+   snapshots used (write-once `meta/{version}` rows version the flushes; the `head` row
+   stays the commit point; clears stay best-effort post-commit). The load-bearing fact is
+   the sharding lemma's corollary: a clean key's stored row content is complete — only its
+   `AppliedRevision` label is stale and is relabeled to head on serve — so clean keys need
+   NO per-key tail replay, and recovery is O(tail + touched keys). Row GC is lazy (rows
+   compact when next dirtied+flushed; every serve path re-applies the floor, and reads
+   below the floor are rejected anyway). `Commit` evaluates over a partial base assembled
+   by candidate-key resolution; `ReadState` survives as the admin plane's on-demand
+   whole-state assembly. A legacy whole-state `snapshot/{version}` store migrates in place
+   on first activation.
+
+7. **The co-placement director** (§5) — built as `GraphLocalityPlacement`, default OFF:
+   the locality hint is proven by a multi-silo co-location gate, and ENABLING it in a
+   deployment remains gated by measurement, per the simplicity-over-performance stance.
 
 ---
 
@@ -274,8 +307,8 @@ candidates-plus-Check-confirmation.
 - **GC as a log event.** Every shard applies `GcApplied(floor)` in its fold identically.
 - **The corpus stays green, unweakened**, and `authzed.api.v1` compatibility (cursors and
   token formats included) is unchanged.
-- **No application SQL.** Shard snapshots and the log persist through stock Orleans grain
-  storage, as today.
+- **No application SQL.** The log, the per-key shard rows and the meta rows all persist
+  through stock Orleans grain storage.
 
 This reshape also strengthens rather than spends the other analyzed directions:
 incrementally-materialized reachability (`future-work.md` §2.2) becomes another shard family

@@ -121,6 +121,7 @@ public interface IPermissionChecker
 /// </remarks>
 public sealed class PermissionChecker(
     IDatastore datastore,
+    ISchemaSource schemaSource,
     IDispatcher root,
     ISchemaProvider schemaProvider,
     SchemaResolver schemaResolver,
@@ -134,13 +135,14 @@ public sealed class PermissionChecker(
     public const int DefaultBatchConcurrency = 50;
 
     /// <summary>
-    /// Resolves the compiled schema effective at the resolved revision, matching what every CheckGrain in
+    /// Resolves the compiled schema effective at the resolved revision (through the
+    /// <see cref="ISchemaSource"/> seam on a hash miss), matching what every CheckGrain in
     /// the dispatched tree evaluates under (so the collapse uses the same caveats the dispatch ran under),
     /// rather than the possibly-stale ambient current schema on a non-writer silo.
     /// </summary>
     private Task<SchemaSnapshot> ResolveSchema(ResolvedRevision resolved, CancellationToken ct) =>
         schemaResolver.ResolveAsync(
-            resolved.SchemaHash, datastore.SnapshotReader(resolved.Revision), schemaProvider.Current, ct);
+            resolved.SchemaHash, schemaSource, resolved.Revision, schemaProvider.Current, ct);
 
     /// <inheritdoc />
     public async Task<PermissionCheckResult> Check(

@@ -1,7 +1,5 @@
 using Spiceport.Core;
-using Spiceport.Datastore;
 using Spiceport.Grains.Abstractions;
-using Spiceport.Schema;
 
 namespace Spiceport.Grains.Tests;
 
@@ -9,10 +7,12 @@ namespace Spiceport.Grains.Tests;
 /// Fold-level gates for GC <see cref="LogEvent"/>s (<c>ev.GcFloor</c> non-null): proves
 /// <see cref="LogFold.ApplyEvent"/> on a GC event is exactly "collect below the floor, then advance the
 /// head to the event's revision" — the same equivalence <see cref="LogEventEquivalenceTests"/> establishes
-/// for ordinary events — and that <see cref="SiloProjection"/> folds a GC event in its log tail harmlessly
-/// (it carries no relationship/schema/counter changes). The Leopard membership-walk grain mesh needs no
-/// analogous fold-tolerance gate: each walk runs over a reader pinned to one exact revision (see
-/// <c>Spiceport.Engine.MembershipWalk</c>), so a GC event elsewhere in the log never touches it.
+/// for ordinary events. A GC event carries no relationship/schema/counter changes, so any log-tail
+/// consumer (the shard grains' <c>ShardFold</c>, the Watch feed) folds it harmlessly — the shard-level
+/// gate is <c>ShardedReaderEquivalenceTests.Gc_Floor_Is_Enforced_Through_The_Shard_Grain</c>. The Leopard
+/// membership-walk grain mesh needs no analogous fold-tolerance gate: each walk runs over a reader pinned
+/// to one exact revision (see <c>Spiceport.Engine.MembershipWalk</c>), so a GC event elsewhere in the log
+/// never touches it.
 /// </summary>
 public sealed class DatastoreGcFoldTests
 {
@@ -79,70 +79,4 @@ public sealed class DatastoreGcFoldTests
         Assert.Empty(ev.CounterChanges);
     }
 
-    [Fact]
-    public async Task SiloProjection_folds_a_gc_event_in_its_tail_and_matches_ReadState()
-    {
-        var grain = new FakeLog(Seed);
-        grain.Append(TouchEvent(Seed + 1, "a", "alice"));
-        grain.Append(TouchEvent(Seed + 2, "b", "bob"));
-
-        var projection = new SiloProjection(grain);
-        _ = await projection.StateAtLeast(Seed + 2); // bootstrap + fold up to here
-
-        grain.Append(DeleteEvent(Seed + 3, "a", "alice"));
-        grain.Append(GcEvent(Seed + 4, Seed + 3)); // collects "a" (dead at Seed+3)
-
-        var folded = await projection.StateAtLeast(Seed + 4);
-        var readState = await grain.ReadState(); // independently folds the whole log from empty
-
-        Assert.Equal(LiveIdsFromMemory(DatastoreStateConverters.ToMemory(readState)), LiveIdsFromMemory(folded));
-        Assert.DoesNotContain(readState.Relationships, r => r.Relationship.ResourceId == "a");
-        Assert.Contains(readState.Relationships, r => r.Relationship.ResourceId == "b");
-    }
-
-    private static SortedSet<string> LiveIdsFromMemory(DatastoreState state)
-    {
-        var set = new SortedSet<string>();
-        foreach (var rel in state.LiveAt(state.HeadRevision))
-            set.Add($"{rel.Resource.ObjectId}:{rel.Subject.ObjectId}");
-        return set;
-    }
-
-    /// <summary>
-    /// A minimal in-process <see cref="IDatastoreGrain"/> owning an append-only <see cref="LogEvent"/> list,
-    /// mirroring <see cref="Stage2SiloProjectionTests"/>'s fake (kept separate here so this file has no
-    /// dependency on that test class's private nested type).
-    /// </summary>
-    private sealed class FakeLog(long seed) : IDatastoreGrain
-    {
-        private readonly List<LogEvent> _events = new();
-
-        public void Append(LogEvent ev) => _events.Add(ev);
-
-        public Task<DatastoreGrainState> ReadState()
-        {
-            var state = DatastoreGrainState.Empty(seed);
-            foreach (var ev in _events)
-                state = LogFold.ApplyEvent(state, ev);
-            return Task.FromResult(state);
-        }
-
-        public Task<LogSegment> ReadFrom(long afterRevision, int maxCount)
-        {
-            var head = _events.Count > 0 ? _events[^1].Revision : seed;
-            var page = _events
-                .Where(e => e.Revision > afterRevision)
-                .OrderBy(e => e.Revision)
-                .Take(maxCount < 0 ? int.MaxValue : maxCount)
-                .ToList();
-            return Task.FromResult(new LogSegment(page, head));
-        }
-
-        public Task<DatastoreHeadWire> GetHead() => throw new NotSupportedException();
-        public Task<long?> AppendCommit(long expectedHead, ProposedWrite write) => throw new NotSupportedException();
-        public Task<DatastoreHeadWire> SubscribeWatch(IDatastoreWatcher watcher) => throw new NotSupportedException();
-        public Task UnsubscribeWatch(IDatastoreWatcher watcher) => throw new NotSupportedException();
-        public Task<long?> RunGc() => throw new NotSupportedException();
-        public Task<GraphShardState> ReadShard(GraphShardKeyWire key) => throw new NotSupportedException();
-    }
 }

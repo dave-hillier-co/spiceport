@@ -6,6 +6,8 @@ using Orleans.TestingHost;
 using Spiceport.Core;
 using Spiceport.Datastore;
 using Spiceport.Grains;
+using Microsoft.Extensions.Configuration;
+using Spiceport.Server.Hosting;
 
 namespace Spiceport.Grains.Tests;
 
@@ -32,7 +34,11 @@ public sealed class GrainBackedDatastoreFidelityTests
     {
         public void Configure(ISiloBuilder b)
         {
-            b.AddMemoryGrainStorage("datastore");
+            // The PRODUCTION "datastore" registration (in-memory branch): forces the binary grain-storage
+            // serializer. The provider's Newtonsoft-JSON default cannot round-trip the meta state's
+            // ImmutableDictionary key index (and silently corrupts boxed-JsonElement caveat context) —
+            // see AddDatastoreGrainStorage.
+            b.AddDatastoreGrainStorage(new ConfigurationBuilder().Build());
             b.AddCustomStorageBasedLogConsistencyProvider("CustomStorage");
         }
     }
@@ -51,8 +57,8 @@ public sealed class GrainBackedDatastoreFidelityTests
     {
         var inMem = new ReferenceDatastore();
         await using var scope = new ClusterScope(await NewClusterAsync());
-        await using var host = new PrivateProjectionHost(scope.Cluster.GrainFactory);
-        IDatastore grainDs = new GrainBackedDatastore(scope.Cluster.GrainFactory, host);
+        await using var hub = IsolatedWatchHub.Create(scope.Cluster.GrainFactory);
+        IDatastore grainDs = new GrainBackedDatastore(scope.Cluster.GrainFactory, hub);
 
         // Step 1: distinct creates.
         var a = Rel("doc", "a", "viewer", "user", "alice");

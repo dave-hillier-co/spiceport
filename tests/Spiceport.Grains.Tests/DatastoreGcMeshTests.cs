@@ -6,6 +6,8 @@ using Orleans.TestingHost;
 using Spiceport.Core;
 using Spiceport.Datastore;
 using Spiceport.Grains.Abstractions;
+using Microsoft.Extensions.Configuration;
+using Spiceport.Server.Hosting;
 
 namespace Spiceport.Grains.Tests;
 
@@ -45,7 +47,11 @@ public class DatastoreGcMeshTests
     {
         public void Configure(ISiloBuilder b)
         {
-            b.AddMemoryGrainStorage("datastore");
+            // The PRODUCTION "datastore" registration (in-memory branch): forces the binary grain-storage
+            // serializer. The provider's Newtonsoft-JSON default cannot round-trip the meta state's
+            // ImmutableDictionary key index (and silently corrupts boxed-JsonElement caveat context) —
+            // see AddDatastoreGrainStorage.
+            b.AddDatastoreGrainStorage(new ConfigurationBuilder().Build());
             b.AddCustomStorageBasedLogConsistencyProvider("CustomStorage");
             b.UseInMemoryReminderService();
             b.ConfigureServices(services => services.AddSingleton<IOptions<DatastoreGcOptions>>(
@@ -64,7 +70,11 @@ public class DatastoreGcMeshTests
     {
         public void Configure(ISiloBuilder b)
         {
-            b.AddMemoryGrainStorage("datastore");
+            // The PRODUCTION "datastore" registration (in-memory branch): forces the binary grain-storage
+            // serializer. The provider's Newtonsoft-JSON default cannot round-trip the meta state's
+            // ImmutableDictionary key index (and silently corrupts boxed-JsonElement caveat context) —
+            // see AddDatastoreGrainStorage.
+            b.AddDatastoreGrainStorage(new ConfigurationBuilder().Build());
             b.AddCustomStorageBasedLogConsistencyProvider("CustomStorage");
             b.ConfigureServices(services => services.AddSingleton<IOptions<DatastoreGcOptions>>(
                 Options.Create(new DatastoreGcOptions { Window = TimeSpan.Zero })));
@@ -95,8 +105,8 @@ public class DatastoreGcMeshTests
     public async Task RunGc_appends_a_log_event_advances_head_and_collects_dead_rows()
     {
         await using var scope = new Scope(await NewClusterAsync<GcSiloConfigurator>());
-        await using var host = new PrivateProjectionHost(scope.Cluster.GrainFactory);
-        IDatastore ds = new GrainBackedDatastore(scope.Cluster.GrainFactory, host);
+        await using var hub = IsolatedWatchHub.Create(scope.Cluster.GrainFactory);
+        IDatastore ds = new GrainBackedDatastore(scope.Cluster.GrainFactory, hub);
         var grain = Grain(scope.Cluster);
 
         await ds.ReadWriteTx(tx => tx.WriteRelationships(new[] { Create("a", "alice"), Create("b", "bob") }));
@@ -129,8 +139,8 @@ public class DatastoreGcMeshTests
     public async Task RunGc_is_a_no_op_when_the_window_exceeds_elapsed_epoch_time()
     {
         await using var scope = new Scope(await NewClusterAsync<HugeWindowSiloConfigurator>());
-        await using var host = new PrivateProjectionHost(scope.Cluster.GrainFactory);
-        IDatastore ds = new GrainBackedDatastore(scope.Cluster.GrainFactory, host);
+        await using var hub = IsolatedWatchHub.Create(scope.Cluster.GrainFactory);
+        IDatastore ds = new GrainBackedDatastore(scope.Cluster.GrainFactory, hub);
         var grain = Grain(scope.Cluster);
 
         await ds.ReadWriteTx(tx => tx.WriteRelationships(new[] { Create("a", "alice") }));
@@ -150,7 +160,11 @@ public class DatastoreGcMeshTests
     {
         public void Configure(ISiloBuilder b)
         {
-            b.AddMemoryGrainStorage("datastore");
+            // The PRODUCTION "datastore" registration (in-memory branch): forces the binary grain-storage
+            // serializer. The provider's Newtonsoft-JSON default cannot round-trip the meta state's
+            // ImmutableDictionary key index (and silently corrupts boxed-JsonElement caveat context) —
+            // see AddDatastoreGrainStorage.
+            b.AddDatastoreGrainStorage(new ConfigurationBuilder().Build());
             b.AddCustomStorageBasedLogConsistencyProvider("CustomStorage");
             b.ConfigureServices(services => services.AddSingleton<IOptions<DatastoreGcOptions>>(
                 // Comfortably longer than elapsed Unix-epoch time (~56 years), safely under the long-range
@@ -165,7 +179,11 @@ public class DatastoreGcMeshTests
     {
         public void Configure(ISiloBuilder b)
         {
-            b.AddMemoryGrainStorage("datastore");
+            // The PRODUCTION "datastore" registration (in-memory branch): forces the binary grain-storage
+            // serializer. The provider's Newtonsoft-JSON default cannot round-trip the meta state's
+            // ImmutableDictionary key index (and silently corrupts boxed-JsonElement caveat context) —
+            // see AddDatastoreGrainStorage.
+            b.AddDatastoreGrainStorage(new ConfigurationBuilder().Build());
             b.AddCustomStorageBasedLogConsistencyProvider("CustomStorage");
             b.ConfigureServices(services => services.AddSingleton<IOptions<DatastoreGcOptions>>(
                 Options.Create(new DatastoreGcOptions { Window = TimeSpan.FromHours(24), ReminderEnabled = false })));
@@ -173,22 +191,21 @@ public class DatastoreGcMeshTests
     }
 
     [Fact]
-    public async Task Second_projection_instance_folds_the_gc_event_via_the_log_tail_and_serves_correct_reads()
+    public async Task Second_datastore_instance_observes_gc_results_through_the_grain()
     {
         await using var scope = new Scope(await NewClusterAsync<GcSiloConfigurator>());
         var gf = scope.Cluster.GrainFactory;
-        // Two ISOLATED hosts: "reader" must fold the GC event from the log tail via its OWN SiloProjection,
-        // never by sharing "writer"'s in-memory state.
-        await using var writerHost = new PrivateProjectionHost(gf);
-        await using var readerHost = new PrivateProjectionHost(gf);
-        IDatastore writer = new GrainBackedDatastore(gf, writerHost);
-        IDatastore reader = new GrainBackedDatastore(gf, readerHost); // a SEPARATE per-silo projection instance
+        // Two ISOLATED instances: "reader" can only observe rows (and their collection) through the
+        // singleton grain's state, never by sharing "writer"'s in-memory transaction state.
+        await using var writerHub = IsolatedWatchHub.Create(gf);
+        await using var readerHub = IsolatedWatchHub.Create(gf);
+        IDatastore writer = new GrainBackedDatastore(gf, writerHub);
+        IDatastore reader = new GrainBackedDatastore(gf, readerHub); // a SEPARATE facade instance
         var grain = Grain(scope.Cluster);
 
         var rev1 = await writer.ReadWriteTx(tx => tx.WriteRelationships(new[] { Create("a", "alice") }));
 
-        // Bootstrap the second instance's own projection BEFORE GC runs, so its later catch-up must fold
-        // the GC event from the log tail rather than re-bootstrapping a fresh (already-collected) snapshot.
+        // A pre-GC reader on the second instance sees the row live at its revision.
         var before = await LiveIds(reader.SnapshotReader(rev1));
         Assert.Contains("a:alice", before);
 
@@ -202,17 +219,17 @@ public class DatastoreGcMeshTests
     }
 
     [Fact]
-    public async Task Reader_pinned_below_the_floor_throws_once_the_gc_event_is_observed_locally()
+    public async Task Reader_pinned_below_the_floor_is_rejected_on_first_read()
     {
-        // The floor rejection is enforced from the projection's OWN folded floor — deliberately local,
-        // never probed from the singleton per reader (see GrainBackedDatastore.SnapshotReader's remarks).
-        // The contract this pins is therefore two-sided: a projection whose watermark still sits BEFORE
-        // the GC event serves the pinned revision with MVCC-CORRECT retained data (never wrong data, and
-        // no spurious rejection), and once the projection has folded the GC event — any catch-up past it —
-        // the same pinned revision is rejected with RevisionNotFoundException.
+        // The floor rejection is the MvccSnapshotReader ctor guard over the state fetched from the
+        // sequencer on the reader's FIRST query (see GrainBackedDatastore.SnapshotReader). That state
+        // always carries the sequencer's current GcFloor, so a below-floor pin is rejected immediately —
+        // there is no deferred-error window (that bounded-lag contract belonged to the retired per-silo
+        // projection; the per-shard analogue is pinned by ShardedReaderEquivalenceTests'
+        // Gc_Floor_Is_Enforced_Through_The_Shard_Grain).
         await using var scope = new Scope(await NewClusterAsync<GcSiloConfigurator>());
-        await using var host = new PrivateProjectionHost(scope.Cluster.GrainFactory);
-        IDatastore ds = new GrainBackedDatastore(scope.Cluster.GrainFactory, host);
+        await using var hub = IsolatedWatchHub.Create(scope.Cluster.GrainFactory);
+        IDatastore ds = new GrainBackedDatastore(scope.Cluster.GrainFactory, hub);
         var grain = Grain(scope.Cluster);
 
         var oldHead = await ds.HeadRevision(); // strictly before the write below, so below the post-GC floor
@@ -220,18 +237,8 @@ public class DatastoreGcMeshTests
 
         var floor = await grain.RunGc();
         Assert.NotNull(floor);
+        Assert.True(floor > ((TimestampRevision)oldHead.Revision).TimestampNanosSinceEpoch);
 
-        // Behind the GC event (the write above bootstrapped the projection at the pre-GC head): the pinned
-        // reader serves the state that was live at oldHead — alice did not exist yet, and the rows that did
-        // are still retained by the un-collected local fold. Correct data, deferred error.
-        var behind = await LiveIds(ds.SnapshotReader(oldHead.Revision));
-        Assert.DoesNotContain("a:alice", behind);
-
-        // Catch up past the GC event (an at-head read folds it), advancing the local floor…
-        var head = await ds.HeadRevision();
-        _ = await LiveIds(ds.SnapshotReader(head.Revision));
-
-        // …after which the same below-floor pin is rejected.
         var reader = ds.SnapshotReader(oldHead.Revision);
         await Assert.ThrowsAsync<RevisionNotFoundException>(async () =>
         {
@@ -239,6 +246,11 @@ public class DatastoreGcMeshTests
             {
             }
         });
+
+        // A reader pinned AT (or above) the floor still serves: the retained rows are intact.
+        var head = await ds.HeadRevision();
+        var live = await LiveIds(ds.SnapshotReader(head.Revision));
+        Assert.Contains("a:alice", live);
     }
 
     [Fact]
@@ -250,10 +262,10 @@ public class DatastoreGcMeshTests
         // to test the floor-rejection behavior itself, below).
         await using var scope = new Scope(await NewClusterAsync<RealWindowSiloConfigurator>());
         var gf = scope.Cluster.GrainFactory;
-        await using var watcherHost = new PrivateProjectionHost(gf);
-        await using var committerHost = new PrivateProjectionHost(gf);
-        var watcher = new GrainBackedDatastore(gf, watcherHost);
-        var committer = new GrainBackedDatastore(gf, committerHost);
+        await using var watcherHub = IsolatedWatchHub.Create(gf);
+        await using var committerHub = IsolatedWatchHub.Create(gf);
+        var watcher = new GrainBackedDatastore(gf, watcherHub);
+        var committer = new GrainBackedDatastore(gf, committerHub);
         var grain = Grain(scope.Cluster);
 
         var head = (await watcher.HeadRevision()).Revision;
@@ -297,8 +309,8 @@ public class DatastoreGcMeshTests
     public async Task New_watch_from_a_cursor_below_the_floor_throws()
     {
         await using var scope = new Scope(await NewClusterAsync<GcSiloConfigurator>());
-        await using var host = new PrivateProjectionHost(scope.Cluster.GrainFactory);
-        IDatastore ds = new GrainBackedDatastore(scope.Cluster.GrainFactory, host);
+        await using var hub = IsolatedWatchHub.Create(scope.Cluster.GrainFactory);
+        IDatastore ds = new GrainBackedDatastore(scope.Cluster.GrainFactory, hub);
         var grain = Grain(scope.Cluster);
 
         var oldHead = await ds.HeadRevision();
@@ -322,7 +334,11 @@ public class DatastoreGcMeshTests
     {
         public void Configure(ISiloBuilder b)
         {
-            b.AddMemoryGrainStorage("datastore");
+            // The PRODUCTION "datastore" registration (in-memory branch): forces the binary grain-storage
+            // serializer. The provider's Newtonsoft-JSON default cannot round-trip the meta state's
+            // ImmutableDictionary key index (and silently corrupts boxed-JsonElement caveat context) —
+            // see AddDatastoreGrainStorage.
+            b.AddDatastoreGrainStorage(new ConfigurationBuilder().Build());
             b.AddCustomStorageBasedLogConsistencyProvider("CustomStorage");
             b.ConfigureServices(services => services.AddSingleton<IOptions<DatastoreGcOptions>>(
                 Options.Create(new DatastoreGcOptions
@@ -354,8 +370,8 @@ public class DatastoreGcMeshTests
         var gcOptions = services.GetRequiredService<IOptions<DatastoreGcOptions>>();
         var grain = Grain(scope.Cluster);
 
-        await using var host = new PrivateProjectionHost(gf);
-        IDatastore ds = new GrainBackedDatastore(gf, host, gcOptions: gcOptions);
+        await using var hub = IsolatedWatchHub.Create(gf);
+        IDatastore ds = new GrainBackedDatastore(gf, hub, gcOptions: gcOptions);
 
         var revision = await ds.ReadWriteTx(tx => tx.WriteRelationships(new[] { Create("a", "alice") }));
 
@@ -407,8 +423,8 @@ public class DatastoreGcMeshTests
         // The try/catch gate in DatastoreGrain.OnActivateAsync: no reminder service is configured on this
         // cluster at all, yet the grain must still activate and serve calls normally.
         await using var scope = new Scope(await NewClusterAsync<GcWithoutReminderServiceSiloConfigurator>());
-        await using var host = new PrivateProjectionHost(scope.Cluster.GrainFactory);
-        IDatastore ds = new GrainBackedDatastore(scope.Cluster.GrainFactory, host);
+        await using var hub = IsolatedWatchHub.Create(scope.Cluster.GrainFactory);
+        IDatastore ds = new GrainBackedDatastore(scope.Cluster.GrainFactory, hub);
         var grain = Grain(scope.Cluster);
 
         await ds.ReadWriteTx(tx => tx.WriteRelationships(new[] { Create("a", "alice") }));

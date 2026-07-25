@@ -33,6 +33,23 @@ internal static class WireConvert
         u.Operation == RelationshipUpdateOpWire.Delete ? UpdateOperation.Delete : UpdateOperation.Touch);
 
     /// <summary>
+    /// Converts a wire relationship update to a core <see cref="RelationshipUpdate"/> PRESERVING the
+    /// Create operation — the write-REQUEST form (used by the grain-side commit execution): a Create must
+    /// reach <c>MvccReadWriteTransaction.WriteRelationships</c> as a Create so the create-conflict check
+    /// (<c>CreateRelationshipExistsException</c>) fires. Deliberately distinct from
+    /// <see cref="ToUpdate"/>, the log/Watch form, where a committed event only ever carries the RESOLVED
+    /// Touch or Delete.
+    /// </summary>
+    public static RelationshipUpdate ToWriteUpdate(RelationshipUpdateWire u) => new(
+        ToRelationship(u.Relationship),
+        u.Operation switch
+        {
+            RelationshipUpdateOpWire.Create => UpdateOperation.Create,
+            RelationshipUpdateOpWire.Delete => UpdateOperation.Delete,
+            _ => UpdateOperation.Touch,
+        });
+
+    /// <summary>
     /// Converts a core relationship to its wire form. NOTE: <c>OptionalIntegrity</c> is intentionally
     /// dropped — the wire type carries no integrity field. This is the same loss the data-plane write
     /// path already incurs; integrity is unused by the engine and the conformance corpus.

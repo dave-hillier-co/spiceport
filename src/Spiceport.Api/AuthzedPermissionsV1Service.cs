@@ -16,7 +16,7 @@ namespace Spiceport.Api;
 /// gRPC front door for the <c>authzed.api.v1.PermissionsService</c>. A pure translation layer over the
 /// SAME grain mesh and in-process read helpers the internal <see cref="PermissionsGrpcService"/> uses:
 /// unary check/write/delete dispatch through <see cref="IPermissionChecker"/> / <see cref="IRelationshipsGrain"/>;
-/// expand and the read + lookup RPCs run in-process over the local silo's projection via
+/// expand and the read + lookup RPCs run in-process via
 /// <see cref="Grains.ReverseOps"/> / <see cref="Grains.RelationshipReads"/> (mirroring <see cref="BulkGrpcService"/>).
 /// </summary>
 public sealed class AuthzedPermissionsV1Service(

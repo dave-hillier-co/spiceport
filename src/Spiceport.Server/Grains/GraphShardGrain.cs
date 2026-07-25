@@ -9,37 +9,37 @@ namespace Spiceport.Grains;
 /// One graph shard as a grain: the activation state IS the shard cache. The state is the per-key
 /// restriction of the datastore fold (<see cref="ShardFold"/>) for the <see cref="GraphShardKeyWire"/>
 /// named by this grain's string key — hydrated once from <see cref="IDatastoreGrain.ReadShard"/> and
-/// thereafter advanced by tailing the same <see cref="LogEvent"/> feed the per-silo projection folds.
+/// thereafter advanced by tailing the same <see cref="LogEvent"/> feed the sequencer persists.
 /// Cold keys never activate; Orleans idle collection is the eviction policy — silo memory is O(hot
 /// working set), not O(graph) (<c>docs/graph-sharded-datastore.md</c> §2).
 /// </summary>
 /// <remarks>
-/// Modelled explicitly on <see cref="SiloProjection"/>, restricted to one key: the same single-flight
-/// <see cref="SemaphoreSlim"/> gate, the same fast path (serve when the watermark already covers the
-/// pinned revision), and the same catch-up-on-demand pull loop with re-bootstrap on
-/// <see cref="RevisionNotFoundException"/> (compaction GC'd past our watermark). The per-shard
-/// <see cref="GraphShardState.AppliedRevision"/> watermark is the SAME closed-timestamp gate the
-/// projection carries — valid because every shard folds EVERY log event (the watermark advances even
+/// The incremental bootstrap-then-tail-fold shape (the pattern the retired per-silo whole-graph
+/// projection carried, restricted here to one key): a single-flight <see cref="SemaphoreSlim"/> gate, a
+/// fast path (serve when the watermark already covers the pinned revision), and a catch-up-on-demand
+/// pull loop with re-bootstrap on <see cref="RevisionNotFoundException"/> (compaction GC'd past our
+/// watermark). The per-shard <see cref="GraphShardState.AppliedRevision"/> watermark is the
+/// closed-timestamp gate — valid because every shard folds EVERY log event (the watermark advances even
 /// when nothing matches the key; see <see cref="ShardFold.ApplyEvent"/>) — so "watermark &gt;= rev"
 /// proves all commits &lt;= rev are present in this slice (<c>docs/graph-sharded-datastore.md</c> §2).
-/// The one deliberate divergence from the projection: a cold shard ALWAYS hydrates via
-/// <see cref="IDatastoreGrain.ReadShard"/> first, never by replaying <c>ReadFrom(0)</c> — the log's
-/// retained tail starts at the compaction floor, so a from-zero replay would silently miss compacted
-/// history.
+/// A cold shard ALWAYS hydrates via <see cref="IDatastoreGrain.ReadShard"/> first, never by replaying
+/// <c>ReadFrom(0)</c> — the log's retained tail starts at the compaction floor, so a from-zero replay
+/// would silently miss compacted history.
 /// <para>
-/// GC-floor stance: this mirrors <c>GrainBackedDatastore.SnapshotReader</c>'s bounded-lag argument
-/// exactly. A shard enforces the floor IT has folded/hydrated — never a per-read probe of the
+/// GC-floor stance: a shard enforces the floor IT has folded/hydrated — never a per-read probe of the
 /// singleton — so at the floor boundary a cold shard (hydrated after a GC run) may reject a pinned
-/// revision that a warm projection which has not yet folded the GC event still serves, and vice
-/// versa. Data is never wrong on either side: a state that has not folded the GC event still retains
-/// every row live at the pinned revision, while a state that has collected them carries the advanced
-/// floor and throws. Only the stale-token ERROR surfaces earlier or later — the same stance as
-/// cross-silo projection lag today.
+/// revision that a warm shard which has not yet folded the GC event still serves, and vice versa. Data
+/// is never wrong on either side: a state that has not folded the GC event still retains every row live
+/// at the pinned revision, while a state that has collected them carries the advanced floor and throws.
+/// Only the stale-token ERROR surfaces earlier or later — bounded by the shard's own catch-up.
 /// </para>
 /// </remarks>
+[GraphLocalityPlacement] // First-activation locality hint only (director no-ops to a random pick unless
+                         // GraphPlacementOptions.CoLocateWithShards is enabled); the grain directory
+                         // stays the sole authority for identity/dedup. See GraphLocalityPlacement.
 public sealed class GraphShardGrain : Grain, IGraphShardGrain
 {
-    /// <summary>Log-tail page size for catch-up pulls (mirrors <see cref="SiloProjection"/>).</summary>
+    /// <summary>Log-tail page size for catch-up pulls (matches the Watch feed's page size).</summary>
     private const int BatchSize = 256;
 
     // Single-flight gate: only one hydration/catch-up runs at a time. RowsAt is [AlwaysInterleave], so
@@ -101,7 +101,7 @@ public sealed class GraphShardGrain : Grain, IGraphShardGrain
                 catch (RevisionNotFoundException)
                 {
                     // Fell below the grain's retained log window; re-hydrate from a fresh per-key
-                    // snapshot and continue (mirrors SiloProjection.PullOnce's re-bootstrap). If we
+                    // snapshot and continue. If we
                     // must re-hydrate AGAIN without the watermark having advanced, we are inside the
                     // compaction window described above — back off briefly instead of hot-spinning
                     // against the singleton until its compaction settles.
@@ -118,9 +118,9 @@ public sealed class GraphShardGrain : Grain, IGraphShardGrain
                 if (seg.Events.Count < BatchSize)
                 {
                     // A short page proves we drained to the observed head; jump the watermark to it
-                    // (covers the seed/change-free-head case where head > the last event's revision) —
-                    // mirrors SiloProjection.PullOnce's drain semantics exactly. The pinned revision is
-                    // always <= the grain head, so the loop condition now releases us.
+                    // (covers the seed/change-free-head case where head > the last event's revision).
+                    // The pinned revision is always <= the grain head, so the loop condition now
+                    // releases us.
                     _state = _state with { AppliedRevision = Math.Max(_state.AppliedRevision, seg.HeadRevision) };
                     break;
                 }

@@ -42,9 +42,17 @@ public sealed class SerializationException : DatastoreException
 /// </summary>
 public sealed class CreateRelationshipExistsException : DatastoreException
 {
+    /// <summary>
+    /// The canonical (already-formatted) relationship string the CREATE collided on — carried as data
+    /// (mirroring <see cref="CounterAlreadyRegisteredException.CounterName"/>) so a caller that ships the
+    /// failure across a process/grain boundary as reply data can reconstruct this exact exception (the
+    /// constructor derives the message from it deterministically).
+    /// </summary>
+    public string Relationship { get; }
+
     /// <summary>Creates a create-conflict exception for the given (already-formatted) relationship.</summary>
     public CreateRelationshipExistsException(string relationship)
-        : base($"relationship already exists: {relationship}") { }
+        : base($"relationship already exists: {relationship}") => Relationship = relationship;
 }
 
 /// <summary>Thrown when a revision is malformed or otherwise invalid for the datastore.</summary>

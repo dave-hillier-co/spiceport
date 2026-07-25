@@ -55,7 +55,7 @@ missing candidate is the failure confirmation cannot see).
 ### 1.2 Reminder-driven MVCC garbage collection (implemented)
 
 An Orleans **Reminder** on the singleton `DatastoreGrain` periodically appends a `GcApplied(floor)`
-event to the log. Because GC is itself a log event, every fold — grain state, silo projections, the
+event to the log. Because GC is itself a log event, every fold — grain state, graph-shard folds, the
 membership index — applies it identically. The collect drops relationship rows fully dead below the
 floor, sweeps expired tuples, and compacts old schema and counter versions. Reads pinned below the
 floor throw `RevisionNotFoundException`, so consumers re-bootstrap; stale zookies map to
@@ -127,22 +127,17 @@ is now exactly the canonical sub-problem (the grain key) plus the cancellation t
 repo accepts this with an explicit test helper (`SetDispatchContext`) to inject context for
 unit verification.
 
-### 1.8 `GrainService` for the per-silo components (implemented)
+### 1.8 Lifecycle ownership of the per-silo components (implemented, then simplified by 1.13)
 
-`DatastoreProjectionService` (a `GrainService`) owns the lifecycle of the per-silo
-`SiloProjection`/`LogWatchHub` pair: it bootstraps the projection and starts the hub at the
-`RuntimeGrainServices` lifecycle stage — strictly before the silo accepts traffic, so the first
-request never pays the bootstrap — and disposes the hub (bounded observer unsubscribe) on silo
-shutdown. Identity lives in the `IDatastoreProjectionHost` DI singleton rather than the
-`GrainService` itself: the only supported DI-reachable client of a live `GrainService` is the
-message-passing `GrainServiceClient<T>`, which would put a hop back on the per-Check read path the
-projection exists to eliminate. The Leopard accelerator (§1.1) needs no analogous per-silo
-lifecycle-managed component: `IMembershipWalkGrain` activations resolve on demand via
-`IGrainFactory` exactly like every other grain, keyed by (subject, revision, schemaHash), so there
-is no shared singleton to bootstrap. `GrainBackedDatastore` has a single,
-host-fed constructor; the push-Watch proofs get a genuinely isolated hub via a test-only
-`IDatastoreProjectionHost` implementation (`PrivateProjectionHost` in `Spiceport.Grains.Tests`)
-rather than a dedicated constructor.
+The remaining per-silo component is the `LogWatchHub` Watch notifier, a plain DI singleton whose
+lifetime belongs to the container, which disposes it (bounded observer unsubscribe) on silo
+teardown. A `GrainService` (`DatastoreProjectionService`) originally existed to bootstrap the
+per-silo `SiloProjection` before the silo accepted traffic; the graph-sharded datastore (1.13)
+retired the projection and with it the service — there is nothing to bootstrap pre-traffic,
+because `GraphShardGrain`s hydrate their own key's slice on first touch. The Leopard accelerator
+(§1.1) likewise needs no per-silo lifecycle-managed component: `IMembershipWalkGrain` activations
+resolve on demand via `IGrainFactory`, keyed by (subject, revision, schemaHash), so there is no
+shared singleton to bootstrap.
 
 ### 1.9 `[Immutable]` wire types (implemented)
 
@@ -155,14 +150,15 @@ grain calls.
 ### 1.10 In-process reverse-ops / data-plane reads (implemented)
 
 `LookupSubjects`, `LookupResources`, `ExpandPermissionTree`, `ReadRelationships`, and
-`BulkExportRelationships` run IN-PROCESS in the gRPC service layer, over the co-hosted silo's local
-`SiloProjection` — the same pattern `AuthzedWatchV1Service` already uses for Watch (see its remarks). Two
-Server-layer helper classes, `ReverseOps` (`Spiceport.Grains.ReverseOps`) and `RelationshipReads`
-(`Spiceport.Grains.RelationshipReads`), hold the pinning / schema-at-revision resolution / caveat-collapse
+`BulkExportRelationships` run IN-PROCESS in the gRPC service layer — the same pattern
+`AuthzedWatchV1Service` already uses for Watch (see its remarks). Two
+Server-layer helper classes, `ReverseOps` (over the `IGraphReaderSource` shard mesh) and
+`RelationshipReads` (over the `ISnapshotScanner` scan seam), hold the pinning /
+schema-at-revision resolution / caveat-collapse
 logic and expose the same `IAsyncEnumerable`/`Task` shapes an earlier Guid-keyed grain layer used to; they
 are registered as DI singletons alongside the rest of the grain mesh services
-(`AddSpiceportGrainServices`) and injected straight into the gRPC services. Every read these ops perform is
-served from local memory, so a grain hop bought only compute placement, not a consistency or caching
+(`AddSpiceportGrainServices`) and injected straight into the gRPC services. A dedicated per-stream
+grain hop bought only compute placement, not a consistency or caching
 benefit — unlike `CheckGrain`, `SubjectFrontierGrain`, and `MembershipWalkGrain`, which memoize state
 across calls and so stay real grains, dispatched to from these in-process walks exactly as before.
 
@@ -189,33 +185,39 @@ directly in the gRPC service process.
 
 ### 1.11 Broadcast channel for the log fan-out (deliberately deferred)
 
-A per-silo implicit subscription could unify projection freshness and the Watch signal into one
+A per-silo implicit subscription could unify shard catch-up freshness and the Watch signal into one
 push feed. Deferred because the observer + slow-heartbeat design is simpler than adding a stream
 provider, and the closed-timestamp gate needs a pull path for exactness anyway. Revisit only if
-projection catch-up latency appears in profiles.
+shard catch-up latency appears in profiles.
 
-### 1.12 `ISnapshotSegmentGrain` for the bootstrap read path (deliberately deferred)
+### 1.12 `ISnapshotSegmentGrain` for the bootstrap read path (dissolved by 1.13)
 
-`ISnapshotSegmentGrain` keyed by snapshot log version reading the write-once snapshot/{version} row
-via a shared DatastoreSnapshotStore helper; GetHead gaining SnapshotVersion; bounded loud-failing
-retry on the compaction race (DatastoreGrain clears the old snapshot right after each new head
-commit); deferred because bootstrap ReadState is now the ONLY ReadState call in production
-(GrainBackedDatastore.ReadWriteTx derives its write base from the local SiloProjection instead of a
-per-write ReadState) and it is once-per-silo pre-traffic; build only if multi-silo cold-start
-contention is observed. The graph-sharded datastore direction (1.13) dissolves this problem rather
-than optimizing it: with per-key shard grains there is no whole-snapshot bootstrap for a new silo
-to perform.
+`ISnapshotSegmentGrain` keyed by snapshot log version was the deferred answer to multi-silo
+cold-start contention on the whole-snapshot bootstrap. The graph-sharded datastore (1.13)
+dissolved the problem rather than optimizing it: there is no whole-snapshot silo bootstrap — a
+cold `GraphShardGrain` hydrates its own key's slice on first touch via a per-key `ReadShard` read.
 
-### 1.13 Graph-sharded datastore: dissolve `IDatastore` into grains (design document)
+### 1.13 Graph-sharded datastore: dissolve `IDatastore` into grains (largely realized)
 
-The deepest remaining lean-into-Orleans move: retire the whole-graph storage shape — the
-singleton `DatastoreGrain` fold plus per-silo `SiloProjection` — in favor of a thin commit
-sequencer (the total order, unchanged) plus two grain-sharded adjacency families
-(`ObjectShardGrain` by resource, `SubjectShardGrain` by subject key), each a per-key
-restriction of the same log fold, co-locatable with the compute family that consumes it
-(`CheckGrain` / the walk grains). Eliminates the state ceiling (the graph no longer fits in
-RAM on every silo) and the silo bootstrap; deliberately retains the single-writer ceiling.
-Analyzed in full — interfaces, commit protocol, the §3.1 objections, migration gates — in
+The deepest lean-into-Orleans move, and the read side is built: the per-silo `SiloProjection`
+whole-graph replica is retired; engine reads resolve to per-key `GraphShardGrain`s (forward by
+object, reverse by subject), each the per-key restriction of the same log fold (`ShardFold`),
+activation-as-hot-set-cache with a per-shard closed-timestamp watermark; writes are declarative
+`DatastoreGrain.Commit` requests with typed `CommitReply` failures; broad scans and
+schema-at-revision go storage-direct (`ISnapshotScanner` / `ISchemaSource`). This removes the
+per-silo read-fleet state ceiling (silo memory is O(hot shards)) and the silo bootstrap, and
+deliberately retains the single-writer ceiling. What remains, per the design document's staging:
+
+- **The thin-sequencer flush protocol** — the sequencer grain still materializes the whole fold
+  within the GC window. Sketch: shards persist their own snapshots via stock Orleans grain
+  storage; the sequencer trims its log tail only past the flushed floor (the minimum durable
+  shard watermark); `ReadShard` falls back to the per-shard durable snapshot instead of the
+  sequencer fold; sequencer-side preconditions become shard-base-at-watermark plus in-memory
+  tail overlay.
+- **The co-placement director** — check/walk grains landing on their shard's silo; pure
+  performance, gated on measurement per the simplicity-over-performance stance.
+
+Design, interfaces, the §3.1 objections, and the realized-vs-remaining staging are in
 [`graph-sharded-datastore.md`](graph-sharded-datastore.md).
 
 ---
@@ -254,7 +256,7 @@ to Leopard because materializing views at Spanner write volumes was infeasible �
 not a correctness one.
 
 **The relaxation.** With the event log, a materialized "who-can-see-what" reachability set is
-*just another fold*, incrementally maintained like the projection. For non-caveated paths, Check
+*just another fold*, incrementally maintained like the graph shards. For non-caveated paths, Check
 becomes a hash lookup; the dispatch mesh remains the evaluator for caveated/complex paths and the
 verifier for the view. The candidates-never-verdicts discipline applies until an equivalence gate
 (the Leopard on==off pattern) proves the view verdict-identical and lets it serve verdicts directly.
@@ -265,8 +267,8 @@ verifier for the view. The candidates-never-verdicts discipline applies until an
 **The contingent detail.** Zanzibar defaults to bounded staleness because cache shareability at
 ~10⁷ QPS demands quantization, pushing the freshness burden onto clients via zookie plumbing.
 
-**The relaxation.** The closed-timestamp gate makes freshness a cheap watermark wait on a local
-projection. Flip the default: every read is read-your-writes unless the caller opts into staleness
+**The relaxation.** The closed-timestamp gate makes freshness a cheap per-shard watermark wait.
+Flip the default: every read is read-your-writes unless the caller opts into staleness
 for latency. This changes only the default for callers that do not supply a zookie.
 
 **Non-negotiable constraint.** Zookies remain fully supported and first-class for explicit
@@ -319,7 +321,7 @@ Recorded so they are not relitigated by accident:
 - **Per-object *current-state* entity grains.** Ruled out in `architecture-analysis.md` §3.1:
   too large/cold to activate economically; zookie point-in-time reads are incompatible with
   "the grain's latest value". The ruling does not extend to per-key grains holding *versioned
-  slices of the MVCC fold* — that direction is a candidate, not a non-goal, and is analyzed in
+  slices of the MVCC fold* — that is the built graph-shard shape, analyzed in
   [`graph-sharded-datastore.md`](graph-sharded-datastore.md) (see 1.13).
 - **Built-in multi-tenancy / per-tenant log sharding.** Discounted (see 2.1). The
   `authzed.api.v1` surface has no tenant field and this project supports only that protocol, so a
@@ -337,19 +339,19 @@ Recorded so they are not relitigated by accident:
   sharing across the grain boundary (each activation holds isolated memory, so consecutive
   revisions could not share structure), reintroduce per-Check hops or full fetches, and make the
   hot quantized revision a cluster-wide single-activation bottleneck — while the write side still
-  needs the one serialization point regardless. The narrow variant that may someday earn a place:
-  immutable snapshot/log-segment grains for *bootstrap distribution only* (new silos hydrating
-  from a peer instead of the singleton).
+  needs the one serialization point regardless. The narrow variant this ruling anticipated —
+  immutable snapshot grains for bootstrap distribution — was dissolved along with the whole-snapshot
+  silo bootstrap itself (see 1.12/1.13).
 
 ## Suggested ordering, if taken as a program
 
 1. **1.1–1.7** — all completed. Cross-cutting infrastructure (filters, RequestContext) is now
    in place and the dispatcher seam is clean: error mapping and depth enforcement are native,
    and the wire contract is minimal (sub-problem + cancellation).
-2. **1.11 / 1.12** — the remaining deferred refinements (broadcast channel, snapshot segment
-   grains) — low leverage on their own, and both dissolve if 1.13 is taken. (1.8, 1.9, and
-   1.10 are done.)
-3. **2.3 / 2.4 / 2.5** — cheap, immediately differentiating product capabilities.
-4. **1.13 graph-sharded datastore** — the scalability move; its design document exists
-   (`graph-sharded-datastore.md`) and its migration is staged behind fold-equivalence gates.
+2. **1.13 graph-sharded datastore** — realized on the read and write-contract side (per-key
+   shard grains, declarative `Commit`, storage-direct scans; the per-silo projection is gone),
+   dissolving 1.12 along the way; the thin-sequencer flush protocol and the co-placement
+   director are its recorded remaining steps (`graph-sharded-datastore.md` §7).
+3. **1.11** — the broadcast channel remains a deferred refinement, low leverage on its own.
+4. **2.3 / 2.4 / 2.5** — cheap, immediately differentiating product capabilities.
 5. **2.1 per-tenant** and **2.2 materialized reachability** — each behind its own design document.

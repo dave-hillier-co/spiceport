@@ -4,6 +4,8 @@ using Orleans.Runtime;
 using Orleans.TestingHost;
 using Spiceport.Core;
 using Spiceport.Datastore;
+using Microsoft.Extensions.Configuration;
+using Spiceport.Server.Hosting;
 
 namespace Spiceport.Grains.Tests;
 
@@ -30,10 +32,10 @@ public class Stage3WatchPushMeshTests
         await using var scope = new Scope(await NewDatastoreClusterAsync());
         var gf = scope.Cluster.GrainFactory;
 
-        await using var watcherHost = new PrivateProjectionHost(gf, heartbeatInterval: TimeSpan.FromSeconds(30));
-        await using var committerHost = new PrivateProjectionHost(gf);
-        var watcher = new GrainBackedDatastore(gf, watcherHost);
-        var committer = new GrainBackedDatastore(gf, committerHost);
+        await using var watcherHub = IsolatedWatchHub.Create(gf, heartbeatInterval: TimeSpan.FromSeconds(30));
+        await using var committerHub = IsolatedWatchHub.Create(gf);
+        var watcher = new GrainBackedDatastore(gf, watcherHub);
+        var committer = new GrainBackedDatastore(gf, committerHub);
 
         var head = (await watcher.HeadRevision()).Revision;
 
@@ -77,10 +79,10 @@ public class Stage3WatchPushMeshTests
         await using var scope = new Scope(await NewDatastoreClusterAsync());
         var gf = scope.Cluster.GrainFactory;
 
-        await using var watcherHost = new PrivateProjectionHost(gf);
-        await using var committerHost = new PrivateProjectionHost(gf);
-        var watcher = new GrainBackedDatastore(gf, watcherHost);
-        var committer = new GrainBackedDatastore(gf, committerHost);
+        await using var watcherHub = IsolatedWatchHub.Create(gf);
+        await using var committerHub = IsolatedWatchHub.Create(gf);
+        var watcher = new GrainBackedDatastore(gf, watcherHub);
+        var committer = new GrainBackedDatastore(gf, committerHub);
 
         var head = (await watcher.HeadRevision()).Revision;
 
@@ -130,7 +132,11 @@ public class Stage3WatchPushMeshTests
     {
         public void Configure(ISiloBuilder b)
         {
-            b.AddMemoryGrainStorage("datastore");
+            // The PRODUCTION "datastore" registration (in-memory branch): forces the binary grain-storage
+            // serializer. The provider's Newtonsoft-JSON default cannot round-trip the meta state's
+            // ImmutableDictionary key index (and silently corrupts boxed-JsonElement caveat context) —
+            // see AddDatastoreGrainStorage.
+            b.AddDatastoreGrainStorage(new ConfigurationBuilder().Build());
             b.AddCustomStorageBasedLogConsistencyProvider("CustomStorage");
         }
     }

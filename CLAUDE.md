@@ -35,8 +35,8 @@ dotnet test tests/Spiceport.Conformance.Tests  # the SpiceDB conformance corpus 
 - **Storage is not *dispatch*-grain state.** Evaluation is a pure function of
   `(schema@revision, tuples@revision, request)`; dispatch grains never hold relationship data.
   The MVCC mechanics (visibility at a revision, the per-revision diff) live in `Spiceport.Datastore`
-  and are reused everywhere — the `ReferenceDatastore` reference model and the silo projections
-  share one fold.
+  and are reused everywhere — the `ReferenceDatastore` reference model and the per-key graph-shard
+  folds (`ShardFold`, a key-restriction of the same fold) share one set of semantics.
 - **Storage is an event-sourced grain (the log is the storage/compute seam).** All
   relationship/schema/counter state lives behind a single cluster-singleton `DatastoreGrain`, a
   **journaled grain whose append-only `LogEvent` log is the source of truth**; the materialized state
@@ -44,12 +44,21 @@ dotnet test tests/Spiceport.Conformance.Tests  # the SpiceDB conformance corpus 
   whole-state rewrite; the single non-reentrant activation makes the minted revision the cluster-wide
   global order. Persistence is the grain's own via `ICustomStorageInterface` over an Orleans
   grain-storage provider — **no application SQL** (per-version log entries + periodic snapshots +
-  compaction). Each silo reads from a **`SiloProjection`** folded incrementally from the log
-  (`ReadFrom` tail, bootstrap-once) — no per-Check full fetch; exact/at-least-as-fresh reads block
-  until the projection watermark covers the pinned revision (closed-timestamp gate). The write path
-  (`GrainBackedDatastore.ReadWriteTx`) derives its write base from this same local projection rather
-  than a per-attempt grain `ReadState`, so `ReadState` is now used only for the projection's one-time
-  bootstrap; the grain's CAS append remains the sole serialization point. The same log feed
+  compaction). Engine reads go through **per-key `GraphShardGrain`s** (forward shards keyed by
+  object, reverse shards keyed by subject — resolved via `ShardedGraphReader` behind the
+  `IGraphReaderSource` seam): each shard's activation state is the per-key restriction of the fold
+  (`ShardFold`), hydrated once from `ReadShard` and advanced by tailing the log, so activation *is*
+  the hot-set cache — cold keys never activate, silo memory is O(hot shards), not O(graph). The
+  per-shard `AppliedRevision` watermark is the closed-timestamp gate: exact/at-least-as-fresh reads
+  block until the shard's watermark covers the pinned revision. Writes are **declarative
+  `DatastoreGrain.Commit`** — preconditions/updates/deleteByFilter/schema (with `ExpectedSchemaHash`)
+  /counters evaluated and executed on the sequencer's single non-reentrant activation, rejections
+  returned as typed `CommitReply` failures with nothing applied; `ReadWriteTx` survives only as the
+  `ExpectedHead` compatibility path over the same wire contract. Broad/admin scans (loose-filter
+  ReadRelationships, bulk export, counters) and schema-at-revision bypass the shard mesh and fetch
+  the sequencer snapshot (`ISnapshotScanner` / `ISchemaSource`). The sequencer grain still
+  materializes the whole fold; slimming it (per-shard durable snapshots + tail trim) is the recorded
+  next step (`docs/graph-sharded-datastore.md` §7). The same log feed
   drives **Watch** (one per-silo `LogWatchHub` notifier, no per-stream polling) and an on-by-default
   (opt-out via `MembershipWalkOptions`) **Leopard membership-walk grain mesh** (`IMembershipWalkGrain`,
   sharded as addressable per-subject walk grains — sibling recursion across grain boundaries, cold sets
@@ -75,8 +84,8 @@ dotnet test tests/Spiceport.Conformance.Tests  # the SpiceDB conformance corpus 
   Revisions are quantized so grain keys are shared within a window; `schemaHash` is in the key
   so a schema change yields a fresh keyspace.
 - **Consistency.** Reads honor a `ConsistencyRequirement`; consistency is enforced entirely at
-  `RevisionResolver` time — which revision string gets pinned, plus the projection's
-  closed-timestamp gate — so fresh/at-exact/fully-consistent reads never serve stale data. The
+  `RevisionResolver` time — which revision string gets pinned, plus the per-shard
+  closed-timestamp watermark gate — so fresh/at-exact/fully-consistent reads never serve stale data. The
   pinned revision string is the grain key's whole identity: no separate cache-mode segment exists
   downstream of resolution.
 
@@ -85,8 +94,9 @@ dotnet test tests/Spiceport.Conformance.Tests  # the SpiceDB conformance corpus 
 - Idiomatic modern C#: records for immutable data, file-scoped namespaces, `IAsyncEnumerable`
   for streaming, `[GenerateSerializer]` for any type crossing a grain boundary.
 - Keep engine logic out of the API layer. gRPC service classes are pure translation over the
-  grains and the Server-layer read helpers (`ReverseOps`, `RelationshipReads`) that run in-process
-  over the local silo's projection — the same pattern `AuthzedWatchV1Service` uses for Watch;
+  grains and the Server-layer read helpers (`ReverseOps` over the `IGraphReaderSource` shard mesh,
+  `RelationshipReads` over the `ISnapshotScanner` scan seam) that run in-process on the serving
+  silo — the same pattern `AuthzedWatchV1Service` uses for Watch;
   engine/graph logic lives in `Spiceport.Engine`/`Spiceport.Grains`.
 - Map errors to gRPC status codes deliberately (e.g. CREATE-conflict -> `AlreadyExists`,
   precondition/schema-validation failure -> `FailedPrecondition`, bad consistency token ->

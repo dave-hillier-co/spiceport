@@ -1,4 +1,3 @@
-using Spiceport.Datastore;
 using Spiceport.Engine;
 using Spiceport.Grains.Abstractions;
 
@@ -35,8 +34,11 @@ namespace Spiceport.Grains;
 /// caller-supplied budget varying the completeness of what gets cached, and hence nothing here to guard.
 /// </para>
 /// </remarks>
+[GraphLocalityPlacement] // First-activation locality hint only (director no-ops to a random pick unless
+                         // GraphPlacementOptions.CoLocateWithShards is enabled); the grain directory
+                         // stays the sole authority for identity/dedup. See GraphLocalityPlacement.
 public sealed class SubjectFrontierGrain(
-    IDatastore datastore,
+    ISchemaSource schemaSource,
     ISchemaProvider schemaProvider,
     SchemaResolver schemaResolver,
     IGraphReaderSource readerSource,
@@ -68,16 +70,16 @@ public sealed class SubjectFrontierGrain(
         // quantized-revision keyspace.
         var now = DateTimeOffset.UtcNow;
 
-        var reader = datastore.SnapshotReader(revision);
         var schema = await schemaResolver.ResolveAsync(
             parts.SchemaHash,
-            reader,
+            schemaSource,
+            revision,
             schemaProvider.Current,
             cancellationToken);
 
-        // The engine walk reads through the IGraphReaderSource seam (projection or shard mesh, per
-        // GraphReaderOptions) at the same pinned revision; schema resolution above keeps the
-        // projection-pinned reader — see IGraphReaderSource.
+        // The engine walk reads through the IGraphReaderSource seam (the shard mesh) at the same pinned
+        // revision; schema resolution above goes through the ISchemaSource seam (a sequencer read once
+        // per hash per silo, cached by SchemaResolver).
         var engine = new LookupSubjectsEngine(schema.Namespaces);
         var subjects = new List<FrontierSubjectWire>();
         await foreach (var found in engine.LookupSubjects(

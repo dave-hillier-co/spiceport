@@ -8,18 +8,22 @@ using Spiceport.Grains.Abstractions;
 namespace Spiceport.Grains.Tests;
 
 /// <summary>
-/// THE fold-equivalence gate for migration step 3 (<c>docs/graph-sharded-datastore.md</c> §7): every
-/// read answered by both the projection-backed snapshot reader and the <see cref="ShardedGraphReader"/>
-/// over the <c>IGraphShardGrain</c> mesh must agree EXACTLY. Shards serve data, not candidates, so the
-/// applicable instrument is full read-for-read equivalence — not candidates-plus-Check-confirmation.
+/// THE fold-equivalence gate for the sharded read path (<c>docs/graph-sharded-datastore.md</c> §7):
+/// every read answered by both the SEQUENCER-SNAPSHOT reader
+/// (<see cref="GrainBackedDatastore.SnapshotReader"/> — one full-state fetch of the singleton grain's
+/// fold, the independent oracle now that the per-silo whole-graph projection is gone) and the
+/// <see cref="ShardedGraphReader"/> over the <c>IGraphShardGrain</c> mesh must agree EXACTLY. Shards
+/// serve data, not candidates, so the applicable instrument is full read-for-read equivalence — not
+/// candidates-plus-Check-confirmation. The time-travel and catch-up passes here are also where the
+/// per-shard closed-timestamp gate (watermark covers the pinned revision before serving) stays pinned.
 /// </summary>
 /// <remarks>
-/// The cluster boots with the sharded-reader flag OFF (production default): the gate constructs the
-/// sharded reader directly, so the projection path stays the untouched oracle while every shard grain
-/// hydrates and catches up on demand against the very same datastore grain log. Rows are compared as
-/// multisets of canonical strings (the <c>GrainBackedDatastoreFidelityTests</c> idiom) because
-/// <see cref="Relationship"/> record equality compares the caveat-context dictionary by REFERENCE —
-/// record equality would report false negatives for equal rows.
+/// The oracle side deliberately does not touch the shard mesh: the sequencer-snapshot reader folds the
+/// whole state via <see cref="MvccSnapshotReader"/>, while every shard grain hydrates and catches up on
+/// demand against the very same datastore grain log. Rows are compared as multisets of canonical
+/// strings (the <c>GrainBackedDatastoreFidelityTests</c> idiom) because <see cref="Relationship"/>
+/// record equality compares the caveat-context dictionary by REFERENCE — record equality would report
+/// false negatives for equal rows.
 /// </remarks>
 [Collection(MeshClusterCollection.Name)]
 public class ShardedReaderEquivalenceTests
@@ -44,7 +48,7 @@ public class ShardedReaderEquivalenceTests
 
     [Theory]
     [MemberData(nameof(EquivalenceFiles))]
-    public async Task Sharded_Reader_Agrees_With_Projection_Reader(string fileName)
+    public async Task Sharded_Reader_Agrees_With_Sequencer_Snapshot_Reader(string fileName)
     {
         var path = Path.Combine(AppContext.BaseDirectory, "TestData", fileName);
         Assert.True(File.Exists(path), $"Linked corpus file missing from output: {path}");
@@ -56,7 +60,7 @@ public class ShardedReaderEquivalenceTests
         await Seed(cluster.Datastore, file.Relationships);
 
         var head = await cluster.Datastore.HeadRevision();
-        IGraphReader projection = cluster.Datastore.SnapshotReader(head.Revision);
+        IGraphReader sequencer = cluster.Datastore.SnapshotReader(head.Revision);
         IGraphReader sharded = new ShardedGraphReader(cluster.GrainFactory, Nanos(head.Revision));
 
         var failures = new List<string>();
@@ -84,7 +88,7 @@ public class ShardedReaderEquivalenceTests
                     OptionalResourceRelation = relation,
                 };
                 CompareSorted(
-                    await Collect(projection.QueryRelationships(filter)),
+                    await Collect(sequencer.QueryRelationships(filter)),
                     await Collect(sharded.QueryRelationships(filter)),
                     $"forward {type}:{id}#{relation ?? "<any>"}",
                     failures);
@@ -100,21 +104,21 @@ public class ShardedReaderEquivalenceTests
         {
             var filter = new SubjectsFilter(type, OptionalSubjectIds: [id]);
             CompareSorted(
-                await Collect(projection.ReverseQueryRelationships(filter)),
+                await Collect(sequencer.ReverseQueryRelationships(filter)),
                 await Collect(sharded.ReverseQueryRelationships(filter)),
                 $"reverse {type}:{id}",
                 failures);
         }
 
         // (c) Sorted equivalence + keyset resume for three representative subjects: the BySubject
-        // sequences must match IN ORDER, and resuming after the middle element of the projection's
+        // sequences must match IN ORDER, and resuming after the middle element of the sequencer reader's
         // sequence must yield identical remainders (the LookupResources cursor contract).
         foreach (var (type, id) in Representatives(subjects))
         {
             var filter = new SubjectsFilter(type, OptionalSubjectIds: [id]);
             var sorted = new ReverseQueryOptions(ReverseQuerySort.BySubject);
 
-            var expectedRows = await Materialize(projection.ReverseQueryRelationships(filter, sorted));
+            var expectedRows = await Materialize(sequencer.ReverseQueryRelationships(filter, sorted));
             var actualRows = await Materialize(sharded.ReverseQueryRelationships(filter, sorted));
             CompareOrdered(
                 expectedRows.Select(Canonical).ToList(),
@@ -128,7 +132,7 @@ public class ShardedReaderEquivalenceTests
             var resume = new ReverseQueryOptions(
                 ReverseQuerySort.BySubject, After: expectedRows[expectedRows.Count / 2].Reference);
             CompareOrdered(
-                (await Materialize(projection.ReverseQueryRelationships(filter, resume))).Select(Canonical).ToList(),
+                (await Materialize(sequencer.ReverseQueryRelationships(filter, resume))).Select(Canonical).ToList(),
                 (await Materialize(sharded.ReverseQueryRelationships(filter, resume))).Select(Canonical).ToList(),
                 $"keyset-resumed reverse {type}:{id}",
                 failures);
@@ -150,17 +154,17 @@ public class ShardedReaderEquivalenceTests
                     $"synthetic keyset for {type}:{id} is not strictly between the first two rows");
 
                 var syntheticResume = new ReverseQueryOptions(ReverseQuerySort.BySubject, After: synthetic);
-                var projectionRemainder =
-                    (await Materialize(projection.ReverseQueryRelationships(filter, syntheticResume))).Select(Canonical).ToList();
+                var sequencerRemainder =
+                    (await Materialize(sequencer.ReverseQueryRelationships(filter, syntheticResume))).Select(Canonical).ToList();
                 CompareOrdered(
-                    projectionRemainder,
+                    sequencerRemainder,
                     (await Materialize(sharded.ReverseQueryRelationships(filter, syntheticResume))).Select(Canonical).ToList(),
                     $"synthetic keyset-resumed reverse {type}:{id}",
                     failures);
                 // Pin what the resume means, not just that the readers agree: everything after row 0.
                 CompareOrdered(
                     expectedRows.Skip(1).Select(Canonical).ToList(),
-                    projectionRemainder,
+                    sequencerRemainder,
                     $"synthetic keyset remainder {type}:{id}",
                     failures);
             }
@@ -168,7 +172,7 @@ public class ShardedReaderEquivalenceTests
 
         Assert.True(
             failures.Count == 0,
-            $"{fileName}: {failures.Count} read(s) diverged between projection and shard mesh:\n{string.Join('\n', failures)}");
+            $"{fileName}: {failures.Count} read(s) diverged between the sequencer snapshot and the shard mesh:\n{string.Join('\n', failures)}");
 
         // (d) Absent keys: a never-written resource and subject activate cold, empty shards — both
         // readers must return nothing (not throw, not invent rows).
@@ -177,12 +181,12 @@ public class ShardedReaderEquivalenceTests
             OptionalResourceType = resources[0].ObjectType,
             OptionalResourceIds = ["spiceport-never-written"],
         };
-        Assert.Empty(await Collect(projection.QueryRelationships(absentForward)));
+        Assert.Empty(await Collect(sequencer.QueryRelationships(absentForward)));
         Assert.Empty(await Collect(sharded.QueryRelationships(absentForward)));
 
         var absentReverse = new SubjectsFilter(
             subjects[0].ObjectType, OptionalSubjectIds: ["spiceport-never-written"]);
-        Assert.Empty(await Collect(projection.ReverseQueryRelationships(absentReverse)));
+        Assert.Empty(await Collect(sequencer.ReverseQueryRelationships(absentReverse)));
         Assert.Empty(await Collect(sharded.ReverseQueryRelationships(absentReverse)));
 
         // (e) Shape guards: scan-shaped filters must be REJECTED by the sharded reader — silently
@@ -247,7 +251,7 @@ public class ShardedReaderEquivalenceTests
         MeshTestCluster cluster, Relationship rel, bool expectPresent, string fileName, IRevision? pinned = null)
     {
         var revision = pinned ?? (await cluster.Datastore.HeadRevision()).Revision;
-        IGraphReader projection = cluster.Datastore.SnapshotReader(revision);
+        IGraphReader sequencer = cluster.Datastore.SnapshotReader(revision);
         IGraphReader sharded = new ShardedGraphReader(cluster.GrainFactory, Nanos(revision));
 
         var forward = new RelationshipsFilter
@@ -259,25 +263,25 @@ public class ShardedReaderEquivalenceTests
         var reverse = new SubjectsFilter(rel.Subject.ObjectType, OptionalSubjectIds: [rel.Subject.ObjectId]);
 
         var failures = new List<string>();
-        var projectionForward = await Collect(projection.QueryRelationships(forward));
-        CompareSorted(projectionForward, await Collect(sharded.QueryRelationships(forward)),
+        var sequencerForward = await Collect(sequencer.QueryRelationships(forward));
+        CompareSorted(sequencerForward, await Collect(sharded.QueryRelationships(forward)),
             $"freshness forward {Identity(rel)}", failures);
-        var projectionReverse = await Collect(projection.ReverseQueryRelationships(reverse));
-        CompareSorted(projectionReverse, await Collect(sharded.ReverseQueryRelationships(reverse)),
+        var sequencerReverse = await Collect(sequencer.ReverseQueryRelationships(reverse));
+        CompareSorted(sequencerReverse, await Collect(sharded.ReverseQueryRelationships(reverse)),
             $"freshness reverse {Identity(rel)}", failures);
         Assert.True(
             failures.Count == 0,
             $"{fileName}: freshness pass (expectPresent={expectPresent}, pinned={(pinned is null ? "head" : Nanos(revision).ToString())}) diverged:\n{string.Join('\n', failures)}");
 
         // Both agree — pin what they agree ON against the write just committed.
-        Assert.Equal(expectPresent, projectionForward.Contains(Canonical(rel)));
-        Assert.Equal(expectPresent, projectionReverse.Contains(Canonical(rel)));
+        Assert.Equal(expectPresent, sequencerForward.Contains(Canonical(rel)));
+        Assert.Equal(expectPresent, sequencerReverse.Contains(Canonical(rel)));
     }
 
     /// <summary>
     /// The LookupResourcesEngine frontier shape: one reverse query carrying SEVERAL subject ids plus
     /// the wildcard — the sharded reader must fan out to one shard per id (the wildcard gets its own
-    /// reverse shard), merge, and still match the projection both as a multiset (unsorted) and as the
+    /// reverse shard), merge, and still match the sequencer-snapshot reader both as a multiset (unsorted) and as the
     /// BySubject global sort with a keyset resume that crosses a subject boundary.
     /// </summary>
     [Theory]
@@ -293,22 +297,22 @@ public class ShardedReaderEquivalenceTests
         await Seed(cluster.Datastore, file.Relationships);
 
         var head = await cluster.Datastore.HeadRevision();
-        IGraphReader projection = cluster.Datastore.SnapshotReader(head.Revision);
+        IGraphReader sequencer = cluster.Datastore.SnapshotReader(head.Revision);
         IGraphReader sharded = new ShardedGraphReader(cluster.GrainFactory, Nanos(head.Revision));
 
         var filter = new SubjectsFilter(subjectType, OptionalSubjectIds: subjectIds);
         var failures = new List<string>();
 
-        // Unsorted: multiset equality against the projection.
+        // Unsorted: multiset equality against the sequencer-snapshot reader.
         CompareSorted(
-            await Collect(projection.ReverseQueryRelationships(filter)),
+            await Collect(sequencer.ReverseQueryRelationships(filter)),
             await Collect(sharded.ReverseQueryRelationships(filter)),
             $"multi-id reverse [{string.Join(",", subjectIds)}]",
             failures);
 
         // Sorted: the merged cross-shard sequence must BE the global BySubject order.
         var sorted = new ReverseQueryOptions(ReverseQuerySort.BySubject);
-        var expectedRows = await Materialize(projection.ReverseQueryRelationships(filter, sorted));
+        var expectedRows = await Materialize(sequencer.ReverseQueryRelationships(filter, sorted));
         var actualRows = await Materialize(sharded.ReverseQueryRelationships(filter, sorted));
         CompareOrdered(
             expectedRows.Select(Canonical).ToList(),
@@ -323,7 +327,7 @@ public class ShardedReaderEquivalenceTests
         }
 
         // Keyset resume ACROSS a subject boundary: After = the last row of the FIRST subject's block
-        // in the projection's sorted sequence, so the remainder starts inside another shard's rows.
+        // in the sequencer reader's sorted sequence, so the remainder starts inside another shard's rows.
         var firstSubject = expectedRows[0].Subject;
         var boundary = expectedRows
             .Last(r => r.Subject.ObjectType == firstSubject.ObjectType && r.Subject.ObjectId == firstSubject.ObjectId)
@@ -331,17 +335,17 @@ public class ShardedReaderEquivalenceTests
         Assert.Contains(expectedRows, r => r.Subject.ObjectId != firstSubject.ObjectId);
 
         var resume = new ReverseQueryOptions(ReverseQuerySort.BySubject, After: boundary);
-        var projectionRemainder =
-            (await Materialize(projection.ReverseQueryRelationships(filter, resume))).Select(Canonical).ToList();
+        var sequencerRemainder =
+            (await Materialize(sequencer.ReverseQueryRelationships(filter, resume))).Select(Canonical).ToList();
         CompareOrdered(
-            projectionRemainder,
+            sequencerRemainder,
             (await Materialize(sharded.ReverseQueryRelationships(filter, resume))).Select(Canonical).ToList(),
             $"multi-id boundary-crossing resume [{string.Join(",", subjectIds)}]",
             failures);
         // The remainder is exactly the later subjects' rows — the resume genuinely crossed the boundary.
         CompareOrdered(
             expectedRows.Where(r => r.Subject.ObjectId != firstSubject.ObjectId).Select(Canonical).ToList(),
-            projectionRemainder,
+            sequencerRemainder,
             $"multi-id boundary remainder [{string.Join(",", subjectIds)}]",
             failures);
 
@@ -354,7 +358,7 @@ public class ShardedReaderEquivalenceTests
     /// Narrowing-filter passes: the shard holds ALL rows of its subject slice, so a
     /// <see cref="SubjectsFilter"/> whose RelationFilter / resource constraints EXCLUDE some of those
     /// rows makes the caller-side <c>Matches</c> re-filter load-bearing — a reader that returned the
-    /// slice unfiltered would show the excluded rows. Each case asserts equality with the projection
+    /// slice unfiltered would show the excluded rows. Each case asserts equality with the sequencer-snapshot reader
     /// AND that the filter really excluded something (fewer rows than the unfiltered slice).
     /// </summary>
     public static IEnumerable<object[]> NarrowingFilterCases()
@@ -409,11 +413,11 @@ public class ShardedReaderEquivalenceTests
         await Seed(cluster.Datastore, file.Relationships);
 
         var head = await cluster.Datastore.HeadRevision();
-        IGraphReader projection = cluster.Datastore.SnapshotReader(head.Revision);
+        IGraphReader sequencer = cluster.Datastore.SnapshotReader(head.Revision);
         IGraphReader sharded = new ShardedGraphReader(cluster.GrainFactory, Nanos(head.Revision));
 
         var failures = new List<string>();
-        var narrowed = await Collect(projection.ReverseQueryRelationships(filter));
+        var narrowed = await Collect(sequencer.ReverseQueryRelationships(filter));
         CompareSorted(
             narrowed.ToList(),
             await Collect(sharded.ReverseQueryRelationships(filter)),
@@ -486,7 +490,7 @@ public class ShardedReaderEquivalenceTests
     /// <c>RunGc</c> computes is <c>min(head, now) == head</c>, so it lands ABOVE the captured
     /// pre-delete revision Rd. A cold shard must hydrate and serve correctly at head, a below-floor
     /// pin must be rejected with <see cref="RevisionNotFoundException"/> ACROSS the grain boundary
-    /// (the surrogate round-trip), and the sharded reader at head must agree with the projection.
+    /// (the surrogate round-trip), and the sharded reader at head must agree with the sequencer-snapshot reader.
     /// </summary>
     [Fact]
     public async Task Gc_Floor_Is_Enforced_Through_The_Shard_Grain()
@@ -534,15 +538,15 @@ public class ShardedReaderEquivalenceTests
         await Assert.ThrowsAsync<RevisionNotFoundException>(
             () => xShard.RowsAt(Nanos(rd), CancellationToken.None));
 
-        // (c) At head, the sharded reader still agrees with the projection reader.
-        IGraphReader projection = cluster.Datastore.SnapshotReader(head.Revision);
+        // (c) At head, the sharded reader still agrees with the sequencer-snapshot reader.
+        IGraphReader sequencer = cluster.Datastore.SnapshotReader(head.Revision);
         IGraphReader sharded = new ShardedGraphReader(cluster.GrainFactory, Nanos(head.Revision));
         var failures = new List<string>();
         foreach (var id in new[] { "x", "cold" })
         {
             var filter = new RelationshipsFilter { OptionalResourceType = "doc", OptionalResourceIds = [id] };
             CompareSorted(
-                await Collect(projection.QueryRelationships(filter)),
+                await Collect(sequencer.QueryRelationships(filter)),
                 await Collect(sharded.QueryRelationships(filter)),
                 $"post-GC forward doc:{id}",
                 failures);
@@ -551,12 +555,84 @@ public class ShardedReaderEquivalenceTests
         {
             var filter = new SubjectsFilter("user", OptionalSubjectIds: [subjectId]);
             CompareSorted(
-                await Collect(projection.ReverseQueryRelationships(filter)),
+                await Collect(sequencer.ReverseQueryRelationships(filter)),
                 await Collect(sharded.ReverseQueryRelationships(filter)),
                 $"post-GC reverse user:{subjectId}",
                 failures);
         }
         Assert.True(failures.Count == 0, $"post-GC head reads diverged:\n{string.Join('\n', failures)}");
+    }
+
+    /// <summary>
+    /// The WARM-shard counterpart of <see cref="Gc_Floor_Is_Enforced_Through_The_Shard_Grain"/>: a shard
+    /// hydrated BEFORE GC must, without deactivating, (a) serve post-GC-correct rows at the new head by
+    /// folding the <c>GcApplied</c> event through its tail catch-up, and (b) reject a below-floor pin
+    /// with <see cref="RevisionNotFoundException"/> from that same warm activation. The window is small
+    /// but NONZERO: with <see cref="TimeSpan.Zero"/> the singleton's per-commit tail trim always empties
+    /// the retained log, so a warm shard could only re-bootstrap — the GC event would never reach it
+    /// through the catch-up fold this gate exists to pin. The shard hydrates at the post-delete head, so
+    /// the GC floor (<c>min(head, now - window)</c>, after the delay) lands EXACTLY on its watermark:
+    /// the catch-up then serves the GcApplied event from the retained tail rather than re-hydrating.
+    /// </summary>
+    [Fact]
+    public async Task Warm_Shard_Folds_GcApplied_And_Rejects_Below_Floor_Without_Reactivation()
+    {
+        const string schema = """
+            definition user {}
+
+            definition doc {
+              relation viewer: user
+            }
+            """;
+        static Relationship Row(string docId, string userId) => Relationship.Create(
+            new ObjectAndRelation("doc", docId, "viewer"),
+            new ObjectAndRelation("user", userId, CoreConstants.Ellipsis));
+
+        var gcWindow = TimeSpan.FromMilliseconds(200);
+        await using var cluster = await MeshTestCluster.CreateAsync(schema, gcWindow: gcWindow);
+
+        await cluster.Datastore.ReadWriteTx(tx =>
+            tx.WriteRelationships([new RelationshipUpdate(Row("x", "alice"), UpdateOperation.Create)]));
+        var rd = await cluster.Datastore.ReadWriteTx(tx =>
+            tx.WriteRelationships([new RelationshipUpdate(Row("x", "bob"), UpdateOperation.Create)]));
+        var r2 = await cluster.Datastore.ReadWriteTx(tx =>
+            tx.WriteRelationships([new RelationshipUpdate(Row("x", "bob"), UpdateOperation.Delete)]));
+
+        // Hydrate the shard WARM at the post-delete head: its state carries bob's full MVCC history and
+        // no GC floor yet, and its watermark sits exactly at r2.
+        var shard = cluster.GrainFactory.GetGrain<IGraphShardGrain>(
+            GraphShardGrainKey.Build(GraphShardKeyWire.ForResource("doc", "x")));
+        var preGc = await shard.RowsAt(Nanos(r2), CancellationToken.None);
+        Assert.Equal("alice", Assert.Single(preGc.Rows).SubjectId);
+
+        // Let wall-clock pass the retention window, then GC: the floor becomes min(head, now - window)
+        // = head = r2 — past the delete (rd's row history is collected) and exactly at the warm shard's
+        // watermark, which is the premise that forces the catch-up to FOLD the GcApplied event from the
+        // retained tail (a floor above the watermark would force a re-bootstrap instead).
+        await Task.Delay(gcWindow + TimeSpan.FromMilliseconds(100));
+        var floor = await cluster.GrainFactory.GetGrain<IDatastoreGrain>(IDatastoreGrain.Key).RunGc();
+        Assert.NotNull(floor);
+        Assert.True(floor > Nanos(rd), $"GC floor {floor} must land past Rd {Nanos(rd)}");
+        Assert.Equal(Nanos(r2), floor.Value);
+
+        var head = await cluster.Datastore.HeadRevision();
+
+        // (a) WITHOUT deactivating: the warm shard catches up by folding the GcApplied event and serves
+        // post-GC-correct rows at the new head, agreeing with the sequencer-snapshot reader.
+        var atHead = await shard.RowsAt(Nanos(head.Revision), CancellationToken.None);
+        Assert.Equal("alice", Assert.Single(atHead.Rows).SubjectId);
+
+        var expected = await Collect(cluster.Datastore.SnapshotReader(head.Revision).QueryRelationships(
+            new RelationshipsFilter { OptionalResourceType = "doc", OptionalResourceIds = ["x"] }));
+        var actual = atHead.Rows.Select(WireConvert.ToRelationship).Select(Canonical).ToList();
+        var failures = new List<string>();
+        CompareSorted(expected, actual, "post-GC warm rows of doc:x", failures);
+        Assert.True(failures.Count == 0, $"warm post-GC read diverged:\n{string.Join('\n', failures)}");
+
+        // (b) The SAME warm activation — its state now carries the folded floor — rejects a below-floor
+        // pin with the domain exception across the grain boundary.
+        await Assert.ThrowsAsync<RevisionNotFoundException>(
+            () => shard.RowsAt(Nanos(rd), CancellationToken.None));
     }
 
     // --- helpers ---
@@ -592,7 +668,7 @@ public class ShardedReaderEquivalenceTests
         if (!expected.SequenceEqual(actual, StringComparer.Ordinal))
         {
             failures.Add(
-                $"  {label}:\n    projection: [{string.Join(", ", expected)}]\n    sharded:    [{string.Join(", ", actual)}]");
+                $"  {label}:\n    sequencer:  [{string.Join(", ", expected)}]\n    sharded:    [{string.Join(", ", actual)}]");
         }
     }
 
