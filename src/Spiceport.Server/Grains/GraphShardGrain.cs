@@ -33,6 +33,14 @@ namespace Spiceport.Grains;
 /// at the pinned revision, while a state that has collected them carries the advanced floor and throws.
 /// Only the stale-token ERROR surfaces earlier or later — bounded by the shard's own catch-up.
 /// </para>
+/// <para>
+/// Filtered serves (the 3.2 subject-filter pushdown) are answered from a lazily-built subject-keyed
+/// index over the served state so a point-membership probe is O(matches), not an O(userset) scan
+/// inside this single activation. Memory: the index holds REFERENCES to the same
+/// <see cref="StoredRelationshipWire"/> rows the state already holds (dictionary/list overhead only,
+/// no row copies), lives only on hot activations, and is dropped with the activation — the
+/// silo-memory-is-O(hot-working-set) principle is unchanged.
+/// </para>
 /// </remarks>
 [GraphLocalityPlacement] // First-activation locality hint only (director no-ops to a random pick unless
                          // GraphPlacementOptions.CoLocateWithShards is enabled); the grain directory
@@ -50,6 +58,16 @@ public sealed class GraphShardGrain : Grain, IGraphShardGrain
     private GraphShardState _state = GraphShardState.Empty;
     private bool _hydrated;
 
+    // --- Subject-keyed index over the served state (scalability-program 3.2, serve-side half) ---
+    // Rebuilt lazily at serve time whenever the served GraphShardState INSTANCE changes (the state is
+    // an immutable record replaced whole, so reference identity is the correct staleness signal).
+    // Safe under [AlwaysInterleave]: Orleans turns are single-threaded and interleave only at awaits;
+    // Serve is fully synchronous, so a rebuild can never be observed half-built. Buckets stay
+    // multi-version (ALL stored versions of a subject's rows); visibility filters at serve time.
+    private GraphShardState? _indexedState;
+    private Dictionary<(string SubjectType, string SubjectId), List<StoredRelationshipWire>>? _subjectIndex;
+    private List<StoredRelationshipWire>? _nonTerminalRows;
+
     /// <summary>The shard key parsed once from the grain's string key.</summary>
     private GraphShardKeyWire _key = null!;
 
@@ -64,13 +82,14 @@ public sealed class GraphShardGrain : Grain, IGraphShardGrain
     }
 
     /// <inheritdoc />
-    public async Task<GraphShardRowsReply> RowsAt(long revision, CancellationToken cancellationToken)
+    public async Task<GraphShardRowsReply> RowsAt(
+        long revision, FullRelationshipsFilterWire? filter, CancellationToken cancellationToken)
     {
         // Fast path: hydrated and the watermark already covers the pinned revision. _state is an
         // immutable record replaced whole, so serving off it with no gate is safe; the interleaved
         // reader sees either the previous fold or the new one, never a partial.
         if (_hydrated && _state.AppliedRevision >= revision && ShardFold.IsReadableAt(_state, revision))
-            return Serve(revision);
+            return Serve(revision, filter);
 
         await _gate.WaitAsync(cancellationToken);
         try
@@ -126,7 +145,7 @@ public sealed class GraphShardGrain : Grain, IGraphShardGrain
                 }
             }
 
-            return Serve(revision);
+            return Serve(revision, filter);
         }
         finally
         {
@@ -134,7 +153,7 @@ public sealed class GraphShardGrain : Grain, IGraphShardGrain
         }
     }
 
-    private GraphShardRowsReply Serve(long revision)
+    private GraphShardRowsReply Serve(long revision, FullRelationshipsFilterWire? filter)
     {
         // A revision below the shard's GC floor cannot be read exactly (rows already collected below the
         // floor would be silently missing) — reject, mirroring the MvccSnapshotReader constructor guard.
@@ -142,6 +161,124 @@ public sealed class GraphShardGrain : Grain, IGraphShardGrain
         if (!ShardFold.IsReadableAt(_state, revision))
             throw new RevisionNotFoundException(new TimestampRevision(revision));
 
-        return new GraphShardRowsReply(ShardFold.VisibleAt(_state, revision).ToImmutableList());
+        if (filter is null)
+            return new GraphShardRowsReply(ShardFold.VisibleAt(_state, revision).ToImmutableList());
+
+        // Subject-filter pushdown (scalability-program 3.2): apply the filter server-side so the reply
+        // is O(matches), not O(userset). Converted ONCE per call; the row conversion reuses the same
+        // WireConvert mapping the reader applies client-side, so server-side and client-side Matches
+        // can never disagree on a row. Expiration deliberately stays a caller-side, caller-clock
+        // concern (see IGraphShardGrain.RowsAt). When every selector is index-servable the candidates
+        // come from the subject-keyed index (O(matches) work, not an O(userset) scan serialized on
+        // this activation); the FULL pipeline — IsVisibleAt + convert + Matches — still runs over the
+        // candidates, so an index-served answer is byte-identical to the scan. Any other selector
+        // shape falls the whole call back to the scan.
+        var coreFilter = WireConvert.ToCoreFilter(filter);
+
+        if (TryCollectIndexCandidates(coreFilter, out var candidates))
+        {
+            var served = ImmutableList.CreateBuilder<RelationshipWire>();
+            foreach (var row in candidates)
+            {
+                if (ShardFold.IsVisibleAt(row, revision) && coreFilter.Matches(WireConvert.ToRelationship(row.Relationship)))
+                    served.Add(row.Relationship);
+            }
+            return new GraphShardRowsReply(served.ToImmutable());
+        }
+
+        return new GraphShardRowsReply(
+            ShardFold.VisibleAt(_state, revision)
+                .Where(row => coreFilter.Matches(WireConvert.ToRelationship(row)))
+                .ToImmutableList());
+    }
+
+    /// <summary>
+    /// Collects the candidate rows for <paramref name="filter"/> from the subject-keyed index, when
+    /// every selector is index-servable; returns false (whole call falls back to the full scan) when
+    /// any selector shape the index cannot serve appears — no selectors at all, a type without ids,
+    /// ids without a type, or a relation filter other than the exact non-terminal shape. Per-branch
+    /// superset arguments:
+    ///   - explicit type + explicit ids: a bucket holds EVERY stored row of that (type, id) subject
+    ///     regardless of subject relation — a superset of any relation-filtered selector over it, so
+    ///     the final Matches narrows and can never miss;
+    ///   - OnlyNonEllipsisRelations with no type/ids (and no other relation constraint): the
+    ///     non-terminals list is EXACTLY that selector's domain (every stored row whose subject
+    ///     relation is not the ellipsis).
+    /// Candidates are deduplicated by REFERENCE: a non-terminal row appears in both its subject's
+    /// bucket and the non-terminals list, and multiple stored versions of one identity are distinct
+    /// instances that must each survive to the visibility check.
+    /// </summary>
+    private bool TryCollectIndexCandidates(
+        RelationshipsFilter filter, out IReadOnlyCollection<StoredRelationshipWire> candidates)
+    {
+        candidates = [];
+        if (filter.OptionalSubjectsSelectors is not { Count: > 0 } selectors)
+            return false;
+
+        foreach (var selector in selectors)
+        {
+            var servableBucketProbe =
+                selector.OptionalSubjectType is not null && selector.OptionalSubjectIds is { Count: > 0 };
+            var servableNonTerminal =
+                selector.OptionalSubjectType is null
+                && selector.OptionalSubjectIds is not { Count: > 0 }
+                && selector.RelationFilter is
+                {
+                    NonEllipsisRelation: null,
+                    IncludeEllipsisRelation: false,
+                    OnlyNonEllipsisRelations: true,
+                };
+            if (!servableBucketProbe && !servableNonTerminal)
+                return false;
+        }
+
+        EnsureIndex();
+
+        var collected = new HashSet<StoredRelationshipWire>(ReferenceEqualityComparer.Instance);
+        foreach (var selector in selectors)
+        {
+            if (selector.OptionalSubjectType is { } subjectType)
+            {
+                foreach (var id in selector.OptionalSubjectIds!)
+                {
+                    if (_subjectIndex!.TryGetValue((subjectType, id), out var bucket))
+                        collected.UnionWith(bucket);
+                }
+            }
+            else
+            {
+                collected.UnionWith(_nonTerminalRows!);
+            }
+        }
+
+        candidates = collected;
+        return true;
+    }
+
+    /// <summary>Rebuilds the subject-keyed index iff the served state instance changed (see the field remarks).</summary>
+    private void EnsureIndex()
+    {
+        if (ReferenceEquals(_indexedState, _state))
+            return;
+
+        var subjectIndex = new Dictionary<(string, string), List<StoredRelationshipWire>>();
+        var nonTerminals = new List<StoredRelationshipWire>();
+        foreach (var row in _state.Rows)
+        {
+            var rel = row.Relationship;
+            var key = (rel.SubjectType, rel.SubjectId);
+            if (!subjectIndex.TryGetValue(key, out var bucket))
+                subjectIndex[key] = bucket = [];
+            bucket.Add(row);
+
+            // The stored subject relation is normalized on fold (empty => ellipsis; see
+            // ShardFold.ApplyEvent), so the ellipsis comparison is exact.
+            if (rel.SubjectRelation != CoreConstants.Ellipsis)
+                nonTerminals.Add(row);
+        }
+
+        _subjectIndex = subjectIndex;
+        _nonTerminalRows = nonTerminals;
+        _indexedState = _state;
     }
 }

@@ -57,12 +57,19 @@ public sealed class ShardedGraphReader : IGraphReader
         // sees the same expiration cutoff.
         var now = DateTimeOffset.UtcNow;
 
+        // Subject-filter pushdown (scalability-program 3.2): the whole filter travels to the shard so
+        // matching happens server-side over the in-memory rows and the reply is O(matches), not
+        // O(userset). The client-side expiry skip AND the client-side filter.Matches below deliberately
+        // STAY — cheap belt-and-braces that keeps the equivalence argument trivial (the pushdown is a
+        // strict restriction, so with or without it the yielded rows are identical).
+        var wireFilter = WireConvert.ToFullFilter(filter);
+
         foreach (var id in resourceIds.Distinct())
         {
             cancellationToken.ThrowIfCancellationRequested();
             var shard = _grainFactory.GetGrain<IGraphShardGrain>(
                 GraphShardGrainKey.Build(GraphShardKeyWire.ForResource(filter.OptionalResourceType, id)));
-            var reply = await shard.RowsAt(_revisionNanos, cancellationToken).ConfigureAwait(false);
+            var reply = await shard.RowsAt(_revisionNanos, wireFilter, cancellationToken).ConfigureAwait(false);
 
             foreach (var row in reply.Rows)
             {
@@ -150,7 +157,9 @@ public sealed class ShardedGraphReader : IGraphReader
     {
         var shard = _grainFactory.GetGrain<IGraphShardGrain>(
             GraphShardGrainKey.Build(GraphShardKeyWire.ForSubject(subjectType, subjectId)));
-        return shard.RowsAt(_revisionNanos, ct);
+        // No pushdown on the reverse path: reverse shards are already subject-narrow (the shard key IS
+        // the subject), so there is no measured payload to shrink; null = every visible row.
+        return shard.RowsAt(_revisionNanos, null, ct);
     }
 
     // Mirrors MvccSnapshotReader.IsExpired exactly: an expiration at or before 'now' excludes the row.

@@ -110,10 +110,18 @@ internal static class ShardFold
     {
         foreach (var row in state.Rows)
         {
-            if (row.CreatedRevision <= revision && (row.DeletedRevision is null || row.DeletedRevision > revision))
+            if (IsVisibleAt(row, revision))
                 yield return row.Relationship;
         }
     }
+
+    /// <summary>
+    /// The per-row visibility predicate of <see cref="VisibleAt"/> (half-open MVCC window
+    /// <c>[created, deleted)</c>), exposed so index-served reads apply the IDENTICAL predicate to
+    /// their candidate rows.
+    /// </summary>
+    public static bool IsVisibleAt(StoredRelationshipWire row, long revision) =>
+        row.CreatedRevision <= revision && (row.DeletedRevision is null || row.DeletedRevision > revision);
 
     /// <summary>True if a read pinned at <paramref name="revision"/> is still exact on this shard.</summary>
     public static bool IsReadableAt(GraphShardState state, long revision) => revision >= state.GcFloor;

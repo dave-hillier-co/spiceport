@@ -124,11 +124,38 @@ public sealed class LocalDispatcher : IDispatcher
         ResolverMeta meta,
         CancellationToken ct)
     {
+        // Subject-filter pushdown (scalability-program 3.2). The selector union below is a SUPERSET of
+        // everything the consumption loop below can use — that superset argument is the load-bearing
+        // correctness claim, so keep it in sync with the loop:
+        //   1. the EXACT subject (terminal match): type + id + the subject's relation
+        //      (NonEllipsisRelation for a concrete relation; the deliberately-loose ellipsis branch of
+        //      SubjectRelationFilter is fine because the loop's exact OnrEquals re-check stays);
+        //   2. the type-scoped PUBLIC WILDCARD short-circuit: type + "*" with IncludeEllipsisRelation
+        //      (SpiceDB wildcards cannot carry a subject relation);
+        //   3. every NON-TERMINAL subject (OnlyNonEllipsisRelations, no type/id constraint): the userset
+        //      references the loop re-dispatches into. Dropping these would break recursion — which is
+        //      why a bare subject==S pushdown would be WRONG.
+        // The loop consumes exactly those three row categories and nothing else; its post-filtering is
+        // unchanged as belt-and-braces. RelationshipsFilter.Matches ANDs the selectors in identically on
+        // the reference-model path and on the sharded path (where the shard also applies them
+        // server-side), so engine-over-reference and mesh verdicts cannot diverge.
+        var subjectRelationFilter = subject.Relation == CoreConstants.Ellipsis
+            ? new SubjectRelationFilter(IncludeEllipsisRelation: true)
+            : new SubjectRelationFilter(NonEllipsisRelation: subject.Relation);
         var filter = new RelationshipsFilter
         {
             OptionalResourceType = resource.ObjectType,
             OptionalResourceIds = [resource.ObjectId],
             OptionalResourceRelation = resource.Relation,
+            OptionalSubjectsSelectors =
+            [
+                new SubjectsSelector(subject.ObjectType, [subject.ObjectId], subjectRelationFilter),
+                new SubjectsSelector(
+                    subject.ObjectType,
+                    [CoreConstants.PublicWildcard],
+                    new SubjectRelationFilter(IncludeEllipsisRelation: true)),
+                new SubjectsSelector(RelationFilter: new SubjectRelationFilter(OnlyNonEllipsisRelations: true)),
+            ],
         };
 
         var found = DispatchCheckResult.None;

@@ -89,9 +89,12 @@ internal static class WireConvert
             ? new CaveatNameFilterWire((int)cf.Option, cf.CaveatName)
             : null;
 
+        // Id lists are materialized to arrays: callers build them with collection expressions, whose
+        // compiler-synthesized list types (<>z__ReadOnlySingleElementList and friends) have no Orleans
+        // codec — the wire form must always be serializable regardless of the caller's list type.
         return new FullRelationshipsFilterWire(
             f.OptionalResourceType,
-            f.OptionalResourceIds,
+            f.OptionalResourceIds?.ToArray(),
             f.OptionalResourceIdPrefix,
             f.OptionalResourceRelation,
             selectors,
@@ -110,7 +113,7 @@ internal static class WireConvert
     private static SubjectsSelectorWire ToWireSelector(SubjectsSelector s) =>
         new(
             s.OptionalSubjectType,
-            s.OptionalSubjectIds,
+            s.OptionalSubjectIds?.ToArray(), // materialized for Orleans serializability (see ToFullFilter)
             s.RelationFilter is { } rf
                 ? new SubjectRelationFilterWire(rf.NonEllipsisRelation, rf.IncludeEllipsisRelation, rf.OnlyNonEllipsisRelations)
                 : null);

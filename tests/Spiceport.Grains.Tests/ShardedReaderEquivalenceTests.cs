@@ -435,6 +435,67 @@ public class ShardedReaderEquivalenceTests
     }
 
     /// <summary>
+    /// The direct-check-shaped forward filter (scalability-program 3.2): resource pin PLUS the
+    /// three-selector subject union <c>CheckDirect</c> pushes down — exact subject, type-scoped public
+    /// wildcard, and every non-terminal subject. With the filter now applied SERVER-SIDE by the shard,
+    /// the sharded reader must still agree row-for-row with the sequencer-snapshot reader, AND the
+    /// result must retain the recursion-bearing categories: the pinned assertions prove the superset
+    /// union does not drop a non-terminal (userset re-dispatch) row nor, where the corpus has one, the
+    /// wildcard row. A union that dropped either category would pass a bare subject==S equality check
+    /// and still break Check recursion — this gate exists to make that regression loud.
+    /// </summary>
+    [Theory]
+    [InlineData("indirectnestedgroups.yaml", "document", "firstdoc", "viewer", "user", "tom",
+        "document:firstdoc#viewer@group:engineering#non_intern_member", null)]
+    [InlineData("simplewildcard.yaml", "test/resource", "first", "viewer", "test/user", "anotheruser",
+        null, "test/resource:first#viewer@test/user:*#...")]
+    public async Task Direct_Check_Shaped_Subject_Union_Agrees_And_Keeps_Recursion_Bearing_Rows(
+        string fileName,
+        string resourceType, string resourceId, string resourceRelation,
+        string subjectType, string subjectId,
+        string? expectedNonTerminalRow, string? expectedWildcardRow)
+    {
+        var path = Path.Combine(AppContext.BaseDirectory, "TestData", fileName);
+        var file = ValidationFileLoader.LoadFromFile(path);
+
+        await using var cluster = await MeshTestCluster.CreateAsync(file.SchemaText);
+        await Seed(cluster.Datastore, file.Relationships);
+
+        var head = await cluster.Datastore.HeadRevision();
+        IGraphReader sequencer = cluster.Datastore.SnapshotReader(head.Revision);
+        IGraphReader sharded = new ShardedGraphReader(cluster.GrainFactory, Nanos(head.Revision));
+
+        // The exact union LocalDispatcher.CheckDirect builds for an ellipsis check subject.
+        var filter = new RelationshipsFilter
+        {
+            OptionalResourceType = resourceType,
+            OptionalResourceIds = [resourceId],
+            OptionalResourceRelation = resourceRelation,
+            OptionalSubjectsSelectors =
+            [
+                new SubjectsSelector(
+                    subjectType, [subjectId], new SubjectRelationFilter(IncludeEllipsisRelation: true)),
+                new SubjectsSelector(
+                    subjectType, [CoreConstants.PublicWildcard],
+                    new SubjectRelationFilter(IncludeEllipsisRelation: true)),
+                new SubjectsSelector(RelationFilter: new SubjectRelationFilter(OnlyNonEllipsisRelations: true)),
+            ],
+        };
+
+        var expected = await Collect(sequencer.QueryRelationships(filter));
+        var actual = await Collect(sharded.QueryRelationships(filter));
+        var failures = new List<string>();
+        CompareSorted(expected, actual, $"direct-check union {resourceType}:{resourceId}#{resourceRelation}", failures);
+        Assert.True(failures.Count == 0, $"{fileName}: direct-check-shaped pass diverged:\n{string.Join('\n', failures)}");
+
+        // Pin the recursion-bearing categories the union must never drop.
+        if (expectedNonTerminalRow is not null)
+            Assert.Contains(actual, row => row.StartsWith(expectedNonTerminalRow, StringComparison.Ordinal));
+        if (expectedWildcardRow is not null)
+            Assert.Contains(actual, row => row.StartsWith(expectedWildcardRow, StringComparison.Ordinal));
+    }
+
+    /// <summary>
     /// Forces the catch-up loop through a FULL 256-event page (<c>Events.Count == BatchSize</c>, loop
     /// again) rather than the single short-page drain every other gate happens to exercise: hydrate a
     /// shard, advance the log by 300 commits on other resources plus one on this shard's key, then
@@ -463,7 +524,7 @@ public class ShardedReaderEquivalenceTests
         var shard = cluster.GrainFactory.GetGrain<IGraphShardGrain>(
             GraphShardGrainKey.Build(GraphShardKeyWire.ForResource("doc", "x")));
         var headBefore = await cluster.Datastore.HeadRevision();
-        var hydrated = await shard.RowsAt(Nanos(headBefore.Revision), CancellationToken.None);
+        var hydrated = await shard.RowsAt(Nanos(headBefore.Revision), null, CancellationToken.None);
         Assert.Single(hydrated.Rows);
 
         // 300 single-row commits touching OTHER resources: more than one full ReadFrom page (256),
@@ -473,7 +534,7 @@ public class ShardedReaderEquivalenceTests
         await Write(cluster.Datastore, Row("x", "late"));
 
         var head = await cluster.Datastore.HeadRevision();
-        var reply = await shard.RowsAt(Nanos(head.Revision), CancellationToken.None);
+        var reply = await shard.RowsAt(Nanos(head.Revision), null, CancellationToken.None);
         var actual = reply.Rows.Select(WireConvert.ToRelationship).Select(Canonical).ToList();
 
         Assert.Contains(Canonical(Row("x", "late")), actual);
@@ -528,7 +589,7 @@ public class ShardedReaderEquivalenceTests
         // snapshot and serves correctly at head.
         var coldShard = cluster.GrainFactory.GetGrain<IGraphShardGrain>(
             GraphShardGrainKey.Build(GraphShardKeyWire.ForResource("doc", "cold")));
-        var coldRows = await coldShard.RowsAt(Nanos(head.Revision), CancellationToken.None);
+        var coldRows = await coldShard.RowsAt(Nanos(head.Revision), null, CancellationToken.None);
         Assert.Equal("carol", Assert.Single(coldRows.Rows).SubjectId);
 
         // (b) A below-floor pin is rejected with the DOMAIN exception type across the grain boundary —
@@ -536,7 +597,7 @@ public class ShardedReaderEquivalenceTests
         var xShard = cluster.GrainFactory.GetGrain<IGraphShardGrain>(
             GraphShardGrainKey.Build(GraphShardKeyWire.ForResource("doc", "x")));
         await Assert.ThrowsAsync<RevisionNotFoundException>(
-            () => xShard.RowsAt(Nanos(rd), CancellationToken.None));
+            () => xShard.RowsAt(Nanos(rd), null, CancellationToken.None));
 
         // (c) At head, the sharded reader still agrees with the sequencer-snapshot reader.
         IGraphReader sequencer = cluster.Datastore.SnapshotReader(head.Revision);
@@ -602,7 +663,7 @@ public class ShardedReaderEquivalenceTests
         // no GC floor yet, and its watermark sits exactly at r2.
         var shard = cluster.GrainFactory.GetGrain<IGraphShardGrain>(
             GraphShardGrainKey.Build(GraphShardKeyWire.ForResource("doc", "x")));
-        var preGc = await shard.RowsAt(Nanos(r2), CancellationToken.None);
+        var preGc = await shard.RowsAt(Nanos(r2), null, CancellationToken.None);
         Assert.Equal("alice", Assert.Single(preGc.Rows).SubjectId);
 
         // Let wall-clock pass the retention window, then GC: the floor becomes min(head, now - window)
@@ -619,7 +680,7 @@ public class ShardedReaderEquivalenceTests
 
         // (a) WITHOUT deactivating: the warm shard catches up by folding the GcApplied event and serves
         // post-GC-correct rows at the new head, agreeing with the sequencer-snapshot reader.
-        var atHead = await shard.RowsAt(Nanos(head.Revision), CancellationToken.None);
+        var atHead = await shard.RowsAt(Nanos(head.Revision), null, CancellationToken.None);
         Assert.Equal("alice", Assert.Single(atHead.Rows).SubjectId);
 
         var expected = await Collect(cluster.Datastore.SnapshotReader(head.Revision).QueryRelationships(
@@ -632,7 +693,7 @@ public class ShardedReaderEquivalenceTests
         // (b) The SAME warm activation — its state now carries the folded floor — rejects a below-floor
         // pin with the domain exception across the grain boundary.
         await Assert.ThrowsAsync<RevisionNotFoundException>(
-            () => shard.RowsAt(Nanos(rd), CancellationToken.None));
+            () => shard.RowsAt(Nanos(rd), null, CancellationToken.None));
     }
 
     // --- helpers ---

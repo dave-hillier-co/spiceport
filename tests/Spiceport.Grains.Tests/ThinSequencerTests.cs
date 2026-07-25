@@ -358,7 +358,7 @@ public class ThinSequencerTests
         var coldShardGrain = cluster.GrainFactory.GetGrain<IGraphShardGrain>(
             GraphShardGrainKey.Build(GraphShardKeyWire.ForResource("doc", "cold")));
         await Assert.ThrowsAsync<RevisionNotFoundException>(
-            () => coldShardGrain.RowsAt(Nanos(rev1), CancellationToken.None));
+            () => coldShardGrain.RowsAt(Nanos(rev1), null, CancellationToken.None));
 
         // Re-dirty "cold" and push another flush past it: this flush is where its stored row
         // physically compacts (the tombstone is finally dropped from storage).

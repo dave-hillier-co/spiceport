@@ -155,11 +155,22 @@ through the mesh.
 **Trigger.** The userset-size sweep shows Check latency scaling with userset cardinality, or
 cross-silo `RowsAt` payload sizes dominating dispatch cost in the skewed workload.
 
-**Trigger status: FIRED.** Harness runs (distinct-subject probes, so the activation memo
-cannot mask the fetch) show point-membership latency scaling linearly with userset
-cardinality and multiplying severalfold cross-silo. This is the first mitigation to build.
-Measurement note for reproducers: the userset sweep must probe DISTINCT subjects per op —
-probing a fixed subject measures the activation memo, not the fetch.
+**Trigger status: FIRED, then BUILT — goal met.** Harness runs (distinct-subject probes, so
+the activation memo cannot mask the fetch) showed point-membership latency scaling linearly
+with userset cardinality and multiplying severalfold cross-silo. The build took two rounds,
+both measurement-driven: the pushdown alone removed the wire cost (latency became
+silo-count-independent) but left an O(userset) serve-side scan serialized on the shard
+activation, so the shard gained a lazily-built per-state subject index (multi-version
+buckets by subject + a non-terminals list; index-served candidates run the identical
+visibility/Matches pipeline, so answers are byte-identical to the scan). Post-build the
+sweep is flat within ~1.5× across three decades of userset size on both silo configs.
+Two notes for reproducers: the sweep must probe DISTINCT subjects per op (a fixed subject
+measures the memo, not the fetch), and the engine-side narrowing must stay a SUPERSET of
+what CheckDirect consumes — exact subject, type-scoped wildcard, and every non-terminal
+subject — because a bare subject-equality pushdown silently breaks recursion. Residual,
+off the steady path: one-time O(userset) hydration payload and first index build per
+activation (visible as max-latency spikes at extreme cardinality); the chunked-`RowsAt`
+fallback in the sketch remains the answer if that ever matters.
 
 **Fallback if enumeration paths hit message-size limits:** chunked/streaming `RowsAt` for the
 enumerate-everything callers; a `[StatelessWorker]` read facade over hot shards stays the
@@ -263,8 +274,8 @@ cheap wins, and a better instrument before the two judgment calls:
 1. **Diagnose the exact-key precondition cost** (3.3's status note) — RESOLVED: it was the
    index scan; explicit-id filters now probe the index maps by constructed key, and the
    cardinality sweep is flat.
-2. **Subject-filter pushdown (3.2)** — the fired trigger; small change, strictly less data
-   movement, shifts the read-side baseline.
+2. **Subject-filter pushdown (3.2)** — BUILT, goal met: point-membership is flat in userset
+   cardinality (pushdown + shard-side subject index; see 3.2's status note).
 3. **Re-baseline** — re-run the userset, commit-breadth, and decomposition sweeps. Fixes
    demonstrably dominate each other's signal; nothing further is decided on stale numbers.
 4. **Key-index chunking (3.4)**, with flush write batching (3.3 item 3) adjacent — the one
