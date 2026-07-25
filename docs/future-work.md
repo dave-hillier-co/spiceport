@@ -197,28 +197,33 @@ cold-start contention on the whole-snapshot bootstrap. The graph-sharded datasto
 dissolved the problem rather than optimizing it: there is no whole-snapshot silo bootstrap — a
 cold `GraphShardGrain` hydrates its own key's slice on first touch via a per-key `ReadShard` read.
 
-### 1.13 Graph-sharded datastore: dissolve `IDatastore` into grains (largely realized)
+### 1.13 Graph-sharded datastore: dissolve `IDatastore` into grains (realized)
 
-The deepest lean-into-Orleans move, and the read side is built: the per-silo `SiloProjection`
+The deepest lean-into-Orleans move, realized in full: the per-silo `SiloProjection`
 whole-graph replica is retired; engine reads resolve to per-key `GraphShardGrain`s (forward by
 object, reverse by subject), each the per-key restriction of the same log fold (`ShardFold`),
 activation-as-hot-set-cache with a per-shard closed-timestamp watermark; writes are declarative
-`DatastoreGrain.Commit` requests with typed `CommitReply` failures; broad scans and
-schema-at-revision go storage-direct (`ISnapshotScanner` / `ISchemaSource`). This removes the
-per-silo read-fleet state ceiling (silo memory is O(hot shards)) and the silo bootstrap, and
-deliberately retains the single-writer ceiling. What remains, per the design document's staging:
+`DatastoreGrain.Commit` requests executed at the serialization point with typed `CommitReply`
+failures; broad scans and schema-at-revision go storage-direct (`ISnapshotScanner` /
+`ISchemaSource`); the **thin-sequencer flush protocol** removed the fold from the sequencer
+grain itself (slim meta state + dirty-buffer flush to version-qualified per-key rows, the head
+row as the sole commit point, O(tail) recovery, in-place migration from the whole-state
+layout); and the **co-placement director** (`GraphLocalityPlacement`) is built as a
+default-off locality hint whose enablement is gated on measurement. No component holds the
+whole graph: silo memory is O(hot shards), sequencer memory O(tail + dirty keys + metadata).
+The single-writer total order is deliberately retained. Design, interfaces, the §3.1
+objections, and the staging are in [`graph-sharded-datastore.md`](graph-sharded-datastore.md).
 
-- **The thin-sequencer flush protocol** — the sequencer grain still materializes the whole fold
-  within the GC window. Sketch: shards persist their own snapshots via stock Orleans grain
-  storage; the sequencer trims its log tail only past the flushed floor (the minimum durable
-  shard watermark); `ReadShard` falls back to the per-shard durable snapshot instead of the
-  sequencer fold; sequencer-side preconditions become shard-base-at-watermark plus in-memory
-  tail overlay.
-- **The co-placement director** — check/walk grains landing on their shard's silo; pure
-  performance, gated on measurement per the simplicity-over-performance stance.
+### 1.14 Scalability program: measure, then earn each optimization
 
-Design, interfaces, the §3.1 objections, and the realized-vs-remaining staging are in
-[`graph-sharded-datastore.md`](graph-sharded-datastore.md).
+With the state ceilings removed structurally, the remaining scalability questions live in
+constants — grain-hop cost, per-commit candidate I/O, shard catch-up fan-in, large-userset
+marshalling, key-index write amplification — none of which have been measured, by deliberate
+stance. [`scalability-program.md`](scalability-program.md) is the standing program: an
+unconditional measurement harness plus a set of trigger-gated mitigations (per-silo log-tail
+cache, subject-filter pushdown on shard reads, commit-turn shortening, key-index chunking,
+storage-direct scans) each with a design sketch, an equivalence gate, and the measured
+condition that would justify building it. Nothing in it is scheduled; triggers decide.
 
 ---
 
@@ -348,10 +353,14 @@ Recorded so they are not relitigated by accident:
 1. **1.1–1.7** — all completed. Cross-cutting infrastructure (filters, RequestContext) is now
    in place and the dispatcher seam is clean: error mapping and depth enforcement are native,
    and the wire contract is minimal (sub-problem + cancellation).
-2. **1.13 graph-sharded datastore** — realized on the read and write-contract side (per-key
-   shard grains, declarative `Commit`, storage-direct scans; the per-silo projection is gone),
-   dissolving 1.12 along the way; the thin-sequencer flush protocol and the co-placement
-   director are its recorded remaining steps (`graph-sharded-datastore.md` §7).
-3. **1.11** — the broadcast channel remains a deferred refinement, low leverage on its own.
-4. **2.3 / 2.4 / 2.5** — cheap, immediately differentiating product capabilities.
-5. **2.1 per-tenant** and **2.2 materialized reachability** — each behind its own design document.
+2. **1.13 graph-sharded datastore** — realized in full (per-key shard grains, declarative
+   `Commit`, storage-direct scans, the thin-sequencer flush protocol, the default-off
+   co-placement director), dissolving 1.12 along the way.
+3. **1.14 scalability program** — the standing next step: the measurement harness is
+   unconditional; every optimization behind it is trigger-gated
+   (`scalability-program.md`).
+4. **1.11** — the broadcast channel remains a deferred refinement; note the scalability
+   program's per-silo log-tail cache (its §3.1) would deliver most of what 1.11 promised,
+   via the existing observer push rather than a stream provider.
+5. **2.3 / 2.4 / 2.5** — cheap, immediately differentiating product capabilities.
+6. **2.1 per-tenant** and **2.2 materialized reachability** — each behind its own design document.

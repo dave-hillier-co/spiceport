@@ -64,6 +64,19 @@ public sealed class MeshTestCluster : IAsyncDisposable
         return total;
     }
 
+    /// <summary>
+    /// The cluster-wide sum of every silo's sequencer counters (the same pattern as
+    /// <see cref="MetricsSnapshot"/>: only the silo hosting the single <c>DatastoreGrain</c> activation
+    /// is ever nonzero, so the sum IS that silo's view).
+    /// </summary>
+    public SequencerMetricsSnapshot SequencerMetricsSnapshot()
+    {
+        var total = default(SequencerMetricsSnapshot);
+        foreach (var sp in AllSiloServices)
+            total += sp.GetRequiredService<ISequencerMetrics>().Snapshot();
+        return total;
+    }
+
     /// <summary>The cluster grain factory, for resolving grains (e.g. the membership-walk mesh) in tests.</summary>
     public IGrainFactory GrainFactory => _cluster.GrainFactory;
 
@@ -104,6 +117,12 @@ public sealed class MeshTestCluster : IAsyncDisposable
     /// that needs a GC floor near head (e.g. <see cref="TimeSpan.Zero"/>, where the floor becomes
     /// <c>min(head, now) == head</c>) opts in here; null keeps the production default (24h window).
     /// </param>
+    /// <param name="quantization">
+    /// When set, overrides <see cref="GrainBackedDatastore"/>'s revision-quantization window (the
+    /// optimized-revision bucketing that shares grain keys within a window). Null keeps the production
+    /// default (5s) — exactly what the constructor defaults to when the cluster passes nothing. The
+    /// bench harness sweeps this dial (docs/scalability-program.md section 3.5).
+    /// </param>
     public static async Task<MeshTestCluster> CreateAsync(
         string schemaText,
         int batchConcurrency = PermissionChecker.DefaultBatchConcurrency,
@@ -112,7 +131,8 @@ public sealed class MeshTestCluster : IAsyncDisposable
         bool useSubjectFrontierMemo = true,
         int? subjectFrontierMaxMemoSubjects = null,
         TimeSpan? gcWindow = null,
-        bool coLocateWithShards = false)
+        bool coLocateWithShards = false,
+        TimeSpan? quantization = null)
     {
         SchemaHolder.SchemaText = schemaText;
         SchemaHolder.BatchConcurrency = batchConcurrency;
@@ -124,6 +144,7 @@ public sealed class MeshTestCluster : IAsyncDisposable
         SchemaHolder.UseRandomPlacement = false;
         SchemaHolder.CoLocateWithShards = coLocateWithShards;
         SchemaHolder.GcWindow = gcWindow;
+        SchemaHolder.Quantization = quantization;
 
         var builder = new TestClusterBuilder(initialSilosCount: 1);
         builder.AddSiloBuilderConfigurator<SiloConfigurator>();
@@ -171,7 +192,8 @@ public sealed class MeshTestCluster : IAsyncDisposable
         bool useActivationMemo = true,
         bool useSubjectFrontierMemo = true,
         bool useRandomPlacement = false,
-        bool coLocateWithShards = false)
+        bool coLocateWithShards = false,
+        TimeSpan? quantization = null)
     {
         if (siloCount < 1)
             throw new ArgumentOutOfRangeException(nameof(siloCount), "Need at least one silo.");
@@ -184,6 +206,7 @@ public sealed class MeshTestCluster : IAsyncDisposable
         SchemaHolder.UseRandomPlacement = useRandomPlacement;
         SchemaHolder.CoLocateWithShards = coLocateWithShards;
         SchemaHolder.GcWindow = null; // statics persist across tests; multi-silo always uses the default window
+        SchemaHolder.Quantization = quantization;
 
         var builder = new TestClusterBuilder(initialSilosCount: (short)siloCount);
         builder.AddSiloBuilderConfigurator<MultiSiloConfigurator>();
@@ -213,6 +236,7 @@ public sealed class MeshTestCluster : IAsyncDisposable
         public static bool UseRandomPlacement;
         public static bool CoLocateWithShards;
         public static TimeSpan? GcWindow;
+        public static TimeSpan? Quantization;
     }
 
     /// <summary>
@@ -259,7 +283,8 @@ public sealed class MeshTestCluster : IAsyncDisposable
                 // AddSpiceportGrainServices registered; the container disposes it on silo teardown.
                 services.AddSingleton<IDatastore>(sp =>
                     new GrainBackedDatastore(
-                        sp.GetRequiredService<IGrainFactory>(), sp.GetRequiredService<LogWatchHub>()));
+                        sp.GetRequiredService<IGrainFactory>(), sp.GetRequiredService<LogWatchHub>(),
+                        quantization: SchemaHolder.Quantization));
                 services.AddSingleton(new MembershipWalkOptions { Enabled = SchemaHolder.UseMembershipWalk });
                 services.AddSingleton(new ActivationMemoOptions { Enabled = SchemaHolder.UseActivationMemo });
                 services.AddSingleton(new SubjectFrontierMemoOptions
@@ -298,7 +323,8 @@ public sealed class MeshTestCluster : IAsyncDisposable
                 // AddSpiceportGrainServices registered; the container disposes it on silo teardown.
                 services.AddSingleton<IDatastore>(sp =>
                     new GrainBackedDatastore(
-                        sp.GetRequiredService<IGrainFactory>(), sp.GetRequiredService<LogWatchHub>()));
+                        sp.GetRequiredService<IGrainFactory>(), sp.GetRequiredService<LogWatchHub>(),
+                        quantization: SchemaHolder.Quantization));
                 services.AddSingleton(new MembershipWalkOptions { Enabled = SchemaHolder.UseMembershipWalk });
                 services.AddSingleton(new ActivationMemoOptions { Enabled = SchemaHolder.UseActivationMemo });
                 services.AddSingleton(new SubjectFrontierMemoOptions

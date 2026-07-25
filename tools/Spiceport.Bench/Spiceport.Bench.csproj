@@ -1,0 +1,31 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\Spiceport.Server\Spiceport.Server.csproj" />
+    <ProjectReference Include="..\..\src\Spiceport.Datastore\Spiceport.Datastore.csproj" />
+    <ProjectReference Include="..\..\src\Spiceport.Core\Spiceport.Core.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Orleans.Persistence.Memory" Version="10.1.0" />
+    <PackageReference Include="Microsoft.Orleans.Sdk" Version="10.1.0" />
+    <PackageReference Include="Microsoft.Orleans.TestingHost" Version="10.1.0" />
+  </ItemGroup>
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+  <!-- Reuse the in-process Orleans mesh harness (tests/Spiceport.Grains.Tests/MeshTestCluster.cs) by
+       linking its source in, exactly the mechanism Spiceport.Differential.Tests already uses for the
+       same file (see that project's csproj). The type is xunit-free and internal to no test framework,
+       so a source link is strictly less invasive than referencing a sibling *.Tests project (which
+       would drag in that project's test-only PackageReferences). -->
+  <ItemGroup>
+    <Compile Include="..\..\tests\Spiceport.Grains.Tests\MeshTestCluster.cs" Link="MeshTestCluster.cs" />
+  </ItemGroup>
+
+</Project>

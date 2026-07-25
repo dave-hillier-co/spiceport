@@ -246,32 +246,40 @@ public sealed class DatastoreInterleavedReadTests
     }
 
     /// <summary>
-    /// Gate 3: a commit whose <c>head</c> write throws must never leak its log entries into a read, whether
-    /// observed on the same (faulted) activation or a freshly reactivated one.
+    /// Gate 3: a commit whose <c>head</c> write fails transiently must never leak a spurious event — and,
+    /// because the log-row writes tolerate overwriting their own orphan (the write-first, ETag-tolerant-
+    /// fallback discipline), the storage adaptor's internal retry now RECOVERS the commit: it re-writes
+    /// the same log entry over the orphan, retries the head write, and the caller's <c>Commit</c>
+    /// completes with the minted revision. This pins three things at once: the commit succeeds despite
+    /// the one-shot fault, exactly ONE event surfaces (the orphan overwrite duplicated nothing), and the
+    /// datastore is writable afterwards. An earlier version of this gate pinned the pre-recovery
+    /// behavior instead — the retry wedged forever on its own write-once orphan, so it could only assert
+    /// the stuck-but-not-leaking half of this contract and had to document the wedge as a known wart.
     /// </summary>
     [Fact]
-    public async Task Failed_head_write_never_leaks_events()
+    public async Task Failed_head_write_recovers_without_leaking_or_duplicating_events()
     {
         await using var scope = new Scope(await NewClusterAsync());
         var grain = Grain(scope.Cluster);
         var oldHead = (await grain.GetHead()).Head;
 
         Gate.ThrowOnceOnHeadWrite = true;
-        await Assert.ThrowsAnyAsync<Exception>(() => grain.Commit(TouchCommit("a", "alice", oldHead)));
+        var reply = await grain.Commit(TouchCommit("a", "alice", oldHead)).WaitAsync(Timeout);
 
-        // Whether this call lands on a reactivated grain (a faulted activation deactivates) or the same one,
-        // the orphaned log entry must never surface.
+        Assert.Null(reply.Failure);
+        Assert.NotNull(reply.Revision);
+
         var head = await grain.GetHead().WaitAsync(Timeout);
-        Assert.Equal(oldHead, head.Head);
+        Assert.Equal(reply.Revision, head.Head);
         var segment = await grain.ReadFrom(oldHead, -1).WaitAsync(Timeout);
-        Assert.Empty(segment.Events);
+        var committed = Assert.Single(segment.Events);
+        Assert.Equal(reply.Revision, committed.Revision);
 
-        // NOTE: intentionally not asserting the datastore is writable again afterwards here — the injected
-        // head-write failure leaves the CustomStorage adaptor mid an internal retry of the SAME (already
-        // durably-written) log entry with a fresh write-once wrapper, which the memory grain-storage
-        // provider correctly rejects as a conflicting duplicate, and that retry loop is a pre-existing
-        // property of the write path unrelated to interleaved reads (which is exactly what this test proves
-        // above: GetHead/ReadFrom still interleave past that stuck retry and never see the orphaned event).
+        // Writable again afterwards — the half of the contract the wedged-retry era could not assert.
+        var reply2 = await grain.Commit(TouchCommit("b", "bob", head.Head)).WaitAsync(Timeout);
+        Assert.Null(reply2.Failure);
+        Assert.NotNull(reply2.Revision);
+        Assert.True(reply2.Revision > reply.Revision);
     }
 
     /// <summary>

@@ -32,6 +32,19 @@ public sealed class SchemaResolver
         _byHash.TryGetValue(schemaHash, out snapshot!);
 
     /// <summary>
+    /// Pre-populates the cache with an already-compiled snapshot under its own hash. Used at registration
+    /// to seed the embedded startup schema: until a <c>WriteSchema</c> persists bytes into the log, every
+    /// grain key carries the SEED schema's hash, and without this entry each dispatch would miss the
+    /// cache, pay a sequencer <c>ReadSchemaAt</c> hop, read null (no persisted schema yet), and fall back —
+    /// an uncacheable per-dispatch singleton call the measurement harness exposed at ~16k/s.
+    /// </summary>
+    public void Seed(SchemaSnapshot snapshot)
+    {
+        ArgumentNullException.ThrowIfNull(snapshot);
+        _byHash.TryAdd(snapshot.SchemaHash, snapshot);
+    }
+
+    /// <summary>
     /// Resolves the compiled schema named by <paramref name="schemaHash"/> at the revision
     /// <paramref name="reader"/> is pinned to: a cache hit is a pure lookup; a miss reads the schema bytes
     /// persisted at the revision (via <paramref name="reader"/>) and compiles-and-caches them. Returns <paramref name="fallback"/> when the revision pins no
@@ -50,7 +63,7 @@ public sealed class SchemaResolver
             return cached;
 
         var bytes = await reader.ReadStoredSchema(ct).ConfigureAwait(false);
-        return bytes is null ? fallback : CompileFetched(bytes);
+        return bytes is null ? FallbackFor(schemaHash, fallback) : CompileFetched(bytes);
     }
 
     /// <summary>
@@ -75,7 +88,21 @@ public sealed class SchemaResolver
             return cached;
 
         var bytes = await source.ReadSchemaAt(revision, ct).ConfigureAwait(false);
-        return bytes is null ? fallback : CompileFetched(bytes);
+        return bytes is null ? FallbackFor(schemaHash, fallback) : CompileFetched(bytes);
+    }
+
+    /// <summary>
+    /// The no-persisted-schema (seed-window) fallback. When the requested hash IS the fallback's own hash,
+    /// the label provably names the fallback's bytes, so the fallback is cached under it — turning the
+    /// per-dispatch miss-fetch-null-fall-back cycle into a one-time event per silo. A requested hash that
+    /// differs from the fallback's is an ambiguous label with no bytes to verify it against; it stays
+    /// uncached and serves the fallback for this call only.
+    /// </summary>
+    private SchemaSnapshot FallbackFor(string schemaHash, SchemaSnapshot fallback)
+    {
+        if (schemaHash == fallback.SchemaHash)
+            _byHash.TryAdd(schemaHash, fallback);
+        return fallback;
     }
 
     /// <summary>

@@ -1,8 +1,10 @@
 # CLAUDE.md
 
 Guidance for working in this repository. See `README.md` for the project overview,
-`docs/architecture-analysis.md` for the design rationale, and `docs/future-work.md` for
-candidate directions that are analyzed but not committed.
+`docs/architecture-analysis.md` for the design rationale, `docs/graph-sharded-datastore.md`
+for the storage design as built, `docs/future-work.md` for candidate directions that are
+analyzed but not committed, and `docs/scalability-program.md` for the measurement-gated
+performance program (nothing there is scheduled; triggers decide).
 
 ## What this is
 

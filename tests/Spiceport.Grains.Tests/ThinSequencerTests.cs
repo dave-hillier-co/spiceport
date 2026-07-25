@@ -707,4 +707,47 @@ public class ThinSequencerTests
         Assert.True(Nanos(replayed[0].Revision) < Nanos(replayed[1].Revision));
         Assert.True(Nanos(replayed[0].Revision) > Nanos(cursor));
     }
+
+    // ---- (f) Log-row ETag hygiene: a retried append overwrites its own crashed attempt's orphan. ----
+
+    /// <summary>
+    /// The Phase 0 hygiene rider (docs/scalability-program.md section 2): a crashed append attempt can
+    /// leave an ORPHAN log row — the <c>log/{version}</c> entry written but the head never advanced, so
+    /// the durable log version still names the row's slot for the next append. Log-row writes must be
+    /// the same ETag-tolerant read-then-write the versioned shard/meta rows use, so the retried append
+    /// OVERWRITES the orphan instead of ETag-clashing against it (a fresh empty-ETag wrapper would be
+    /// rejected by every provider that enforces optimistic concurrency, MemoryStorage included). Plant
+    /// the orphan directly through the grain's own storage provider at the next log version, then
+    /// commit through the grain: the commit must succeed and the row must hold the NEW event.
+    /// </summary>
+    [Fact]
+    public async Task Commit_overwrites_an_orphan_log_row_left_by_a_crashed_append_attempt()
+    {
+        await using var cluster = await MeshTestCluster.CreateAsync(Schema);
+        var ds = cluster.Datastore;
+
+        // A baseline commit so the grain is active and the durable head row exists.
+        await Write(ds, Row("k0", "u0"));
+
+        var headRow = await ReadRow<LogHeadEntry>(cluster, "head");
+        Assert.True(headRow.RecordExists, "no durable head after the baseline commit");
+        var nextVersion = headRow.State!.LogVersion + 1;
+
+        // Plant the orphan exactly where a crashed append attempt leaves it: the next log version's
+        // row written (with its own storage ETag minted), the head untouched.
+        var storage = cluster.Services.GetRequiredKeyedService<IGrainStorage>("datastore");
+        var grainId = ((GrainReference)Sequencer(cluster)).GrainId;
+        var orphan = new LogEvent(
+            long.MaxValue, Array.Empty<RelationshipUpdateWire>(), SchemaChange: null,
+            Array.Empty<CounterDeltaWire>(), GcFloor: null);
+        await storage.WriteStateAsync($"log/{nextVersion}", grainId, new GrainState<LogEvent>(orphan));
+
+        // The retried append must succeed (no ETag clash) ...
+        var revision = await Write(ds, Row("k1", "u1"));
+
+        // ... and the slot must hold the NEW commit's event, not the orphan's content.
+        var logRow = await ReadRow<LogEvent>(cluster, $"log/{nextVersion}");
+        Assert.True(logRow.RecordExists, $"log/{nextVersion} is missing after the retried append");
+        Assert.Equal(Nanos(revision), logRow.State!.Revision);
+    }
 }

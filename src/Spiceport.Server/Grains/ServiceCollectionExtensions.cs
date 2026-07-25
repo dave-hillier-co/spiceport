@@ -51,11 +51,23 @@ public static class ServiceCollectionExtensions
         // Per-silo compile-and-cache of the schema NAMED by each dispatch (its hash), resolved from the
         // schema bytes folded into the log on every silo. This is what lets a CheckGrain evaluate under the
         // schema its key pins — a pure function of the pinned revision — instead of the silo-local Current,
-        // which only reflects a WriteSchema that landed on this silo.
-        services.AddSingleton<SchemaResolver>();
+        // which only reflects a WriteSchema that landed on this silo. Seeded with the embedded startup
+        // schema so the seed window (no WriteSchema persisted yet) resolves from the cache instead of
+        // paying a per-dispatch sequencer ReadSchemaAt hop (see SchemaResolver.Seed).
+        services.AddSingleton<SchemaResolver>(_ =>
+        {
+            var resolver = new SchemaResolver();
+            resolver.Seed(provider.Current);
+            return resolver;
+        });
 
         // The silo-wide loop-bypass / activation-memo / dispatch counters.
         services.AddSingleton<IDispatchMetrics, DispatchMetrics>();
+
+        // The sequencer-side inbound-call counters (docs/scalability-program.md Phase 0). Registered on
+        // every silo like IDispatchMetrics; only the silo hosting the single DatastoreGrain activation
+        // ever records, so summing every silo's snapshot yields cluster-wide totals.
+        services.AddSingleton<ISequencerMetrics, SequencerMetrics>();
 
         // The check-dispatch cross-cutting grain-call filters, registered as plain DI singletons: Orleans
         // resolves every IIncomingGrainCallFilter/IOutgoingGrainCallFilter from the SAME container the

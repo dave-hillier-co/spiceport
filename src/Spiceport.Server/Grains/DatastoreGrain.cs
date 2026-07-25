@@ -1,4 +1,5 @@
 using System.Collections.Immutable;
+using System.Diagnostics;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -124,6 +125,13 @@ public sealed class DatastoreGrain :
     private readonly DatastoreGcOptions _gcOptions;
 
     /// <summary>
+    /// The sequencer-side inbound-call counters (docs/scalability-program.md Phase 0), or null on a
+    /// host that never registered them — every record site is null-conditional, so the grain works
+    /// unchanged without the seam (the same optional-dependency stance as <see cref="_gcOptions"/>).
+    /// </summary>
+    private readonly ISequencerMetrics? _metrics;
+
+    /// <summary>
     /// How long old revisions stay served by <see cref="ReadFrom"/> / retained in the in-memory window,
     /// and the retention window <see cref="RunGc"/> collects MVCC history beyond. Older cursors throw
     /// <c>RevisionNotFoundException</c>. Derived from <see cref="DatastoreGcOptions.Window"/>.
@@ -179,10 +187,11 @@ public sealed class DatastoreGrain :
     /// The live grain-state wrapper for the <c>head</c> entry — the only singleton entry rewritten in
     /// place. Held as a field so its storage ETag persists across writes (the Orleans grain-storage
     /// providers enforce optimistic concurrency per entry; a fresh empty-ETag wrapper would be rejected on
-    /// the second write). Log entries (<c>log/{version}</c>) are write-once so they use fresh wrappers;
-    /// meta entries (<c>meta/{version}</c>) and version-qualified shard rows are write-once per COMMITTED
-    /// version but a crashed flush attempt can orphan one at the same versioned name, so they go
-    /// read-then-write so the wrapper carries the CURRENT ETag (see <see cref="WriteShardRow"/>).
+    /// the second write). Log entries (<c>log/{version}</c>), meta entries
+    /// (<c>meta/{version}</c>) and version-qualified shard rows are write-once per COMMITTED version but
+    /// a crashed attempt can orphan one at the same versioned name (a crashed append for log rows, a
+    /// crashed flush for shard/meta rows), so they go read-then-write so the wrapper carries the CURRENT
+    /// ETag (see <see cref="WriteLogEntry"/>/<see cref="WriteShardRow"/>).
     /// </summary>
     private readonly GrainState<LogHeadEntry> _headState = new();
 
@@ -205,10 +214,12 @@ public sealed class DatastoreGrain :
     public DatastoreGrain(
         [FromKeyedServices("datastore")] IGrainStorage storage,
         ILogger<DatastoreGrain> logger,
-        IOptions<DatastoreGcOptions>? gcOptions = null)
+        IOptions<DatastoreGcOptions>? gcOptions = null,
+        ISequencerMetrics? metrics = null)
     {
         _storage = storage;
         _logger = logger;
+        _metrics = metrics;
         _watchers = new ObserverManager<IDatastoreWatcher>(WatcherExpiry, logger);
         // Optional so a host/test that never registers DatastoreGcOptions in DI still activates the grain
         // with sane defaults (24h window, 1h reminder, enabled) — only a host that wants non-default GC
@@ -358,6 +369,7 @@ public sealed class DatastoreGrain :
     /// </remarks>
     public async Task<DatastoreGrainState> ReadState()
     {
+        _metrics?.RecordReadState();
         while (true)
         {
             var meta = _storedMeta;
@@ -401,6 +413,7 @@ public sealed class DatastoreGrain :
     /// </remarks>
     public Task<DatastoreHeadWire> GetHead()
     {
+        _metrics?.RecordGetHead();
         var s = _storedMeta;
         return Task.FromResult(new DatastoreHeadWire(s.HeadRevision, s.SchemaHashAt(s.HeadRevision), s.GcFloor));
     }
@@ -409,6 +422,7 @@ public sealed class DatastoreGrain :
     /// <remarks>[AlwaysInterleave]. Small state only; same publication guarantee as <see cref="GetHead"/>.</remarks>
     public Task<byte[]?> ReadSchemaAt(long revision)
     {
+        _metrics?.RecordReadSchemaAt();
         var s = _storedMeta;
         // Below the GC floor the schema history has been collected, so "no schema at this revision" is
         // indistinguishable from "collected away" — a silent null here would make callers fall back to
@@ -431,6 +445,7 @@ public sealed class DatastoreGrain :
     /// </remarks>
     public Task<GraphShardState> ReadShard(GraphShardKeyWire key)
     {
+        _metrics?.RecordReadShard();
         ArgumentNullException.ThrowIfNull(key);
         return CurrentShardState(GraphShardGrainKey.Build(key));
     }
@@ -453,6 +468,27 @@ public sealed class DatastoreGrain :
     {
         ArgumentNullException.ThrowIfNull(request);
 
+        // Duration measured around the WHOLE serialized write turn (candidate loads, staging, append,
+        // confirm) and recorded in a finally so every inbound call — accepted, rejected, or thrown —
+        // counts exactly once. GetTimestamp/GetElapsedTime rather than Stopwatch.StartNew: the same
+        // clock with no per-commit Stopwatch allocation on the sequencer's hot path. The
+        // candidate-key-count buckets are recorded inside CommitCore at the point candidate
+        // resolution completes.
+        var startTimestamp = Stopwatch.GetTimestamp();
+        try
+        {
+            return await CommitCore(request).ConfigureAwait(ContinueOnCapturedContext);
+        }
+        finally
+        {
+            _metrics?.RecordCommit((long)Stopwatch.GetElapsedTime(startTimestamp).TotalMicroseconds);
+        }
+    }
+
+    /// <summary>The whole Commit body (see the <see cref="Commit"/> remarks); split out only so the
+    /// public entry can bracket it with the Phase 0 duration measurement.</summary>
+    private async Task<CommitReply> CommitCore(CommitRequest request)
+    {
         // The confirmed small state: in a write turn this equals _storedMeta (all prior confirms have
         // fully completed), and it is the view RaiseConditionalEvent's own version check pairs with.
         var meta = State.Value;
@@ -508,6 +544,7 @@ public sealed class DatastoreGrain :
             AddFilterCandidates(precondition.Filter, meta, candidates);
         if (request.DeleteByFilter is { } df)
             AddFilterCandidates(df.Filter, meta, candidates);
+        _metrics?.RecordCommitCandidates(candidates.Count);
 
         var loaded = new Dictionary<string, GraphShardState>(StringComparer.Ordinal);
         var candidateRows = new List<StoredRelationshipWire>();
@@ -863,6 +900,7 @@ public sealed class DatastoreGrain :
     /// </remarks>
     public Task<LogSegment> ReadFrom(long afterRevision, int maxCount)
     {
+        _metrics?.RecordReadFrom();
         var head = _storedMeta.HeadRevision;
 
         // The in-memory window retains only events strictly above the flush/GC floor; an older cursor
@@ -1107,9 +1145,11 @@ public sealed class DatastoreGrain :
         foreach (var ev in updates)
         {
             version++;
-            // Log entries are write-once: a fresh wrapper (empty ETag) is correct for an insert.
-            await _storage.WriteStateAsync($"{LogStatePrefix}{version}", this.GetGrainId(), new GrainState<LogEvent>(ev))
-                .ConfigureAwait(ContinueOnCapturedContext);
+            // Log entries are write-once per COMMITTED version, but a crashed append attempt (row
+            // written, head never advanced) leaves an orphan at this exact versioned name that the
+            // boundary's retry must overwrite — WriteLogEntry attempts the single-RTT fresh write and
+            // falls back to ETag-tolerant read-then-write only on that orphan collision.
+            await WriteLogEntry(version, ev).ConfigureAwait(ContinueOnCapturedContext);
 
             if (ev.GcFloor is null)
             {
@@ -1228,6 +1268,10 @@ public sealed class DatastoreGrain :
                     .ConfigureAwait(ContinueOnCapturedContext);
                 newMetaVersion = flushVersion;
                 flushBoundaryRevision = foldedMeta.HeadRevision;
+
+                // Phase 0 observability: one flush boundary written (dirty rows + meta durable) — the
+                // every-64th-commit sawtooth observable (docs/scalability-program.md P5).
+                _metrics?.RecordFlush();
             }
 
             // The head pointer is the commit point: write it AFTER the log entries (+ flushed rows/meta)
@@ -1315,12 +1359,37 @@ public sealed class DatastoreGrain :
     }
 
     // The head entry is rewritten in place through the held wrapper so its ETag carries across writes
-    // (the commit point). Meta entries and shard rows are version-qualified — write-once per COMMITTED
-    // version — but a crashed flush attempt can orphan an entry at a versioned name the boundary's
-    // retry must write again, so both go ETag-tolerant read-then-write with no long-lived wrapper (a
-    // per-row wrapper cache would grow O(touched keys) memory): the read fetches the current ETag (or
-    // none for a genuine first write, where the empty ETag is a valid insert) — the same
+    // (the commit point). Log entries, meta entries and shard rows are version-qualified — write-once
+    // per COMMITTED version — but a crashed attempt can orphan an entry at a versioned name a retry
+    // must write again (a crashed append leaves a log row with no head advance; a crashed flush leaves
+    // shard/meta rows no meta references), so all three tolerate an existing row with no long-lived
+    // wrapper (a per-row wrapper cache would grow O(touched keys) memory). Meta and shard rows go
+    // read-then-write; log entries — the per-commit hot path — attempt the single-RTT fresh write
+    // first and pay the read only on the rare orphan collision (see WriteLogEntry) — the same
     // providers-enforce-etags lesson as the read-then-clear helpers below.
+
+    private async Task WriteLogEntry(int version, LogEvent ev)
+    {
+        var name = $"{LogStatePrefix}{version}";
+        // HOT PATH — one storage RTT: in the overwhelmingly common case this versioned name has never
+        // been written, so a fresh empty-ETag wrapper is a valid insert and the write succeeds first
+        // try. Only when a CRASHED prior append attempt orphaned a row at this exact name (row written,
+        // head never advanced) does the provider reject the empty ETag; then, and only then, fall back
+        // to the ETag-tolerant read-then-write so the retry overwrites the orphan. Any other failure
+        // propagates unchanged.
+        var entry = new GrainState<LogEvent> { State = ev };
+        try
+        {
+            await _storage.WriteStateAsync(name, this.GetGrainId(), entry).ConfigureAwait(ContinueOnCapturedContext);
+        }
+        catch (InconsistentStateException)
+        {
+            var existing = new GrainState<LogEvent>();
+            await _storage.ReadStateAsync(name, this.GetGrainId(), existing).ConfigureAwait(ContinueOnCapturedContext);
+            existing.State = ev;
+            await _storage.WriteStateAsync(name, this.GetGrainId(), existing).ConfigureAwait(ContinueOnCapturedContext);
+        }
+    }
 
     private Task WriteHead(LogHeadEntry entry)
     {
