@@ -185,14 +185,17 @@ must survive batching — the head row remains the sole commit point), `ThinSequ
 **Trigger.** Commit p99 attributable to candidate loads (1, 2) or flush-boundary sawtooth
 p99 materially above steady-state p99 (3), at write rates the deployment actually needs.
 
-**Trigger status: diagnose before building.** The commit-breadth sweep shows an EXACT-KEY
-precondition costing several times a bare commit — far above one storage read, which points
-at candidate resolution itself (suspect: the filter-to-candidate step scans the key index
-even when the filter names explicit ids and a direct lookup would do). That diagnosis comes
-FIRST: fixing a bug-shaped inefficiency changes the baseline every 3.3 item would be
-measured against, so none of 1–3 is built until the exact-key path is understood and the
-sweep re-run. The flush sawtooth is observed (see 3.4, the shared cause); item 3 rides with
-3.4 when that lands.
+**Trigger status: exact-key diagnosis RESOLVED; items 1–2 re-gated on the re-baseline.**
+The suspected bug-shaped inefficiency was real: candidate resolution scanned the whole key
+index (with a string parse per key) even for filters naming explicit ids, making an
+exact-key precondition's cost linear in graph cardinality. Fixed: explicit-id filters now
+construct their keys and probe the index maps directly — O(#ids) — on both the forward and
+reverse sides; the scan survives only for the shapes that cannot name their keys (type-only,
+prefix). Post-fix, the cardinality sweep is flat and an exact-key precondition sits within
+~1.3× of a bare commit (the honest residual: one candidate load + filter evaluation).
+Whether items 1–2 (parallel loads, clean-state LRU) still pay is a question for the
+re-baseline; the flush sawtooth is observed (see 3.4, the shared cause) and item 3 rides
+with 3.4 when that lands.
 
 ### 3.4 Key-index chunking (answers P5)
 
@@ -257,9 +260,9 @@ order below is the decided program — cheapest diagnosis first, fired triggers 
 re-measurement between fixes so attribution stays clean, the one structural change after the
 cheap wins, and a better instrument before the two judgment calls:
 
-1. **Diagnose the exact-key precondition cost** (3.3's status note) — likely a small fix
-   with a large effect on every precondition-carrying write, and a prerequisite for honestly
-   costing anything else in 3.3.
+1. **Diagnose the exact-key precondition cost** (3.3's status note) — RESOLVED: it was the
+   index scan; explicit-id filters now probe the index maps by constructed key, and the
+   cardinality sweep is flat.
 2. **Subject-filter pushdown (3.2)** — the fired trigger; small change, strictly less data
    movement, shifts the read-side baseline.
 3. **Re-baseline** — re-run the userset, commit-breadth, and decomposition sweeps. Fixes

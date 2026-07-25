@@ -766,6 +766,24 @@ public sealed class DatastoreGrain :
 
         if (resourceConstrained)
         {
+            // Exact-key fast path: a filter naming an explicit resource type + explicit ids (no prefix)
+            // determines its candidate keys by CONSTRUCTION — O(#ids) dictionary probes, never a scan.
+            // The index scan below is O(all keys) with a string parse per key, which the measurement
+            // harness showed making an exact-key precondition cost scale linearly with graph cardinality
+            // (docs/scalability-program.md 3.3 trigger note); it remains only for the shapes that
+            // genuinely cannot name their keys (type-only, prefix). An id absent from the index simply
+            // contributes no candidate: no key means no rows, which evaluates preconditions identically.
+            if (filter is { OptionalResourceType: { } exactType, OptionalResourceIds.Count: > 0, OptionalResourceIdPrefix: null })
+            {
+                foreach (var id in filter.OptionalResourceIds)
+                {
+                    var key = GraphShardGrainKey.Build(GraphShardKeyWire.ForResource(exactType, id));
+                    if (meta.ForwardKeys.ContainsKey(key))
+                        candidates.Add(key);
+                }
+                return;
+            }
+
             foreach (var key in meta.ForwardKeys.Keys)
             {
                 var parsed = GraphShardGrainKey.Parse(key);
@@ -784,6 +802,21 @@ public sealed class DatastoreGrain :
 
         if (filter.OptionalSubjectsSelectors is { Count: > 0 } selectors)
         {
+            // Same fast path on the reverse side: when EVERY selector names an explicit subject type +
+            // explicit ids, the reverse keys are constructible; one broader selector falls the whole
+            // filter back to the scan (selectors are OR'd, so a scan-shaped one covers the others too).
+            if (selectors.All(static s => s is { OptionalSubjectType: not null, OptionalSubjectIds.Count: > 0 }))
+            {
+                foreach (var selector in selectors)
+                foreach (var id in selector.OptionalSubjectIds!)
+                {
+                    var key = GraphShardGrainKey.Build(GraphShardKeyWire.ForSubject(selector.OptionalSubjectType!, id));
+                    if (meta.ReverseKeys.ContainsKey(key))
+                        candidates.Add(key);
+                }
+                return;
+            }
+
             foreach (var key in meta.ReverseKeys.Keys)
             {
                 var parsed = GraphShardGrainKey.Parse(key);
