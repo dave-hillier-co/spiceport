@@ -34,7 +34,12 @@ Two kinds of item live here:
   method, knobs, and triggers only. Decisions taken from measurements are recorded as
   maintainer decisions where they land (options defaults, this file's trigger notes).
 - **The single-writer total order stays.** Nothing here touches it; write *throughput* work
-  means shortening the serialized turn, never adding writers.
+  means shortening the serialized turn, never adding writers. The full argument for why —
+  what the consistency contract minimally requires, why weaker orders (vector clocks, HLC
+  without commit-wait) cannot carry it, and the two triggers that would re-open the question
+  — is the standing analysis in `future-work.md` Part 3, with the trigger-gated
+  decomposition ladder (group commit → Corfu ticket split → Calvin execution) recorded as
+  its §1.15.
 
 ---
 

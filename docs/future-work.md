@@ -314,15 +314,115 @@ transactional-outbox guarantee, structurally.
 
 ---
 
+### 1.15 Decomposing the order's work: batch → ticket → Calvin (trigger-gated ladder)
+
+The total order stays (see Part 3's standing analysis for why), but "the order" and "the
+order's WORK" are different things — the sequencer activation currently performs four jobs of
+which only one (issuing the order) is irreducibly singular. A ladder of decompositions, each
+strictly more actor-shaped, none weakening the guarantee, each gated on the scalability
+program's measurement discipline (`scalability-program.md`) with the trigger being measured
+write demand, not taste:
+
+1. **Group commit.** Batch concurrent `Commit` requests into one log append — classic WAL
+   amortization; the actor stays, its throughput multiplies by batch depth. The first rung if
+   the write ceiling ever fires.
+2. **The Corfu split: order without data.** The sequencer becomes a ticket dispenser —
+   assigns positions, touches no payload; log storage moves to sharded segment rows/actors.
+   The thin sequencer is already halfway there (the flush protocol removed the fold); this
+   removes the data path. A near-stateless counter actor can ticket orders of magnitude more
+   commits than it can execute.
+3. **Calvin-style deterministic execution.** Deterministic databases showed that if a
+   transaction's read/write set is declared before execution, a cheap global SEQUENCE plus
+   deterministic per-shard execution yields cross-shard serializability without two-phase
+   commit: single-shard transactions (the common case) never coordinate beyond the ticket;
+   multi-shard ones do one deterministic agreement round. The enabling asset already exists:
+   the declarative `CommitRequest` with candidate-key resolution IS the read/write-set
+   declaration Calvin requires. This moves execution — the sequencer's heaviest job — into
+   the shard actors. Note what it keeps: a total order of REQUESTS, thinned to near-nothing,
+   not removed.
+4. **HLC + commit-wait per shard** — the fully-decentralized rung, external consistency with
+   no ordering actor at all, priced in clock discipline (commit-wait at NTP error is WORSE
+   than a sequencer hop; PTP makes it competitive at real operational burden) and
+   k-dimensional token plumbing. Ranked below Calvin on complexity-per-benefit; recorded so
+   the option is priced, not forgotten.
+
 ## Part 3 — Deliberate non-goals
 
 Recorded so they are not relitigated by accident:
 
+### The standing analysis: is total order truly required?
+
+Asked directly (and worth re-asking): the graph has many seemingly unrelated parts, and
+causal machinery such as vector clocks solves ordering elsewhere — so is the total order a
+requirement or a habit? The analysis, recorded so the next round starts here:
+
+**What the contract minimally requires** — four obligations, none of which literally says
+"total order":
+
+- **R1 (order):** commit order must extend *(in-system causality ∪ real-time order of
+  non-overlapping commits)*. Truly concurrent writes may be left unordered or ordered
+  arbitrarily — no observer can ever hold evidence of either ordering.
+- **R2 (snapshots):** every read is a consistent CUT of that order, and cuts exposed along an
+  observer chain must be monotone.
+- **R3 (tokens):** zookies encode cuts with a computable dominance test (at-least-as-fresh =
+  cut dominance).
+- **R4 (the rest of the API):** preconditions and multi-key writes need cross-shard
+  serializability; Watch needs one stable resumable linearization; fully-consistent reads
+  need a cut dominating everything committed.
+
+**Why R1 includes real time — the load-bearing subtlety.** The paper's canonical new enemy
+(remove the viewer, then have someone ELSE add the sensitive content) carries its causal
+chain through channels the system cannot see — a conversation, an RPC between services that
+never touch a zookie. Vector clocks capture in-system causality only; out-of-band causality
+is invisible to them but not to real time, because every physical channel has latency —
+which is precisely what Spanner's TrueTime exploits. Without any time authority, two
+causally-unlinked writes on different shards stay incomparable FOREVER: a "consistent"
+vector cut can mix one shard's morning with another's evening, serving a state that never
+existed at any instant — an unbounded misordering, not a race window. The graded ladder:
+
+| Mechanism | R1 coverage | Residual anomaly |
+|---|---|---|
+| Single sequencer | full | none |
+| TrueTime / commit-wait | full | none (paid as +ε write latency) |
+| HLC, no commit-wait | causal + real time up to clock skew | out-of-band channels faster than skew (CockroachDB documents this exact gap as its "causal reverse" anomaly — the one thing Spanner prevents that it does not) |
+| Vector clocks alone | in-system causality only | **unbounded** |
+
+Zanzibar's own default STALENESS is not a precedent for relaxing this: stale reads are old
+but prefix-consistent — real past states of the one commit order. A non-prefix cut serves a
+fiction. The whole SpiceDB-compatible behavioral surface (at-exact-snapshot replay included)
+assumes prefix semantics.
+
+**The re-derivation problem.** Build on R1–R4 without the total order and the API
+regenerates small total orders anyway: Watch's resumable checkpointed stream is a
+constructed linearization (a total order moved to read time and frozen forever); Calvin-style
+precondition serializability is a total order of requests; fully-consistent reads need a
+global-frontier authority; tokens become k-dimensional vectors with k-fold dominance gates
+on every chained read. **The total order is not the requirement — it is the FIXED POINT: the
+closed form from which all four obligations fall out as corollaries.** Dismantling it does
+not delete the concept; it shatters it into pieces that must each be maintained.
+
+**The cost model.** Removing the singleton buys write throughput beyond one actor and write
+availability beyond one activation — headroom the project's recorded scale stance does not
+currently need — against commit-wait or anomaly windows, k-dimensional tokens, a multi-shard
+transaction protocol, and a materialized Watch linearization. The one case needing NO
+cross-ordering — provably disjoint subgraphs — is exactly the tenant partition (2.1),
+blocked by the wire protocol, not by ordering theory: within one `authzed.api.v1` graph,
+unrelatedness is one write away from ending.
+
+**Re-open triggers** (either suffices to revisit this analysis rather than the conclusion
+being permanent): measured write demand exceeding what a batched ticket actor can issue
+(see 1.15 rungs 1–2), or the wire-protocol constraint relaxing enough to express tenancy —
+at which point per-tenant total orders (and vector-of-tenant-heads zookies) become the
+natural design rather than a compromise.
+
 - **Orleans distributed transactions.** The single ordered log is the serialization point;
   transactions would blur the global-order story that defeats the new-enemy problem.
-- **Sharded / per-namespace logs within a tenant.** Reintroduces cross-shard ordering. (2.1 is
-  not an exception: tenant isolation removes cross-shard *edges*, which is what makes per-tenant
-  logs sound.)
+- **Sharded / per-namespace logs within a tenant.** Reintroduces cross-shard ordering — see
+  the standing analysis above for the full argument (what the contract requires, why vector
+  clocks cannot carry it, and the two triggers that would re-open the question). Note the
+  1.15 ladder is NOT an exception: Corfu and Calvin shard log storage and execution, never
+  the order. (2.1 is not an exception either: tenant isolation removes cross-shard *edges*,
+  which is what makes per-tenant logs sound.)
 - **Per-object *current-state* entity grains.** Ruled out in `architecture-analysis.md` §3.1:
   too large/cold to activate economically; zookie point-in-time reads are incompatible with
   "the grain's latest value". The ruling does not extend to per-key grains holding *versioned
@@ -362,5 +462,7 @@ Recorded so they are not relitigated by accident:
 4. **1.11** — the broadcast channel remains a deferred refinement; note the scalability
    program's per-silo log-tail cache (its §3.1) would deliver most of what 1.11 promised,
    via the existing observer push rather than a stream provider.
-5. **2.3 / 2.4 / 2.5** — cheap, immediately differentiating product capabilities.
-6. **2.1 per-tenant** and **2.2 materialized reachability** — each behind its own design document.
+5. **1.15** — the order's-work ladder (batch → ticket → Calvin) sits behind the write-demand
+   trigger; nothing is built until the scalability program's evidence fires it.
+6. **2.3 / 2.4 / 2.5** — cheap, immediately differentiating product capabilities.
+7. **2.1 per-tenant** and **2.2 materialized reachability** — each behind its own design document.
