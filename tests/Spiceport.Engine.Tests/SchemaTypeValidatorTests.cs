@@ -72,6 +72,122 @@ public class SchemaTypeValidatorTests
         Assert.Contains("wildcard", ex.Message);
     }
 
+    // --- Wildcard reachable through a userset reference ("wildcard relations cannot be transitively
+    // included") -- issue #33. Real SpiceDB v1.49.2 rejects every shape below at WriteSchema with
+    // FailedPrecondition; verified empirically against the container (see
+    // tests/Spiceport.Differential.Tests/WriteSchemaWildcardTransitivityTests.cs). A relation is validated
+    // wherever it is DEFINED, so a chain of cross-definition userset references is still caught: the link
+    // that directly names a wildcard-bearing relation/subrelation fails on its own, regardless of how
+    // deeply it is nested under the schema's other definitions.
+
+    [Fact]
+    public void Wildcard_ReachableOneLevel_ThroughUserset_IsRejected()
+    {
+        var ex = ValidateThrows("""
+            definition user {}
+            definition group {
+                relation member: user:*
+            }
+            definition document {
+                relation viewer: group#member
+            }
+            """);
+        Assert.Contains("wildcard", ex.Message);
+        Assert.Contains("group#member", ex.Message);
+    }
+
+    [Fact]
+    public void Wildcard_ReachableTwoLevels_ThroughUserset_IsRejected()
+    {
+        // document.viewer -> team#groupmember -> group#member (user:*). The offending link is
+        // team.groupmember itself (validated independently of who references `team#groupmember`), so the
+        // rejection fires regardless of chain depth.
+        var ex = ValidateThrows("""
+            definition user {}
+            definition group {
+                relation member: user:*
+            }
+            definition team {
+                relation groupmember: group#member
+            }
+            definition document {
+                relation viewer: team#groupmember
+            }
+            """);
+        Assert.Contains("wildcard", ex.Message);
+    }
+
+    [Fact]
+    public void Wildcard_ReachableThroughUserset_ViaUnionMember_IsRejected()
+    {
+        // The wildcard-bearing relation is one union arm of an otherwise-fine relation; still rejected,
+        // because `team.groupmember` itself directly names the wildcard-bearing `group#member`.
+        var ex = ValidateThrows("""
+            definition user {}
+            definition group {
+                relation member: user:*
+            }
+            definition team {
+                relation directmember: user
+                relation groupmember: group#member
+                permission member = directmember + groupmember
+            }
+            definition document {
+                relation viewer: team#member
+            }
+            """);
+        Assert.Contains("wildcard", ex.Message);
+    }
+
+    [Fact]
+    public void DirectWildcard_OnBaseRelation_IsAccepted()
+    {
+        // A wildcard on the relation where it is DEFINED is legal SpiceDB -- only a userset reference TO
+        // a wildcard-bearing relation from elsewhere is rejected.
+        Validate("""
+            definition user {}
+            definition document {
+                relation viewer: user:*
+            }
+            """);
+    }
+
+    [Fact]
+    public void Wildcard_ReachableOnlyThroughAPermission_IsAccepted()
+    {
+        // Real SpiceDB does NOT walk into a permission's rewrite tree for the transitive-wildcard check --
+        // only base-relation userset references are checked. A permission computed via an arrow over a
+        // wildcard-bearing relation is a legal userset type.
+        Validate("""
+            definition user {}
+            definition group {
+                relation member: user:*
+            }
+            definition team {
+                relation groupmember: group
+                permission allmembers = groupmember->member
+            }
+            definition document {
+                relation viewer: team#allmembers
+            }
+            """);
+    }
+
+    [Fact]
+    public void Wildcard_ReachableThroughSameDefinition_CrossRelation_IsAccepted()
+    {
+        // Real SpiceDB only rejects a CROSS-definition userset reference to a wildcard-bearing relation;
+        // referencing a wildcard-bearing relation of the SAME definition is accepted (mirrors the
+        // recursive-group self-reference exception below).
+        Validate("""
+            definition user {}
+            definition group {
+                relation adminwildcard: user:*
+                relation member: group#adminwildcard
+            }
+            """);
+    }
+
     [Fact]
     public void Relation_AllowingItself_IsAccepted()
     {
