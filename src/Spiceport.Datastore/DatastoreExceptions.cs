@@ -51,8 +51,15 @@ public sealed class CreateRelationshipExistsException : DatastoreException
     public string Relationship { get; }
 
     /// <summary>Creates a create-conflict exception for the given (already-formatted) relationship.</summary>
+    /// <remarks>
+    /// The message text matches real SpiceDB's <c>CreateRelationshipExistsError</c> verbatim (observed
+    /// v1.49.2, identical on WriteRelationships and ImportBulkRelationships), so clients keying on the
+    /// message see the same string either side.
+    /// </remarks>
     public CreateRelationshipExistsException(string relationship)
-        : base($"relationship already exists: {relationship}") => Relationship = relationship;
+        : base($"could not CREATE relationship `{relationship}`, as it already existed. "
+            + "If this is persistent, please switch to TOUCH operations or specify a precondition")
+        => Relationship = relationship;
 }
 
 /// <summary>Thrown when a revision is malformed or otherwise invalid for the datastore.</summary>

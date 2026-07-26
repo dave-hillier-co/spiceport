@@ -59,6 +59,9 @@ public sealed class SpiceDbGrpcClient : IDisposable
     public async Task<V1::WriteSchemaResponse> WriteSchemaAsync(V1::WriteSchemaRequest request) =>
         await _invoker.AsyncUnaryCall(WriteSchemaMethod, null, Options(), request).ResponseAsync;
 
+    public async Task<V1::ReadSchemaResponse> ReadSchemaAsync(V1::ReadSchemaRequest request) =>
+        await _invoker.AsyncUnaryCall(ReadSchemaMethod, null, Options(), request).ResponseAsync;
+
     public async Task<V1::WriteRelationshipsResponse> WriteRelationshipsAsync(V1::WriteRelationshipsRequest request) =>
         await _invoker.AsyncUnaryCall(WriteRelationshipsMethod, null, Options(), request).ResponseAsync;
 
@@ -72,6 +75,25 @@ public sealed class SpiceDbGrpcClient : IDisposable
     {
         using var call = _invoker.AsyncServerStreamingCall(LookupResourcesMethod, null, Options(), request);
         var results = new List<V1::LookupResourcesResponse>();
+        while (await call.ResponseStream.MoveNext(CancellationToken.None))
+            results.Add(call.ResponseStream.Current);
+        return results;
+    }
+
+    public async Task<V1::ImportBulkRelationshipsResponse> ImportBulkRelationshipsAsync(
+        IEnumerable<V1::ImportBulkRelationshipsRequest> batches)
+    {
+        using var call = _invoker.AsyncClientStreamingCall(ImportBulkRelationshipsMethod, null, Options());
+        foreach (var batch in batches)
+            await call.RequestStream.WriteAsync(batch);
+        await call.RequestStream.CompleteAsync();
+        return await call.ResponseAsync;
+    }
+
+    public async Task<List<V1::ReadRelationshipsResponse>> ReadRelationshipsAsync(V1::ReadRelationshipsRequest request)
+    {
+        using var call = _invoker.AsyncServerStreamingCall(ReadRelationshipsMethod, null, Options(), request);
+        var results = new List<V1::ReadRelationshipsResponse>();
         while (await call.ResponseStream.MoveNext(CancellationToken.None))
             results.Add(call.ResponseStream.Current);
         return results;
@@ -102,6 +124,10 @@ public sealed class SpiceDbGrpcClient : IDisposable
         MethodType.Unary, SchemaServiceName, "WriteSchema",
         ProtoMarshaller<V1::WriteSchemaRequest>(), ProtoMarshaller<V1::WriteSchemaResponse>());
 
+    private static readonly Method<V1::ReadSchemaRequest, V1::ReadSchemaResponse> ReadSchemaMethod = new(
+        MethodType.Unary, SchemaServiceName, "ReadSchema",
+        ProtoMarshaller<V1::ReadSchemaRequest>(), ProtoMarshaller<V1::ReadSchemaResponse>());
+
     private static readonly Method<V1::WriteRelationshipsRequest, V1::WriteRelationshipsResponse> WriteRelationshipsMethod = new(
         MethodType.Unary, PermissionsServiceName, "WriteRelationships",
         ProtoMarshaller<V1::WriteRelationshipsRequest>(), ProtoMarshaller<V1::WriteRelationshipsResponse>());
@@ -117,6 +143,14 @@ public sealed class SpiceDbGrpcClient : IDisposable
     private static readonly Method<V1::LookupResourcesRequest, V1::LookupResourcesResponse> LookupResourcesMethod = new(
         MethodType.ServerStreaming, PermissionsServiceName, "LookupResources",
         ProtoMarshaller<V1::LookupResourcesRequest>(), ProtoMarshaller<V1::LookupResourcesResponse>());
+
+    private static readonly Method<V1::ImportBulkRelationshipsRequest, V1::ImportBulkRelationshipsResponse> ImportBulkRelationshipsMethod = new(
+        MethodType.ClientStreaming, PermissionsServiceName, "ImportBulkRelationships",
+        ProtoMarshaller<V1::ImportBulkRelationshipsRequest>(), ProtoMarshaller<V1::ImportBulkRelationshipsResponse>());
+
+    private static readonly Method<V1::ReadRelationshipsRequest, V1::ReadRelationshipsResponse> ReadRelationshipsMethod = new(
+        MethodType.ServerStreaming, PermissionsServiceName, "ReadRelationships",
+        ProtoMarshaller<V1::ReadRelationshipsRequest>(), ProtoMarshaller<V1::ReadRelationshipsResponse>());
 
     private static readonly Method<V1::LookupSubjectsRequest, V1::LookupSubjectsResponse> LookupSubjectsMethod = new(
         MethodType.ServerStreaming, PermissionsServiceName, "LookupSubjects",

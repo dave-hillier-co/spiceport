@@ -134,8 +134,10 @@ public sealed record ReadSchemaReply(
     [property: Id(1)] string ReadAtToken);
 
 /// <summary>
-/// Arguments for <see cref="IRelationshipsGrain.BulkImportRelationships"/>: one batch of relationships
-/// to load as an efficient insert (create-or-overwrite) in a single write transaction.
+/// Arguments for <see cref="IRelationshipsGrain.BulkImportRelationships"/>: an entire import's
+/// relationships, loaded with CREATE semantics in a single write transaction — a row that already
+/// exists (or repeats within the import) rejects the whole import and nothing applies, matching real
+/// SpiceDB's ImportBulkRelationships.
 /// </summary>
 [GenerateSerializer]
 public sealed record BulkImportRelationshipsArgs(

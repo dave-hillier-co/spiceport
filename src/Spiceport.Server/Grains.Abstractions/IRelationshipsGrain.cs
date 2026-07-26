@@ -33,10 +33,10 @@ public interface IRelationshipsGrain : IGrainWithIntegerKey
     Task<DeleteRelationshipsReply> DeleteRelationships(DeleteRelationshipsArgs args);
 
     /// <summary>
-    /// Loads one batch of relationships as an efficient insert (create-or-overwrite, no per-row
-    /// existence check) in a single, all-or-nothing write transaction. The bulk-import gRPC service
-    /// consumes the client stream and calls this once per inbound batch — the grain stays
-    /// request/response.
+    /// Loads an import's relationships with CREATE semantics in a single, all-or-nothing write
+    /// transaction: a row that already exists, or repeats within the import, rejects the whole import
+    /// (nothing applies) — real SpiceDB's ImportBulkRelationships behavior. The bulk-import gRPC
+    /// services buffer the client stream and call this once — the grain stays request/response.
     /// </summary>
     Task<BulkImportRelationshipsReply> BulkImportRelationships(BulkImportRelationshipsArgs args);
 

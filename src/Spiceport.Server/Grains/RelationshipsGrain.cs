@@ -245,18 +245,15 @@ public sealed class RelationshipsGrain(
     {
         ArgumentNullException.ThrowIfNull(args);
 
-        // Efficient-insert semantics (create-or-overwrite, NO per-row already-exists check), matching
-        // SpiceDB ImportBulk. The whole batch loads in ONE declarative commit: all-or-nothing per batch,
-        // executed inside the sequencer like every other production write — no per-batch full-state
-        // ReadState fetch (the cost the retired ReadWriteTx compatibility path paid per attempt). The
-        // gRPC service drives the client stream and calls this once per inbound batch, so the grain
-        // itself stays request/response. Touch-op updates preserve BulkLoad's contract exactly: the
-        // sequencer validates each row and applies it create-or-overwrite (a Create op would instead
-        // reject an already-present row — a semantics change), and the loaded count is the batch's
-        // update count, exactly what BulkLoad counted per streamed row (within-batch duplicates
-        // included, last write wins on both paths).
+        // CREATE semantics per row, matching real SpiceDB's ImportBulkRelationships (observed v1.49.2):
+        // a row that already exists in the store, or appears twice in the import (the MVCC staging makes
+        // the first Create visible to the second's conflict check), rejects the whole import with the
+        // CREATE-conflict failure — never a silent upsert. The entire import loads in ONE declarative
+        // commit, executed inside the sequencer like every other production write, so a rejected import
+        // applies nothing (SpiceDB's whole-stream atomicity, which the gRPC services preserve by
+        // buffering the client stream and calling this once). The grain itself stays request/response.
         var updates = args.Relationships
-            .Select(r => new RelationshipUpdateWire(RelationshipUpdateOpWire.Touch, r))
+            .Select(r => new RelationshipUpdateWire(RelationshipUpdateOpWire.Create, r))
             .ToList();
 
         var reply = await CommitDeclarative(new CommitRequest(
@@ -268,10 +265,10 @@ public sealed class RelationshipsGrain(
             CounterChanges: Array.Empty<CounterDeltaWire>(),
             ExpectedHead: null)).ConfigureAwait(ContinueOnCapturedContext);
 
-        // Touch ops cannot lose the create-conflict check, and HeadMoved is retried inside
-        // CommitDeclarative (exhaustion throws the same Serialization WriteConflictException the
-        // ReadWriteTx path surfaced) — but map any rejection through the shared mapper so a
-        // CreateAlreadyExists would still surface as the identical typed exception/gRPC code.
+        // A duplicate row surfaces as CreateAlreadyExists and maps through the shared mapper to the
+        // same typed WriteConflictException (-> gRPC AlreadyExists) the WriteRelationships path throws,
+        // with the SpiceDB-verbatim message. HeadMoved is retried inside CommitDeclarative (exhaustion
+        // throws the Serialization WriteConflictException the ReadWriteTx path surfaced).
         if (reply.Failure is { } failure)
             throw RelationshipWriteFailure(failure);
 

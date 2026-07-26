@@ -34,29 +34,38 @@ public sealed class BulkGrpcService(IGrainFactory grains, Grains.RelationshipRea
     {
         ArgumentNullException.ThrowIfNull(requestStream);
 
-        ulong total = 0;
-        string? lastToken = null;
-
-        // Consume the client stream batch by batch. Each batch is one all-or-nothing write transaction in
-        // the grain; the load is additive across the whole stream. Empty batches are skipped so they do
-        // not commit empty transactions.
+        // Buffer the WHOLE client stream, then load it in ONE grain commit — the same shape as the
+        // authzed.api.v1 surface (see AuthzedPermissionsV1Service.ImportBulkRelationships): real
+        // SpiceDB's import is atomic across the entire stream and applies CREATE semantics per row
+        // (a duplicate anywhere rejects the import, nothing applies). This internal proto surface
+        // mirrors ImportBulk deliberately, so it carries the same semantics.
+        var relationships = new List<RelationshipWire>();
         while (await requestStream.MoveNext(context.CancellationToken))
         {
-            var batch = requestStream.Current;
-            if (batch.Relationships.Count == 0)
-                continue;
-
-            var relationships = batch.Relationships.Select(ToWire).ToList();
-            var reply = await Relationships.BulkImportRelationships(
-                new BulkImportRelationshipsArgs(relationships));
-            total += reply.NumLoaded;
-            lastToken = reply.LoadedAtToken;
+            foreach (var relationship in requestStream.Current.Relationships)
+                relationships.Add(ToWire(relationship));
         }
 
-        var response = new ImportBulkRelationshipsResponse { NumLoaded = total };
-        if (lastToken is not null)
-            response.LoadedAt = new ZedToken { Token = lastToken };
-        return response;
+        if (relationships.Count == 0)
+            return new ImportBulkRelationshipsResponse { NumLoaded = 0 };
+
+        try
+        {
+            var reply = await Relationships.BulkImportRelationships(
+                new BulkImportRelationshipsArgs(relationships));
+            return new ImportBulkRelationshipsResponse
+            {
+                NumLoaded = reply.NumLoaded,
+                LoadedAt = new ZedToken { Token = reply.LoadedAtToken },
+            };
+        }
+        catch (WriteConflictException ex)
+        {
+            // CREATE-conflict is permanent (do not retry the doomed import); a genuine write-write
+            // serialization conflict is retryable — the same split the authzed surface maps.
+            var code = ex.Kind == WriteConflictKind.CreateExisting ? StatusCode.AlreadyExists : StatusCode.Aborted;
+            throw new RpcException(new Status(code, ex.Message));
+        }
     }
 
     public override async Task ExportBulkRelationships(

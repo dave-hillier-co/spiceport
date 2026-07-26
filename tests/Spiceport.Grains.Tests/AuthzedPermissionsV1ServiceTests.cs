@@ -328,6 +328,138 @@ public class AuthzedPermissionsV1ServiceTests
     }
 
     [Fact]
+    public async Task WriteRelationships_two_touch_of_same_tuple_is_invalid_argument()
+    {
+        // Verified against real SpiceDB (authzed/spicedb v1.49.2): two TOUCH updates for the identical
+        // tuple in one request reject with InvalidArgument and this exact message, not silent dedup.
+        await using var cluster = await MeshTestCluster.CreateAsync(Schema);
+
+        var req = WriteReq(V1::RelationshipUpdate.Types.Operation.Touch, "readme", "alice");
+        req.Updates.Add(new V1::RelationshipUpdate
+        {
+            Operation = V1::RelationshipUpdate.Types.Operation.Touch,
+            Relationship = new V1::Relationship
+            {
+                Resource = new V1::ObjectReference { ObjectType = "document", ObjectId = "readme" },
+                Relation = "viewer",
+                Subject = UserSubject("alice"),
+            },
+        });
+
+        var ex = await Assert.ThrowsAsync<RpcException>(() =>
+            Service(cluster).WriteRelationships(req, FakeServerCallContext.Default));
+        Assert.Equal(StatusCode.InvalidArgument, ex.StatusCode);
+        Assert.Contains("more than one update with relationship", ex.Status.Detail);
+    }
+
+    [Fact]
+    public async Task WriteRelationships_create_then_touch_of_same_tuple_is_invalid_argument()
+    {
+        // Verified against real SpiceDB: mixing CREATE and TOUCH for the same tuple in one request is
+        // ALSO a duplicate -- the key is the bare tuple, independent of operation kind.
+        await using var cluster = await MeshTestCluster.CreateAsync(Schema);
+
+        var req = new V1::WriteRelationshipsRequest();
+        req.Updates.Add(new V1::RelationshipUpdate
+        {
+            Operation = V1::RelationshipUpdate.Types.Operation.Create,
+            Relationship = new V1::Relationship
+            {
+                Resource = new V1::ObjectReference { ObjectType = "document", ObjectId = "readme" },
+                Relation = "editor",
+                Subject = UserSubject("alice"),
+            },
+        });
+        req.Updates.Add(new V1::RelationshipUpdate
+        {
+            Operation = V1::RelationshipUpdate.Types.Operation.Touch,
+            Relationship = new V1::Relationship
+            {
+                Resource = new V1::ObjectReference { ObjectType = "document", ObjectId = "readme" },
+                Relation = "editor",
+                Subject = UserSubject("alice"),
+            },
+        });
+
+        var ex = await Assert.ThrowsAsync<RpcException>(() =>
+            Service(cluster).WriteRelationships(req, FakeServerCallContext.Default));
+        Assert.Equal(StatusCode.InvalidArgument, ex.StatusCode);
+        Assert.Contains("more than one update with relationship", ex.Status.Detail);
+    }
+
+    [Fact]
+    public async Task WriteRelationships_two_touch_differing_only_by_caveat_context_is_invalid_argument()
+    {
+        // Verified against real SpiceDB: two updates for the same (resource, relation, subject) that
+        // differ ONLY in caveat name/context are still a duplicate -- the dedup key is computed WITHOUT
+        // the caveat (SpiceDB's V1StringRelationshipWithoutCaveatOrExpiration).
+        await using var cluster = await MeshTestCluster.CreateAsync(Schema);
+
+        var req = new V1::WriteRelationshipsRequest();
+        req.Updates.Add(new V1::RelationshipUpdate
+        {
+            Operation = V1::RelationshipUpdate.Types.Operation.Touch,
+            Relationship = new V1::Relationship
+            {
+                Resource = new V1::ObjectReference { ObjectType = "document", ObjectId = "readme" },
+                Relation = "viewer",
+                Subject = UserSubject("alice"),
+                OptionalCaveat = new V1::ContextualizedCaveat { CaveatName = "over_limit" },
+            },
+        });
+        req.Updates.Add(new V1::RelationshipUpdate
+        {
+            Operation = V1::RelationshipUpdate.Types.Operation.Touch,
+            Relationship = new V1::Relationship
+            {
+                Resource = new V1::ObjectReference { ObjectType = "document", ObjectId = "readme" },
+                Relation = "viewer",
+                Subject = UserSubject("alice"),
+                // No caveat on the second update -- still the same underlying tuple key.
+            },
+        });
+
+        var ex = await Assert.ThrowsAsync<RpcException>(() =>
+            Service(cluster).WriteRelationships(req, FakeServerCallContext.Default));
+        Assert.Equal(StatusCode.InvalidArgument, ex.StatusCode);
+        Assert.Contains("more than one update with relationship", ex.Status.Detail);
+    }
+
+    [Fact]
+    public async Task WriteRelationships_non_duplicate_updates_are_unaffected()
+    {
+        // Distinct tuples (different relation, different subject) in the same request are unaffected by
+        // the duplicate check and both apply.
+        await using var cluster = await MeshTestCluster.CreateAsync(Schema);
+
+        var req = new V1::WriteRelationshipsRequest();
+        req.Updates.Add(new V1::RelationshipUpdate
+        {
+            Operation = V1::RelationshipUpdate.Types.Operation.Touch,
+            Relationship = new V1::Relationship
+            {
+                Resource = new V1::ObjectReference { ObjectType = "document", ObjectId = "readme" },
+                Relation = "editor",
+                Subject = UserSubject("alice"),
+            },
+        });
+        req.Updates.Add(new V1::RelationshipUpdate
+        {
+            Operation = V1::RelationshipUpdate.Types.Operation.Touch,
+            Relationship = new V1::Relationship
+            {
+                Resource = new V1::ObjectReference { ObjectType = "document", ObjectId = "readme" },
+                Relation = "editor",
+                Subject = UserSubject("bob"),
+            },
+        });
+
+        var resp = await Service(cluster).WriteRelationships(req, FakeServerCallContext.Default);
+
+        Assert.NotEmpty(resp.WrittenAt.Token);
+    }
+
+    [Fact]
     public async Task WriteRelationships_too_many_updates_is_invalid_argument()
     {
         // More than MaxUpdatesPerWrite (1000) updates is rejected up front with InvalidArgument
@@ -828,6 +960,63 @@ public class AuthzedPermissionsV1ServiceTests
             Subject = UserSubject("carol"),
         }, FakeServerCallContext.Default);
         Assert.Equal(V1::CheckPermissionResponse.Types.Permissionship.HasPermission, check.Permissionship);
+    }
+
+    [Fact]
+    public async Task ImportBulkRelationships_duplicate_in_stream_is_already_exists_and_applies_nothing()
+    {
+        await using var cluster = await MeshTestCluster.CreateAsync(Schema);
+
+        // The duplicate sits in a LATER batch than a clean row: real SpiceDB rejects the whole stream
+        // and applies nothing from it, including earlier batches (observed v1.49.2).
+        var reader = new FakeAsyncStreamReader<V1::ImportBulkRelationshipsRequest>(
+            ImportBatch(("doc1", "alice"), ("doc2", "bob")),
+            ImportBatch(("doc1", "alice")));
+
+        var ex = await Assert.ThrowsAsync<RpcException>(() =>
+            Service(cluster).ImportBulkRelationships(reader, FakeServerCallContext.Default));
+
+        Assert.Equal(StatusCode.AlreadyExists, ex.StatusCode);
+        Assert.Contains("could not CREATE relationship", ex.Status.Detail);
+        Assert.Contains("document:doc1#viewer@user:alice", ex.Status.Detail);
+        Assert.Contains("already existed", ex.Status.Detail);
+
+        // Whole-stream atomicity: the clean row from the first batch must not be visible.
+        var check = await Service(cluster).CheckPermission(new V1::CheckPermissionRequest
+        {
+            Consistency = new V1::Consistency { FullyConsistent = true },
+            Resource = new V1::ObjectReference { ObjectType = "document", ObjectId = "doc2" },
+            Permission = "view",
+            Subject = UserSubject("bob"),
+        }, FakeServerCallContext.Default);
+        Assert.Equal(V1::CheckPermissionResponse.Types.Permissionship.NoPermission, check.Permissionship);
+    }
+
+    [Fact]
+    public async Task ImportBulkRelationships_preexisting_row_is_already_exists()
+    {
+        await using var cluster = await MeshTestCluster.CreateAsync(Schema);
+        await SeedAsync(cluster.Datastore, ("doc1", "viewer", "alice"));
+
+        var reader = new FakeAsyncStreamReader<V1::ImportBulkRelationshipsRequest>(
+            ImportBatch(("doc1", "alice"), ("doc2", "bob")));
+
+        var ex = await Assert.ThrowsAsync<RpcException>(() =>
+            Service(cluster).ImportBulkRelationships(reader, FakeServerCallContext.Default));
+
+        Assert.Equal(StatusCode.AlreadyExists, ex.StatusCode);
+        Assert.Contains("could not CREATE relationship", ex.Status.Detail);
+        Assert.Contains("document:doc1#viewer@user:alice", ex.Status.Detail);
+
+        // Nothing from the failed import applied.
+        var check = await Service(cluster).CheckPermission(new V1::CheckPermissionRequest
+        {
+            Consistency = new V1::Consistency { FullyConsistent = true },
+            Resource = new V1::ObjectReference { ObjectType = "document", ObjectId = "doc2" },
+            Permission = "view",
+            Subject = UserSubject("bob"),
+        }, FakeServerCallContext.Default);
+        Assert.Equal(V1::CheckPermissionResponse.Types.Permissionship.NoPermission, check.Permissionship);
     }
 
     [Fact]

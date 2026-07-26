@@ -127,7 +127,9 @@ public sealed class BenchWorld
         var seen = new HashSet<string>();
         void Add(string resType, string resId, string relation, string subType, string subId, string subRel)
         {
-            // Distinct rows only: a duplicate within one BulkImport batch would be a pointless no-op row.
+            // Distinct rows only — load-bearing, not an optimization: BulkImportRelationships applies
+            // CREATE semantics (matching real SpiceDB's ImportBulkRelationships), so a duplicate row
+            // would reject the whole batch with AlreadyExists and load nothing.
             if (seen.Add($"{resType}:{resId}#{relation}@{subType}:{subId}#{subRel}"))
                 rels.Add(new RelationshipWire(resType, resId, relation, subType, subId, subRel, null, null, null));
         }
@@ -198,10 +200,12 @@ public sealed class BenchWorld
 
     /// <summary>
     /// Loads the world into a running cluster through the DECLARATIVE write path —
-    /// <see cref="IRelationshipsGrain.BulkImportRelationships"/> in fixed-size batches, the fastest
-    /// existing surface (create-or-overwrite, no per-row existence check, one commit per batch).
-    /// Progress goes to stderr so stdout stays clean for result tables. Returns the last batch's
-    /// commit token (the initial freshness floor for at-least-as-fresh checks).
+    /// <see cref="IRelationshipsGrain.BulkImportRelationships"/> in fixed-size batches (one commit per
+    /// batch). The grain applies CREATE semantics (a row that already exists rejects its whole batch
+    /// with a CREATE conflict), so this load is NOT idempotent: it assumes the fresh-cluster-per-cell
+    /// discipline every scenario follows, and the generator emits distinct rows only. Progress goes to
+    /// stderr so stdout stays clean for result tables. Returns the last batch's commit token (the
+    /// initial freshness floor for at-least-as-fresh checks).
     /// </summary>
     public async Task<string> LoadAsync(MeshTestCluster cluster, int batchSize = 1000)
     {

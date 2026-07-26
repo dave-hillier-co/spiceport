@@ -600,34 +600,41 @@ public sealed class AuthzedPermissionsV1Service(
     {
         ArgumentNullException.ThrowIfNull(requestStream);
 
-        ulong total = 0;
+        // Buffer the WHOLE client stream, then load it in ONE grain commit: real SpiceDB's
+        // ImportBulkRelationships is atomic across the entire stream (observed v1.49.2 — a duplicate in
+        // a later batch leaves NOTHING applied, including earlier batches), and one commit is the only
+        // shape that reproduces that. Rows apply with CREATE semantics: a row already stored, or
+        // repeated within the stream, rejects the import with AlreadyExists (SpiceDB's verbatim
+        // "could not CREATE relationship ..." message) so the client does not retry the doomed import;
+        // a genuine write-write serialization conflict maps to Aborted so the client retries.
+        // Cost of the one-commit shape, accepted with eyes open: the buffered rows cross the grain
+        // boundary as ONE Orleans message (subject to the runtime's message-size and response-timeout
+        // limits) and the import executes as one commit turn on the sequencer's single non-reentrant
+        // activation, serializing against every other cluster write for its duration. A truly huge
+        // import that hits those limits should be split by the CALLER into idempotent-safe disjoint
+        // streams; chunking here would silently forfeit the observed whole-stream atomicity.
+        var relationships = new List<RelationshipWire>();
+        while (await requestStream.MoveNext(context.CancellationToken))
+        {
+            foreach (var relationship in requestStream.Current.Relationships)
+                relationships.Add(ToWire(relationship));
+        }
 
-        // Consume the client stream batch by batch. Each batch is one all-or-nothing write transaction in
-        // the grain; the load is additive across the whole stream. Empty batches are skipped so they do not
-        // commit empty transactions. A CREATE-style conflict (relationship already exists) maps to
-        // AlreadyExists so the client does not retry the doomed import; a genuine write-write
-        // serialization conflict maps to Aborted so the client retries the transaction.
+        if (relationships.Count == 0)
+            return new V1::ImportBulkRelationshipsResponse { NumLoaded = 0 };
+
         try
         {
-            while (await requestStream.MoveNext(context.CancellationToken))
-            {
-                var batch = requestStream.Current;
-                if (batch.Relationships.Count == 0)
-                    continue;
+            var reply = await Relationships.BulkImportRelationships(
+                new BulkImportRelationshipsArgs(relationships));
 
-                var relationships = batch.Relationships.Select(ToWire).ToList();
-                var reply = await Relationships.BulkImportRelationships(
-                    new BulkImportRelationshipsArgs(relationships));
-                total += reply.NumLoaded;
-            }
+            // v1 ImportBulkRelationshipsResponse carries only num_loaded (no token).
+            return new V1::ImportBulkRelationshipsResponse { NumLoaded = reply.NumLoaded };
         }
         catch (WriteConflictException ex)
         {
             throw new RpcException(new Status(ToStatusCode(ex.Kind), ex.Message));
         }
-
-        // v1 ImportBulkRelationshipsResponse carries only num_loaded (no token).
-        return new V1::ImportBulkRelationshipsResponse { NumLoaded = total };
     }
 
     public override async Task ExportBulkRelationships(
