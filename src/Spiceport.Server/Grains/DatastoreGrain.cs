@@ -796,6 +796,24 @@ public sealed class DatastoreGrain :
             // Defunct observers are pruned by ObserverManager; nothing else to do.
         }
 
+        // A schema change committed this revision: push the bytes to every silo's watch hub alongside the
+        // head advance. Without this, a WriteSchema landing on THIS silo's grain activation only swaps
+        // ISchemaProvider locally on the silo that ran it — every other silo keeps serving its stale
+        // Current schema hash (a live divergence, not just a cache-miss latency cost) until its own hub
+        // heartbeat notices the stored hash moved. Same best-effort/isolated stance as HeadAdvanced above.
+        if (ev.SchemaChange is { } schemaChange)
+        {
+            try
+            {
+                await _watchers.Notify(w => w.SchemaAdvanced(schemaChange.Bytes, schemaChange.Hash))
+                    .ConfigureAwait(ContinueOnCapturedContext);
+            }
+            catch
+            {
+                // Defunct observers are pruned by ObserverManager; nothing else to do.
+            }
+        }
+
         return new CommitReply(newRevision, null, deletedCount, reachedLimit);
 
         static CommitReply Rejected(CommitFailureKind kind, string? detail) =>

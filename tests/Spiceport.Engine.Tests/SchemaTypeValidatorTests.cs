@@ -6,7 +6,7 @@ namespace Spiceport.Engine.Tests;
 /// Unit tests for <see cref="SchemaTypeValidator"/>, mirroring SpiceDB's <c>TypeSystem.Validate</c>
 /// (<c>pkg/schema/typesystem_validation.go</c>) and <c>ValidateCaveatDefinition</c>
 /// (<c>internal/namespace/caveats.go</c>): undefined references, permission-on-left-of-arrow, wildcard
-/// in arrow, self-reference, missing allowed types, undefined caveat, duplicate/reused names, and the
+/// in arrow, missing allowed types, undefined caveat, duplicate/reused names, and the
 /// caveat-definition rules (≥1 parameter, parseable CEL, every declared parameter referenced).
 /// </summary>
 public class SchemaTypeValidatorTests
@@ -73,14 +73,16 @@ public class SchemaTypeValidatorTests
     }
 
     [Fact]
-    public void Relation_AllowingItself_IsRejected()
+    public void Relation_AllowingItself_IsAccepted()
     {
-        var ex = ValidateThrows("""
-            definition document {
-                relation viewer: document#viewer
+        // Canonical recursive-group SpiceDB shape (the conformance corpus' directgroups.yaml);
+        // real SpiceDB's WriteSchema accepts it, so ours must too.
+        Validate("""
+            definition user {}
+            definition group {
+                relation member: user | group#member
             }
             """);
-        Assert.Contains("itself", ex.Message);
     }
 
     [Fact]

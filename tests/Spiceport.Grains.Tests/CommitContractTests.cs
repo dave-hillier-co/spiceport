@@ -540,11 +540,15 @@ public class CommitContractTests
 
     // ---- 15. Failed commits never notify watchers; successful ones do. ----
 
-    /// <summary>Records every <see cref="IDatastoreWatcher.HeadAdvanced"/> push it receives.</summary>
+    /// <summary>
+    /// Records every <see cref="IDatastoreWatcher.HeadAdvanced"/> and
+    /// <see cref="IDatastoreWatcher.SchemaAdvanced"/> push it receives.
+    /// </summary>
     private sealed class RecordingWatcher : IDatastoreWatcher
     {
         private readonly object _lock = new();
         private readonly List<long> _heads = new();
+        private readonly List<string> _schemaHashes = new();
 
         public Task HeadAdvanced(long head)
         {
@@ -553,10 +557,23 @@ public class CommitContractTests
             return Task.CompletedTask;
         }
 
+        public Task SchemaAdvanced(byte[] schemaBytes, string storedHash)
+        {
+            lock (_lock)
+                _schemaHashes.Add(storedHash);
+            return Task.CompletedTask;
+        }
+
         public IReadOnlyList<long> Heads()
         {
             lock (_lock)
                 return _heads.ToArray();
+        }
+
+        public IReadOnlyList<string> SchemaHashes()
+        {
+            lock (_lock)
+                return _schemaHashes.ToArray();
         }
     }
 

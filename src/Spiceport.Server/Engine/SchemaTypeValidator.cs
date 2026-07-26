@@ -202,18 +202,13 @@ public static class SchemaTypeValidator
 
         if (subject.ObjectType == def.Name)
         {
-            // Same definition: the subrelation (if any) must be one of this definition's relations, and
-            // a relation may not allow itself as a subject of the same subrelation.
-            if (resolvesSubrelation)
-            {
-                if (subrelation == relation.Name)
-                    throw new SchemaTypeException(
-                        $"relation `{relation.Name}` in definition `{def.Name}` cannot reference itself as an allowed subject type");
-
-                if (!def.Relations.Any(r => r.Name == subrelation))
-                    throw new SchemaTypeException(
-                        $"relation/permission `{subrelation}` not found under definition `{def.Name}`");
-            }
+            // Same definition: the subrelation (if any) must be one of this definition's relations.
+            // Self-reference (`relation member: user | group#member`) is VALID SpiceDB — it is the
+            // canonical recursive-group shape (the conformance corpus' directgroups.yaml, accepted by
+            // real SpiceDB's WriteSchema in the differential suite).
+            if (resolvesSubrelation && !def.Relations.Any(r => r.Name == subrelation))
+                throw new SchemaTypeException(
+                    $"relation/permission `{subrelation}` not found under definition `{def.Name}`");
 
             return;
         }

@@ -1,5 +1,7 @@
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
 using Orleans;
 using Orleans.Hosting;
 using Spiceport.Datastore;
@@ -87,12 +89,29 @@ public static class ServiceCollectionExtensions
         // local commits and parks Watch streams on it; it lazily starts its observer subscription +
         // heartbeat on first use (LogWatchHub.EnsureStarted) and the CONTAINER owns its lifetime — it is
         // an IAsyncDisposable singleton created by this factory, so silo teardown disposes it (a bounded,
-        // timeout-guarded unsubscribe from the datastore grain's observer set).
+        // timeout-guarded unsubscribe from the datastore grain's observer set). Also wired here as the
+        // cross-silo SCHEMA propagation channel: applySchema swaps this silo's ISchemaProvider whenever
+        // the hub receives a pushed or heartbeat-repaired schema change (see LogWatchHub's class doc) — a
+        // WriteSchema on any silo would otherwise leave every OTHER silo's live schema stale forever.
         services.AddSingleton<LogWatchHub>(sp =>
         {
             var grainFactory = sp.GetRequiredService<IGrainFactory>();
-            return new LogWatchHub(grainFactory.GetGrain<IDatastoreGrain>(IDatastoreGrain.Key), grainFactory);
+            var provider = sp.GetRequiredService<ISchemaProvider>();
+            var logger = sp.GetService<ILogger<LogWatchHub>>();
+            return new LogWatchHub(
+                grainFactory.GetGrain<IDatastoreGrain>(IDatastoreGrain.Key),
+                grainFactory,
+                applySchema: text => provider.Update(text),
+                logger: logger);
         });
+
+        // Historically LogWatchHub started lazily on this silo's first Watch call (EnsureStarted, called
+        // from GrainBackedDatastore.Watch) — fine when the hub only mattered to Watch streams, since a
+        // silo nobody is watching has no consumer to wake. Now that the SAME hub is also the cross-silo
+        // SCHEMA propagation channel, that laziness is wrong: a silo that never opens a Watch stream must
+        // still receive schema pushes/heartbeat repairs so its ISchemaProvider does not diverge forever.
+        // A tiny hosted service starts the hub unconditionally at silo boot instead.
+        services.AddHostedService<LogWatchHubStarter>();
 
         // The two storage-direct seams of the graph-sharded design (docs/graph-sharded-datastore.md
         // section 3), both resolved against the cluster-singleton sequencer grain via IGrainFactory:
@@ -106,14 +125,16 @@ public static class ServiceCollectionExtensions
         // attribute is UNCONDITIONAL on the four graph grain classes (Orleans placement attributes attach
         // per class and cannot be conditional), so the director must be registered wherever those grains
         // can activate — i.e. wherever this mesh is wired — and the on/off decision lives in
-        // GraphPlacementOptions (default OFF: the director then mirrors random placement, a pure inert
-        // pass-through). Enabling co-location is a deployment opt-in via
-        // SiloBuilderExtensions.AddGraphLocalityPlacement (or an options override), gated on measurement.
+        // GraphPlacementOptions (default ON — the enablement was gated on measurement and the
+        // real-network rig's A/B decided it, docs/scalability-program.md section 3.5; when opted out
+        // the director mirrors random placement, a pure inert pass-through). Opting out is a
+        // deployment override via SiloBuilderExtensions.AddGraphLocalityPlacement (or an options
+        // override).
         services.AddPlacementDirector<GraphLocalityPlacement, GraphLocalityPlacementDirector>();
-        // TryAdd, not Add: the deployment opt-in (SiloBuilderExtensions.AddGraphLocalityPlacement) may
+        // TryAdd, not Add: a deployment override (SiloBuilderExtensions.AddGraphLocalityPlacement) may
         // legitimately run BEFORE this method (host builders configure the silo before the service
-        // mesh), and an unconditional Add here would supersede that opt-in under DI last-wins,
-        // silently reverting co-location to OFF with no error.
+        // mesh), and an unconditional Add here would supersede that override under DI last-wins,
+        // silently reverting co-location to the default with no error.
         services.TryAddSingleton<GraphPlacementOptions>();
 
         // Leopard membership-walk accelerator toggle (default ON; opt out via a registered options override).
@@ -181,5 +202,21 @@ public static class ServiceCollectionExtensions
             sp.GetRequiredService<ISnapshotScanner>()));
 
         return services;
+    }
+
+    /// <summary>
+    /// Starts this silo's <see cref="LogWatchHub"/> at boot (see the registration comment above): resolves
+    /// the DI singleton and calls <see cref="LogWatchHub.EnsureStarted"/>, which is idempotent, so this
+    /// races harmlessly with any later lazy <c>GrainBackedDatastore.Watch</c> call that also starts it.
+    /// </summary>
+    private sealed class LogWatchHubStarter(LogWatchHub hub) : IHostedService
+    {
+        public Task StartAsync(CancellationToken cancellationToken)
+        {
+            hub.EnsureStarted();
+            return Task.CompletedTask;
+        }
+
+        public Task StopAsync(CancellationToken cancellationToken) => Task.CompletedTask;
     }
 }

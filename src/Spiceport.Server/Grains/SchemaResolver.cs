@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using System.Text;
 using Spiceport.Core;
 using Spiceport.Datastore;
+using Spiceport.Engine;
 using Spiceport.Schema;
 
 namespace Spiceport.Grains;
@@ -114,8 +115,26 @@ public sealed class SchemaResolver
     /// correct MVCC behavior: evaluation is a pure function of schema@rev, and the requested hash was
     /// only a (possibly stale) label for it.
     /// </summary>
-    private SchemaSnapshot CompileFetched(byte[] bytes) =>
-        GetOrCompile(StoredSchemaHash.Compute(bytes), bytes);
+    /// <remarks>
+    /// Dual-key rationale: the bytes are indexed under BOTH their stored-bytes hash
+    /// (<see cref="StoredSchemaHash.Compute(byte[])"/>, a raw SHA-256 over the persisted UTF-8 — what the
+    /// log folds a schema write's hash as) AND their structural hash
+    /// (<see cref="SchemaHash.Compute(System.Collections.Generic.IEnumerable{Spiceport.Core.NamespaceDefinition},System.Collections.Generic.IEnumerable{Spiceport.Core.CaveatDefinition}?)"/>,
+    /// what <see cref="MutableSchemaProvider.CurrentSchemaHash"/> — and therefore every dispatch grain
+    /// key — pins). The two hash spaces are different functions of the same bytes, so a lookup keyed by
+    /// one alone would never hit an entry compiled and cached only under the other: a structural-hash
+    /// request would miss the cache on EVERY call after a fetch (never just once), paying a sequencer
+    /// <c>ReadSchemaAt</c> hop forever. Caching under both is sound (not the poisoning this method's
+    /// primary doc guards against): unlike the REQUESTED hash, which may be stale or plain wrong, both
+    /// hashes cached here are pure, always-correct functions of the compiled model actually produced —
+    /// there is no way for either entry to name the wrong schema.
+    /// </remarks>
+    private SchemaSnapshot CompileFetched(byte[] bytes)
+    {
+        var snapshot = GetOrCompile(StoredSchemaHash.Compute(bytes), bytes);
+        _byHash.TryAdd(SchemaHash.Compute(snapshot.Namespaces, snapshot.Caveats), snapshot);
+        return snapshot;
+    }
 
     /// <summary>
     /// Returns the compiled snapshot for <paramref name="schemaHash"/>, compiling <paramref name="schemaBytes"/>
