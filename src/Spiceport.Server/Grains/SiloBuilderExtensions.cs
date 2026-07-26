@@ -9,9 +9,10 @@ namespace Spiceport.Grains;
 /// boundary (no in-process local-recurse shortcut) and the correctness of a check depending only on
 /// grain identity, placement is never load-bearing: the grain directory's single-activation guarantee
 /// is the whole router. The four graph grain families carry <see cref="GraphLocalityPlacementAttribute"/>,
-/// whose director is by default an inert random pick — <see cref="AddGraphLocalityPlacement"/> is the
-/// measured, deployment-level opt-in that turns it into a shard co-location hint
-/// (<c>docs/graph-sharded-datastore.md</c> §5). Orleans' activation rebalancing remains a host-level
+/// whose director defaults to the shard co-location hint (<c>docs/graph-sharded-datastore.md</c> §5;
+/// the enablement was decided by the real-network rig's A/B, <c>docs/scalability-program.md</c> §3.5) —
+/// <see cref="AddGraphLocalityPlacement"/> is the deployment-level override, e.g. to opt back out to
+/// an inert random pick. Orleans' activation rebalancing remains a host-level
 /// opt-in a deployment can layer on later; this library does not enable it.
 /// </summary>
 public static class SiloBuilderExtensions
@@ -19,14 +20,15 @@ public static class SiloBuilderExtensions
     /// <summary>
     /// Registers the <see cref="GraphLocalityPlacement"/> strategy/director pair and sets
     /// <see cref="GraphPlacementOptions"/> for this silo. <see cref="ServiceCollectionExtensions.AddSpiceportGrainServices"/>
-    /// already registers the pair with the default (OFF, inert) options, so calling this is only needed
-    /// to OPT IN to shard co-location (<see cref="GraphPlacementOptions.CoLocateWithShards"/>) — a pure
-    /// first-activation locality hint, gated on measurement; see <see cref="GraphLocalityPlacement"/>
-    /// for why it is not the deleted hash ring.
+    /// already registers the pair with the default (co-location ON) options, so calling this is only
+    /// needed to OVERRIDE the default — e.g. opting out of shard co-location
+    /// (<see cref="GraphPlacementOptions.CoLocateWithShards"/> = false, reverting the director to an
+    /// inert random pick); see <see cref="GraphLocalityPlacement"/> for why the hint is not the
+    /// deleted hash ring.
     /// </summary>
     /// <param name="siloBuilder">The silo builder to add to.</param>
     /// <param name="options">
-    /// The placement options to use; null registers the default (co-location OFF). Registration is
+    /// The placement options to use; null registers the default (co-location ON). Registration is
     /// last-wins, matching the options-override pattern of the other grain options types.
     /// </param>
     public static ISiloBuilder AddGraphLocalityPlacement(

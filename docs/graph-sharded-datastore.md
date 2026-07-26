@@ -174,14 +174,16 @@ everywhere*.
 
 ## 5. The alignment prize: compute lands on its data
 
-This part is built but OFF by default (see §7): enabling it is pure performance, gated on
-measurement per the simplicity-over-performance stance. `GraphLocalityPlacement` (a pluggable
+This part is built and ON by default: the enablement was gated on measurement per the
+simplicity-over-performance stance, and the real-network rig's A/B decided it
+(`scalability-program.md` §3.5) — on real sockets the hint converts cross-silo grain calls
+into local ones for a decisive latency/throughput win. `GraphLocalityPlacement` (a pluggable
 placement director, the extension `future-work.md` §1.4 anticipated when the hash ring was
 deleted) biases the FIRST activation of the four graph grain families onto the silo a stable
 hash of their locality key names — a hint only; the grain directory remains the sole authority
 for identity and dedup, and on membership change existing activations stay put while locality
-degrades gracefully. The opt-in is `GraphPlacementOptions.CoLocateWithShards` via
-`AddGraphLocalityPlacement`. It is where the design stops being a storage refactor and becomes
+degrades gracefully. The toggle is `GraphPlacementOptions.CoLocateWithShards` (opting out is a deployment override
+via `AddGraphLocalityPlacement`). It is where the design stops being a storage refactor and becomes
 the actor-native completion of the rearchitecture's founding thesis:
 
 - `CheckGrain`'s key begins with `(resourceType, resourceId, …)`; the forward-keyed
@@ -301,9 +303,10 @@ Realized (the built system):
    relationship unreachable — and its first flush persists that emptiness durably. Roll
    forward only; recover a wrongly rolled-back store from backup, not by re-upgrading.
 
-7. **The co-placement director** (§5) — built as `GraphLocalityPlacement`, default OFF:
-   the locality hint is proven by a multi-silo co-location gate, and ENABLING it in a
-   deployment remains gated by measurement, per the simplicity-over-performance stance.
+7. **The co-placement director** (§5) — built as `GraphLocalityPlacement`, default ON:
+   the locality hint is proven by a multi-silo co-location gate, and the default was decided
+   by the real-network rig's A/B (`scalability-program.md` §3.5), per the measurement-gated
+   stance. Opting out remains a deployment override.
 
 ---
 

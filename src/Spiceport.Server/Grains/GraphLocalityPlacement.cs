@@ -25,8 +25,9 @@ namespace Spiceport.Grains;
 /// The strategy attaches per grain CLASS via <see cref="GraphLocalityPlacementAttribute"/>, which
 /// Orleans cannot make conditional — so the attribute is unconditional on all four grain classes and
 /// the on/off decision lives in the DIRECTOR (see <see cref="GraphLocalityPlacementDirector"/>):
-/// when <see cref="GraphPlacementOptions.CoLocateWithShards"/> is false (the default) the director
-/// mirrors Orleans' random placement, a uniform pick from the compatible silos.
+/// when <see cref="GraphPlacementOptions.CoLocateWithShards"/> is false (a deployment opt-out; the
+/// default is ON) the director mirrors Orleans' random placement, a uniform pick from the
+/// compatible silos.
 /// </para>
 /// </remarks>
 [Immutable]
