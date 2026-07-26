@@ -18,5 +18,6 @@
   </Folder>
   <Folder Name="/tools/">
     <Project Path="tools/Spiceport.Bench/Spiceport.Bench.csproj" />
+    <Project Path="tools/Spiceport.RigSilo/Spiceport.RigSilo.csproj" />
   </Folder>
 </Solution>

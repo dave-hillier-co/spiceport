@@ -114,13 +114,27 @@ hypothesis the set exists to test, not a reason to skip it. Results are still ne
 committed — the baseline is whatever the previous run produced, and a missing baseline
 means running the set twice, before and after.
 
-**The real-network rig** (built when either decision below needs it, not before): an
-attended run against genuinely separate silo processes on a real network — the follow-up
-instrument for the questions the in-process cluster structurally cannot answer, because they
-are priced in per-call RTTs and serialization the shared-process cluster skips. Two items
-wait on it: the co-placement default (3.5) and the tail-cache verdict (3.1). It reuses the
-same scenarios and seams; only the cluster bootstrap differs. Like every measurement here it
-is attended and manual, with explicit teardown, never part of the automated suite.
+**The real-network rig.** An attended run against genuinely separate silo processes on a real
+network — the follow-up instrument for the questions the in-process cluster structurally
+cannot answer, because they are priced in per-call RTTs and serialization the shared-process
+cluster skips. Two items wait on it: the co-placement default (3.5) and the tail-cache
+verdict (3.1).
+
+It lives in three pieces. `tools/Spiceport.RigSilo` is the silo process: the same production
+grain/gRPC wiring as `src/Spiceport.Api`, parameterized per-process (ports, cluster id,
+co-placement on/off) and exposing `/healthz` plus a plain-JSON `/rig/metrics` /
+`/rig/reset` pair over the same `IDispatchMetrics`/`ISequencerMetrics` seams the in-process
+harness reads. `tools/Spiceport.Bench`'s `remote-check` and `remote-decomposition` scenarios
+are the driver: real `authzed.api.v1` gRPC calls against a `--endpoints` list, fanned out
+across workers, with the same latency/metrics reporting as their in-process counterparts.
+`tools/rig/rig.sh` is the orchestrator: boots and tears down an N-silo cluster with
+deterministic port allocation, refuses to start over a live or port-colliding previous run,
+and drives the co-placement A/B procedure (`rig.sh ab`) end to end — fresh cluster per arm
+per trial, `off` then `on`, `remote-check --json` per cell.
+
+Like every measurement here it is attended and manual, with explicit teardown (`rig.sh down`,
+also trap-driven on interruption), never part of the automated suite, and results are written
+outside the repository tree — `rig.sh` never writes into it.
 
 ---
 
@@ -146,11 +160,17 @@ structural tripwire pins that the cache type holds `LogEvent`s only (no row coll
 (rather than silo count) under fresh-read load, or sequencer turn saturation attributable to
 tail serving before commit throughput is otherwise exhausted.
 
-**Trigger status: not fired in-process.** Harness runs confirm the call-volume shape (an
-order of magnitude more `ReadFrom` under fresh-read mixes) but show only marginal throughput
-cost — the calls are cheap without a network. The cost this mitigation answers lives in
-per-call RTTs the in-process cluster cannot express, so the verdict is deferred to the
-real-network rig (§2); do not build on in-process evidence alone.
+**Trigger status: NOT FIRED — measured on the real-network rig.** In-process runs confirmed
+the call-volume shape (an order of magnitude more `ReadFrom` under fresh-read mixes) but the
+calls are cheap without a network, so the verdict waited for the rig (§2). The rig's
+decomposition runs (3 real silo processes, mixed load at realistic write rates) price the
+calls with real RTTs and still show no symptom: `ReadFrom` dominates sequencer inbound calls
+by count exactly as projected, yet check p99 and mean commit latency hold steady as the write
+rate grows fivefold — and `ReadFrom` volume grows markedly *sublinearly* with write rate,
+because a shard's catch-up call covers every commit since its watermark, an amortization the
+per-commit fan-in model undercounts. The cache stays sketched, not built. Re-measure on the
+rig at larger silo and hot-shard counts, or when sequencer turn saturation appears with
+`ReadFrom` as the dominant inbound class.
 
 ### 3.2 Subject-filter pushdown on shard reads (answers P3, the Check half)
 
@@ -266,10 +286,14 @@ tracking) only if a deployment's cardinality demands it.
 - **Co-placement** (`GraphPlacementOptions.CoLocateWithShards`): flip on when the A/B shows
   a real hop/latency win; the locality hash is stable across quantization-window keyspace
   rotation, so the measurement should confirm the win persists across windows.
-  *Status: pending the real-network rig.* In-process A/B trials are consistently positive
-  (throughput up, p50 down, never negative), and the same-silo effect can only grow once a
-  real network prices the cross-silo hop — but the flip waits for that confirmation, since
-  the in-process delta alone is modest.
+  *Status: DECIDED — default ON.* The real-network rig's A/B (`rig.sh ab`, fresh 3-silo
+  cluster per cell, three trials per arm) was decisive with non-overlapping ranges: on real
+  sockets the ON arm carries substantially higher check throughput with p50 and p99 both
+  well under the OFF arm's, in every trial. Hops per check are essentially unchanged between
+  arms — the mechanism is hop *locality*, not hop count: co-placement converts cross-silo
+  grain calls into local ones, which is precisely the cost the in-process cluster could not
+  price and why the in-process delta alone was modest. Opting out remains a deployment
+  override via `AddGraphLocalityPlacement`.
 - **Revision quantization**: the window is a shard/memo reuse dial; sweep it and record the
   chosen default as a maintainer decision where the option lives.
   *Status: DECIDED — the 5s default stays.* Sweeps show the window is a weak dial for
@@ -314,8 +338,12 @@ cheap wins, and a better instrument before the two judgment calls:
 4. **Key-index chunking (3.4)**, with flush write batching (3.3 item 3) adjacent — BUILT,
    goal substantially met (see 3.4's status note): flush cost is O(dirty + N/BucketCount),
    the cardinality sweep flattened, and absolute commit throughput rose at every point.
-5. **The real-network rig (§2)** — the prerequisite instrument for the two open decisions:
-   the co-placement default (3.5) and whether the tail cache (3.1) fires at all.
-6. **Only on evidence:** the tail cache (3.1) if the real-network numbers fire it; the
-   remaining commit-turn items (3.3.1/3.3.2) if the re-baseline still shows candidate-load
-   cost; storage-direct scans (3.6) when admin-scan interference is observed.
+5. **The real-network rig (§2)** — BUILT, and both decisions it existed for are taken:
+   the co-placement default is ON (3.5's status note) and the tail cache did not fire
+   (3.1's status note). The rig also immediately earned its keep as a correctness
+   instrument: its first boots exposed two real-multi-process bugs the in-process cluster
+   structurally hides (cross-silo schema propagation; a WriteSchema validator divergence
+   from SpiceDB), both fixed with regression tests.
+6. **Only on evidence:** the tail cache (3.1) if rig runs at larger silo/hot-shard counts
+   fire it; the remaining commit-turn items (3.3.1/3.3.2) if the re-baseline still shows
+   candidate-load cost; storage-direct scans (3.6) when admin-scan interference is observed.

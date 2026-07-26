@@ -66,6 +66,8 @@ public static class BenchJson
     public static void Write(string path, object payload)
     {
         var json = JsonSerializer.Serialize(payload, new JsonSerializerOptions { WriteIndented = true });
+        if (Path.GetDirectoryName(path) is { Length: > 0 } directory)
+            Directory.CreateDirectory(directory);
         File.WriteAllText(path, json);
         Console.Error.WriteLine($"json results written to {path}");
     }

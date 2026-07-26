@@ -4,9 +4,11 @@
     <ProjectReference Include="..\..\src\Spiceport.Server\Spiceport.Server.csproj" />
     <ProjectReference Include="..\..\src\Spiceport.Datastore\Spiceport.Datastore.csproj" />
     <ProjectReference Include="..\..\src\Spiceport.Core\Spiceport.Core.csproj" />
+    <ProjectReference Include="..\..\src\Spiceport.Protos\Spiceport.Protos.csproj" />
   </ItemGroup>
 
   <ItemGroup>
+    <PackageReference Include="Grpc.Net.Client" Version="2.80.0" />
     <PackageReference Include="Microsoft.Orleans.Persistence.Memory" Version="10.1.0" />
     <PackageReference Include="Microsoft.Orleans.Sdk" Version="10.1.0" />
     <PackageReference Include="Microsoft.Orleans.TestingHost" Version="10.1.0" />

@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\Spiceport.Api\Spiceport.Api.csproj" />
+    <ProjectReference Include="..\..\src\Spiceport.Server\Spiceport.Server.csproj" />
+    <ProjectReference Include="..\..\src\Spiceport.Datastore\Spiceport.Datastore.csproj" />
+  </ItemGroup>
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+
+</Project>

@@ -48,3 +48,42 @@ dotnet run -c Release --project tools/Spiceport.Bench -- sequencer-decomposition
 Each maps to a pressure point in `docs/scalability-program.md` §1: consistency-sweep (P2),
 commit-breadth (P1/P5), userset-sweep (P3), placement-ab and quantization-sweep (P4, the
 §3.5 enablement decisions), sequencer-decomposition (P2/P6). `--help` documents every flag.
+
+## Remote mode: driving the real-network rig
+
+Every scenario above shares one thread pool and skips real networking — deltas only, never
+absolute capacity, and structurally blind to per-call RTT and serialization cost. `remote-check`
+and `remote-decomposition` are the real-network counterparts: the same workload/consistency-mix
+model, but issuing genuine `authzed.api.v1` gRPC calls against a cluster of separate
+`tools/Spiceport.RigSilo` processes.
+
+Boot the cluster with the orchestrator, then point Bench at it:
+
+```
+tools/rig/rig.sh up 3
+dotnet run -c Release --project tools/Spiceport.Bench -- remote-check \
+  --endpoints=127.0.0.1:8500,127.0.0.1:8501,127.0.0.1:8502 \
+  --rig=127.0.0.1:8580,127.0.0.1:8581,127.0.0.1:8582 \
+  --mix=100/0/0
+dotnet run -c Release --project tools/Spiceport.Bench -- remote-decomposition \
+  --endpoints=127.0.0.1:8500,127.0.0.1:8501,127.0.0.1:8502 \
+  --rig=127.0.0.1:8580,127.0.0.1:8581,127.0.0.1:8582 \
+  --write-rate=20 --mix=70/20/10
+tools/rig/rig.sh down
+```
+
+`rig.sh up N` prints the exact `--endpoints`/`--rig` values for the cluster it just started, so
+they can be pasted straight into the commands above rather than derived from the port scheme by
+hand. `rig.sh ab [--silos=N] [--trials=T] [bench flags...]` automates the co-placement A/B
+procedure itself: fresh cluster per arm (co-placement off, then on) per trial, running
+`remote-check --json` into each cell, with results left under `$HOME/.spiceport-rig/results/`
+(overridable via `SPICEPORT_RIG_HOME`) — never inside this repository, per the results-are-never-
+committed rule above. See `tools/rig/rig.sh`'s header comment for the port-allocation scheme and
+state-directory layout, and `docs/scalability-program.md` §2 for what the rig answers that the
+in-process harness cannot.
+
+Once a real network and real serialization are in the loop, `remote-*` numbers are still
+*relative* — compare A/B deltas between configurations under the same rig, same seed, same
+world — but they are no longer relative in the same forgiving way the in-process numbers are:
+per-call RTT and (de)serialization cost, which the in-process cluster hides entirely, now shows
+up directly in the latencies and in cross-silo vs same-silo comparisons.

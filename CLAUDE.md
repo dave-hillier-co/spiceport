@@ -123,7 +123,9 @@ dotnet test tests/Spiceport.Conformance.Tests  # the SpiceDB conformance corpus 
   `IServerStreamWriter`/`IAsyncStreamReader` + a fake `ServerCallContext`. Do **not** start a
   Kestrel host (`dotnet run`) inside tests/CI — a backgrounded host can orphan and run forever.
 - A real `zed`/`grpcurl` smoke test against a booted host is valuable but is an attended,
-  manual step with explicit host teardown — keep it out of the automated suite.
+  manual step with explicit host teardown — keep it out of the automated suite. The
+  real-network measurement rig (`tools/rig/rig.sh`, `tools/Spiceport.RigSilo`) has the same
+  standing: attended and manual, never invoked from tests/.
 - Cluster-using tests share a non-parallel xUnit collection (the test cluster passes schema via
   a process-wide static).
 

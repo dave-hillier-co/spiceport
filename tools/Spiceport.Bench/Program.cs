@@ -14,6 +14,8 @@ var scenarios = new (string Name, string Help, Func<BenchArgs, Task> Run)[]
     (PlacementAbScenario.Name, PlacementAbScenario.Help, PlacementAbScenario.RunAsync),
     (QuantizationSweepScenario.Name, QuantizationSweepScenario.Help, QuantizationSweepScenario.RunAsync),
     (SequencerDecompositionScenario.Name, SequencerDecompositionScenario.Help, SequencerDecompositionScenario.RunAsync),
+    (RemoteCheckScenario.Name, RemoteCheckScenario.Help, RemoteCheckScenario.RunAsync),
+    (RemoteDecompositionScenario.Name, RemoteDecompositionScenario.Help, RemoteDecompositionScenario.RunAsync),
 };
 
 if (args.Length == 0 || args[0] is "--help" or "-h" or "help")
@@ -70,6 +72,10 @@ void PrintHelp()
     Console.WriteLine();
     Console.WriteLine("All numbers are RELATIVE: the in-process cluster shares one thread pool and skips real");
     Console.WriteLine("networking, so compare A/B deltas between configurations, never absolute capacity.");
+    Console.WriteLine();
+    Console.WriteLine("The remote-* scenarios instead drive a real RigSilo cluster over real gRPC (tools/rig/rig.sh");
+    Console.WriteLine("boots the silos): still relative numbers, but now priced in real per-call RTTs and");
+    Console.WriteLine("protobuf serialization rather than in-process method calls.");
     Console.WriteLine();
     Console.WriteLine("Scenarios:");
     foreach (var (scenarioName, help, _) in scenarios)
