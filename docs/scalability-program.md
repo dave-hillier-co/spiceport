@@ -132,6 +132,18 @@ deterministic port allocation, refuses to start over a live or port-colliding pr
 and drives the co-placement A/B procedure (`rig.sh ab`) end to end — fresh cluster per arm
 per trial, `off` then `on`, `remote-check --json` per cell.
 
+The rig also carries the **durable arm** (`up N --durable [--fresh-data]`): a Postgres
+container under the same teardown discipline, the vendored Orleans DDL applied once per
+data volume, and `ConnectionStrings__OrleansStorage` passed to every silo so
+`AddDatastoreGrainStorage` runs its production AdoNet path. The data volume deliberately
+survives `down` — recovery runs reboot over it (`zed` reading a recovered store with
+nothing reloaded is the proof pattern). Two deployment facts the durable arm established,
+recorded here because any real deployment re-derives them the hard way: the connection
+budget must satisfy silos × per-silo pool < server `max_connections` (Npgsql defaults to a
+100-connection pool PER PROCESS; the failure mode is a cluster-wide write outage of opaque
+`53300` errors), and a loopback container prices durability I/O but not database-network
+RTT, so durable-arm numbers stay relative like everything else here.
+
 Like every measurement here it is attended and manual, with explicit teardown (`rig.sh down`,
 also trap-driven on interruption), never part of the automated suite, and results are written
 outside the repository tree — `rig.sh` never writes into it.
@@ -242,10 +254,21 @@ prefix). Post-fix, the cardinality sweep is flat and an exact-key precondition s
 The re-baseline answered the items-1–2 question: NOT triggered in-process. Realistic
 commits resolve one-to-few candidates (nothing to parallelize) and candidate loads against
 in-memory storage are far below the turn's other costs; an exact-key precondition's
-steady-state residual is sub-millisecond. Both items stay sketched, re-gated on evidence
-from durable-backend or real-network runs where a candidate load is a genuine RTT. The
-flush sawtooth is the write path's dominant remaining cost (see 3.4) and item 3 rides with
-3.4 when that lands.
+steady-state residual is sub-millisecond. The flush sawtooth is the write path's dominant
+remaining cost (see 3.4) and item 3 rides with 3.4 when that lands.
+
+**Durable-backend verdict (rig, Postgres arm): items 1–2 stay NOT fired.** The rig's
+durable campaign (loopback Postgres container, per-silo pool caps, fresh store per cell)
+prices the commit turn with real I/O: the turn is dominated by the per-commit durable log
+append plus the flush-boundary writes, not by candidate loads — a single-update commit's
+mean turn lands around an fsync (~10 ms class on the test hardware), with single-key
+preconditions indistinguishable from bare commits. Nothing here is a candidate-load cost to
+parallelize or LRU away. What the durable numbers DO establish is the single-writer
+ceiling itself: offered write load above roughly 1/mean-turn collapses into open-loop
+queueing (latencies ramp until Orleans' response timeout), which is the write-demand
+number the `future-work.md` §1.15 ladder trigger asks for, and the graceful-overload gap
+is tracked as its own issue. Checks kept serving throughout write saturation (interleaved
+reads), with degraded p99 while the activation queue was deep.
 
 ### 3.4 Key-index chunking (answers P5)
 
@@ -345,5 +368,8 @@ cheap wins, and a better instrument before the two judgment calls:
    structurally hides (cross-silo schema propagation; a WriteSchema validator divergence
    from SpiceDB), both fixed with regression tests.
 6. **Only on evidence:** the tail cache (3.1) if rig runs at larger silo/hot-shard counts
-   fire it; the remaining commit-turn items (3.3.1/3.3.2) if the re-baseline still shows
-   candidate-load cost; storage-direct scans (3.6) when admin-scan interference is observed.
+   fire it; storage-direct scans (3.6) when admin-scan interference is observed. The
+   commit-turn items (3.3.1/3.3.2) are now CLOSED on durable-backend evidence — the durable
+   commit turn is I/O-dominated, not candidate-load-dominated (3.3's status note) — leaving
+   the write path's next lever the `future-work.md` §1.15 ladder, behind its write-demand
+   trigger, and graceful overload behavior at the ceiling tracked as an issue.

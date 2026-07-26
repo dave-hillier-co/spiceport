@@ -109,6 +109,49 @@ public sealed class RemoteRig : IDisposable
     }
 
     /// <summary>
+    /// Touches one or more <c>document#viewer@user</c> relationships in a SINGLE <c>WriteRelationships</c>
+    /// call (the remote analog of <c>CommitBreadthScenario</c>'s multi-update commits), optionally
+    /// attaching the same single-key precondition <c>CommitBreadthScenario</c>'s "single" breadth uses:
+    /// a fully-specified <c>MUST_NOT_MATCH</c> filter naming one tuple that never exists — the narrowest
+    /// precondition a client can express, exercised here under real wire serialization. Returns the
+    /// commit's <c>ZedToken</c>.
+    /// </summary>
+    public async Task<string> WriteBatchAsync(
+        CallInvoker invoker, IReadOnlyList<(string Doc, string User)> updates, bool singleKeyPrecondition)
+    {
+        var request = new V1::WriteRelationshipsRequest();
+        foreach (var (doc, user) in updates)
+        {
+            request.Updates.Add(new V1::RelationshipUpdate
+            {
+                Operation = V1::RelationshipUpdate.Types.Operation.Touch,
+                Relationship = ToRelationship(new RelationshipWire(
+                    "document", doc, "viewer", "user", user, CoreConstants.Ellipsis, null, null, null)),
+            });
+        }
+        if (singleKeyPrecondition)
+        {
+            request.OptionalPreconditions.Add(new V1::Precondition
+            {
+                Operation = V1::Precondition.Types.Operation.MustNotMatch,
+                Filter = new V1::RelationshipFilter
+                {
+                    ResourceType = "document",
+                    OptionalResourceId = "never_doc",
+                    OptionalRelation = "viewer",
+                    OptionalSubjectFilter = new V1::SubjectFilter
+                    {
+                        SubjectType = "user",
+                        OptionalSubjectId = "never_user",
+                    },
+                },
+            });
+        }
+        var reply = await invoker.AsyncUnaryCall(WriteRelationshipsMethod, null, new CallOptions(), request).ResponseAsync;
+        return reply.WrittenAt.Token;
+    }
+
+    /// <summary>
     /// Issues <c>document.view</c> for a uniform user, mapping <paramref name="consistency"/> onto the
     /// <c>authzed.api.v1.Consistency</c> oneof (<c>ConsistencyRequirement.MinimizeLatency</c> -&gt;
     /// <c>minimize_latency</c>, <c>FullyConsistent</c> -&gt; <c>fully_consistent</c>,

@@ -22,12 +22,26 @@
 #     rig.pid                           one line per live silo: pid idx siloPort gwPort grpcPort httpPort clusterId
 #     rig.pid.partial                   same format, written during the spawn loop; down/status/up
 #                                       consult it too so an interrupt mid-spawn cannot orphan silos
+#     pg.cid                            container id of the durable-arm Postgres (present only for
+#                                       `up --durable` clusters; down removes the container, never
+#                                       the data volume)
 #     logs/silo-<i>.log                 stdout+stderr of each silo process
 #     results/*.json                    `ab` output (--json paths handed to Bench); never in the repo
 #
+# Durable arm (`up N --durable`): starts a Postgres container (spiceport-rig-pg, port
+# SPICEPORT_RIG_PG_PORT default 15432, data on the named volume spiceport-rig-pgdata), applies the
+# vendored Orleans DDL on a fresh volume, and passes ConnectionStrings__OrleansStorage to every
+# silo, switching AddDatastoreGrainStorage to durable AdoNet storage. The data VOLUME survives
+# `down` (recovery runs reboot over it); pass --fresh-data to `up` to drop it first. A loopback
+# container prices durability I/O (fsync, serialization), not database-network RTT — numbers stay
+# relative, A/B between arms.
+#
 # Commands:
-#   rig.sh up N [--co-locate=on|off]    boot an N-silo cluster (default --co-locate=on, the
-#                                       production default; rig.sh ab drives both arms explicitly)
+#   rig.sh up N [--co-locate=on|off] [--durable] [--fresh-data]
+#                                       boot an N-silo cluster (default --co-locate=on, the
+#                                       production default; rig.sh ab drives both arms explicitly).
+#                                       --durable backs the datastore with the Postgres container;
+#                                       --fresh-data drops its data volume first (requires --durable)
 #   rig.sh down                         tear down the recorded cluster (idempotent)
 #   rig.sh status                       live pids + healthz probe per recorded silo
 #   rig.sh ab [--silos=N] [--trials=T] [bench flags...]
@@ -64,6 +78,18 @@ BASE_HTTP_PORT="${SPICEPORT_RIG_HTTP_BASE:-8580}"
 UP_TIMEOUT_SECS=60
 DOWN_WAIT_ITERATIONS=20   # 20 * 0.5s = 10s bounded wait before KILL
 
+# Durable arm: the Postgres container backing AddDatastoreGrainStorage's AdoNet path.
+PG_PORT="${SPICEPORT_RIG_PG_PORT:-15432}"
+PG_CONTAINER="spiceport-rig-pg"
+PG_VOLUME="spiceport-rig-pgdata"
+PG_IMAGE="postgres:17-alpine"
+PG_USER="spiceport"
+PG_DB="spiceport"
+PG_CIDFILE_NAME="pg.cid"
+# The vendored Orleans DDL the durability tests apply (Main first: OrleansQuery + versioning;
+# then Persistence: OrleansStorage + query rows) — one source of truth, reused here.
+ORLEANS_SQL_DIR_REL="tests/Spiceport.Grains.Tests/Durability/OrleansSql"
+
 DEFAULT_AB_SILOS=3
 DEFAULT_AB_TRIALS=3
 
@@ -75,7 +101,7 @@ usage_error() { echo "rig: $*" >&2; echo >&2; print_usage >&2; exit 2; }
 print_usage() {
   cat <<'EOF'
 Usage:
-  rig.sh up N [--co-locate=on|off]
+  rig.sh up N [--co-locate=on|off] [--durable] [--fresh-data]
   rig.sh down
   rig.sh status
   rig.sh ab [--silos=N] [--trials=T] [bench flags...]
@@ -163,6 +189,94 @@ check_ports_free() {
   fi
 }
 
+# ---- durable-arm Postgres --------------------------------------------------------------------
+
+pg_cidfile() { echo "$STATE_DIR/$PG_CIDFILE_NAME"; }
+
+# Connection budget, sized deliberately: Npgsql defaults to a 100-connection pool PER PROCESS, so
+# N silos can demand N*100 against Postgres' default max_connections=100 — under load the shard-row
+# storage reads exhaust the server ("53300: too many clients already") and every write errors. Cap
+# the per-silo pool and start the server with headroom; a real deployment needs the same arithmetic
+# (or a pooler like pgbouncer) — silos * MaxPoolSize < max_connections.
+PG_MAX_POOL_PER_SILO=25
+PG_MAX_CONNECTIONS=300
+
+pg_conn_string() {
+  echo "Host=127.0.0.1;Port=$PG_PORT;Database=$PG_DB;Username=$PG_USER;Password=$PG_USER;Maximum Pool Size=$PG_MAX_POOL_PER_SILO"
+}
+
+# Same refusal discipline as the silos: an already-present container (running or exited) means a
+# previous durable run was not torn down — refuse and point at recovery, never adopt or clobber.
+refuse_if_pg_present() {
+  if [[ -n "$(docker ps -aq --filter "name=^${PG_CONTAINER}$")" ]]; then
+    die "Postgres container '$PG_CONTAINER' already exists (previous durable run not torn down). Run 'rig.sh down' first."
+  fi
+}
+
+pg_up() {
+  local fresh="$1"
+  require_tool docker
+  refuse_if_pg_present
+
+  local hit
+  hit="$(lsof -nP -iTCP:"$PG_PORT" -sTCP:LISTEN 2>/dev/null || true)"
+  [[ -z "$hit" ]] || { echo "$hit" >&2; die "port $PG_PORT (Postgres) is already bound; free it or set SPICEPORT_RIG_PG_PORT."; }
+
+  if [[ "$fresh" == "1" ]] && docker volume inspect "$PG_VOLUME" >/dev/null 2>&1; then
+    echo "rig: --fresh-data: removing data volume $PG_VOLUME..." >&2
+    # 'docker rm -f' returns before the container's mounts are fully released, so an immediate
+    # volume rm can race it ("volume is in use") — bounded retry instead of failing the boot.
+    local vol_tries=0
+    until docker volume rm "$PG_VOLUME" >/dev/null 2>&1; do
+      (( ++vol_tries < 10 )) || die "could not remove volume $PG_VOLUME after ${vol_tries}s (still in use?)."
+      sleep 1
+    done
+  fi
+
+  echo "rig: starting Postgres ($PG_IMAGE, port $PG_PORT, volume $PG_VOLUME)..." >&2
+  local cid
+  cid="$(docker run -d --name "$PG_CONTAINER" \
+    -p "127.0.0.1:$PG_PORT:5432" \
+    -v "$PG_VOLUME:/var/lib/postgresql/data" \
+    -e POSTGRES_USER="$PG_USER" -e POSTGRES_PASSWORD="$PG_USER" -e POSTGRES_DB="$PG_DB" \
+    "$PG_IMAGE" -c "max_connections=$PG_MAX_CONNECTIONS")" || die "docker run failed for $PG_CONTAINER."
+  echo "$cid" > "$(pg_cidfile)"
+
+  local waited=0
+  until docker exec "$PG_CONTAINER" pg_isready -q -U "$PG_USER" -d "$PG_DB" 2>/dev/null; do
+    (( waited < UP_TIMEOUT_SECS )) || { pg_down; die "Postgres did not become ready within ${UP_TIMEOUT_SECS}s."; }
+    sleep 1; waited=$((waited + 1))
+  done
+
+  # Apply the vendored Orleans DDL exactly once per volume (a reused volume already has it; the
+  # scripts are not idempotent). OrleansStorage's presence is the applied marker.
+  local applied
+  applied="$(docker exec "$PG_CONTAINER" psql -U "$PG_USER" -d "$PG_DB" -tAc \
+    "SELECT to_regclass('public.orleansstorage')" 2>/dev/null | tr -d '[:space:]')"
+  if [[ -z "$applied" ]]; then
+    echo "rig: applying Orleans DDL (fresh volume)..." >&2
+    local sql_file
+    for sql_file in "PostgreSQL-Main.sql" "PostgreSQL-Persistence.sql"; do
+      docker exec -i "$PG_CONTAINER" psql -q -U "$PG_USER" -d "$PG_DB" -v ON_ERROR_STOP=1 \
+        < "$REPO_ROOT/$ORLEANS_SQL_DIR_REL/$sql_file" >/dev/null \
+        || { pg_down; die "applying $sql_file failed."; }
+    done
+  fi
+}
+
+# Removes the container (recorded or name-matched), NEVER the data volume — recovery runs depend
+# on rebooting over it; 'up --durable --fresh-data' is the explicit way to drop it. Idempotent.
+pg_down() {
+  if [[ -f "$(pg_cidfile)" ]] || [[ -n "$(docker ps -aq --filter "name=^${PG_CONTAINER}$" 2>/dev/null)" ]]; then
+    docker rm -f "$PG_CONTAINER" >/dev/null 2>&1 || true
+    if [[ -n "$(docker ps -aq --filter "name=^${PG_CONTAINER}$" 2>/dev/null)" ]]; then
+      echo "rig: warning: container $PG_CONTAINER still present after docker rm -f" >&2
+    fi
+    rm -f "$(pg_cidfile)"
+    echo "rig: postgres container removed (data volume $PG_VOLUME kept)" >&2
+  fi
+}
+
 wait_all_healthy() {
   local n="$1" i http_port deadline
   deadline=$((SECONDS + UP_TIMEOUT_SECS))
@@ -184,20 +298,29 @@ cmd_up() {
   [[ "$n" =~ ^[0-9]+$ && "$n" -ge 1 ]] || usage_error "up: N must be a positive integer, got '${n:-<missing>}'."
   shift || true
 
-  local colocate="on"
+  local colocate="on" durable=0 fresh_data=0
   local arg
   for arg in "$@"; do
     case "$arg" in
       --co-locate=on) colocate="on" ;;
       --co-locate=off) colocate="off" ;;
-      *) usage_error "up: unknown argument '$arg' (expected --co-locate=on|off)." ;;
+      --durable) durable=1 ;;
+      --fresh-data) fresh_data=1 ;;
+      *) usage_error "up: unknown argument '$arg' (expected --co-locate=on|off, --durable, --fresh-data)." ;;
     esac
   done
+  (( fresh_data == 0 || durable == 1 )) || usage_error "up: --fresh-data requires --durable."
 
   refuse_if_already_running
   check_ports_free "$n"
 
   mkdir -p "$STATE_DIR" "$LOG_DIR"
+
+  local conn_string=""
+  if (( durable == 1 )); then
+    pg_up "$fresh_data"
+    conn_string="$(pg_conn_string)"
+  fi
 
   echo "rig: building RigSilo (Release, once, so $n processes do not race the build)..." >&2
   dotnet build -c Release "$RIGSILO_PROJECT" >&2 || die "build failed."
@@ -218,7 +341,10 @@ cmd_up() {
     grpc_port="$(grpcPortAt "$i")"
     http_port="$(httpPortAt "$i")"
     log="$LOG_DIR/silo-$i.log"
-    echo "rig: starting silo $i (silo=$silo_port gateway=$gw_port grpc=$grpc_port http=$http_port co-locate=$colocate)..." >&2
+    echo "rig: starting silo $i (silo=$silo_port gateway=$gw_port grpc=$grpc_port http=$http_port co-locate=$colocate durable=$durable)..." >&2
+    # env-var config: AddDatastoreGrainStorage switches to durable AdoNet storage when
+    # ConnectionStrings__OrleansStorage is present; empty means in-memory (the default arm).
+    ConnectionStrings__OrleansStorage="$conn_string" \
     nohup dotnet "$DLL_PATH" \
       --silo-port="$silo_port" --gateway-port="$gw_port" --primary-silo-port="$primary_port" \
       --grpc-port="$grpc_port" --http-port="$http_port" --co-locate="$colocate" --cluster-id="$cluster_id" \
@@ -245,6 +371,9 @@ cmd_up() {
 cmd_down() {
   recorded_pid_files
   if [[ -z "${RECORDED_PID_FILES[@]+x}" ]]; then
+    # No silos recorded, but a durable-arm Postgres may still linger (e.g. a crash between pg_up
+    # and the silo spawn loop) — sweep it before declaring the down a no-op.
+    pg_down
     echo "rig: no cluster recorded (down)"
     return 0
   fi
@@ -291,12 +420,16 @@ cmd_down() {
   fi
 
   rm -f "$PIDFILE" "$PIDFILE.partial"
+  pg_down
   echo "rig: down"
 }
 
 # ---- status --------------------------------------------------------------------------------
 
 cmd_status() {
+  if command -v docker >/dev/null 2>&1 && [[ -n "$(docker ps -aq --filter "name=^${PG_CONTAINER}$" 2>/dev/null)" ]]; then
+    echo "postgres: $(docker ps -a --filter "name=^${PG_CONTAINER}$" --format '{{.Status}}') (port $PG_PORT, volume $PG_VOLUME)"
+  fi
   recorded_pid_files
   if [[ -z "${RECORDED_PID_FILES[@]+x}" ]]; then
     echo "rig: no cluster recorded"

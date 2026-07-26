@@ -19,13 +19,16 @@ public static class RemoteDecompositionScenario
         "  --rig=host:port,...            rig HTTP addresses, same order as --endpoints (required)\n" +
         "  --check-workers=8              closed-loop check workers, round-robined across channels\n" +
         "  --write-rate=20                open-loop writes/second (coordinated-omission-safe pacing)\n" +
-        "  --mix=70/20/10                 check consistency mix (min-latency/at-least-as-fresh/fully-consistent)";
+        "  --mix=70/20/10                 check consistency mix (min-latency/at-least-as-fresh/fully-consistent)\n" +
+        "  --updates-per-commit=1         relationship updates per paced WriteRelationships call (commit shape)\n" +
+        "  --breadth=none|single          precondition breadth per write (none / single-key MUST_NOT_MATCH);\n" +
+        "                                 'type' is deliberately unsupported here (see docs/scalability-program.md P1)";
 
     public static async Task RunAsync(BenchArgs args)
     {
         args.Validate([
             .. BenchCommon.SharedFlagNames, .. BenchWorldOptions.FlagNames,
-            "endpoints", "rig", "check-workers", "write-rate", "mix",
+            "endpoints", "rig", "check-workers", "write-rate", "mix", "updates-per-commit", "breadth",
         ]);
         var seed = args.GetInt("seed", 42);
         var duration = args.GetDuration("duration", TimeSpan.FromSeconds(10));
@@ -33,6 +36,20 @@ public static class RemoteDecompositionScenario
         var checkWorkers = args.GetInt("check-workers", 8);
         var writeRate = args.GetDouble("write-rate", 20);
         var mix = ConsistencyMix.Parse(args.GetString("mix", "70/20/10")!);
+        var updatesPerCommit = args.GetInt("updates-per-commit", 1);
+        if (updatesPerCommit < 1)
+            throw new BenchUsageException($"--updates-per-commit must be >= 1, got {updatesPerCommit}.");
+        var breadth = args.GetString("breadth", "none")!;
+        // 'type' (a type-wide MUST_NOT_MATCH scan) is a documented pathological path
+        // (docs/scalability-program.md P1) that the durable-backend campaign does not need;
+        // rejected explicitly rather than silently degrading to 'none'.
+        if (breadth == "type")
+            throw new BenchUsageException(
+                "--breadth=type is not supported by remote-decomposition (the type-wide scan is a documented " +
+                "pathological path; use commit-breadth for that measurement). Use none or single.");
+        if (breadth is not ("none" or "single"))
+            throw new BenchUsageException($"Unknown --breadth '{breadth}' (expected none or single).");
+        var singleKeyPrecondition = breadth == "single";
         var jsonPath = BenchJson.ResolveOutputPath(args);
 
         var world = BenchWorld.Generate(seed, BenchWorldOptions.FromArgs(args));
@@ -57,15 +74,38 @@ public static class RemoteDecompositionScenario
         var writeRng = BenchCommon.WorkerRngs(seed, checkWorkers + 1)[checkWorkers];
         var writeInvoker = rig.InvokerForWorker(checkWorkers);
 
+        long writeCounter = 0;
         Func<Task> writeOp = async () =>
         {
-            string doc, user;
-            lock (writeRng)
+            IReadOnlyList<(string Doc, string User)> updates;
+            if (updatesPerCommit == 1)
             {
-                doc = world.Documents[docSampler.Next(writeRng)];
-                user = world.Users[writeRng.Next(world.Users.Count)];
+                string doc, user;
+                lock (writeRng)
+                {
+                    doc = world.Documents[docSampler.Next(writeRng)];
+                    user = world.Users[writeRng.Next(world.Users.Count)];
+                }
+                updates = new[] { (doc, user) };
             }
-            var written = await rig.TouchAsync(writeInvoker, doc, user);
+            else
+            {
+                // Mirrors CommitBreadthScenario's multi-update commits: each write TOUCHES
+                // `updatesPerCommit` DISTINCT document#viewer rows drawn round-robin from a bounded
+                // key space, so tuples are unique within a commit (a duplicate update in one write
+                // is rejected) and the world stays bounded over any run length.
+                var i = Interlocked.Increment(ref writeCounter);
+                var batch = new (string, string)[updatesPerCommit];
+                for (var j = 0; j < updatesPerCommit; j++)
+                {
+                    var k = i * updatesPerCommit + j;
+                    batch[j] = (
+                        world.Documents[(int)(k % world.Documents.Count)],
+                        world.Users[(int)(k % world.Users.Count)]);
+                }
+                updates = batch;
+            }
+            var written = await rig.WriteBatchAsync(writeInvoker, updates, singleKeyPrecondition);
             token.Set(written);
         };
 
@@ -94,12 +134,17 @@ public static class RemoteDecompositionScenario
         Console.WriteLine();
         Console.WriteLine(
             $"remote-decomposition  seed={seed} silos={rig.SiloCount} duration={duration} warmup={warmup} " +
-            $"checkWorkers={checkWorkers} writeRate={writeRate} mix={mix}");
+            $"checkWorkers={checkWorkers} writeRate={writeRate} mix={mix} " +
+            $"updatesPerCommit={updatesPerCommit} breadth={breadth}");
         Console.WriteLine();
         var load = new ConsoleTable("op class", "ops/s", "p50 ms", "p99 ms", "max ms", "errors", "maxIF");
         load.AddRow("check", checks.MeasuredCompletionsPerSecond.ToString("0.0"),
             chk.Ms(chk.P50Micros), chk.Ms(chk.P99Micros), chk.Ms(chk.MaxMicros), chk.Errors, checks.MaxInFlight);
-        load.AddRow("write", writes.MeasuredCompletionsPerSecond.ToString("0.0"),
+        // The write op-class label carries the commit shape (upd/commit, precondition breadth) inline
+        // since this table has no separate column for it — the shape is what the durable-backend
+        // campaign is varying, so it must be visible next to the numbers it produced.
+        load.AddRow($"write (upd/commit={updatesPerCommit} breadth={breadth})",
+            writes.MeasuredCompletionsPerSecond.ToString("0.0"),
             wr.Ms(wr.P50Micros), wr.Ms(wr.P99Micros), wr.Ms(wr.MaxMicros), wr.Errors, writes.MaxInFlight);
         load.Print(Console.Out);
         if (chk.FirstError is not null)
@@ -142,6 +187,7 @@ public static class RemoteDecompositionScenario
             BenchJson.Write(jsonPath, new
             {
                 scenario = Name, seed, silos = rig.SiloCount, duration, warmup, checkWorkers, writeRate, mix = mix.ToString(),
+                updatesPerCommit, breadth,
                 checksPerSecond = checks.MeasuredCompletionsPerSecond,
                 writesPerSecond = writes.MeasuredCompletionsPerSecond,
                 checkMaxInFlight = checks.MaxInFlight,

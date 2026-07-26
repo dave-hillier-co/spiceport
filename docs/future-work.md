@@ -413,7 +413,14 @@ unrelatedness is one write away from ending.
 being permanent): measured write demand exceeding what a batched ticket actor can issue
 (see 1.15 rungs 1–2), or the wire-protocol constraint relaxing enough to express tenancy —
 at which point per-tenant total orders (and vector-of-tenant-heads zookies) become the
-natural design rather than a compromise.
+natural design rather than a compromise. The rig's durable campaign put the first real
+number behind the demand side of that trigger: with a durable backend the unbatched
+single-writer ceiling is roughly one commit per durable-append turn (an fsync-class mean —
+on the order of a hundred single-update commits per second on modest hardware,
+proportionally fewer as updates per commit grow), so rung 1 (group commit)
+becomes worth building as soon as a durable deployment's sustained write demand approaches
+its measured ceiling; the rig's `remote-decomposition --durable` cells are the standing
+instrument for measuring it.
 
 - **Orleans distributed transactions.** The single ordered log is the serialization point;
   transactions would blur the global-order story that defeats the new-enemy problem.

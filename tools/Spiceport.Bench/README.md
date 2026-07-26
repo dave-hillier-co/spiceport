@@ -68,9 +68,15 @@ dotnet run -c Release --project tools/Spiceport.Bench -- remote-check \
 dotnet run -c Release --project tools/Spiceport.Bench -- remote-decomposition \
   --endpoints=127.0.0.1:8500,127.0.0.1:8501,127.0.0.1:8502 \
   --rig=127.0.0.1:8580,127.0.0.1:8581,127.0.0.1:8582 \
-  --write-rate=20 --mix=70/20/10
+  --write-rate=20 --mix=70/20/10 --updates-per-commit=8 --breadth=single
 tools/rig/rig.sh down
 ```
+
+`remote-decomposition --updates-per-commit=N --breadth=none|single` mirrors `commit-breadth`'s
+commit-shape dimensions (multi-update commits, single-key `MUST_NOT_MATCH` precondition) for the
+durable-backend campaign; `--breadth=type` is deliberately rejected there (see the scenario's
+`--help`), since the type-wide scan is a pathological path `commit-breadth` already covers
+in-process.
 
 `rig.sh up N` prints the exact `--endpoints`/`--rig` values for the cluster it just started, so
 they can be pasted straight into the commands above rather than derived from the port scheme by
