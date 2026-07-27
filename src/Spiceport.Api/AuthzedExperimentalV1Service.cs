@@ -40,6 +40,12 @@ public sealed class AuthzedExperimentalV1Service(IGrainFactory grains, ISchemaPr
         {
             throw ToRpc(ex);
         }
+        catch (SequencerOverloadedException ex)
+        {
+            // The per-silo admission gate shed this commit — the sequencer is saturated. A deliberate,
+            // retryable overload signal (back off and retry), never an opaque timeout.
+            throw new RpcException(new Status(StatusCode.ResourceExhausted, ex.Message));
+        }
 
         return new V1::ExperimentalRegisterRelationshipCounterResponse();
     }
@@ -54,6 +60,11 @@ public sealed class AuthzedExperimentalV1Service(IGrainFactory grains, ISchemaPr
         catch (CounterOperationException ex)
         {
             throw ToRpc(ex);
+        }
+        catch (SequencerOverloadedException ex)
+        {
+            // Sequencer overload shed by the admission gate: retryable RESOURCE_EXHAUSTED.
+            throw new RpcException(new Status(StatusCode.ResourceExhausted, ex.Message));
         }
 
         return new V1::ExperimentalUnregisterRelationshipCounterResponse();

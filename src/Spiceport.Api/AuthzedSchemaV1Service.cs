@@ -57,6 +57,12 @@ public sealed class AuthzedSchemaV1Service(IGrainFactory grains, ISchemaProvider
         {
             throw new RpcException(new Status(StatusCode.FailedPrecondition, ex.Message));
         }
+        catch (SequencerOverloadedException ex)
+        {
+            // The per-silo admission gate shed this commit — the sequencer is saturated. A deliberate,
+            // retryable overload signal (back off and retry), never an opaque timeout.
+            throw new RpcException(new Status(StatusCode.ResourceExhausted, ex.Message));
+        }
     }
 
     public override Task<V1::ReflectSchemaResponse> ReflectSchema(

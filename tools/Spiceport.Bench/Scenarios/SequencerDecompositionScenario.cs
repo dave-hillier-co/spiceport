@@ -83,6 +83,7 @@ public static class SequencerDecompositionScenario
         Console.WriteLine();
         var table = new ConsoleTable("sequencer counter", "count", "note");
         table.AddRow("Commit", seq.Commit, "inbound commits (accepted, rejected, or thrown)");
+        table.AddRow("CommitShed", seq.CommitShed, "commits shed by the per-silo admission gate (RESOURCE_EXHAUSTED)");
         table.AddRow("ReadFrom", seq.ReadFrom, "log-tail catch-up calls - the P2 fan-in observable");
         table.AddRow("ReadShard", seq.ReadShard, "cold-shard hydrations");
         table.AddRow("GetHead", seq.GetHead, "head reads (fresh-pinned consistency resolution)");

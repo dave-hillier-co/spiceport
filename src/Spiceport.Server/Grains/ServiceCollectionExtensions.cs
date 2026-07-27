@@ -71,6 +71,15 @@ public static class ServiceCollectionExtensions
         // ever records, so summing every silo's snapshot yields cluster-wide totals.
         services.AddSingleton<ISequencerMetrics, SequencerMetrics>();
 
+        // The per-silo sequencer write admission gate (issue #36): bounds this silo's in-flight commits
+        // to the singleton sequencer so overload sheds (RESOURCE_EXHAUSTED, retryable) instead of
+        // ramping into Orleans response timeouts. Default ON; retune or disable via an options override
+        // (the last-registration-wins pattern the other toggles use).
+        services.AddSingleton<SequencerAdmissionOptions>();
+        services.AddSingleton<SequencerAdmission>(sp => new SequencerAdmission(
+            sp.GetRequiredService<SequencerAdmissionOptions>(),
+            sp.GetRequiredService<ISequencerMetrics>()));
+
         // The check-dispatch cross-cutting grain-call filters, registered as plain DI singletons: Orleans
         // resolves every IIncomingGrainCallFilter/IOutgoingGrainCallFilter from the SAME container the
         // silo runtime uses, so this one registration covers both co-hosted hosts (Api, Silo) and any

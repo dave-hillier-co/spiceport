@@ -53,6 +53,14 @@ public interface ISequencerMetrics
     /// </summary>
     void RecordFlush();
 
+    /// <summary>
+    /// One commit was SHED by this silo's <see cref="SequencerAdmission"/> gate (never submitted to the
+    /// sequencer, surfaced to the client as <c>RESOURCE_EXHAUSTED</c>). Unlike every other counter here,
+    /// this is recorded on the SUBMITTING silo — the gate is per-silo — so any silo's value can be
+    /// nonzero; the snapshot sum is still the cluster-wide total.
+    /// </summary>
+    void RecordCommitShed();
+
     /// <summary>An immutable point-in-time snapshot of the counters.</summary>
     SequencerMetricsSnapshot Snapshot();
 
@@ -77,6 +85,7 @@ public interface ISequencerMetrics
 /// <param name="CommitCandidates9To64">Commits whose candidate-key set resolved to 9-64 keys.</param>
 /// <param name="CommitCandidates65Plus">Commits whose candidate-key set resolved to 65 or more keys.</param>
 /// <param name="Flush">Flush boundaries written (dirty-buffer flush + meta row durable).</param>
+/// <param name="CommitShed">Commits shed by the per-silo admission gate (recorded on the submitting silo).</param>
 public readonly record struct SequencerMetricsSnapshot(
     long Commit,
     long ReadFrom = 0,
@@ -90,7 +99,8 @@ public readonly record struct SequencerMetricsSnapshot(
     long CommitCandidates2To8 = 0,
     long CommitCandidates9To64 = 0,
     long CommitCandidates65Plus = 0,
-    long Flush = 0)
+    long Flush = 0,
+    long CommitShed = 0)
 {
     /// <summary>
     /// Aggregation across silos: component-wise sum, except <see cref="CommitMicrosMax"/> which combines
@@ -110,7 +120,8 @@ public readonly record struct SequencerMetricsSnapshot(
             a.CommitCandidates2To8 + b.CommitCandidates2To8,
             a.CommitCandidates9To64 + b.CommitCandidates9To64,
             a.CommitCandidates65Plus + b.CommitCandidates65Plus,
-            a.Flush + b.Flush);
+            a.Flush + b.Flush,
+            a.CommitShed + b.CommitShed);
 }
 
 /// <summary>Thread-safe atomic-counter <see cref="ISequencerMetrics"/> (the <see cref="DispatchMetrics"/> mechanism).</summary>
@@ -129,6 +140,7 @@ public sealed class SequencerMetrics : ISequencerMetrics
     private long _commitCandidates9To64;
     private long _commitCandidates65Plus;
     private long _flush;
+    private long _commitShed;
 
     /// <inheritdoc />
     public void RecordCommit(long elapsedMicroseconds)
@@ -176,6 +188,9 @@ public sealed class SequencerMetrics : ISequencerMetrics
     public void RecordFlush() => Interlocked.Increment(ref _flush);
 
     /// <inheritdoc />
+    public void RecordCommitShed() => Interlocked.Increment(ref _commitShed);
+
+    /// <inheritdoc />
     public SequencerMetricsSnapshot Snapshot() => new(
         Interlocked.Read(ref _commit),
         Interlocked.Read(ref _readFrom),
@@ -189,7 +204,8 @@ public sealed class SequencerMetrics : ISequencerMetrics
         Interlocked.Read(ref _commitCandidates2To8),
         Interlocked.Read(ref _commitCandidates9To64),
         Interlocked.Read(ref _commitCandidates65Plus),
-        Interlocked.Read(ref _flush));
+        Interlocked.Read(ref _flush),
+        Interlocked.Read(ref _commitShed));
 
     /// <inheritdoc />
     public void Reset()
@@ -207,5 +223,6 @@ public sealed class SequencerMetrics : ISequencerMetrics
         Interlocked.Exchange(ref _commitCandidates9To64, 0);
         Interlocked.Exchange(ref _commitCandidates65Plus, 0);
         Interlocked.Exchange(ref _flush, 0);
+        Interlocked.Exchange(ref _commitShed, 0);
     }
 }

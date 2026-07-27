@@ -238,7 +238,15 @@ Ceilings, honestly stated:
   touched keys), never O(graph). The one deliberately O(graph) surface left is the
   admin-plane `ReadState` assembly (scan seam, compatibility writes, equivalence gates).
 - **Write ceiling — deliberately retained.** One sequencer, one total order: the new-enemy
-  invariant and the recorded non-goal. The ceiling is a design stance, not a casualty.
+  invariant and the recorded non-goal. The ceiling is a design stance, not a casualty. What
+  happens AT the ceiling is governed: a per-silo admission gate (`SequencerAdmission`,
+  entered by the production declarative write path in `RelationshipsGrain`) bounds each
+  silo's in-flight commits, shedding the excess as `SequencerOverloadedException` → gRPC
+  `RESOURCE_EXHAUSTED` — a deliberate, retryable overload signal instead of an unbounded
+  activation queue collapsing into Orleans response timeouts (issue #36). The bound is
+  `SequencerAdmissionOptions.MaxInFlightCommits`; shed commits are counted by
+  `ISequencerMetrics.RecordCommitShed`. Raising the ceiling itself remains the separate,
+  demand-triggered batch/ticket/Calvin ladder (`docs/future-work.md` §1.15).
 
 Honest costs:
 

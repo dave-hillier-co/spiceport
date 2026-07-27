@@ -170,6 +170,12 @@ public sealed class AuthzedPermissionsV1Service(
             // SerializationError): a genuine write-write conflict the client retries as a whole tx.
             throw new RpcException(new Status(ToStatusCode(ex.Kind), ex.Message));
         }
+        catch (SequencerOverloadedException ex)
+        {
+            // The per-silo admission gate shed this commit — the sequencer is saturated. A deliberate,
+            // retryable overload signal (back off and retry), never an opaque timeout.
+            throw new RpcException(new Status(StatusCode.ResourceExhausted, ex.Message));
+        }
     }
 
     private static StatusCode ToStatusCode(WriteConflictKind kind) => kind switch
@@ -236,6 +242,11 @@ public sealed class AuthzedPermissionsV1Service(
         catch (PreconditionFailedException ex)
         {
             throw new RpcException(new Status(StatusCode.FailedPrecondition, ex.Message));
+        }
+        catch (SequencerOverloadedException ex)
+        {
+            // Sequencer overload shed by the admission gate: retryable RESOURCE_EXHAUSTED.
+            throw new RpcException(new Status(StatusCode.ResourceExhausted, ex.Message));
         }
     }
 
@@ -634,6 +645,11 @@ public sealed class AuthzedPermissionsV1Service(
         catch (WriteConflictException ex)
         {
             throw new RpcException(new Status(ToStatusCode(ex.Kind), ex.Message));
+        }
+        catch (SequencerOverloadedException ex)
+        {
+            // Sequencer overload shed by the admission gate: retryable RESOURCE_EXHAUSTED.
+            throw new RpcException(new Status(StatusCode.ResourceExhausted, ex.Message));
         }
     }
 

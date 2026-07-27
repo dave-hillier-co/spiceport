@@ -29,7 +29,8 @@ public sealed class RelationshipsGrain(
     ISchemaProvider schemaProvider,
     ISchemaSource schemaSource,
     ISnapshotScanner scanner,
-    LogWatchHub hub) : Grain, IRelationshipsGrain
+    LogWatchHub hub,
+    SequencerAdmission admission) : Grain, IRelationshipsGrain
 {
     // Orleans grain code must not ConfigureAwait(false); keep the captured context.
     private const ConfigureAwaitOptions ContinueOnCapturedContext = ConfigureAwaitOptions.ContinueOnCapturedContext;
@@ -45,6 +46,18 @@ public sealed class RelationshipsGrain(
 
     /// <summary>The cluster-singleton sequencer grain every declarative commit executes inside.</summary>
     private IDatastoreGrain Sequencer => GrainFactory.GetGrain<IDatastoreGrain>(IDatastoreGrain.Key);
+
+    /// <summary>
+    /// Submits one commit to the sequencer through the per-silo admission gate: a slot is held only for
+    /// the duration of the grain call (each retry attempt re-enters, so a retry storm is shed like any
+    /// other offered load). A full gate throws <see cref="SequencerOverloadedException"/> — the write is
+    /// shed before it can join the sequencer's activation queue (issue #36).
+    /// </summary>
+    private async Task<CommitReply> SubmitCommit(CommitRequest request)
+    {
+        using var slot = admission.Enter();
+        return await Sequencer.Commit(request).ConfigureAwait(ContinueOnCapturedContext);
+    }
 
     /// <inheritdoc />
     public async Task<WriteSchemaReply> WriteSchema(WriteSchemaArgs args)
@@ -137,7 +150,7 @@ public sealed class RelationshipsGrain(
                 .Select(c => new CommitPreconditionWire(WireConvert.ToFullFilter(c.Filter), MustMatch: false))
                 .ToList();
 
-            var reply = await Sequencer.Commit(new CommitRequest(
+            var reply = await SubmitCommit(new CommitRequest(
                 preconditions,
                 Array.Empty<RelationshipUpdateWire>(),
                 DeleteByFilter: null,
@@ -356,7 +369,7 @@ public sealed class RelationshipsGrain(
     {
         for (var attempt = 0; ; attempt++)
         {
-            var reply = await Sequencer.Commit(request).ConfigureAwait(ContinueOnCapturedContext);
+            var reply = await SubmitCommit(request).ConfigureAwait(ContinueOnCapturedContext);
             if (reply.Failure is not { Kind: CommitFailureKind.HeadMoved })
             {
                 // Same-silo Watch pulse parity with GrainBackedDatastore.ReadWriteTx: the sequencer's

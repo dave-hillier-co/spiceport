@@ -223,6 +223,12 @@ public sealed class PermissionsGrpcService(
             // The change would orphan existing relationships: reject and commit nothing.
             throw new RpcException(new Status(StatusCode.FailedPrecondition, ex.Message));
         }
+        catch (SequencerOverloadedException ex)
+        {
+            // The per-silo admission gate shed this commit — the sequencer is saturated. A deliberate,
+            // retryable overload signal (back off and retry), never an opaque timeout.
+            throw new RpcException(new Status(StatusCode.ResourceExhausted, ex.Message));
+        }
     }
 
     public override async Task<ReadSchemaResponse> ReadSchema(
@@ -249,6 +255,11 @@ public sealed class PermissionsGrpcService(
         catch (PreconditionFailedException ex)
         {
             throw new RpcException(new Status(StatusCode.FailedPrecondition, ex.Message));
+        }
+        catch (SequencerOverloadedException ex)
+        {
+            // Sequencer overload shed by the admission gate: retryable RESOURCE_EXHAUSTED.
+            throw new RpcException(new Status(StatusCode.ResourceExhausted, ex.Message));
         }
     }
 
@@ -295,6 +306,11 @@ public sealed class PermissionsGrpcService(
         catch (PreconditionFailedException ex)
         {
             throw new RpcException(new Status(StatusCode.FailedPrecondition, ex.Message));
+        }
+        catch (SequencerOverloadedException ex)
+        {
+            // Sequencer overload shed by the admission gate: retryable RESOURCE_EXHAUSTED.
+            throw new RpcException(new Status(StatusCode.ResourceExhausted, ex.Message));
         }
     }
 

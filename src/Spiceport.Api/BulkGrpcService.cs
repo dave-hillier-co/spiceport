@@ -66,6 +66,12 @@ public sealed class BulkGrpcService(IGrainFactory grains, Grains.RelationshipRea
             var code = ex.Kind == WriteConflictKind.CreateExisting ? StatusCode.AlreadyExists : StatusCode.Aborted;
             throw new RpcException(new Status(code, ex.Message));
         }
+        catch (SequencerOverloadedException ex)
+        {
+            // The per-silo admission gate shed this commit — the sequencer is saturated. A deliberate,
+            // retryable overload signal (back off and retry), never an opaque timeout.
+            throw new RpcException(new Status(StatusCode.ResourceExhausted, ex.Message));
+        }
     }
 
     public override async Task ExportBulkRelationships(
