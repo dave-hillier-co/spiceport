@@ -24,7 +24,8 @@ public static class DatastoreStorageConfig
     /// <summary>
     /// Primary configuration key for the Orleans grain-storage Postgres connection string. Set this
     /// (appsettings, user-secrets, or env <c>ConnectionStrings__OrleansStorage</c>) to enable durable
-    /// Postgres storage. When unset/empty, storage falls back to non-durable in-memory.
+    /// Postgres storage. When neither this key nor the fallback is present at all, storage falls back
+    /// to non-durable in-memory; a key that is present but blank refuses to start instead.
     /// </summary>
     public const string ConnectionStringKey = "ConnectionStrings:OrleansStorage";
 
@@ -44,8 +45,7 @@ public static class DatastoreStorageConfig
         ArgumentNullException.ThrowIfNull(silo);
         ArgumentNullException.ThrowIfNull(configuration);
 
-        var connectionString =
-            configuration[ConnectionStringKey] ?? configuration[FallbackConnectionStringKey];
+        var connectionString = ResolveConnectionString(configuration);
 
         if (string.IsNullOrWhiteSpace(connectionString))
         {
@@ -76,5 +76,42 @@ public static class DatastoreStorageConfig
             optionsBuilder.Configure<Serializer>((options, serializer) =>
                 options.GrainStorageSerializer = new OrleansGrainStorageSerializer(serializer));
         });
+    }
+
+    /// <summary>
+    /// Resolves the connection string as the first configured key that is present AND non-blank —
+    /// unlike <c>??</c>, an empty (but non-null) primary value does NOT short-circuit the fallback.
+    /// If a key was configured (present in <see cref="IConfiguration"/>) but every configured key
+    /// resolved blank, this refuses to start rather than silently degrading a production silo to
+    /// non-durable in-memory storage over what is almost always an unset env var / Helm default /
+    /// typo. A silo where NEITHER key is present at all (the ordinary local-dev/test shape) is left
+    /// alone and falls back to in-memory as before.
+    /// </summary>
+    internal static string? ResolveConnectionString(IConfiguration configuration)
+    {
+        var primary = configuration[ConnectionStringKey];
+        var fallback = configuration[FallbackConnectionStringKey];
+
+        if (!string.IsNullOrWhiteSpace(primary))
+        {
+            return primary;
+        }
+
+        if (!string.IsNullOrWhiteSpace(fallback))
+        {
+            return fallback;
+        }
+
+        if (primary is not null || fallback is not null)
+        {
+            throw new InvalidOperationException(
+                $"Datastore connection string configuration is present but blank " +
+                $"(checked '{ConnectionStringKey}' and '{FallbackConnectionStringKey}'). " +
+                "Refusing to silently start a non-durable in-memory datastore in place of the " +
+                "durable Postgres storage that was evidently intended. Either supply a valid " +
+                "connection string, or remove the key(s) entirely to opt into in-memory storage.");
+        }
+
+        return null;
     }
 }
