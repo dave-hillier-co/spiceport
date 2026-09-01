@@ -766,7 +766,7 @@ public sealed class AuthzedPermissionsV1Service(
         return new RelationshipUpdateWire(op, ToWire(u.Relationship));
     }
 
-    private static RelationshipWire ToWire(V1::Relationship r)
+    internal static RelationshipWire ToWire(V1::Relationship r)
     {
         var subjectRelation = string.IsNullOrEmpty(r.Subject.OptionalRelation)
             ? CoreConstants.Ellipsis

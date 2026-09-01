@@ -338,7 +338,7 @@ public sealed class PermissionsGrpcService(
         return new RelationshipUpdateWire(op, ToWire(u.Relationship));
     }
 
-    private static RelationshipWire ToWire(Relationship r)
+    internal static RelationshipWire ToWire(Relationship r)
     {
         var subjectRelation = string.IsNullOrEmpty(r.Subject.OptionalRelation)
             ? CoreConstants.Ellipsis

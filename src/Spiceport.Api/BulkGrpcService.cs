@@ -154,7 +154,7 @@ public sealed class BulkGrpcService(IGrainFactory grains, Grains.RelationshipRea
         f.OptionalSubjectIds.Count > 0 ? f.OptionalSubjectIds.ToList() : null,
         NullIfEmpty(f.OptionalSubjectRelation));
 
-    private static RelationshipWire ToWire(ProtoRelationship r)
+    internal static RelationshipWire ToWire(ProtoRelationship r)
     {
         var subjectRelation = string.IsNullOrEmpty(r.Subject.OptionalRelation)
             ? CoreConstants.Ellipsis

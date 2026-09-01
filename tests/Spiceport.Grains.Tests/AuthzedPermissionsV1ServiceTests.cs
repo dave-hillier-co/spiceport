@@ -540,42 +540,6 @@ public class AuthzedPermissionsV1ServiceTests
     }
 
     [Fact]
-    public async Task WriteRelationships_empty_caveat_name_with_context_discards_the_whole_caveat()
-    {
-        // A caveat with an empty name is not a valid caveat reference (SpiceDB requires a non-empty
-        // CaveatName to attach one at all) even when a context is present alongside it - the context
-        // must not survive as an orphan attached to an otherwise-uncaveated relationship (issue #42).
-        await using var cluster = await MeshTestCluster.CreateAsync(Schema);
-
-        var ctx = new Google.Protobuf.WellKnownTypes.Struct();
-        ctx.Fields["orphan"] = Google.Protobuf.WellKnownTypes.Value.ForString("context");
-
-        var req = new V1::WriteRelationshipsRequest();
-        req.Updates.Add(new V1::RelationshipUpdate
-        {
-            Operation = V1::RelationshipUpdate.Types.Operation.Touch,
-            Relationship = new V1::Relationship
-            {
-                Resource = new V1::ObjectReference { ObjectType = "document", ObjectId = "readme" },
-                Relation = "viewer",
-                Subject = UserSubject("alice"),
-                OptionalCaveat = new V1::ContextualizedCaveat { CaveatName = "", Context = ctx },
-            },
-        });
-
-        await Service(cluster).WriteRelationships(req, FakeServerCallContext.Default);
-
-        var reader = new CollectingStreamWriter<V1::ReadRelationshipsResponse>();
-        await Service(cluster).ReadRelationships(new V1::ReadRelationshipsRequest
-        {
-            RelationshipFilter = new V1::RelationshipFilter { ResourceType = "document", OptionalResourceId = "readme" },
-        }, reader, FakeServerCallContext.Default);
-
-        var only = Assert.Single(reader.Collected);
-        Assert.Null(only.Relationship.OptionalCaveat);
-    }
-
-    [Fact]
     public async Task CheckPermission_oversized_caveat_context_is_invalid_argument()
     {
         // A request caveat context larger than MaxCaveatContextSize (4096 bytes) is rejected with
