@@ -154,7 +154,7 @@ public sealed class BulkGrpcService(IGrainFactory grains, Grains.RelationshipRea
         f.OptionalSubjectIds.Count > 0 ? f.OptionalSubjectIds.ToList() : null,
         NullIfEmpty(f.OptionalSubjectRelation));
 
-    private static RelationshipWire ToWire(ProtoRelationship r)
+    internal static RelationshipWire ToWire(ProtoRelationship r)
     {
         var subjectRelation = string.IsNullOrEmpty(r.Subject.OptionalRelation)
             ? CoreConstants.Ellipsis
@@ -166,7 +166,7 @@ public sealed class BulkGrpcService(IGrainFactory grains, Grains.RelationshipRea
             r.Resource.ObjectType, r.Resource.ObjectId, r.ResourceRelation,
             r.Subject.Object.ObjectType, r.Subject.Object.ObjectId, subjectRelation,
             r.OptionalCaveat is { CaveatName.Length: > 0 } c ? c.CaveatName : null,
-            r.OptionalCaveat is { } cc ? StructToDict(cc.Context) : null,
+            r.OptionalCaveat is { CaveatName.Length: > 0 } cc ? StructToDict(cc.Context) : null,
             expiration);
     }
 

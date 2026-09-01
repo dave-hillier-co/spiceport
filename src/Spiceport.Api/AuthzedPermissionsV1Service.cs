@@ -766,7 +766,7 @@ public sealed class AuthzedPermissionsV1Service(
         return new RelationshipUpdateWire(op, ToWire(u.Relationship));
     }
 
-    private static RelationshipWire ToWire(V1::Relationship r)
+    internal static RelationshipWire ToWire(V1::Relationship r)
     {
         var subjectRelation = string.IsNullOrEmpty(r.Subject.OptionalRelation)
             ? CoreConstants.Ellipsis
@@ -775,7 +775,7 @@ public sealed class AuthzedPermissionsV1Service(
             r.Resource.ObjectType, r.Resource.ObjectId, r.Relation,
             r.Subject.Object.ObjectType, r.Subject.Object.ObjectId, subjectRelation,
             r.OptionalCaveat is { CaveatName.Length: > 0 } c ? c.CaveatName : null,
-            r.OptionalCaveat is { } cc ? StructToDict(cc.Context) : null,
+            r.OptionalCaveat is { CaveatName.Length: > 0 } cc ? StructToDict(cc.Context) : null,
             r.OptionalExpiresAt is { } exp ? exp.ToDateTimeOffset() : null);
     }
 
