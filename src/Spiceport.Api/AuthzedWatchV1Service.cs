@@ -158,8 +158,10 @@ public sealed class AuthzedWatchV1Service(IDatastore datastore, ISchemaProvider 
             };
         }
 
-        // If only checkpoints (or only schema) were selected, we still need a content slice or the
-        // changefeed would emit nothing to checkpoint over; SpiceDB's content selection is additive.
+        // No additive fallback needed here: the datastore's checkpoint emission (see
+        // IDatastore.Watch/WatchOptions) is keyed off commit activity itself, not off whether the
+        // requested content flags matched anything, so a checkpoints-only (or schema-only) mask still
+        // sees checkpoints emitted on every commit.
         return content;
     }
 

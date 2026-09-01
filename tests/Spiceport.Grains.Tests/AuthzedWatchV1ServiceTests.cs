@@ -206,6 +206,35 @@ public class AuthzedWatchV1ServiceTests
         Assert.Empty(first.Updates);
     }
 
+    [Fact]
+    public async Task Watch_with_checkpoints_only_still_emits_checkpoints_with_no_content()
+    {
+        await using var cluster = await MeshTestCluster.CreateAsync(Schema);
+        var service = Service(cluster);
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        var writer = new CollectingStreamWriter<V1::WatchResponse>();
+        var ctx = new FakeServerCallContext(cts.Token);
+
+        // Requesting checkpoints ONLY (no IncludeRelationshipUpdates, no IncludeSchemaUpdates): the
+        // resulting WatchContent has just the Checkpoints bit set. Content selection is additive in
+        // name only here — checkpoint emission is driven by commit activity, not by the content mask
+        // matching anything, so this must still see a checkpoint (and never relationship content).
+        var request = new V1::WatchRequest();
+        request.OptionalUpdateKinds.Add(V1::WatchKind.IncludeCheckpoints);
+        var watchTask = service.Watch(request, writer, ctx);
+
+        await WriteViewer(cluster, "document", "doc1", "alice");
+
+        var response = await writer.WaitForNext(TimeSpan.FromSeconds(10), watchTask);
+        cts.Cancel();
+        await watchTask;
+
+        Assert.True(response.IsCheckpoint);
+        Assert.Empty(response.Updates);
+        Assert.False(string.IsNullOrEmpty(response.ChangesThrough.Token));
+    }
+
     private sealed class CollectingStreamWriter<T> : IServerStreamWriter<T>
     {
         private readonly Channel<T> _channel = Channel.CreateUnbounded<T>();
