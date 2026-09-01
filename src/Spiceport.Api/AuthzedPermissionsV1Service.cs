@@ -771,13 +771,12 @@ public sealed class AuthzedPermissionsV1Service(
         var subjectRelation = string.IsNullOrEmpty(r.Subject.OptionalRelation)
             ? CoreConstants.Ellipsis
             : r.Subject.OptionalRelation;
-        // v1 core.proto Relationship has no expiration field in this snapshot.
         return new RelationshipWire(
             r.Resource.ObjectType, r.Resource.ObjectId, r.Relation,
             r.Subject.Object.ObjectType, r.Subject.Object.ObjectId, subjectRelation,
             r.OptionalCaveat is { CaveatName.Length: > 0 } c ? c.CaveatName : null,
             r.OptionalCaveat is { } cc ? StructToDict(cc.Context) : null,
-            null);
+            r.OptionalExpiresAt is { } exp ? exp.ToDateTimeOffset() : null);
     }
 
     private static V1::Relationship ToProto(RelationshipWire w)
@@ -800,6 +799,9 @@ public sealed class AuthzedPermissionsV1Service(
                 Context = DictToStruct(w.CaveatContext),
             };
         }
+
+        if (w.Expiration is { } expiration)
+            rel.OptionalExpiresAt = Timestamp.FromDateTimeOffset(expiration);
 
         return rel;
     }

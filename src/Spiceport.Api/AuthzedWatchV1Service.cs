@@ -204,6 +204,9 @@ public sealed class AuthzedWatchV1Service(IDatastore datastore, ISchemaProvider 
             proto.OptionalCaveat = pc;
         }
 
+        if (rel.OptionalExpiration is { } expiration)
+            proto.OptionalExpiresAt = Google.Protobuf.WellKnownTypes.Timestamp.FromDateTimeOffset(expiration);
+
         return proto;
     }
 
