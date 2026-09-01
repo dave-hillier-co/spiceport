@@ -33,10 +33,11 @@ public sealed class SchemaFilters
                 throw Invalid("cannot filter by both definition and caveat name");
             if (hasRelation && hasPermission)
                 throw Invalid("cannot filter by both relation and permission name");
+            // A caveat + relation/permission combination is rejected by one of the rules above:
+            // with a definition filter the def+caveat rule fires; without one this rule fires.
+            // Matches SpiceDB, which has no dedicated caveat-vs-relation check.
             if ((hasRelation || hasPermission) && !hasDef)
                 throw Invalid("relation/permission filter requires a definition filter");
-            if (hasCaveat && (hasRelation || hasPermission))
-                throw Invalid("cannot filter by both caveat and relation/permission name");
         }
 
         return new SchemaFilters(filters);
