@@ -84,4 +84,33 @@ public sealed class DatastoreStorageConfigTests
 
         Assert.Throws<InvalidOperationException>(() => DatastoreStorageConfig.ResolveConnectionString(config));
     }
+
+    /// <summary>
+    /// The refuse-to-start path must not break the shipped hosts under plain <c>dotnet run</c>: their
+    /// committed appsettings.json must resolve (to null or a real value), never throw.
+    /// </summary>
+    [Theory]
+    [InlineData("src/Spiceport.Api/appsettings.json")]
+    [InlineData("src/Spiceport.Silo/appsettings.json")]
+    public void ShippedHostAppsettings_ResolveWithoutRefusingToStart(string relativePath)
+    {
+        var config = new ConfigurationBuilder()
+            .AddJsonFile(Path.Combine(FindRepoRoot(), relativePath))
+            .Build();
+
+        var resolved = DatastoreStorageConfig.ResolveConnectionString(config);
+
+        Assert.True(resolved is null || !string.IsNullOrWhiteSpace(resolved));
+    }
+
+    private static string FindRepoRoot()
+    {
+        var dir = new DirectoryInfo(AppContext.BaseDirectory);
+        while (dir is not null && !File.Exists(Path.Combine(dir.FullName, "Spiceport.slnx")))
+        {
+            dir = dir.Parent!;
+        }
+
+        return dir?.FullName ?? throw new InvalidOperationException("Spiceport.slnx not found above test base directory.");
+    }
 }

@@ -24,7 +24,8 @@ public static class DatastoreStorageConfig
     /// <summary>
     /// Primary configuration key for the Orleans grain-storage Postgres connection string. Set this
     /// (appsettings, user-secrets, or env <c>ConnectionStrings__OrleansStorage</c>) to enable durable
-    /// Postgres storage. When unset/empty, storage falls back to non-durable in-memory.
+    /// Postgres storage. When neither this key nor the fallback is present at all, storage falls back
+    /// to non-durable in-memory; a key that is present but blank refuses to start instead.
     /// </summary>
     public const string ConnectionStringKey = "ConnectionStrings:OrleansStorage";
 
