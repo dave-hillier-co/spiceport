@@ -211,6 +211,87 @@ public class ConsistencyMeshTests
         Assert.Equal(CheckPermissionResponse.Types.Permissionship.HasPermission, resp.Permissionship);
     }
 
+    // ---- 6b. Garbage at_exact_snapshot tokens are InvalidArgument on every reverse/read RPC, not just
+    // CheckPermission (issue #41: ReadRelationships/ExpandPermissionTree/LookupSubjects/LookupResources
+    // had no error mapping at all, so RevisionResolver's InvalidConsistencyTokenException surfaced as an
+    // unmapped Unknown/Internal status instead). ----
+
+    private static Consistency GarbageSnapshot => new() { AtExactSnapshot = new ZedToken { Token = "garbage" } };
+
+    [Fact]
+    public async Task ReadRelationships_with_garbage_exact_snapshot_token_is_InvalidArgument()
+    {
+        await using var cluster = await MeshTestCluster.CreateAsync(ViewerSchema);
+        var service = Service(cluster);
+
+        var req = new ReadRelationshipsRequest
+        {
+            Filter = new RelationshipFilter { ResourceType = "document" },
+            Consistency = GarbageSnapshot,
+        };
+
+        var ex = await Assert.ThrowsAsync<RpcException>(
+            () => service.ReadRelationships(req, FakeContext.Instance));
+        Assert.Equal(StatusCode.InvalidArgument, ex.StatusCode);
+    }
+
+    [Fact]
+    public async Task ExpandPermissionTree_with_garbage_exact_snapshot_token_is_InvalidArgument()
+    {
+        await using var cluster = await MeshTestCluster.CreateAsync(ViewerSchema);
+        var service = Service(cluster);
+        await WriteViewer(service, "readme", "alice");
+
+        var req = new ExpandPermissionTreeRequest
+        {
+            Resource = new ObjectReference { ObjectType = "document", ObjectId = "readme" },
+            Permission = "view",
+            Consistency = GarbageSnapshot,
+        };
+
+        var ex = await Assert.ThrowsAsync<RpcException>(
+            () => service.ExpandPermissionTree(req, FakeContext.Instance));
+        Assert.Equal(StatusCode.InvalidArgument, ex.StatusCode);
+    }
+
+    [Fact]
+    public async Task LookupSubjects_with_garbage_exact_snapshot_token_is_InvalidArgument()
+    {
+        await using var cluster = await MeshTestCluster.CreateAsync(ViewerSchema);
+        var service = Service(cluster);
+
+        var req = new LookupSubjectsRequest
+        {
+            Resource = new ObjectReference { ObjectType = "document", ObjectId = "readme" },
+            Permission = "view",
+            SubjectObjectType = "user",
+            Consistency = GarbageSnapshot,
+        };
+
+        var ex = await Assert.ThrowsAsync<RpcException>(
+            () => service.LookupSubjects(req, FakeContext.Instance));
+        Assert.Equal(StatusCode.InvalidArgument, ex.StatusCode);
+    }
+
+    [Fact]
+    public async Task LookupResources_with_garbage_exact_snapshot_token_is_InvalidArgument()
+    {
+        await using var cluster = await MeshTestCluster.CreateAsync(ViewerSchema);
+        var service = Service(cluster);
+
+        var req = new LookupResourcesRequest
+        {
+            ResourceObjectType = "document",
+            Permission = "view",
+            Subject = new SubjectReference { Object = new ObjectReference { ObjectType = "user", ObjectId = "alice" } },
+            Consistency = GarbageSnapshot,
+        };
+
+        var ex = await Assert.ThrowsAsync<RpcException>(
+            () => service.LookupResources(req, FakeContext.Instance));
+        Assert.Equal(StatusCode.InvalidArgument, ex.StatusCode);
+    }
+
     // ---- 7. Response-token chaining never goes backwards. ----
 
     [Fact]

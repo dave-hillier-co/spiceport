@@ -77,6 +77,13 @@ public sealed class PermissionsGrpcService(
             },
             ex.Message));
 
+    private static RpcException ToRpc(CaveatEvaluationException ex) =>
+        new(new Status(
+            ex.Kind == CaveatEvaluationErrorKind.ParameterTypeMismatch
+                ? StatusCode.InvalidArgument
+                : StatusCode.FailedPrecondition,
+            ex.Message));
+
     public override async Task<CheckPermissionResponse> CheckPermission(
         CheckPermissionRequest request, ServerCallContext context)
     {
@@ -117,11 +124,7 @@ public sealed class PermissionsGrpcService(
         }
         catch (CaveatEvaluationException ex)
         {
-            throw new RpcException(new Status(
-                ex.Kind == CaveatEvaluationErrorKind.ParameterTypeMismatch
-                    ? StatusCode.InvalidArgument
-                    : StatusCode.FailedPrecondition,
-                ex.Message));
+            throw ToRpc(ex);
         }
         catch (DispatchFailedException ex)
         {
@@ -267,15 +270,30 @@ public sealed class PermissionsGrpcService(
         ReadRelationshipsRequest request, ServerCallContext context)
     {
         var limit = request.OptionalLimit == 0 ? (int?)null : (int)request.OptionalLimit;
-        var (items, cursor) = await Drain(
-            relationshipReads.ReadRelationships(
-                new ReadRelationshipsArgs(
-                    ToWire(request.Filter),
-                    limit,
-                    NullIfEmpty(request.OptionalCursor),
-                    ToWire(request.Consistency)),
-                context.CancellationToken),
-            limit, i => i.ResumeCursor, context.CancellationToken);
+        List<RelationshipStreamItem> items;
+        string? cursor;
+        try
+        {
+            (items, cursor) = await Drain(
+                relationshipReads.ReadRelationships(
+                    new ReadRelationshipsArgs(
+                        ToWire(request.Filter),
+                        limit,
+                        NullIfEmpty(request.OptionalCursor),
+                        ToWire(request.Consistency)),
+                    context.CancellationToken),
+                limit, i => i.ResumeCursor, context.CancellationToken);
+        }
+        catch (InvalidConsistencyTokenException ex)
+        {
+            throw new RpcException(new Status(StatusCode.InvalidArgument, ex.Message));
+        }
+        catch (RevisionNotFoundException ex)
+        {
+            // The pinned revision has been garbage-collected (or never existed): same client-facing
+            // contract as an invalid consistency token.
+            throw new RpcException(new Status(StatusCode.InvalidArgument, ex.Message));
+        }
 
         var resp = new ReadRelationshipsResponse
         {
@@ -395,12 +413,30 @@ public sealed class PermissionsGrpcService(
             ? ExpandModeWire.Recursive
             : ExpandModeWire.Shallow;
 
-        var reply = await reverseOps.ExpandPermissionTree(new ExpandTreeArgs(
-            request.Resource.ObjectType,
-            request.Resource.ObjectId,
-            request.Permission,
-            mode,
-            ToWire(request.Consistency)));
+        ExpandTreeReply reply;
+        try
+        {
+            reply = await reverseOps.ExpandPermissionTree(new ExpandTreeArgs(
+                request.Resource.ObjectType,
+                request.Resource.ObjectId,
+                request.Permission,
+                mode,
+                ToWire(request.Consistency)));
+        }
+        catch (InvalidConsistencyTokenException ex)
+        {
+            throw new RpcException(new Status(StatusCode.InvalidArgument, ex.Message));
+        }
+        catch (RevisionNotFoundException ex)
+        {
+            // The pinned revision has been garbage-collected (or never existed): same client-facing
+            // contract as an invalid consistency token.
+            throw new RpcException(new Status(StatusCode.InvalidArgument, ex.Message));
+        }
+        catch (DispatchFailedException ex)
+        {
+            throw ToRpc(ex);
+        }
 
         return new ExpandPermissionTreeResponse
         {
@@ -417,20 +453,43 @@ public sealed class PermissionsGrpcService(
             : request.OptionalSubjectRelation;
 
         var limit = request.OptionalLimit == 0 ? (int?)null : (int)request.OptionalLimit;
-        var (items, cursor) = await Drain(
-            reverseOps.StreamLookupSubjects(
-                new LookupSubjectsArgs(
-                    request.Resource.ObjectType,
-                    request.Resource.ObjectId,
-                    request.Permission,
-                    request.SubjectObjectType,
-                    subjectRelation,
-                    StructToDict(request.Context),
-                    limit,
-                    NullIfEmpty(request.OptionalCursor),
-                    ToWire(request.Consistency)),
-                context.CancellationToken),
-            limit, i => i.ResumeCursor, context.CancellationToken);
+        List<FoundSubjectStreamItem> items;
+        string? cursor;
+        try
+        {
+            (items, cursor) = await Drain(
+                reverseOps.StreamLookupSubjects(
+                    new LookupSubjectsArgs(
+                        request.Resource.ObjectType,
+                        request.Resource.ObjectId,
+                        request.Permission,
+                        request.SubjectObjectType,
+                        subjectRelation,
+                        StructToDict(request.Context),
+                        limit,
+                        NullIfEmpty(request.OptionalCursor),
+                        ToWire(request.Consistency)),
+                    context.CancellationToken),
+                limit, i => i.ResumeCursor, context.CancellationToken);
+        }
+        catch (InvalidConsistencyTokenException ex)
+        {
+            throw new RpcException(new Status(StatusCode.InvalidArgument, ex.Message));
+        }
+        catch (RevisionNotFoundException ex)
+        {
+            // The pinned revision has been garbage-collected (or never existed): same client-facing
+            // contract as an invalid consistency token.
+            throw new RpcException(new Status(StatusCode.InvalidArgument, ex.Message));
+        }
+        catch (CaveatEvaluationException ex)
+        {
+            throw ToRpc(ex);
+        }
+        catch (DispatchFailedException ex)
+        {
+            throw ToRpc(ex);
+        }
 
         var resp = new LookupSubjectsResponse
         {
@@ -449,20 +508,43 @@ public sealed class PermissionsGrpcService(
             : request.Subject.OptionalRelation;
 
         var limit = request.OptionalLimit == 0 ? (int?)null : (int)request.OptionalLimit;
-        var (items, cursor) = await Drain(
-            reverseOps.StreamLookupResources(
-                new LookupResourcesArgs(
-                    request.ResourceObjectType,
-                    request.Permission,
-                    request.Subject.Object.ObjectType,
-                    request.Subject.Object.ObjectId,
-                    subjectRelation,
-                    StructToDict(request.Context),
-                    limit,
-                    NullIfEmpty(request.OptionalCursor),
-                    ToWire(request.Consistency)),
-                context.CancellationToken),
-            limit, r => r.AfterResultCursor, context.CancellationToken);
+        List<WireFoundResource> items;
+        string? cursor;
+        try
+        {
+            (items, cursor) = await Drain(
+                reverseOps.StreamLookupResources(
+                    new LookupResourcesArgs(
+                        request.ResourceObjectType,
+                        request.Permission,
+                        request.Subject.Object.ObjectType,
+                        request.Subject.Object.ObjectId,
+                        subjectRelation,
+                        StructToDict(request.Context),
+                        limit,
+                        NullIfEmpty(request.OptionalCursor),
+                        ToWire(request.Consistency)),
+                    context.CancellationToken),
+                limit, r => r.AfterResultCursor, context.CancellationToken);
+        }
+        catch (InvalidConsistencyTokenException ex)
+        {
+            throw new RpcException(new Status(StatusCode.InvalidArgument, ex.Message));
+        }
+        catch (RevisionNotFoundException ex)
+        {
+            // The pinned revision has been garbage-collected (or never existed): same client-facing
+            // contract as an invalid consistency token.
+            throw new RpcException(new Status(StatusCode.InvalidArgument, ex.Message));
+        }
+        catch (CaveatEvaluationException ex)
+        {
+            throw ToRpc(ex);
+        }
+        catch (DispatchFailedException ex)
+        {
+            throw ToRpc(ex);
+        }
 
         var resp = new LookupResourcesResponse
         {
