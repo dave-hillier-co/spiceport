@@ -741,6 +741,36 @@ public class AuthzedPermissionsV1ServiceTests
     }
 
     [Fact]
+    public async Task WriteRelationships_then_ReadRelationships_round_trips_expiration()
+    {
+        await using var cluster = await MeshTestCluster.CreateAsync(Schema);
+
+        var expiresAt = new DateTimeOffset(2099, 1, 1, 0, 0, 0, TimeSpan.Zero);
+        var req = new V1::WriteRelationshipsRequest();
+        req.Updates.Add(new V1::RelationshipUpdate
+        {
+            Operation = V1::RelationshipUpdate.Types.Operation.Touch,
+            Relationship = new V1::Relationship
+            {
+                Resource = new V1::ObjectReference { ObjectType = "document", ObjectId = "readme" },
+                Relation = "viewer",
+                Subject = UserSubject("alice"),
+                OptionalExpiresAt = Google.Protobuf.WellKnownTypes.Timestamp.FromDateTimeOffset(expiresAt),
+            },
+        });
+        await Service(cluster).WriteRelationships(req, FakeServerCallContext.Default);
+
+        var writer = new CollectingStreamWriter<V1::ReadRelationshipsResponse>();
+        await Service(cluster).ReadRelationships(new V1::ReadRelationshipsRequest
+        {
+            RelationshipFilter = new V1::RelationshipFilter { ResourceType = "document", OptionalResourceId = "readme" },
+        }, writer, FakeServerCallContext.Default);
+
+        var only = Assert.Single(writer.Collected);
+        Assert.Equal(Google.Protobuf.WellKnownTypes.Timestamp.FromDateTimeOffset(expiresAt), only.Relationship.OptionalExpiresAt);
+    }
+
+    [Fact]
     public async Task DeleteRelationships_deletes_matching_and_returns_token()
     {
         await using var cluster = await MeshTestCluster.CreateAsync(Schema);

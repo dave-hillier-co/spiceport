@@ -45,6 +45,15 @@ public class AuthzedWatchV1ServiceTests
         return cluster.Relationships.WriteRelationships(new WireWriteArgs(new List<WireUpdate> { update }));
     }
 
+    private static Task WriteViewerWithExpiration(
+        MeshTestCluster cluster, string type, string id, string user, DateTimeOffset expiration)
+    {
+        var update = new WireUpdate(
+            WireOp.Touch,
+            new WireRelationship(type, id, "viewer", "user", user, "...", null, null, expiration));
+        return cluster.Relationships.WriteRelationships(new WireWriteArgs(new List<WireUpdate> { update }));
+    }
+
     [Fact]
     public async Task Watch_from_head_sees_subsequent_write_with_token()
     {
@@ -96,6 +105,31 @@ public class AuthzedWatchV1ServiceTests
         var update = Assert.Single(response.Updates);
         Assert.Equal("doc2", update.Relationship.Resource.ObjectId);
         Assert.Equal("bob", update.Relationship.Subject.Object.ObjectId);
+    }
+
+    [Fact]
+    public async Task Watch_includes_relationship_expiration()
+    {
+        await using var cluster = await MeshTestCluster.CreateAsync(Schema);
+        var service = Service(cluster);
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        var writer = new CollectingStreamWriter<V1::WatchResponse>();
+        var ctx = new FakeServerCallContext(cts.Token);
+
+        var watchTask = service.Watch(new V1::WatchRequest(), writer, ctx);
+
+        var expiresAt = new DateTimeOffset(2099, 1, 1, 0, 0, 0, TimeSpan.Zero);
+        await WriteViewerWithExpiration(cluster, "document", "doc3", "dana", expiresAt);
+
+        var response = await writer.WaitForNext(TimeSpan.FromSeconds(10), watchTask);
+        cts.Cancel();
+        await watchTask;
+
+        var update = Assert.Single(response.Updates);
+        Assert.Equal(
+            Google.Protobuf.WellKnownTypes.Timestamp.FromDateTimeOffset(expiresAt),
+            update.Relationship.OptionalExpiresAt);
     }
 
     [Fact]
