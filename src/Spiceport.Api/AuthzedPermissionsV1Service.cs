@@ -776,7 +776,7 @@ public sealed class AuthzedPermissionsV1Service(
             r.Resource.ObjectType, r.Resource.ObjectId, r.Relation,
             r.Subject.Object.ObjectType, r.Subject.Object.ObjectId, subjectRelation,
             r.OptionalCaveat is { CaveatName.Length: > 0 } c ? c.CaveatName : null,
-            r.OptionalCaveat is { } cc ? StructToDict(cc.Context) : null,
+            r.OptionalCaveat is { CaveatName.Length: > 0 } cc ? StructToDict(cc.Context) : null,
             null);
     }
 
