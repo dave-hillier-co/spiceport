@@ -377,12 +377,48 @@ public sealed class LegacyMigrationDurabilityTests
         }
     }
 
+    /// <summary>
+    /// A silo wired ONLY with the "datastore" grain-storage provider — no <c>AddSpiceportGrainServices</c>,
+    /// so no <c>LogWatchHubStarter</c> hosted service and therefore no <c>LogWatchHub</c> heartbeat that
+    /// would call <see cref="IDatastoreGrain.SubscribeWatch"/> on boot and activate the singleton grain
+    /// (issue #38: that activation raced the seed phase's own read-then-write of the <c>head</c> row).
+    /// A grain REFERENCE (<see cref="Grain"/>) never activates anything — only a call does — so this
+    /// still yields the exact <see cref="GrainId"/> the production grain will be addressed by, with
+    /// nothing left running to race the seed writes.
+    /// </summary>
+    private sealed class SeedOnlySiloConfigurator : ISiloConfigurator
+    {
+        public void Configure(ISiloBuilder siloBuilder)
+        {
+            var config = new ConfigurationBuilder()
+                .AddInMemoryCollection(new Dictionary<string, string?>
+                {
+                    [DatastoreStorageConfig.ConnectionStringKey] = ConnHolder.ConnectionString,
+                })
+                .Build();
+            siloBuilder.AddDatastoreGrainStorage(config);
+            siloBuilder.AddCustomStorageBasedLogConsistencyProvider("CustomStorage");
+        }
+    }
+
     private static async Task<TestCluster> BuildClusterAsync(string connectionString)
     {
         ConnHolder.ConnectionString = connectionString;
         var builder = new TestClusterBuilder(initialSilosCount: 1);
         builder.Options.ServiceId = "spiceport-durability-thin-migration";
         builder.AddSiloBuilderConfigurator<MigrationSiloConfigurator>();
+        var cluster = builder.Build();
+        await cluster.DeployAsync();
+        return cluster;
+    }
+
+    /// <summary>Same storage/ServiceId namespace as <see cref="BuildClusterAsync"/>, minus the grain services.</summary>
+    private static async Task<TestCluster> BuildSeedOnlyClusterAsync(string connectionString)
+    {
+        ConnHolder.ConnectionString = connectionString;
+        var builder = new TestClusterBuilder(initialSilosCount: 1);
+        builder.Options.ServiceId = "spiceport-durability-thin-migration";
+        builder.AddSiloBuilderConfigurator<SeedOnlySiloConfigurator>();
         var cluster = builder.Build();
         await cluster.DeployAsync();
         return cluster;
@@ -485,14 +521,18 @@ public sealed class LegacyMigrationDurabilityTests
         const int legacyVersion = 3; // the pre-rework layout: head names snapshot/{v} with LogVersion == v
 
         // --- Phase 1: seed the database in the OLD layout through the storage provider directly,
-        // WITHOUT ever calling the datastore grain (getting a grain reference does not activate it). ---
-        var seedCluster = await BuildClusterAsync(_fixture.ConnectionString);
+        // WITHOUT ever calling the datastore grain (getting a grain reference does not activate it) and
+        // WITHOUT any grain-services silo that would activate it itself (issue #38: LogWatchHubStarter's
+        // heartbeat used to do exactly that on the seed cluster, racing this phase's read-then-write of
+        // the head row). ---
+        GrainId seedGrainId;
+        var seedCluster = await BuildSeedOnlyClusterAsync(_fixture.ConnectionString);
         try
         {
             var storage = Storage(seedCluster);
-            var grainId = DatastoreGrainId(seedCluster);
-            await WriteRow(storage, grainId, $"snapshot/{legacyVersion}", legacy);
-            await WriteRow(storage, grainId, "head", new LogHeadEntry(legacyVersion, head, legacyVersion));
+            seedGrainId = DatastoreGrainId(seedCluster);
+            await WriteRow(storage, seedGrainId, $"snapshot/{legacyVersion}", legacy);
+            await WriteRow(storage, seedGrainId, "head", new LogHeadEntry(legacyVersion, head, legacyVersion));
         }
         finally
         {
@@ -503,6 +543,11 @@ public sealed class LegacyMigrationDurabilityTests
         var cluster = await BuildClusterAsync(_fixture.ConnectionString);
         try
         {
+            // Pins the seed-only cluster's derived GrainId against a real, fully-wired cluster's identity
+            // for the same key — the derivation cannot silently drift and leave the seed writing rows the
+            // production grain never reads.
+            Assert.Equal(DatastoreGrainId(cluster), seedGrainId);
+
             var ds = Datastore(cluster);
 
             // The migrated head/schema-hash are exactly the legacy ones (not a re-seeded empty state).
@@ -727,12 +772,44 @@ public sealed class InlineIndexMigrationDurabilityTests
         }
     }
 
+    /// <summary>
+    /// See <see cref="LegacyMigrationDurabilityTests.SeedOnlySiloConfigurator"/>: no grain services, so
+    /// no <c>LogWatchHubStarter</c> heartbeat to activate the singleton grain out from under the seed
+    /// phase's own read-then-write of its rows (issue #38).
+    /// </summary>
+    private sealed class SeedOnlySiloConfigurator : ISiloConfigurator
+    {
+        public void Configure(ISiloBuilder siloBuilder)
+        {
+            var config = new ConfigurationBuilder()
+                .AddInMemoryCollection(new Dictionary<string, string?>
+                {
+                    [DatastoreStorageConfig.ConnectionStringKey] = ConnHolder.ConnectionString,
+                })
+                .Build();
+            siloBuilder.AddDatastoreGrainStorage(config);
+            siloBuilder.AddCustomStorageBasedLogConsistencyProvider("CustomStorage");
+        }
+    }
+
     private static async Task<TestCluster> BuildClusterAsync(string connectionString)
     {
         ConnHolder.ConnectionString = connectionString;
         var builder = new TestClusterBuilder(initialSilosCount: 1);
         builder.Options.ServiceId = "spiceport-durability-thin-v1-migration";
         builder.AddSiloBuilderConfigurator<InlineMigrationSiloConfigurator>();
+        var cluster = builder.Build();
+        await cluster.DeployAsync();
+        return cluster;
+    }
+
+    /// <summary>Same storage/ServiceId namespace as <see cref="BuildClusterAsync"/>, minus the grain services.</summary>
+    private static async Task<TestCluster> BuildSeedOnlyClusterAsync(string connectionString)
+    {
+        ConnHolder.ConnectionString = connectionString;
+        var builder = new TestClusterBuilder(initialSilosCount: 1);
+        builder.Options.ServiceId = "spiceport-durability-thin-v1-migration";
+        builder.AddSiloBuilderConfigurator<SeedOnlySiloConfigurator>();
         var cluster = builder.Build();
         await cluster.DeployAsync();
         return cluster;
@@ -834,19 +911,22 @@ public sealed class InlineIndexMigrationDurabilityTests
         };
 
         // --- Phase 1: seed the database in the v1 layout through the storage provider directly (the
-        // old-shape meta entry: inline maps, no IndexLayout), WITHOUT activating the grain. ---
-        var seedCluster = await BuildClusterAsync(_fixture.ConnectionString);
+        // old-shape meta entry: inline maps, no IndexLayout), WITHOUT activating the grain (no grain
+        // call) and WITHOUT a grain-services silo that would activate it itself via the LogWatchHub
+        // heartbeat (issue #38). ---
+        GrainId seedGrainId;
+        var seedCluster = await BuildSeedOnlyClusterAsync(_fixture.ConnectionString);
         try
         {
             var storage = Storage(seedCluster);
-            var grainId = DatastoreGrainId(seedCluster);
+            seedGrainId = DatastoreGrainId(seedCluster);
             foreach (var (key, row) in shardRows)
             {
-                await WriteRow(storage, grainId, ShardRowKey(v1Version, key),
+                await WriteRow(storage, seedGrainId, ShardRowKey(v1Version, key),
                     new GraphShardState(head, 0, ImmutableList.Create(row)));
             }
-            await WriteRow(storage, grainId, $"meta/{v1Version}", new DatastoreMetaEntry(v1Meta, v1Version));
-            await WriteRow(storage, grainId, "head", new LogHeadEntry(v1Version, head, v1Version));
+            await WriteRow(storage, seedGrainId, $"meta/{v1Version}", new DatastoreMetaEntry(v1Meta, v1Version));
+            await WriteRow(storage, seedGrainId, "head", new LogHeadEntry(v1Version, head, v1Version));
         }
         finally
         {
@@ -857,6 +937,11 @@ public sealed class InlineIndexMigrationDurabilityTests
         var cluster = await BuildClusterAsync(_fixture.ConnectionString);
         try
         {
+            // Pins the seed-only cluster's derived GrainId against a real, fully-wired cluster's identity
+            // for the same key — the derivation cannot silently drift and leave the seed writing rows the
+            // production grain never reads.
+            Assert.Equal(DatastoreGrainId(cluster), seedGrainId);
+
             var ds = Datastore(cluster);
 
             // Migrated head/schema-hash exactly the seeded ones (not a re-seeded empty state).
