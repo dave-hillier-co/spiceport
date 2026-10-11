@@ -40,27 +40,31 @@ dotnet test tests/Spiceport.Conformance.Tests  # the SpiceDB conformance corpus 
   and are reused everywhere — the `ReferenceDatastore` reference model and the per-key graph-shard
   folds (`ShardFold`, a key-restriction of the same fold) share one set of semantics.
 - **Storage is an event-sourced grain (the log is the storage/compute seam).** All
-  relationship/schema/counter state lives behind a single cluster-singleton `DatastoreGrain`, a
-  **journaled grain whose append-only `LogEvent` log is the source of truth**; the materialized state
-  is the fold. A commit is a version-checked **append** (the CAS serialization point), not a
-  whole-state rewrite; the single non-reentrant activation makes the minted revision the cluster-wide
-  global order. Persistence is the grain's own via `ICustomStorageInterface` over an Orleans
-  grain-storage provider — **no application SQL** (per-version log entries + periodic snapshots +
-  compaction). Engine reads go through **per-key `GraphShardGrain`s** (forward shards keyed by
-  object, reverse shards keyed by subject — resolved via `ShardedGraphReader` behind the
-  `IGraphReaderSource` seam): each shard's activation state is the per-key restriction of the fold
-  (`ShardFold`), hydrated once from `ReadShard` and advanced by tailing the log, so activation *is*
-  the hot-set cache — cold keys never activate, silo memory is O(hot shards), not O(graph). The
-  per-shard `AppliedRevision` watermark is the closed-timestamp gate: exact/at-least-as-fresh reads
-  block until the shard's watermark covers the pinned revision. Writes are **declarative
-  `DatastoreGrain.Commit`** — preconditions/updates/deleteByFilter/schema (with `ExpectedSchemaHash`)
-  /counters evaluated and executed on the sequencer's single non-reentrant activation, rejections
-  returned as typed `CommitReply` failures with nothing applied; `ReadWriteTx` survives only as the
-  `ExpectedHead` compatibility path over the same wire contract. Broad/admin scans (loose-filter
-  ReadRelationships, bulk export, counters) and schema-at-revision bypass the shard mesh and fetch
-  the sequencer snapshot (`ISnapshotScanner` / `ISchemaSource`). The sequencer grain still
-  materializes the whole fold; slimming it (per-shard durable snapshots + tail trim) is the recorded
-  next step (`docs/graph-sharded-datastore.md` §7). The same log feed
+  relationship/schema/counter state is sequenced by a single cluster-singleton `DatastoreGrain`, an
+  ordinary **journaled grain** (state-storage log consistency over a stock Orleans grain-storage
+  provider) whose journal of `LogEvent`s is the source of truth; the single non-reentrant activation
+  makes the minted revision the cluster-wide global order. Its journaled state is only the small
+  state (head, schemas, counters, GC floor, types seen) plus the **pending tail** — committed events
+  not yet projected. **No application SQL and no storage layout of its own.** Every 64 events the
+  sequencer **projects** the tail: each per-key `GraphShardGrain` it touches (forward shards keyed by
+  object, reverse shards keyed by subject) folds its events into its own persisted state
+  (`ShardFold`, a key-restriction of the log fold), the keys go into the bucketed `ShardIndexGrain`s,
+  and only then is a `Projected` entry journaled — so every committed event is either projected or
+  pending, and a crash just replays the tail (projection is idempotent by its label). Engine reads go
+  through the shard grains (resolved via `ShardedGraphReader` behind the `IGraphReaderSource` seam):
+  a shard's activation state is its projection plus the pending events for its key, advanced by
+  tailing the log, so activation *is* the hot-set cache — cold keys never activate except to be
+  projected, silo memory is O(hot shards), not O(graph). The per-shard `AppliedRevision` watermark is
+  the closed-timestamp gate: exact/at-least-as-fresh reads block until the shard's watermark covers
+  the pinned revision. Writes are **declarative `DatastoreGrain.Commit`** —
+  preconditions/updates/deleteByFilter/schema (with `ExpectedSchemaHash`)/counters evaluated and
+  executed on the sequencer's single non-reentrant activation over a partial base of exactly the keys
+  the request can read, rejections returned as typed `CommitReply` failures with nothing applied;
+  `ReadWriteTx` survives only as the `ExpectedHead` compatibility path over the same wire contract.
+  Broad/admin scans (loose-filter ReadRelationships, bulk export, counters) assemble the
+  sequencer's on-demand `ReadState` through the shard index (`ISnapshotScanner`), and
+  schema-at-revision reads the sequencer (`ISchemaSource`). See `docs/graph-sharded-datastore.md`.
+  The same log feed
   drives **Watch** (one per-silo `LogWatchHub` notifier, no per-stream polling) and an on-by-default
   (opt-out via `MembershipWalkOptions`) **Leopard membership-walk grain mesh** (`IMembershipWalkGrain`,
   sharded as addressable per-subject walk grains — sibling recursion across grain boundaries, cold sets

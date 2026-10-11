@@ -128,8 +128,8 @@ internal static class ShardFold
 
     /// <summary>
     /// Collects the shard's rows below <paramref name="floor"/> and stamps the watermark to
-    /// <paramref name="revision"/> — the GC branch of the fold, exposed for the thin sequencer's lazy
-    /// row GC: stored rows are only compacted when next dirtied and flushed, so every serve path
+    /// <paramref name="revision"/> — the GC branch of the fold, exposed for lazy row GC: a shard's
+    /// projected rows are only compacted when its key is next projected, so every serve path
     /// re-applies the current floor through this method (a floor at or below the shard's own is a pure
     /// relabel). Applying the LATEST floor once is equivalent to applying every intermediate GC event's
     /// floor in sequence: a row is dropped iff it is fully dead or expired at/below the final floor,
@@ -138,6 +138,30 @@ internal static class ShardFold
     /// </summary>
     public static GraphShardState CollectBelow(GraphShardState state, long revision, long floor) =>
         ApplyGc(state, revision, floor);
+
+    /// <summary>
+    /// The current per-key state from a shard's PROJECTED state and the sequencer's pending tail:
+    /// folds the pending relationship events that touch <paramref name="key"/> and lie above the
+    /// projected label (those at or below it are already projected), then relabels to
+    /// <paramref name="head"/> and applies <paramref name="floor"/>. Exact because every event touching
+    /// the key is either projected (at or below the label) or pending; GC events need no replay, since
+    /// applying the latest floor once subsumes every earlier one (see <see cref="CollectBelow"/>).
+    /// </summary>
+    public static GraphShardState Overlay(
+        GraphShardState projected, IEnumerable<LogEvent> pending, GraphShardKeyWire key, long head, long floor)
+    {
+        var state = projected;
+        foreach (var ev in pending)
+        {
+            if (ev.Revision > projected.AppliedRevision && Touches(ev, key))
+                state = ApplyEvent(state, ev, key);
+        }
+        return ApplyGc(state, Math.Max(state.AppliedRevision, head), Math.Max(floor, state.GcFloor));
+    }
+
+    /// <summary>True when <paramref name="ev"/> changes a relationship in <paramref name="key"/>'s slice.</summary>
+    public static bool Touches(LogEvent ev, GraphShardKeyWire key) =>
+        ev.GcFloor is null && ev.RelationshipChanges.Any(change => key.Matches(change.Relationship));
 
     // Mirrors DatastoreState.CollectBelow's relationship rules exactly: drop a row when it is fully
     // dead below the floor (DeletedRevision <= floor) OR expired at/before the floor (the expiration

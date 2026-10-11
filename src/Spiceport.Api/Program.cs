@@ -19,7 +19,7 @@ builder.Host.UseOrleans(silo =>
     silo.AddDatastoreGrainStorage(builder.Configuration);
     // The event-sourced datastore grain owns its persistence via ICustomStorageInterface over the
     // "datastore" grain-storage provider above.
-    silo.AddCustomStorageBasedLogConsistencyProvider("CustomStorage");
+    silo.AddStateStorageBasedLogConsistencyProvider("StateStorage");
     // Backs the datastore grain's periodic MVCC-GC reminder ("mvcc-gc"). In-memory is fine even for a
     // durable deployment: losing a reminder registration is safe because the singleton grain re-registers
     // it on every activation (see DatastoreGrain.OnActivateAsync) — a production cluster that wants the

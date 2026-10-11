@@ -17,12 +17,11 @@ public interface IDatastoreGrain : IGrainWithIntegerKey, IDatastoreLog
 
     /// <summary>
     /// Returns the full committed state, ASSEMBLED on demand for the admin plane (the scan seam, the
-    /// compatibility ReadWriteTx write base, the equivalence gates): under the thin-sequencer layout the
-    /// grain no longer materializes the whole fold, so this call rebuilds it from the small state plus
-    /// every indexed forward key's current shard state (dirty overlay winning per key). Semantics are
-    /// identical to the retired materialized fold; the cost is O(graph) storage reads and transfer PER
-    /// CALL — never use it on the per-Check hot path (that reads through <see cref="ReadShard"/> / the
-    /// shard mesh). Marked <see cref="AlwaysInterleaveAttribute"/> — see the remark on
+    /// compatibility ReadWriteTx write base, the equivalence gates): the sequencer holds no relationship
+    /// rows, so this call enumerates every forward key through the shard index (plus the pending tail's
+    /// keys) and folds each key's pending events over its shard grain's projected state. The cost is
+    /// O(graph) grain calls and transfer PER CALL — never use it on the per-Check hot path (that reads
+    /// through the shard mesh). Marked <see cref="AlwaysInterleaveAttribute"/> — see the remark on
     /// <see cref="Commit"/> — never <c>[ReadOnly]</c>, which would not interleave against the
     /// non-read-only <see cref="Commit"/>.
     /// </summary>
@@ -50,19 +49,31 @@ public interface IDatastoreGrain : IGrainWithIntegerKey, IDatastoreLog
     Task<byte[]?> ReadSchemaAt(long revision);
 
     /// <summary>
-    /// The once-per-shard hydration read: the current per-key slice for <paramref name="key"/>, served
-    /// WITHOUT any whole-state scan — the sequencer's dirty-buffer entry when the key was touched since
-    /// its last flush, otherwise the key's durable shard row relabeled to the current head (sound because
-    /// any touching event would have dirtied the key — the sharding fact), otherwise empty-at-head. The
-    /// reply's <see cref="GraphShardState.AppliedRevision"/> is the CURRENT head and
-    /// <see cref="GraphShardState.GcFloor"/> the current floor (applied to the rows) — a shard hydrated
-    /// from this snapshot is exactly the per-key fold at that head (the sharding lemma). Marked
-    /// <see cref="AlwaysInterleaveAttribute"/> — a pure read, interleaving exactly like
-    /// <see cref="ReadState"/>; never <c>[ReadOnly]</c>, which would not interleave past the
-    /// non-read-only <see cref="Commit"/> (the lesson documented on <see cref="IDatastoreLog.ReadFrom"/>).
+    /// The current per-key slice for <paramref name="key"/> at the current head: the key's shard grain's
+    /// projected state with the pending events that touch it folded over, relabeled to the head
+    /// (sound because any event touching the key is either projected or pending), with the current GC
+    /// floor applied. An admin-plane and test read; a shard grain hydrating itself uses
+    /// <see cref="ReadShardTail"/> instead, so it never waits on a call back into itself.
     /// </summary>
     [AlwaysInterleave]
     Task<GraphShardState> ReadShard(GraphShardKeyWire key);
+
+    /// <summary>
+    /// The pending events touching <paramref name="key"/>, with the head and GC floor: what a shard
+    /// grain folds over its own projected state to hydrate. Read the tail BEFORE re-reading the
+    /// projected state it is folded over: a projection that lands in between is then already in the
+    /// projected state and skipped by its label, while one that has not landed is still in the tail.
+    /// Marked <see cref="AlwaysInterleaveAttribute"/> — a pure read of the journaled state.
+    /// </summary>
+    [AlwaysInterleave]
+    Task<ShardTailWire> ReadShardTail(GraphShardKeyWire key);
+
+    /// <summary>
+    /// Projects every pending event into the shard grains it touches and the shard index, then journals
+    /// that the projection has caught up. The sequencer does this itself every flush interval; calling
+    /// it directly is a test and operations seam. A write: never interleaves another write.
+    /// </summary>
+    Task FlushProjection();
 
     /// <summary>
     /// Executes a declarative <see cref="CommitRequest"/> INSIDE the sequencer (docs/graph-sharded-datastore.md

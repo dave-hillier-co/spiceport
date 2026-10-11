@@ -240,6 +240,8 @@ public sealed class GrainBackedDatastoreWriteBaseTests
 
         // The write path under test never hydrates shards; a call here would be a routing bug.
         public Task<GraphShardState> ReadShard(GraphShardKeyWire key) => throw new NotSupportedException();
+        public Task<ShardTailWire> ReadShardTail(GraphShardKeyWire key) => throw new NotSupportedException();
+        public Task FlushProjection() => Task.CompletedTask;
 
         public Task<byte[]?> ReadSchemaAt(long revision)
         {

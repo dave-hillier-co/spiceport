@@ -6,12 +6,15 @@ using Spiceport.Grains.Abstractions;
 namespace Spiceport.Grains;
 
 /// <summary>
-/// One graph shard as a grain: the activation state IS the shard cache. The state is the per-key
+/// One graph shard as a grain, with two states. Its PROJECTED state is durable: the per-key
 /// restriction of the datastore fold (<see cref="ShardFold"/>) for the <see cref="GraphShardKeyWire"/>
-/// named by this grain's string key — hydrated once from <see cref="IDatastoreGrain.ReadShard"/> and
-/// thereafter advanced by tailing the same <see cref="LogEvent"/> feed the sequencer persists.
-/// Cold keys never activate; Orleans idle collection is the eviction policy — silo memory is O(hot
-/// working set), not O(graph) (<c>docs/graph-sharded-datastore.md</c> §2).
+/// named by this grain's string key, persisted by the sequencer's <see cref="Project"/> calls and
+/// labelled with the revision the projection reached. Its SERVED state is the activation's cache:
+/// the projected state with the sequencer's pending events for this key folded over
+/// (<see cref="IDatastoreGrain.ReadShardTail"/>), thereafter advanced by tailing the same
+/// <see cref="LogEvent"/> feed. Cold keys never activate except to be projected; Orleans idle
+/// collection is the eviction policy — silo memory is O(hot working set), not O(graph)
+/// (<c>docs/graph-sharded-datastore.md</c> §2).
 /// </summary>
 /// <remarks>
 /// The incremental bootstrap-then-tail-fold shape (the pattern the retired per-silo whole-graph
@@ -22,9 +25,9 @@ namespace Spiceport.Grains;
 /// closed-timestamp gate — valid because every shard folds EVERY log event (the watermark advances even
 /// when nothing matches the key; see <see cref="ShardFold.ApplyEvent"/>) — so "watermark &gt;= rev"
 /// proves all commits &lt;= rev are present in this slice (<c>docs/graph-sharded-datastore.md</c> §2).
-/// A cold shard ALWAYS hydrates via <see cref="IDatastoreGrain.ReadShard"/> first, never by replaying
-/// <c>ReadFrom(0)</c> — the log's retained tail starts at the compaction floor, so a from-zero replay
-/// would silently miss compacted history.
+/// A cold shard ALWAYS hydrates from its projected state plus the sequencer's pending tail first,
+/// never by replaying <c>ReadFrom(0)</c> — the log's retained tail starts at the projection floor, so a
+/// from-zero replay would silently miss projected history.
 /// <para>
 /// GC-floor stance: a shard enforces the floor IT has folded/hydrated — never a per-read probe of the
 /// singleton — so at the floor boundary a cold shard (hydrated after a GC run) may reject a pinned
@@ -45,7 +48,9 @@ namespace Spiceport.Grains;
 [GraphLocalityPlacement] // First-activation locality hint only (director no-ops to a random pick unless
                          // GraphPlacementOptions.CoLocateWithShards is enabled); the grain directory
                          // stays the sole authority for identity/dedup. See GraphLocalityPlacement.
-public sealed class GraphShardGrain : Grain, IGraphShardGrain
+public sealed class GraphShardGrain(
+    [PersistentState("projection", "datastore")] IPersistentState<GraphShardState> projection)
+    : Grain, IGraphShardGrain
 {
     /// <summary>Log-tail page size for catch-up pulls (matches the Watch feed's page size).</summary>
     private const int BatchSize = 256;
@@ -96,9 +101,9 @@ public sealed class GraphShardGrain : Grain, IGraphShardGrain
         {
             if (!_hydrated)
             {
-                // ALWAYS hydrate via the per-key snapshot read first — never rely on ReadFrom(0)
-                // semantics for a cold shard (see the class remarks).
-                _state = await _datastore.ReadShard(_key);
+                // ALWAYS hydrate from the projection plus the pending tail first — never rely on
+                // ReadFrom(0) semantics for a cold shard (see the class remarks).
+                _state = await Hydrate();
                 _hydrated = true;
             }
 
@@ -126,7 +131,7 @@ public sealed class GraphShardGrain : Grain, IGraphShardGrain
                     // against the singleton until its compaction settles.
                     if (lastRehydrateWatermark == _state.AppliedRevision)
                         await Task.Delay(TimeSpan.FromMilliseconds(10), cancellationToken);
-                    _state = await _datastore.ReadShard(_key);
+                    _state = await Hydrate();
                     lastRehydrateWatermark = _state.AppliedRevision;
                     continue;
                 }
@@ -151,6 +156,50 @@ public sealed class GraphShardGrain : Grain, IGraphShardGrain
         {
             _gate.Release();
         }
+    }
+
+    /// <inheritdoc />
+    public async Task<bool> Project(ImmutableList<LogEvent> events, long through, long gcFloor)
+    {
+        var current = projection.State;
+        if (through <= current.AppliedRevision)
+            return current.Rows.Count > 0; // already projected: a replay after an unconfirmed flush.
+
+        var next = current;
+        foreach (var ev in events)
+        {
+            if (ev.Revision > current.AppliedRevision && ShardFold.Touches(ev, _key))
+                next = ShardFold.ApplyEvent(next, ev, _key);
+        }
+        next = ShardFold.CollectBelow(next, through, Math.Max(gcFloor, next.GcFloor));
+
+        // Restore the previous state if the write fails: a label the store does not hold would make
+        // the sequencer's replay of these events look already projected, and they would be lost.
+        projection.State = next;
+        try
+        {
+            await projection.WriteStateAsync();
+        }
+        catch
+        {
+            projection.State = current;
+            throw;
+        }
+        return next.Rows.Count > 0;
+    }
+
+    /// <inheritdoc />
+    public Task<GraphShardState> ReadProjected() => Task.FromResult(projection.State);
+
+    /// <summary>
+    /// The served state from scratch: the pending tail is read FIRST and the projected state AFTER the
+    /// await, so a projection landing in between is already in the projected state (and its events
+    /// skipped by the label), while one that has not landed is still in the tail.
+    /// </summary>
+    private async Task<GraphShardState> Hydrate()
+    {
+        var tail = await _datastore.ReadShardTail(_key);
+        return ShardFold.Overlay(projection.State, tail.Events, _key, tail.HeadRevision, tail.GcFloor);
     }
 
     private GraphShardRowsReply Serve(long revision, FullRelationshipsFilterWire? filter)

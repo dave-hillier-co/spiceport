@@ -137,7 +137,8 @@ public class Stage3WatchPushMeshTests
             // ImmutableDictionary key index (and silently corrupts boxed-JsonElement caveat context) —
             // see AddDatastoreGrainStorage.
             b.AddDatastoreGrainStorage(new ConfigurationBuilder().Build());
-            b.AddCustomStorageBasedLogConsistencyProvider("CustomStorage");
+            b.AddStateStorageBasedLogConsistencyProvider("StateStorage");
+            b.AddGraphLocalityPlacement(); // the sequencer reads and projects through the shard grains
         }
     }
 

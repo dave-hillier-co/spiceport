@@ -52,7 +52,8 @@ public class DatastoreGcMeshTests
             // ImmutableDictionary key index (and silently corrupts boxed-JsonElement caveat context) —
             // see AddDatastoreGrainStorage.
             b.AddDatastoreGrainStorage(new ConfigurationBuilder().Build());
-            b.AddCustomStorageBasedLogConsistencyProvider("CustomStorage");
+            b.AddStateStorageBasedLogConsistencyProvider("StateStorage");
+            b.AddGraphLocalityPlacement(); // the sequencer reads and projects through the shard grains
             b.UseInMemoryReminderService();
             b.ConfigureServices(services => services.AddSingleton<IOptions<DatastoreGcOptions>>(
                 Options.Create(new DatastoreGcOptions
@@ -75,7 +76,8 @@ public class DatastoreGcMeshTests
             // ImmutableDictionary key index (and silently corrupts boxed-JsonElement caveat context) —
             // see AddDatastoreGrainStorage.
             b.AddDatastoreGrainStorage(new ConfigurationBuilder().Build());
-            b.AddCustomStorageBasedLogConsistencyProvider("CustomStorage");
+            b.AddStateStorageBasedLogConsistencyProvider("StateStorage");
+            b.AddGraphLocalityPlacement(); // the sequencer reads and projects through the shard grains
             b.ConfigureServices(services => services.AddSingleton<IOptions<DatastoreGcOptions>>(
                 Options.Create(new DatastoreGcOptions { Window = TimeSpan.Zero })));
         }
@@ -165,7 +167,8 @@ public class DatastoreGcMeshTests
             // ImmutableDictionary key index (and silently corrupts boxed-JsonElement caveat context) —
             // see AddDatastoreGrainStorage.
             b.AddDatastoreGrainStorage(new ConfigurationBuilder().Build());
-            b.AddCustomStorageBasedLogConsistencyProvider("CustomStorage");
+            b.AddStateStorageBasedLogConsistencyProvider("StateStorage");
+            b.AddGraphLocalityPlacement(); // the sequencer reads and projects through the shard grains
             b.ConfigureServices(services => services.AddSingleton<IOptions<DatastoreGcOptions>>(
                 // Comfortably longer than elapsed Unix-epoch time (~56 years), safely under the long-range
                 // overflow the ms->nanos conversion could hit at TimeSpan.MaxValue.
@@ -184,7 +187,8 @@ public class DatastoreGcMeshTests
             // ImmutableDictionary key index (and silently corrupts boxed-JsonElement caveat context) —
             // see AddDatastoreGrainStorage.
             b.AddDatastoreGrainStorage(new ConfigurationBuilder().Build());
-            b.AddCustomStorageBasedLogConsistencyProvider("CustomStorage");
+            b.AddStateStorageBasedLogConsistencyProvider("StateStorage");
+            b.AddGraphLocalityPlacement(); // the sequencer reads and projects through the shard grains
             b.ConfigureServices(services => services.AddSingleton<IOptions<DatastoreGcOptions>>(
                 Options.Create(new DatastoreGcOptions { Window = TimeSpan.FromHours(24), ReminderEnabled = false })));
         }
@@ -339,7 +343,8 @@ public class DatastoreGcMeshTests
             // ImmutableDictionary key index (and silently corrupts boxed-JsonElement caveat context) —
             // see AddDatastoreGrainStorage.
             b.AddDatastoreGrainStorage(new ConfigurationBuilder().Build());
-            b.AddCustomStorageBasedLogConsistencyProvider("CustomStorage");
+            b.AddStateStorageBasedLogConsistencyProvider("StateStorage");
+            b.AddGraphLocalityPlacement(); // the sequencer reads and projects through the shard grains
             b.ConfigureServices(services => services.AddSingleton<IOptions<DatastoreGcOptions>>(
                 Options.Create(new DatastoreGcOptions
                 {

@@ -6,8 +6,9 @@ namespace Spiceport.Grains;
 /// <summary>
 /// The SMALL-STATE restriction of <see cref="LogFold"/>: folds the same committed <see cref="LogEvent"/>
 /// sequence, but keeps only what <see cref="DatastoreMetaState"/> carries — head, schema versions,
-/// counter versions, GC floor, and the key index. Relationship row content is deliberately NOT folded
-/// here; it belongs to the per-key <see cref="ShardFold"/> (the dirty buffer / shard rows). Together,
+/// counter versions, GC floor, the types seen, and the pending (not yet projected) tail. Relationship
+/// row content is deliberately NOT folded here; it belongs to the per-key <see cref="ShardFold"/> (the
+/// shard grains' projections). Together,
 /// <c>MetaFold + ShardFold-per-touched-key</c> is exactly <see cref="LogFold"/> split along the sharding
 /// lemma: <c>fold(log) == merge(fold(log | key) for all keys)</c> for the rows, plus this fold for
 /// everything else.
@@ -24,19 +25,36 @@ namespace Spiceport.Grains;
 /// </remarks>
 internal static class MetaFold
 {
-    /// <summary>Folds one committed <see cref="LogEvent"/> into the small state.</summary>
+    /// <summary>
+    /// Folds one journal entry into the small state. A committed event advances the head, the
+    /// schema/counter histories and the GC floor exactly as the whole-state fold does, records the
+    /// types it names, and joins the pending tail; a projection checkpoint drops the pending events it
+    /// covers. Pure and deterministic, as the log-consistency adaptor requires.
+    /// </summary>
+    public static DatastoreMetaState ApplyEntry(DatastoreMetaState state, DatastoreJournalEntry entry) => entry switch
+    {
+        DatastoreJournalEntry.Seeded seeded => DatastoreMetaState.Empty(seeded.Revision),
+        DatastoreJournalEntry.Committed committed => ApplyEvent(state, committed.Event),
+        DatastoreJournalEntry.Projected projected => ApplyProjected(state, projected.Through),
+        _ => throw new InvalidOperationException($"unknown datastore journal entry {entry.GetType().Name}"),
+    };
+
+    /// <summary>The <see cref="DatastoreJournalEntry.Committed"/> half of <see cref="ApplyEntry"/>.</summary>
     public static DatastoreMetaState ApplyEvent(DatastoreMetaState state, LogEvent ev)
     {
+        var pending = state.Pending.Add(ev);
+
         if (ev.GcFloor is { } floor)
         {
             if (floor <= state.GcFloor)
-                return state with { HeadRevision = ev.Revision };
+                return state with { HeadRevision = ev.Revision, Pending = pending };
             return state with
             {
                 HeadRevision = ev.Revision,
                 GcFloor = floor,
                 Schemas = CompactSchemas(state.Schemas, floor),
                 Counters = CompactCounters(state.Counters, floor),
+                Pending = pending,
             };
         }
 
@@ -46,23 +64,12 @@ internal static class MetaFold
         foreach (var counter in ev.CounterChanges)
             counters = counters.Add(new CounterVersionWire(ev.Revision, counter.Name, counter.Filter));
 
-        // Index every touched key. Add-only here, and VERSION-NEUTRAL: a key not yet indexed is added
-        // at NoRowVersion (it has no durable row — its state lives in the dirty buffer until a flush
-        // writes one), and an already-indexed key KEEPS its recorded row version. The fold must stay a
-        // pure function of the event sequence — it cannot know which storage version a row will land
-        // under — so the version bump happens exclusively at the flush, on the meta entry the flush
-        // persists (see DatastoreGrain.ApplyUpdatesToStorage); keys whose shard state becomes empty
-        // are pruned there too, never mid-fold.
-        var forward = state.ForwardKeys;
-        var reverse = state.ReverseKeys;
+        var forwardTypes = state.ForwardTypes;
+        var reverseTypes = state.ReverseTypes;
         foreach (var change in ev.RelationshipChanges)
         {
-            var forwardKey = ForwardKeyOf(change.Relationship);
-            if (!forward.ContainsKey(forwardKey))
-                forward = forward.Add(forwardKey, DatastoreMetaState.NoRowVersion);
-            var reverseKey = ReverseKeyOf(change.Relationship);
-            if (!reverse.ContainsKey(reverseKey))
-                reverse = reverse.Add(reverseKey, DatastoreMetaState.NoRowVersion);
+            forwardTypes = forwardTypes.Add(change.Relationship.ResourceType);
+            reverseTypes = reverseTypes.Add(change.Relationship.SubjectType);
         }
 
         return state with
@@ -70,8 +77,20 @@ internal static class MetaFold
             HeadRevision = ev.Revision,
             Schemas = schemas,
             Counters = counters,
-            ForwardKeys = forward,
-            ReverseKeys = reverse,
+            Pending = pending,
+            ForwardTypes = forwardTypes,
+            ReverseTypes = reverseTypes,
+        };
+    }
+
+    private static DatastoreMetaState ApplyProjected(DatastoreMetaState state, long through)
+    {
+        if (through <= state.ProjectedThrough)
+            return state;
+        return state with
+        {
+            Pending = state.Pending.RemoveAll(e => e.Revision <= through),
+            ProjectedThrough = through,
         };
     }
 

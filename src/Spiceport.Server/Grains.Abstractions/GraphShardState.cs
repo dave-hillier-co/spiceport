@@ -19,4 +19,10 @@ public sealed record GraphShardState(
 {
     /// <summary>The empty shard, before any log event has been folded.</summary>
     public static GraphShardState Empty { get; } = new(0, 0, ImmutableList<StoredRelationshipWire>.Empty);
+
+    /// <summary>The empty state; the constructor persisted state is created through.</summary>
+    public GraphShardState()
+        : this(0, 0, ImmutableList<StoredRelationshipWire>.Empty)
+    {
+    }
 }
