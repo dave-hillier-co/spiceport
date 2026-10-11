@@ -140,7 +140,7 @@ public sealed class CheckEngine
         var revision = atRevision is null ? (IRevision)InProcessRevision.Instance : atRevision;
         var meta = new ResolverMeta(revision, _maxDepth, ImmutableHashSet<VisitKey>.Empty);
         var request = new DispatchCheckRequest(resource, subject, meta);
-        var result = await dispatcher.DispatchCheck(request, cancellationToken).ConfigureAwait(false);
+        var result = await dispatcher.DispatchCheck(request, cancellationToken).ConfigureAwait(true);
 
         // Collapse stays the per-request, post-dispatch step: evaluate the accumulated caveat with
         // the request-time context. (CycleCut is computed/propagated but does not affect the verdict.)

@@ -100,8 +100,8 @@ public sealed class LocalDispatcher : IDispatcher
         var reader = _readerFor(meta.Revision);
 
         return relation.UsersetRewrite is { } rewrite
-            ? await CheckRewrite(reader, resource, subject, rewrite.Operation, meta, ct).ConfigureAwait(false)
-            : await CheckDirect(reader, resource, subject, meta, ct).ConfigureAwait(false);
+            ? await CheckRewrite(reader, resource, subject, rewrite.Operation, meta, ct).ConfigureAwait(true)
+            : await CheckDirect(reader, resource, subject, meta, ct).ConfigureAwait(true);
     }
 
     /// <summary>Dispatches a sub-problem at a decremented depth through the injected dispatcher.</summary>
@@ -110,7 +110,7 @@ public sealed class LocalDispatcher : IDispatcher
     {
         var subMeta = meta with { DepthRemaining = meta.DepthRemaining - 1 };
         var child = await Dispatcher.DispatchCheck(new DispatchCheckRequest(resource, subject, subMeta), ct)
-            .ConfigureAwait(false);
+            .ConfigureAwait(true);
         // This dispatch hop consumes one level of depth: the result this node returns requires one more
         // than whatever its child required. Mirrors SpiceDB's addCallToResponseMetadata (DepthRequired+1).
         return child with { DepthRequired = child.DepthRequired + 1 };
@@ -161,7 +161,7 @@ public sealed class LocalDispatcher : IDispatcher
         var found = DispatchCheckResult.None;
         List<(ObjectAndRelation Onr, CaveatExpression? Parent)>? intermediates = null;
 
-        await foreach (var rel in reader.QueryRelationships(filter, ct).ConfigureAwait(false))
+        await foreach (var rel in reader.QueryRelationships(filter, ct).ConfigureAwait(true))
         {
             if (IsExpired(rel))
                 continue;
@@ -196,7 +196,7 @@ public sealed class LocalDispatcher : IDispatcher
 
         foreach (var (intermediate, parent) in intermediates)
         {
-            var sub = await Sub(intermediate, subject, meta, ct).ConfigureAwait(false);
+            var sub = await Sub(intermediate, subject, meta, ct).ConfigureAwait(true);
             // Carry the cycle-cut AND the depth this child consumed up into the accumulator, even when the
             // child is a non-member: the depth we walked is what gates cache reuse, regardless of verdict.
             found = found with
@@ -233,7 +233,7 @@ public sealed class LocalDispatcher : IDispatcher
                 var acc = DispatchCheckResult.None;
                 foreach (var child in operation.Children)
                 {
-                    var b = await CheckChild(reader, resource, subject, child, meta, ct).ConfigureAwait(false);
+                    var b = await CheckChild(reader, resource, subject, child, meta, ct).ConfigureAwait(true);
                     acc = acc with { CycleCut = acc.CycleCut || b.CycleCut };
                     acc = Or(acc, b);
                     // Caveat-completeness: only a DEFINITE (uncaveated) member short-circuits the union; a
@@ -254,7 +254,7 @@ public sealed class LocalDispatcher : IDispatcher
                 var depth = 1;
                 foreach (var child in operation.Children)
                 {
-                    var b = await CheckChild(reader, resource, subject, child, meta, ct).ConfigureAwait(false);
+                    var b = await CheckChild(reader, resource, subject, child, meta, ct).ConfigureAwait(true);
                     cut = cut || b.CycleCut;
                     depth = Math.Max(depth, b.DepthRequired);
                     if (!b.Member)
@@ -269,7 +269,7 @@ public sealed class LocalDispatcher : IDispatcher
                 if (operation.Children.Count == 0)
                     return DispatchCheckResult.None;
 
-                var acc = await CheckChild(reader, resource, subject, operation.Children[0], meta, ct).ConfigureAwait(false);
+                var acc = await CheckChild(reader, resource, subject, operation.Children[0], meta, ct).ConfigureAwait(true);
                 var cut = acc.CycleCut;
                 var depth = acc.DepthRequired;
                 if (!acc.Member)
@@ -277,7 +277,7 @@ public sealed class LocalDispatcher : IDispatcher
 
                 for (var i = 1; i < operation.Children.Count; i++)
                 {
-                    var excluded = await CheckChild(reader, resource, subject, operation.Children[i], meta, ct).ConfigureAwait(false);
+                    var excluded = await CheckChild(reader, resource, subject, operation.Children[i], meta, ct).ConfigureAwait(true);
                     cut = cut || excluded.CycleCut;
                     depth = Math.Max(depth, excluded.DepthRequired);
                     acc = Subtract(acc, excluded);
@@ -304,7 +304,7 @@ public sealed class LocalDispatcher : IDispatcher
         switch (child)
         {
             case SetOperationChild.This:
-                return await CheckDirect(reader, resource, subject, meta, ct).ConfigureAwait(false);
+                return await CheckDirect(reader, resource, subject, meta, ct).ConfigureAwait(true);
 
             case SetOperationChild.Nil:
                 return DispatchCheckResult.None;
@@ -317,20 +317,20 @@ public sealed class LocalDispatcher : IDispatcher
                     : DispatchCheckResult.None;
 
             case SetOperationChild.ComputedUsersetChild(var cu):
-                return await Sub(resource.WithRelation(cu.Relation), subject, meta, ct).ConfigureAwait(false);
+                return await Sub(resource.WithRelation(cu.Relation), subject, meta, ct).ConfigureAwait(true);
 
             case SetOperationChild.TupleToUsersetChild(var ttu):
                 return await CheckTupleToUserset(
                     reader, resource, subject, ttu.TuplesetRelation, ttu.ComputedUserset,
-                    TupleToUsersetFunction.Any, meta, ct).ConfigureAwait(false);
+                    TupleToUsersetFunction.Any, meta, ct).ConfigureAwait(true);
 
             case SetOperationChild.FunctionedTupleToUsersetChild(var fttu):
                 return await CheckTupleToUserset(
                     reader, resource, subject, fttu.TuplesetRelation, fttu.ComputedUserset,
-                    fttu.Function, meta, ct).ConfigureAwait(false);
+                    fttu.Function, meta, ct).ConfigureAwait(true);
 
             case SetOperationChild.NestedRewrite(var nested):
-                return await CheckRewrite(reader, resource, subject, nested.Operation, meta, ct).ConfigureAwait(false);
+                return await CheckRewrite(reader, resource, subject, nested.Operation, meta, ct).ConfigureAwait(true);
 
             default:
                 return DispatchCheckResult.None;
@@ -360,7 +360,7 @@ public sealed class LocalDispatcher : IDispatcher
 
         List<(ObjectAndRelation Onr, CaveatExpression? Parent)>? targets = null;
 
-        await foreach (var rel in reader.QueryRelationships(filter, ct).ConfigureAwait(false))
+        await foreach (var rel in reader.QueryRelationships(filter, ct).ConfigureAwait(true))
         {
             if (IsExpired(rel))
                 continue;
@@ -383,7 +383,7 @@ public sealed class LocalDispatcher : IDispatcher
             var depth = 1;
             foreach (var (target, parent) in targets)
             {
-                var sub = await Sub(target, subject, meta, ct).ConfigureAwait(false);
+                var sub = await Sub(target, subject, meta, ct).ConfigureAwait(true);
                 cut = cut || sub.CycleCut;
                 depth = Math.Max(depth, sub.DepthRequired);
                 if (!sub.Member)
@@ -397,7 +397,7 @@ public sealed class LocalDispatcher : IDispatcher
         var any = DispatchCheckResult.None;
         foreach (var (target, parent) in targets)
         {
-            var sub = await Sub(target, subject, meta, ct).ConfigureAwait(false);
+            var sub = await Sub(target, subject, meta, ct).ConfigureAwait(true);
             any = any with
             {
                 CycleCut = any.CycleCut || sub.CycleCut,
