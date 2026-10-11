@@ -237,8 +237,8 @@ schema of its own:
   floor defaults to a 24-hour window, bounding state growth and aligning with Zanzibar's use of
   zookie staleness as a retention boundary. Reads pinned below the floor throw
   `RevisionNotFoundException`, so consumers re-bootstrap.
-  The single non-reentrant activation makes the head-compare-and-append atomic, so the revision it
-  mints is the **cluster-wide global order**. *This single ordered log is the total order that
+  The single-writer activation (commits group-committed under one write lock) makes the
+  head-compare-and-append atomic, so the revision it mints is the **cluster-wide global order**. *This single ordered log is the total order that
   defeats Zanzibar's "new enemy" problem — the global-order point Spanner provides in the original.*
 
 - **The log is the seam between storage and compute.** Reads do not fetch the whole state per Check.
@@ -263,7 +263,7 @@ schema of its own:
 
 - **Single-writer ceiling is intentional.** All writes serialize through the one ordered log (the
   global-order point), submitted as declarative `Commit` requests the sequencer evaluates and
-  executes on its single non-reentrant activation. The design scales *reads* (on-demand shard
+  executes on its single-writer activation. The design scales *reads* (on-demand shard
   grains) and cheapens *writes* (appends, not whole-blob rewrites), but does not raise the
   single-writer ceiling. Sharded per-namespace logs are out of scope — they would reintroduce the
   cross-shard global-order problem.

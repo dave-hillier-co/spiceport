@@ -37,6 +37,13 @@ public sealed class DatastoreInterleavedReadTests
             DeleteByFilter: null, SchemaBytes: null, ExpectedSchemaHash: null,
             Array.Empty<CounterDeltaWire>(), expectedHead);
 
+    /// <summary>A declarative commit (no ExpectedHead) of one relationship update.</summary>
+    private static CommitRequest UpdateCommit(RelationshipUpdateOpWire op, string rid, string sid) =>
+        new(Array.Empty<CommitPreconditionWire>(),
+            new[] { new RelationshipUpdateWire(op, WireConvert.ToWire(Rel(rid, sid))) },
+            DeleteByFilter: null, SchemaBytes: null, ExpectedSchemaHash: null,
+            Array.Empty<CounterDeltaWire>(), ExpectedHead: null);
+
     private static IDatastoreGrain Grain(TestCluster cluster) =>
         cluster.GrainFactory.GetGrain<IDatastoreGrain>(IDatastoreGrain.Key);
 
@@ -67,9 +74,11 @@ public sealed class DatastoreInterleavedReadTests
         public static TaskCompletionSource<bool>? HeadWriteParked;
         public static volatile bool ThrowOnceOnHeadWrite;
         public static volatile bool ThrowOnceOnShardWrite;
+        public static int DatastoreWrites;
 
         public static void Reset()
         {
+            DatastoreWrites = 0;
             HeadWriteBlock = null;
             HeadWriteParked = null;
             ThrowOnceOnHeadWrite = false;
@@ -99,6 +108,7 @@ public sealed class DatastoreInterleavedReadTests
 
             if (grainType == "datastore")
             {
+                Interlocked.Increment(ref Gate.DatastoreWrites);
                 if (Gate.ThrowOnceOnHeadWrite)
                 {
                     Gate.ThrowOnceOnHeadWrite = false;
@@ -333,5 +343,91 @@ public sealed class DatastoreInterleavedReadTests
         // the same CAS invariant the retired two-step append surfaced as a null revision.
         Assert.Single(results, r => r.Revision is not null);
         Assert.Single(results, r => r.Failure is { Kind: CommitFailureKind.HeadMoved });
+    }
+
+    /// <summary>
+    /// Group commit: commits that arrive while a write is parked are not queued behind it one write
+    /// each. They are evaluated in order and appended together, so the sequencer's write count is two
+    /// (the parked write, then one for the whole batch) rather than one per commit, and every commit
+    /// still gets its own revision.
+    /// </summary>
+    [Fact]
+    public async Task Commits_arriving_during_a_write_share_one_write()
+    {
+        await using var scope = new Scope(await NewClusterAsync());
+        var grain = Grain(scope.Cluster);
+        var oldHead = (await grain.GetHead()).Head;
+        var writesBefore = Gate.DatastoreWrites;
+
+        Gate.HeadWriteBlock = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        Gate.HeadWriteParked = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var first = grain.Commit(UpdateCommit(RelationshipUpdateOpWire.Touch, "first", "alice"));
+        Task<CommitReply>[] batched;
+        try
+        {
+            await Gate.HeadWriteParked.Task.WaitAsync(Timeout);
+            Gate.HeadWriteParked = null;
+            batched = Enumerable.Range(0, 5)
+                .Select(i => grain.Commit(UpdateCommit(RelationshipUpdateOpWire.Touch, $"b{i}", "bob")))
+                .ToArray();
+            // Let every batched call reach the activation before the parked write resumes.
+            await Task.Delay(TimeSpan.FromMilliseconds(500));
+        }
+        finally
+        {
+            Gate.HeadWriteBlock.TrySetResult(true);
+            Gate.HeadWriteBlock = null;
+        }
+
+        var firstReply = await first.WaitAsync(Timeout);
+        var replies = await Task.WhenAll(batched).WaitAsync(Timeout);
+
+        Assert.Null(firstReply.Failure);
+        Assert.All(replies, r => Assert.Null(r.Failure));
+        var revisions = replies.Select(r => r.Revision!.Value).ToArray();
+        Assert.Equal(revisions.Length, revisions.Distinct().Count());
+        Assert.All(revisions, r => Assert.True(r > firstReply.Revision));
+        Assert.Equal(writesBefore + 2, Gate.DatastoreWrites);
+
+        var segment = await grain.ReadFrom(oldHead, -1);
+        Assert.Equal(6, segment.Events.Count);
+        Assert.Equal(revisions.Max(), segment.HeadRevision);
+    }
+
+    /// <summary>
+    /// A commit evaluated later in a batch sees the commits before it in the same batch: two Creates of
+    /// one relationship batched together still conflict, exactly one winning.
+    /// </summary>
+    [Fact]
+    public async Task A_batched_commit_sees_the_commits_before_it_in_its_batch()
+    {
+        await using var scope = new Scope(await NewClusterAsync());
+        var grain = Grain(scope.Cluster);
+
+        Gate.HeadWriteBlock = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        Gate.HeadWriteParked = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var first = grain.Commit(UpdateCommit(RelationshipUpdateOpWire.Touch, "first", "alice"));
+        Task<CommitReply>[] creates;
+        try
+        {
+            await Gate.HeadWriteParked.Task.WaitAsync(Timeout);
+            Gate.HeadWriteParked = null;
+            creates = new[]
+            {
+                grain.Commit(UpdateCommit(RelationshipUpdateOpWire.Create, "x", "carol")),
+                grain.Commit(UpdateCommit(RelationshipUpdateOpWire.Create, "x", "carol")),
+            };
+            await Task.Delay(TimeSpan.FromMilliseconds(500));
+        }
+        finally
+        {
+            Gate.HeadWriteBlock.TrySetResult(true);
+            Gate.HeadWriteBlock = null;
+        }
+
+        await first.WaitAsync(Timeout);
+        var replies = await Task.WhenAll(creates).WaitAsync(Timeout);
+        Assert.Single(replies, r => r.Revision is not null);
+        Assert.Single(replies, r => r.Failure is { Kind: CommitFailureKind.CreateAlreadyExists });
     }
 }

@@ -322,11 +322,20 @@ order's WORK" are different things — the sequencer activation currently perfor
 which only one (issuing the order) is irreducibly singular. A ladder of decompositions, each
 strictly more actor-shaped, none weakening the guarantee, each gated on the scalability
 program's measurement discipline (`scalability-program.md`) with the trigger being measured
-write demand, not taste:
+write demand, not taste. The FoundationDB-shaped plan that realises rungs 1 and 2 (the steps
+inside the one sequencer, the target roles, the commit semantics, recovery and the staged
+gates) is [`transaction-system.md`](transaction-system.md).
 
-1. **Group commit.** Batch concurrent `Commit` requests into one log append — classic WAL
-   amortization; the actor stays, its throughput multiplies by batch depth. The first rung if
-   the write ceiling ever fires.
+1. **Group commit (built).** Concurrent `Commit` requests are batched into one log append —
+   classic WAL amortization; the actor stays, its throughput multiplies by batch depth.
+   `Commit` interleaves and queues; one batch loop evaluates the queue in arrival order (each
+   request against the state the ones before it left) and appends the batch with one
+   conditional raise and one confirm. Batches, GC and projection flushes share one write lock,
+   and every reply, rejections included, waits for the batch to be durable.
+
+   Before rung 2, more of FoundationDB's ideas fit inside the one sequencer (read-version
+   batching, a fault-injection harness, caller-side evaluation with sequencer-side conflict
+   checks, pipelining); `transaction-system.md` §2 orders them.
 2. **The Corfu split: order without data.** The sequencer becomes a ticket dispenser —
    assigns positions, touches no payload; log storage moves to sharded segment rows/actors.
    The projecting sequencer is already halfway there (projection removed the fold); this

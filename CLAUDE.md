@@ -2,7 +2,8 @@
 
 Guidance for working in this repository. See `README.md` for the project overview,
 `docs/architecture-analysis.md` for the design rationale, `docs/graph-sharded-datastore.md`
-for the storage design as built, `docs/future-work.md` for candidate directions that are
+for the storage design as built, `docs/transaction-system.md` for the staged plan to scale writes
+past the single sequencer, `docs/future-work.md` for candidate directions that are
 analyzed but not committed, and `docs/scalability-program.md` for the measurement-gated
 performance program (nothing there is scheduled; triggers decide).
 
@@ -42,8 +43,9 @@ dotnet test tests/Spiceport.Conformance.Tests  # the SpiceDB conformance corpus 
 - **Storage is an event-sourced grain (the log is the storage/compute seam).** All
   relationship/schema/counter state is sequenced by a single cluster-singleton `DatastoreGrain`, an
   ordinary **journaled grain** (state-storage log consistency over a stock Orleans grain-storage
-  provider) whose journal of `LogEvent`s is the source of truth; the single non-reentrant activation
-  makes the minted revision the cluster-wide global order. Its journaled state is only the small
+  provider) whose journal of `LogEvent`s is the source of truth; the single-writer activation
+  makes the minted revision the cluster-wide global order, and commits are group-committed (a batch
+  is evaluated in order and appended in one write). Its journaled state is only the small
   state (head, schemas, counters, GC floor, types seen) plus the **pending tail** — committed events
   not yet projected. **No application SQL and no storage layout of its own.** Every 64 events the
   sequencer **projects** the tail: each per-key `GraphShardGrain` it touches (forward shards keyed by
@@ -58,7 +60,7 @@ dotnet test tests/Spiceport.Conformance.Tests  # the SpiceDB conformance corpus 
   the closed-timestamp gate: exact/at-least-as-fresh reads block until the shard's watermark covers
   the pinned revision. Writes are **declarative `DatastoreGrain.Commit`** —
   preconditions/updates/deleteByFilter/schema (with `ExpectedSchemaHash`)/counters evaluated and
-  executed on the sequencer's single non-reentrant activation over a partial base of exactly the keys
+  executed on the sequencer's single-writer activation over a partial base of exactly the keys
   the request can read, rejections returned as typed `CommitReply` failures with nothing applied;
   `ReadWriteTx` survives only as the `ExpectedHead` compatibility path over the same wire contract.
   Broad/admin scans (loose-filter ReadRelationships, bulk export, counters) assemble the
