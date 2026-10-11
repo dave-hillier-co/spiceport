@@ -237,7 +237,7 @@ schema of its own:
   floor defaults to a 24-hour window, bounding state growth and aligning with Zanzibar's use of
   zookie staleness as a retention boundary. Reads pinned below the floor throw
   `RevisionNotFoundException`, so consumers re-bootstrap.
-  The single-writer activation (commits group-committed under one write lock) makes the
+  The single-writer activation (one write queue; commits group-committed) makes the
   head-compare-and-append atomic, so the revision it mints is the **cluster-wide global order**. *This single ordered log is the total order that
   defeats Zanzibar's "new enemy" problem — the global-order point Spanner provides in the original.*
 

@@ -71,8 +71,11 @@ public interface IDatastoreGrain : IGrainWithIntegerKey, IDatastoreLog
     /// <summary>
     /// Projects every pending event into the shard grains it touches and the shard index, then journals
     /// that the projection has caught up. The sequencer does this itself every flush interval; calling
-    /// it directly is a test and operations seam. A write: never interleaves another write.
+    /// it directly is a test and operations seam. A write: it queues behind the writes before it and
+    /// never interleaves another, so the call itself is <see cref="AlwaysInterleaveAttribute"/> and
+    /// waits in the sequencer's write queue rather than the activation's.
     /// </summary>
+    [AlwaysInterleave]
     Task FlushProjection();
 
     /// <summary>
@@ -84,8 +87,8 @@ public interface IDatastoreGrain : IGrainWithIntegerKey, IDatastoreLog
     /// <see cref="CommitRequest.ExpectedHead"/>) needs no caller retry loop. Commits are GROUP-COMMITTED:
     /// the call is <see cref="AlwaysInterleaveAttribute"/> so a commit arriving while a batch is being
     /// written can queue for the next one, and each batch is evaluated in arrival order and appended in
-    /// one write. Batches, GC rounds and projection flushes share one write lock, so writes never
-    /// interleave EACH OTHER: each request is evaluated against the head left by every write before it,
+    /// one write. Batches, GC rounds and projection flushes are work items in one write queue, drained
+    /// in arrival order by a single writer, so writes never interleave EACH OTHER: each request is evaluated against the head left by every write before it,
     /// and its append lands before any later write evaluates, which is both why the head cannot move
     /// under a declarative commit and why the caller-evaluated CAS of the lambda compatibility path (the
     /// optional <see cref="CommitRequest.ExpectedHead"/> compare) is exact. The reply is sent only once
@@ -115,7 +118,9 @@ public interface IDatastoreGrain : IGrainWithIntegerKey, IDatastoreLog
     /// never above the current head), and — if it advances the floor already recorded — appends a GC
     /// <see cref="LogEvent"/> that collects history below it. This is both the reminder's periodic body
     /// and a directly callable test seam. Returns the new floor, or null if no collection was needed
-    /// (the computed floor did not advance the current one).
+    /// (the computed floor did not advance the current one). Like <see cref="FlushProjection"/>, it
+    /// queues as one write and is <see cref="AlwaysInterleaveAttribute"/>.
     /// </summary>
+    [AlwaysInterleave]
     Task<long?> RunGc();
 }

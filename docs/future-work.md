@@ -328,10 +328,10 @@ gates) is [`transaction-system.md`](transaction-system.md).
 
 1. **Group commit (built).** Concurrent `Commit` requests are batched into one log append —
    classic WAL amortization; the actor stays, its throughput multiplies by batch depth.
-   `Commit` interleaves and queues; one batch loop evaluates the queue in arrival order (each
-   request against the state the ones before it left) and appends the batch with one
-   conditional raise and one confirm. Batches, GC and projection flushes share one write lock,
-   and every reply, rejections included, waits for the batch to be durable.
+   `Commit` interleaves and queues; one writer (an Orleans `BatchWorker`) drains the queue in
+   arrival order, evaluating each run of commits as a batch (each request against the state the
+   ones before it left) and appending it with one conditional raise and one confirm. GC rounds
+   and projection flushes are items in the same queue, and every reply, rejections included, waits for the batch to be durable.
 
    Before rung 2, more of FoundationDB's ideas fit inside the one sequencer (read-version
    batching, a fault-injection harness, caller-side evaluation with sequencer-side conflict

@@ -38,10 +38,12 @@ The plan takes those apart, cheapest step first.
 These need no new roles. Each removes work from the serialization point or makes a later split
 a move rather than a rewrite.
 
-1. **Group commit (built).** `Commit` interleaves and queues. One batch loop evaluates the
-   queue in arrival order, each request against the state the requests before it left, and
-   appends the batch with one conditional raise and one confirm. Batches, GC rounds and
-   projection flushes share one write lock. Every reply, rejections included, waits for the
+1. **Group commit (built).** `Commit` interleaves and queues. One writer, an Orleans
+   `BatchWorker`, drains the queue in arrival order: each run of commits is a batch, each
+   request evaluated against the state the requests before it left, appended with one
+   conditional raise and one confirm. GC rounds and projection flushes are items in the same
+   queue, so writes never interleave and none waits in the activation's own request queue,
+   where it would hold up the non-interleaving calls behind it. Every reply, rejections included, waits for the
    batch to be durable, because a rejection may rest on an earlier member's event. A batch
    costs one storage write however many commits it carries. In BeneDB, Thresh's journal
    adaptor writes a confirm's pending events in one append, which is what makes the batch one

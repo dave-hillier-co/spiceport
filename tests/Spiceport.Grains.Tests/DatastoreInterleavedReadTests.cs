@@ -430,4 +430,95 @@ public sealed class DatastoreInterleavedReadTests
         Assert.Single(replies, r => r.Revision is not null);
         Assert.Single(replies, r => r.Failure is { Kind: CommitFailureKind.CreateAlreadyExists });
     }
+
+    /// <summary>
+    /// Writes run in arrival order through one queue: a GC round issued while a write is parked, and a
+    /// commit issued after it, append in that order. The GC neither waits for every commit in flight to
+    /// finish nor lets a later commit overtake it.
+    /// </summary>
+    [Fact]
+    public async Task A_gc_round_queues_with_commits_in_arrival_order()
+    {
+        await using var scope = new Scope(await NewClusterAsync());
+        var grain = Grain(scope.Cluster);
+        var oldHead = (await grain.GetHead()).Head;
+
+        Gate.HeadWriteBlock = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        Gate.HeadWriteParked = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var first = grain.Commit(UpdateCommit(RelationshipUpdateOpWire.Touch, "first", "alice"));
+        Task<long?> gc;
+        Task<CommitReply> after;
+        try
+        {
+            await Gate.HeadWriteParked.Task.WaitAsync(Timeout);
+            Gate.HeadWriteParked = null;
+            gc = grain.RunGc();
+            await Task.Delay(TimeSpan.FromMilliseconds(200));
+            after = grain.Commit(UpdateCommit(RelationshipUpdateOpWire.Touch, "after", "bob"));
+            await Task.Delay(TimeSpan.FromMilliseconds(500));
+        }
+        finally
+        {
+            Gate.HeadWriteBlock.TrySetResult(true);
+            Gate.HeadWriteBlock = null;
+        }
+
+        await first.WaitAsync(Timeout);
+        Assert.NotNull(await gc.WaitAsync(Timeout));
+        Assert.Null((await after.WaitAsync(Timeout)).Failure);
+
+        var segment = await grain.ReadFrom(oldHead, -1);
+        Assert.Collection(
+            segment.Events,
+            e => Assert.Equal("first", Assert.Single(e.RelationshipChanges).Relationship.ResourceId),
+            e => Assert.NotNull(e.GcFloor),
+            e => Assert.Equal("after", Assert.Single(e.RelationshipChanges).Relationship.ResourceId));
+    }
+
+    /// <summary>
+    /// A write waiting its turn does not hold the activation: with a commit's write parked and a GC round
+    /// issued behind it, a non-interleaving call (<see cref="IDatastoreGrain.SubscribeWatch"/>, the watch
+    /// hubs' heartbeat) still completes. Writes wait in the sequencer's own queue; a GC round waiting in
+    /// the activation as its blocking request would hold every non-interleaving call behind the write.
+    /// </summary>
+    [Fact]
+    public async Task A_queued_gc_round_does_not_block_the_watch_heartbeat()
+    {
+        await using var scope = new Scope(await NewClusterAsync());
+        var grain = Grain(scope.Cluster);
+        await grain.GetHead(); // activate first, so the parked write below is the commit's, not the seed's
+        var watcher = scope.Cluster.GrainFactory.CreateObjectReference<IDatastoreWatcher>(new NullWatcher());
+
+        Gate.HeadWriteBlock = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        Gate.HeadWriteParked = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var first = grain.Commit(UpdateCommit(RelationshipUpdateOpWire.Touch, "first", "alice"));
+        Task<long?> gc;
+        try
+        {
+            await Gate.HeadWriteParked.Task.WaitAsync(Timeout);
+            Gate.HeadWriteParked = null;
+            gc = grain.RunGc();
+            await Task.Delay(TimeSpan.FromMilliseconds(200));
+
+            var subscribe = grain.SubscribeWatch(watcher);
+            var winner = await Task.WhenAny(subscribe, Task.Delay(Timeout));
+            Assert.True(
+                ReferenceEquals(winner, subscribe),
+                "SubscribeWatch did not complete while a GC round waited behind a parked write.");
+        }
+        finally
+        {
+            Gate.HeadWriteBlock.TrySetResult(true);
+            Gate.HeadWriteBlock = null;
+        }
+
+        await first.WaitAsync(Timeout);
+        await gc.WaitAsync(Timeout);
+    }
+
+    private sealed class NullWatcher : IDatastoreWatcher
+    {
+        public Task HeadAdvanced(long head) => Task.CompletedTask;
+        public Task SchemaAdvanced(byte[] schemaBytes, string storedHash) => Task.CompletedTask;
+    }
 }
