@@ -226,19 +226,20 @@ last resort, priced as a real replication protocol.
 ### 3.3 Commit-turn shortening (answers P1)
 
 **Sketch**, in escalating order — take only what the numbers demand:
-1. **Parallelize candidate loads**: the per-key storage reads are independent;
-   `Task.WhenAll` them before the serialized apply. Shortens the turn, changes nothing else.
-2. **Bounded clean-state LRU** in the sequencer: the thin sequencer is one end of a dial
-   whose other end was the old whole-fold-in-memory design; an LRU of clean shard states is
-   a chosen point between them. The bound is a stated option; the no-whole-graph invariant
-   caps it. Takes storage reads off the common path for hot keys.
-3. **Flush write batching/parallelism**: dirty rows are independent write-once rows; fan them
-   out. Trims the every-64th-commit sawtooth.
+1. **Parallelize candidate loads**: the per-key reads are independent; `Task.WhenAll` them
+   before the serialized apply. Realized by the projection redesign, which reads candidates
+   from their shard grains in parallel.
+2. **Bounded clean-state LRU** in the sequencer: moot since the projection redesign — the
+   sequencer reads candidates from the shard grains that hold them, whose activations already
+   are the hot-key cache.
+3. **Flush write batching/parallelism**: the projection's per-shard writes are independent; fan
+   them out. Realized by the projection redesign (`Project` calls run in parallel).
 Broad preconditions (type-wide filters) stay honestly slow — that cost is inherent to
 serializable breadth and is the documented trade.
 
 **Gates.** `CommitContractTests`, the crash-window/durability suites (write-order discipline
-must survive batching — the head row remains the sole commit point), `ThinSequencerTests`.
+must survive batching — the journal write remains the sole commit point),
+`ProjectionSequencerTests`.
 
 **Trigger.** Commit p99 attributable to candidate loads (1, 2) or flush-boundary sawtooth
 p99 materially above steady-state p99 (3), at write rates the deployment actually needs.

@@ -399,5 +399,5 @@ runtime replace the entire `remote`/`cluster`/hashring distribution layer.
 
 Candidate directions beyond this design — further Orleans-native consolidation and deliberate
 relaxations of Google-contingent Zanzibar details — are analyzed in [`future-work.md`](future-work.md);
-the deepest of them, the graph-sharded datastore, is realized (its design and the remaining
-thin-sequencer step are in [`graph-sharded-datastore.md`](graph-sharded-datastore.md)).
+the deepest of them, the graph-sharded datastore, is realized (its design is in
+[`graph-sharded-datastore.md`](graph-sharded-datastore.md)).

@@ -270,7 +270,7 @@ public sealed class MeshTestCluster : IAsyncDisposable
             // default silently corrupts boxed-JsonElement caveat context on the flushed-shard-row read
             // path — see AddDatastoreGrainStorage).
             siloBuilder.AddDatastoreGrainStorage(new ConfigurationBuilder().Build());
-            siloBuilder.AddCustomStorageBasedLogConsistencyProvider("CustomStorage");
+            siloBuilder.AddStateStorageBasedLogConsistencyProvider("StateStorage");
             siloBuilder.AddGraphLocalityPlacement(new GraphPlacementOptions
             {
                 CoLocateWithShards = SchemaHolder.CoLocateWithShards,
@@ -310,7 +310,7 @@ public sealed class MeshTestCluster : IAsyncDisposable
             siloBuilder.AddActivationMemoCollectionAge();
             // See SiloConfigurator: the production in-memory registration, binary serializer forced.
             siloBuilder.AddDatastoreGrainStorage(new ConfigurationBuilder().Build());
-            siloBuilder.AddCustomStorageBasedLogConsistencyProvider("CustomStorage");
+            siloBuilder.AddStateStorageBasedLogConsistencyProvider("StateStorage");
             siloBuilder.AddGraphLocalityPlacement(new GraphPlacementOptions
             {
                 CoLocateWithShards = SchemaHolder.CoLocateWithShards,

@@ -1,13 +1,10 @@
 using System.Collections.Immutable;
 using System.Diagnostics;
-using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Orleans.EventSourcing;
-using Orleans.EventSourcing.CustomStorage;
 using Orleans.Providers;
 using Orleans.Runtime;
-using Orleans.Storage;
 using Orleans.Utilities;
 using Spiceport.Core;
 using Spiceport.Datastore;
@@ -16,63 +13,51 @@ using Spiceport.Grains.Abstractions;
 namespace Spiceport.Grains;
 
 /// <summary>
-/// The cluster-singleton datastore grain (<see cref="IDatastoreGrain.Key"/> = 0): the single source of
-/// truth for the whole MVCC datastore. It is EVENT-SOURCED — the append-only log of <see cref="LogEvent"/>s
-/// is the source of truth — and, under the THIN-SEQUENCER layout, it no longer materializes the whole
-/// fold: the journaled state is only the SMALL state (<see cref="DatastoreMetaState"/> — head, schemas,
-/// counters, GC floor, key index), relationship rows are persisted per adjacency key as
-/// VERSION-QUALIFIED <c>shard/{rowVersion}/{direction}/{type}/{id}</c> <see cref="GraphShardState"/> rows
-/// (write-once per version, reachable only through the meta's key->version index maps; both directions —
-/// the 2x row storage is the two-family design's own model), and the grain holds a DIRTY BUFFER of the keys touched
-/// since their rows were last flushed. It is a single non-reentrant activation; WRITES
-/// (<see cref="Commit"/>, <see cref="RunGc"/> — no interleave attribute) never interleave EACH OTHER, so
-/// a write's turn still runs to completion before the next write's, keeping the head-compare-and-append
-/// atomic. The PURE reads (<see cref="ReadState"/>, <see cref="GetHead"/>, <see cref="ReadSchemaAt"/>,
-/// <see cref="ReadShard"/>, <see cref="IDatastoreLog.ReadFrom"/>) are explicitly marked
-/// <c>[AlwaysInterleave]</c> on the grain interface and may run DURING a write's await — never
-/// concurrently with it (the scheduler is still single-threaded) and never observing a write's
-/// intermediate state; see the publication discipline in <see cref="ApplyUpdatesToStorage"/>.
+/// The cluster-singleton datastore grain (<see cref="IDatastoreGrain.Key"/> = 0): the sequencer whose
+/// journal is the source of truth for the whole MVCC datastore. It is an ordinary JOURNALED grain over
+/// a standard log-consistency provider: each commit journals a canonical <see cref="LogEvent"/>, and
+/// the journaled state is only the SMALL state (<see cref="DatastoreMetaState"/> — head, schemas,
+/// counters, GC floor, the types seen, and the pending tail of events not yet projected). Relationship
+/// rows are owned by the per-key <see cref="GraphShardGrain"/> projections, which persist their own
+/// state, and listed by the <see cref="ShardIndexGrain"/> buckets. It is a single non-reentrant
+/// activation; WRITES (<see cref="Commit"/>, <see cref="RunGc"/>, <see cref="FlushProjection"/> — no
+/// interleave attribute) never interleave EACH OTHER, so a write's turn runs to completion before the
+/// next write's, keeping the head-compare-and-append atomic. The PURE reads (<see cref="ReadState"/>,
+/// <see cref="GetHead"/>, <see cref="ReadSchemaAt"/>, <see cref="ReadShard"/>,
+/// <see cref="ReadShardTail"/>, <see cref="IDatastoreLog.ReadFrom"/>) are <c>[AlwaysInterleave]</c> on
+/// the grain interface and may run DURING a write's await — never concurrently with it, and never
+/// observing a write's intermediate state, because they read the confirmed view.
 /// </summary>
 /// <remarks>
 /// <para>
-/// Persistence is OUR responsibility via <see cref="ICustomStorageInterface{TState,TDelta}"/> over an
-/// Orleans grain-storage provider (NO application SQL): each event is a per-version <c>log/{version}</c>
-/// entry, a <c>head</c> pointer tracks the contiguous log version + the timestamp head revision + the
-/// current flush (meta) version, and every <see cref="FlushInterval"/> events the dirty buffer is FLUSHED
-/// (per-key shard rows written under the new flush version + a <c>meta/{version}</c> row) and the log compacted, bounding
-/// replay cost. Orleans' <c>RetrieveConfirmedEvents</c> is NOT supported under CustomStorage; the grain
-/// keeps its own in-memory recent-events window so <see cref="ReadFrom"/> serves the live tail with no
-/// storage reads.
+/// THE PROJECTION. Every <see cref="FlushInterval"/> pending events, the sequencer projects them: each
+/// shard grain an event touches folds its events over its persisted state and persists the result
+/// (<see cref="IGraphShardGrain.Project"/>), the touched keys are added to the shard index, and only
+/// then is a <see cref="DatastoreJournalEntry.Projected"/> entry journaled, which drops those events
+/// from the pending tail. A crash anywhere before that entry leaves the events pending, and the next
+/// flush replays them; shard projection is idempotent by its label. So every committed event is, at
+/// every instant, either projected into each shard it touches or pending in the journaled state —
+/// which is what makes a key's current state exactly its projected state with its pending events
+/// folded over (<see cref="ShardFold.Overlay"/>), relabeled to the head.
 /// </para>
 /// <para>
-/// THE LOAD-BEARING SHARDING FACT (pinned by <c>ShardFoldLemmaTests</c>): a stored shard row's CONTENT is
-/// complete unless an event touched its key — any touching event dirties the key and the next flush
-/// rewrites the row — so a clean key's stored row is current except for its <c>AppliedRevision</c> label,
-/// which may safely be relabeled to the current head. That is why serving a clean key needs NO per-key
-/// log replay. Row-level GC is LAZY: a GC event advances the small state's floor immediately, but a clean
-/// key's stored row keeps its sub-floor dead rows until it is next dirtied and flushed. Sound because
-/// reads pinned below the floor are rejected outright and every serve path re-applies the current floor
-/// (<see cref="ShardFold.CollectBelow"/>) before answering, so lazily-retained dead rows are invisible.
+/// THE ORDER RULE for reading a key's current state while a flush may interleave: take the pending
+/// tail FIRST, read the projected state SECOND. A projection that lands in between is then already in
+/// the projected state and its events skipped by the label; one that has not landed is still in the
+/// captured tail.
 /// </para>
 /// <para>
-/// THE KEY INDEX IS CHUNKED IN STORAGE (durable layout v2, docs/scalability-program.md 3.4): the meta
-/// row never serializes the forward/reverse key maps — they are persisted as per-direction BUCKET rows
-/// (<c>indexb/{version}/{dir}/{bucket}</c>, <c>bucket = FNV-1a-64(key) % B</c> with B fixed at store
-/// creation) rewritten ONE bucket per direction per flush in round-robin rotation, plus a per-flush
-/// DELTA row (<c>indexd/{version}</c>) carrying exactly the entries that flush dirtied (removals as
-/// explicit tombstones). Per-flush durable cost is therefore O(dirty entries) + two buckets of ~N/B
-/// entries + a fixed-size meta row — proportional to the dirty set plus a small bounded term, never to
-/// total graph cardinality (the honest residual is the O(N/B) rotated bucket pair, plus an in-memory
-/// O(N) selection scan over the index maps to extract the rotated buckets' entries — CPU-only, no
-/// serialization or IO of the full maps). Recovery reads all 2B bucket rows in parallel and overlays
-/// the pending deltas — bounded by 2B reads plus at most one rotation's worth of delta rows.
+/// Row-level GC is LAZY: a GC event advances the small state's floor immediately, but a projected row
+/// keeps its sub-floor dead rows until its key is next projected. Sound because reads pinned below the
+/// floor are rejected outright and every serve path re-applies the current floor
+/// (<see cref="ShardFold.CollectBelow"/>) before answering.
 /// </para>
 /// </remarks>
-[LogConsistencyProvider(ProviderName = "CustomStorage")]
+[LogConsistencyProvider(ProviderName = "StateStorage")]
+[StorageProvider(ProviderName = "datastore")]
 public sealed class DatastoreGrain :
-    JournaledGrain<DatastoreMetaHolder, LogEvent>,
+    JournaledGrain<DatastoreMetaHolder, DatastoreJournalEntry>,
     IDatastoreGrain,
-    ICustomStorageInterface<DatastoreMetaHolder, LogEvent>,
     IRemindable
 {
     /// <summary>The name of the periodic MVCC-GC reminder registered in <see cref="OnActivateAsync"/>.</summary>
@@ -81,83 +66,20 @@ public sealed class DatastoreGrain :
     // Orleans grain code must not ConfigureAwait(false); keep the captured context.
     private const ConfigureAwaitOptions ContinueOnCapturedContext = ConfigureAwaitOptions.ContinueOnCapturedContext;
 
-    /// <summary>Storage state-name of the durable head pointer (one row, rewritten in place — the commit point).</summary>
-    private const string HeadStateName = "head";
-
-    /// <summary>Per-version small-state entry prefix: <c>meta/{version}</c> (write-once, so crash-safe).</summary>
-    private const string MetaStatePrefix = "meta/";
-
     /// <summary>
-    /// Per-key shard row prefix. Shard rows are VERSION-QUALIFIED and write-once per version:
-    /// <c>shard/{rowVersion}/</c> + the escaped <c>GraphShardGrainKey</c> string (<c>f/type/id</c> or
-    /// <c>r/type/id</c>), where <c>rowVersion</c> is the meta (flush) version the row was written
-    /// under. A flush never rewrites a row any durable meta references — it writes each dirty key's
-    /// row under the NEW flush version and only the meta+head commit makes those rows reachable (the
-    /// key index maps key -> rowVersion). Writes still go read-then-write for the provider ETag,
-    /// because a crashed flush attempt can leave an orphan row at the same versioned name that the
-    /// boundary's retry must overwrite.
+    /// Project the pending tail once it holds this many events. It bounds the journaled state (and so
+    /// the cost of each commit's state write) and is the retention of <see cref="ReadFrom"/>, whose
+    /// floor is the projection boundary.
     /// </summary>
-    private const string ShardStatePrefix = "shard/";
-
-    /// <summary>The storage state-name of one version-qualified shard row.</summary>
-    private static string ShardRowName(int rowVersion, string shardKey) =>
-        $"{ShardStatePrefix}{rowVersion}/{shardKey}";
-
-    /// <summary>
-    /// Key-index BUCKET row prefix (durable layout v2): <c>indexb/{version}/{dir}/{bucket}</c>, one
-    /// direction's one bucket's full key->rowVersion entries as of the flush at <c>{version}</c>.
-    /// Version-qualified and write-once per version, same ETag discipline as shard rows.
-    /// </summary>
-    private const string IndexBucketStatePrefix = "indexb/";
-
-    /// <summary>
-    /// Key-index DELTA row prefix (durable layout v2): <c>indexd/{version}</c>, the index entries the
-    /// flush at <c>{version}</c> dirtied (both directions, removals as explicit tombstones).
-    /// </summary>
-    private const string IndexDeltaStatePrefix = "indexd/";
-
-    /// <summary>The storage state-name of one version-qualified key-index bucket row.</summary>
-    private static string IndexBucketRowName(int version, bool forward, int bucket) =>
-        $"{IndexBucketStatePrefix}{version}/{(forward ? "f" : "r")}/{bucket}";
-
-    /// <summary>The storage state-name of one per-flush key-index delta row.</summary>
-    private static string IndexDeltaRowName(int version) => $"{IndexDeltaStatePrefix}{version}";
-
-    /// <summary>
-    /// Resolves a shard key through the meta key index (forward or reverse — a key string is
-    /// direction-prefixed, so it lives in exactly one map). Returns false for an unindexed key; a true
-    /// result may still carry <see cref="DatastoreMetaState.NoRowVersion"/> (indexed, but no durable
-    /// row yet — the dirty buffer covers it).
-    /// </summary>
-    private static bool TryGetRowVersion(DatastoreMetaState meta, string shardKey, out int rowVersion) =>
-        meta.ForwardKeys.TryGetValue(shardKey, out rowVersion)
-        || meta.ReverseKeys.TryGetValue(shardKey, out rowVersion);
-
-    /// <summary>
-    /// The RETIRED whole-state snapshot prefix (<c>snapshot/{version}</c>). Only read during the one-time
-    /// activation MIGRATION of a store written by the previous layout, then cleared best-effort.
-    /// </summary>
-    private const string LegacySnapshotStatePrefix = "snapshot/";
-
-    /// <summary>Per-event log entry state-name prefix: <c>log/{version}</c>.</summary>
-    private const string LogStatePrefix = "log/";
-
-    /// <summary>Flush the dirty buffer (and compact the log) every N appended events — the same 64-event
-    /// cadence the retired whole-state snapshots used, so the <see cref="ReadFrom"/> retention contract
-    /// (its floor is the flush boundary) is unchanged for shard grains and Watch.</summary>
     private const int FlushInterval = 64;
 
     /// <summary>
-    /// The bucket count used wherever a key-index LAYOUT IS CREATED (the fresh-store seed, the
-    /// missing-meta fallback, and the two migrations' full-coverage write). TEST SEAM ONLY: production
-    /// always leaves this at <see cref="KeyIndexLayout.DefaultBucketCount"/>; tests may lower it (e.g.
-    /// to 2) to make a full rotation — and therefore delta pruning — reachable in a handful of flush
-    /// boundaries. It applies ONLY at layout creation: the count is stored in the layout and honored
-    /// downstream, and changing it for an EXISTING store is FORBIDDEN — <c>bucket = hash % count</c> is
-    /// part of the durable contract, so a different count would strand every stored bucket row (see
-    /// <see cref="KeyIndexLayout.BucketOf"/>).
+    /// The most shard or index grain calls the sequencer has in flight at once. A flush touches up
+    /// to two keys per event, and every one of those grains persists through the storage provider:
+    /// unbounded, a flush opens as many storage connections as it touches keys and exhausts the
+    /// database's connection limit, failing the projection.
     /// </summary>
-    internal static int CreationBucketCount = KeyIndexLayout.DefaultBucketCount;
+    private const int MaxConcurrentShardCalls = 16;
 
     /// <summary>
     /// How long a watcher registration lives without a <see cref="SubscribeWatch"/> refresh. 10x the hubs'
@@ -165,7 +87,6 @@ public sealed class DatastoreGrain :
     /// </summary>
     private static readonly TimeSpan WatcherExpiry = TimeSpan.FromSeconds(10);
 
-    private readonly IGrainStorage _storage;
     private readonly ILogger<DatastoreGrain> _logger;
     private readonly DatastoreGcOptions _gcOptions;
 
@@ -176,11 +97,7 @@ public sealed class DatastoreGrain :
     /// </summary>
     private readonly ISequencerMetrics? _metrics;
 
-    /// <summary>
-    /// How long old revisions stay served by <see cref="ReadFrom"/> / retained in the in-memory window,
-    /// and the retention window <see cref="RunGc"/> collects MVCC history beyond. Older cursors throw
-    /// <c>RevisionNotFoundException</c>. Derived from <see cref="DatastoreGcOptions.Window"/>.
-    /// </summary>
+    /// <summary>The retention window <see cref="RunGc"/> collects MVCC history beyond.</summary>
     private readonly long _gcWindowNanos;
 
     /// <summary>
@@ -190,88 +107,11 @@ public sealed class DatastoreGrain :
     /// </summary>
     private readonly ObserverManager<IDatastoreWatcher> _watchers;
 
-    /// <summary>The contiguous append-only log version (= number of confirmed events) currently in storage.</summary>
-    private int _logVersion;
-
-    /// <summary>The log version of the current <c>meta/{version}</c> row (log entries at or below it are compacted).</summary>
-    private int _metaVersion;
-
-    /// <summary>
-    /// The small state as currently PERSISTED-or-published (the meta fold of all stored events). Tracked
-    /// here so the storage methods never touch <c>JournaledGrain.State</c> — accessing the confirmed view
-    /// from inside a confirm round-trip would re-enter the log-consistency adaptor — and so every serve
-    /// path reads head/floor/schemas/counters/index from the SAME publication unit as
-    /// <see cref="_dirty"/>/<see cref="_recent"/> (they are only ever assigned together in one synchronous
-    /// block; see <see cref="ApplyUpdatesToStorage"/>).
-    /// </summary>
-    private DatastoreMetaState _storedMeta = DatastoreMetaState.Empty(0);
-
-    /// <summary>
-    /// The durable key-index layout descriptor (bucket count, per-bucket row versions, rotation cursor,
-    /// pending delta versions) as of the current meta row — the v2 counterpart of what the retired
-    /// inline maps carried implicitly. Consumed only by the flush (which rotates it forward) and
-    /// recovery (which reconstructs the in-memory maps from the rows it describes); serve paths never
-    /// touch it. Published in the same synchronous blocks as <see cref="_storedMeta"/>.
-    /// </summary>
-    private KeyIndexLayout _indexLayout = KeyIndexLayout.CreateEmpty(CreationBucketCount);
-
-    /// <summary>
-    /// THE DIRTY BUFFER: the folded CURRENT <see cref="GraphShardState"/> of every shard key touched since
-    /// its storage row was last flushed, keyed by the escaped <c>GraphShardGrainKey</c> string. Seeding
-    /// rule: before an event is folded into the buffer, every key it touches must already hold an entry
-    /// seeded from its storage row (or <see cref="GraphShardState.Empty"/>) — seeding happens in ASYNC
-    /// contexts only (<see cref="Commit"/> pre-stages the keys it touches; recovery seeds while replaying);
-    /// the synchronous fold paths only apply <see cref="ShardFold.ApplyEvent"/> to entries guaranteed
-    /// present. Between flushes the buffer only grows (bounded by write rate x <see cref="FlushInterval"/>
-    /// events); a flush rewrites every entry's row and clears it. An entry left by a REJECTED commit's
-    /// pre-seeding is content-correct (it is the key's current state) and merely rides to the next flush.
-    /// </summary>
-    private Dictionary<string, GraphShardState> _dirty = new(StringComparer.Ordinal);
-
-    /// <summary>
-    /// Serializes the flush's shard-row rewrites against <see cref="CurrentShardState"/>'s clean-key
-    /// storage reads. Without it, an interleaved read racing a flush could fetch a key's PRE-flush row
-    /// (missing the dirty-window events), then observe the buffer already cleared and wrongly relabel that
-    /// stale content to the new head. Readers hold it only across one row read; the flush holds it across
-    /// its whole write-rows/meta/head/clear section. Never held across <c>RaiseConditionalEvent</c>.
-    /// </summary>
-    private readonly SemaphoreSlim _shardIo = new(1, 1);
-
-    /// <summary>
-    /// The live grain-state wrapper for the <c>head</c> entry — the only singleton entry rewritten in
-    /// place. Held as a field so its storage ETag persists across writes (the Orleans grain-storage
-    /// providers enforce optimistic concurrency per entry; a fresh empty-ETag wrapper would be rejected on
-    /// the second write). Log entries (<c>log/{version}</c>), meta entries
-    /// (<c>meta/{version}</c>) and version-qualified shard rows are write-once per COMMITTED version but
-    /// a crashed attempt can orphan one at the same versioned name (a crashed append for log rows, a
-    /// crashed flush for shard/meta rows), so they go read-then-write so the wrapper carries the CURRENT
-    /// ETag (see <see cref="WriteLogEntry"/>/<see cref="WriteShardRow"/>).
-    /// </summary>
-    private readonly GrainState<LogHeadEntry> _headState = new();
-
-    /// <summary>
-    /// The in-memory recent-events window (ascending by revision) that <see cref="ReadFrom"/> tails. It
-    /// retains exactly the events with revision &gt; <see cref="_recentFloorRevision"/>; it is rebuilt from
-    /// storage on activation (the post-flush tail) and appended to on each confirmed write.
-    /// </summary>
-    private readonly List<LogEvent> _recent = new();
-
-    /// <summary>
-    /// The exclusive lower bound of <see cref="_recent"/>: events at or below this revision have been
-    /// flushed into per-key shard rows (or aged past the GC window) and are no longer individually
-    /// retained, so <see cref="ReadFrom"/> cannot serve a cursor older than this and throws (the consumer
-    /// re-bootstraps from a snapshot via <see cref="ReadState"/> / <see cref="ReadShard"/>). Kept
-    /// consistent live and after reactivation.
-    /// </summary>
-    private long _recentFloorRevision;
-
     public DatastoreGrain(
-        [FromKeyedServices("datastore")] IGrainStorage storage,
         ILogger<DatastoreGrain> logger,
         IOptions<DatastoreGcOptions>? gcOptions = null,
         ISequencerMetrics? metrics = null)
     {
-        _storage = storage;
         _logger = logger;
         _metrics = metrics;
         _watchers = new ObserverManager<IDatastoreWatcher>(WatcherExpiry, logger);
@@ -286,6 +126,15 @@ public sealed class DatastoreGrain :
     public override async Task OnActivateAsync(CancellationToken cancellationToken)
     {
         await base.OnActivateAsync(cancellationToken).ConfigureAwait(ContinueOnCapturedContext);
+
+        if (Version == 0)
+        {
+            // A fresh store: seed the head at a monotonic timestamp (mirrors ReferenceDatastore's initial
+            // Empty(NowNanos)) and JOURNAL the seed, so the pre-first-write head is stable across
+            // reactivation (a re-seed with a fresh, larger NowNanos would silently move the head).
+            RaiseEvent(new DatastoreJournalEntry.Seeded(NowNanos()));
+            await ConfirmEvents().ConfigureAwait(ContinueOnCapturedContext);
+        }
 
         if (!_gcOptions.ReminderEnabled)
             return;
@@ -315,160 +164,112 @@ public sealed class DatastoreGrain :
 
     // --- Fold (JournaledGrain) ---
 
-    /// <summary>
-    /// Folds a confirmed event into the in-place holder — the SMALL state only (the adaptor's confirmed
-    /// view, which <see cref="Commit"/>/<see cref="RunGc"/> read at the top of a write turn). The dirty
-    /// buffer's per-key fold deliberately does NOT happen here: it happens in
-    /// <see cref="ApplyUpdatesToStorage"/> (into locals, published atomically with
-    /// <see cref="_storedMeta"/>), because a flush inside that method must write rows that already include
-    /// the in-flight batch, and folding the buffer twice (here and there) would corrupt it while folding
-    /// it only here would leave the flush's rows missing the batch. This method stays deterministic and
-    /// synchronous, exactly as the adaptor requires.
-    /// </summary>
-    protected override void TransitionState(DatastoreMetaHolder holder, LogEvent ev) =>
-        holder.Value = MetaFold.ApplyEvent(holder.Value, ev);
+    /// <summary>Folds a journal entry into the in-place holder — the small state only.</summary>
+    protected override void TransitionState(DatastoreMetaHolder holder, DatastoreJournalEntry entry) =>
+        holder.Value = MetaFold.ApplyEntry(holder.Value, entry);
 
     // --- serve-path core -------------------------------------------------------------------------
 
     /// <summary>
-    /// current-state(key): the exact per-key fold at the current head, served without any per-key log
-    /// replay. Resolution order: the dirty buffer entry (folded through every confirmed touching event);
-    /// otherwise the key's STORAGE row relabeled to head (sound by the sharding fact — a clean key's row
-    /// content is complete, only its label is stale) — read at the row version the key index maps the key
-    /// to, so an unindexed key resolves to empty-at-head with no storage read (this also shields leaked or
-    /// orphaned rows the index never references); otherwise empty-at-head. Every branch re-applies the
-    /// current GC floor via <see cref="ShardFold.CollectBelow"/> (the lazy row-GC contract), which also
-    /// performs the relabel.
+    /// current-state(key) against the captured state <paramref name="meta"/>: the key's shard grain's
+    /// projected state with <paramref name="meta"/>'s pending events for the key folded over, relabeled
+    /// to its head with its floor applied. <paramref name="meta"/> must be captured BEFORE this call
+    /// reads the projected state (the order rule in the class remarks).
     /// </summary>
-    /// <remarks>
-    /// Interleave safety: the dirty-hit and unindexed branches are fully synchronous over one publication
-    /// unit. The storage-read branch awaits under <see cref="_shardIo"/> so it cannot race a flush's row
-    /// rewrite, and re-checks the buffer afterwards — if a commit dirtied the key during the read, it
-    /// loops and serves the (authoritative) buffer entry instead; unrelated commits landing during the
-    /// read are safe without a retry because the key being clean at the re-check proves no event through
-    /// the re-read head touched it.
-    /// </remarks>
-    private async Task<GraphShardState> CurrentShardState(string shardKey)
+    private async Task<GraphShardState> CurrentShardState(DatastoreMetaState meta, string shardKey)
     {
-        while (true)
-        {
-            var meta = _storedMeta;
-            if (_dirty.TryGetValue(shardKey, out var entry))
-            {
-                return ShardFold.CollectBelow(
-                    entry, Math.Max(entry.AppliedRevision, meta.HeadRevision), meta.GcFloor);
-            }
-
-            // Index miss => empty-at-head with no storage read. Rows are reachable ONLY through the
-            // index maps (shard rows are version-qualified), so a leaked physical row — a crashed
-            // best-effort clear, or an abandoned flush attempt's orphan — can never be served. A key
-            // indexed at NoRowVersion but NOT dirty is unreachable in practice (a key first touched
-            // after the last flush stays in the dirty buffer until the flush that assigns it a row
-            // version); treat it like an index miss defensively rather than dereference the sentinel.
-            if (!TryGetRowVersion(meta, shardKey, out var rowVersion) || rowVersion < 0)
-                return new GraphShardState(meta.HeadRevision, meta.GcFloor, ImmutableList<StoredRelationshipWire>.Empty);
-
-            GraphShardState? stored;
-            await _shardIo.WaitAsync().ConfigureAwait(ContinueOnCapturedContext);
-            try
-            {
-                stored = await ReadShardRow(rowVersion, shardKey).ConfigureAwait(ContinueOnCapturedContext);
-            }
-            finally
-            {
-                _shardIo.Release();
-            }
-
-            // Synchronous re-validation (no await between here and the return): a commit may have landed
-            // during the read. If it touched THIS key the buffer now holds the authority — loop (the next
-            // iteration returns it synchronously). If a FLUSH landed instead (possible while parked on
-            // the semaphore), the key's current row may have moved to a newer version and the row just
-            // read may already be post-commit-cleared — loop and resolve through the fresh index. If
-            // neither happened, the row content is still complete through the CURRENT head and the
-            // relabel below is exact.
-            if (_dirty.ContainsKey(shardKey))
-                continue;
-            if (!TryGetRowVersion(_storedMeta, shardKey, out var currentVersion) || currentVersion != rowVersion)
-                continue;
-
-            // Serve at the MAX of the small state's floor and the stored row's own stamped floor. On this
-            // activation they agree (rows are stamped with the flush-time floor, and the meta floor never
-            // regresses past it); they can diverge only when a STALE DUPLICATE activation (membership
-            // churn) reads a row a newer activation has GC-compacted further — taking the max turns what
-            // would be a silently-incomplete answer for a pin between the two floors into the standard
-            // below-floor rejection at the consumer (fail loud, never wrong).
-            var current = _storedMeta;
-            return ShardFold.CollectBelow(
-                stored ?? GraphShardState.Empty,
-                current.HeadRevision,
-                Math.Max(current.GcFloor, stored?.GcFloor ?? 0));
-        }
+        var key = GraphShardGrainKey.Parse(shardKey);
+        var projected = await GrainFactory.GetGrain<IGraphShardGrain>(shardKey).ReadProjected()
+            .ConfigureAwait(ContinueOnCapturedContext);
+        return ShardFold.Overlay(projected, meta.Pending, key, meta.HeadRevision, meta.GcFloor);
     }
+
+    /// <summary>
+    /// Every key of <paramref name="direction"/> and <paramref name="objectType"/> that may hold rows:
+    /// the shard index's listing plus the keys the pending tail touches (not yet indexed).
+    /// </summary>
+    private async Task<IEnumerable<GraphShardKeyWire>> KeysOf(
+        DatastoreMetaState meta, GraphShardDirection direction, string objectType)
+    {
+        var listed = await ShardIndexKey.ListAsync(GrainFactory, direction, objectType)
+            .ConfigureAwait(ContinueOnCapturedContext);
+        return listed.Concat(PendingKeys(meta, direction).Where(key =>
+            string.Equals(key.ObjectType, objectType, StringComparison.Ordinal)));
+    }
+
+    /// <summary>The keys of <paramref name="direction"/> the pending tail touches.</summary>
+    private static IEnumerable<GraphShardKeyWire> PendingKeys(DatastoreMetaState meta, GraphShardDirection direction) =>
+        meta.Pending
+            .Where(ev => ev.GcFloor is null)
+            .SelectMany(ev => ev.RelationshipChanges)
+            .Select(change => direction == GraphShardDirection.Forward
+                ? GraphShardKeyWire.ForResource(change.Relationship.ResourceType, change.Relationship.ResourceId)
+                : GraphShardKeyWire.ForSubject(change.Relationship.SubjectType, change.Relationship.SubjectId));
 
     // --- IDatastoreGrain ---
 
     /// <inheritdoc />
     /// <remarks>
-    /// [AlwaysInterleave]. ADMIN-PLANE ASSEMBLY: the thin sequencer no longer holds the whole fold, so
-    /// this rebuilds a <see cref="DatastoreGrainState"/> from the small state plus the current state of
-    /// every indexed FORWARD key (each row belongs to exactly one forward key, so the union is exact and
-    /// duplicate-free; the dirty overlay wins per key inside <see cref="CurrentShardState"/>). Semantics
-    /// are identical to the retired materialized fold; the cost is O(graph) storage reads + transfer per
-    /// call, which is acceptable ONLY for its admin-plane consumers (the scan seam, the compatibility
-    /// ReadWriteTx base, the equivalence gates) — the per-Check hot path never comes here.
-    /// Consistency: rows are collected against one captured small state; a commit landing mid-assembly
-    /// can only contribute rows STAMPED ABOVE the captured head, which MVCC visibility filters for every
-    /// pin at or below it; a GC-floor advance mid-assembly restarts the assembly (rare — floors move once
-    /// per GC run), so the returned state's floor always covers its rows.
+    /// [AlwaysInterleave]. ADMIN-PLANE ASSEMBLY: rebuilds a <see cref="DatastoreGrainState"/> from the
+    /// captured small state plus the current state of every FORWARD key the shard index or the pending
+    /// tail names (each row belongs to exactly one forward key, so the union is exact and
+    /// duplicate-free). The cost is O(graph) grain calls + transfer per call, acceptable ONLY for its
+    /// admin-plane consumers (the scan seam, the compatibility ReadWriteTx base, the equivalence gates).
+    /// Consistency: every key is read against the one captured state (the order rule), so a projection
+    /// landing mid-assembly is never double-applied or lost; a key whose projection already includes
+    /// events above the captured head contributes rows stamped above it, which MVCC visibility filters
+    /// for every pin at or below it.
     /// </remarks>
     public async Task<DatastoreGrainState> ReadState()
     {
         _metrics?.RecordReadState();
-        while (true)
+        var meta = State.Value;
+
+        var keys = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var type in meta.ForwardTypes)
         {
-            var meta = _storedMeta;
-            var rows = new List<StoredRelationshipWire>();
-            var floor = meta.GcFloor;
-            foreach (var shardKey in meta.ForwardKeys.Keys)
-            {
-                var state = await CurrentShardState(shardKey).ConfigureAwait(ContinueOnCapturedContext);
-                rows.AddRange(state.Rows);
-                // Normally equal to the small state's floor; a HIGHER per-key floor can only come from
-                // the stale-duplicate divergence documented in CurrentShardState — propagate it so a pin
-                // between the floors is rejected (fail loud) instead of served incomplete.
-                floor = Math.Max(floor, state.GcFloor);
-            }
-
-            if (_storedMeta.GcFloor != meta.GcFloor)
-                continue; // a GC event landed mid-assembly; restart so floor and rows agree.
-
-            // Order by created revision to approximate the retired fold's append order (ties — rows of
-            // one commit — land in per-key iteration order). Order is cosmetic: every consumer is an
-            // MVCC reader, and anything order-sensitive (keyset cursors, the limited delete's canonical
-            // pick) imposes its own deterministic order downstream.
-            rows.Sort(static (a, b) => a.CreatedRevision.CompareTo(b.CreatedRevision));
-
-            return new DatastoreGrainState
-            {
-                HeadRevision = meta.HeadRevision,
-                Relationships = rows.ToImmutableList(),
-                Schemas = meta.Schemas,
-                Counters = meta.Counters,
-                GcFloor = floor,
-            };
+            foreach (var key in await KeysOf(meta, GraphShardDirection.Forward, type).ConfigureAwait(ContinueOnCapturedContext))
+                keys.Add(GraphShardGrainKey.Build(key));
         }
+
+        var states = await InBatches(keys, key => CurrentShardState(meta, key))
+            .ConfigureAwait(ContinueOnCapturedContext);
+
+        var rows = new List<StoredRelationshipWire>();
+        var floor = meta.GcFloor;
+        foreach (var state in states)
+        {
+            rows.AddRange(state.Rows);
+            // Normally equal to the small state's floor; a HIGHER projected floor (a GC and a projection
+            // landed mid-assembly) is propagated so a pin between the floors is rejected (fail loud)
+            // instead of served incomplete.
+            floor = Math.Max(floor, state.GcFloor);
+        }
+
+        // Order by created revision to approximate the whole fold's append order. Order is cosmetic:
+        // every consumer is an MVCC reader, and anything order-sensitive (keyset cursors, the limited
+        // delete's canonical pick) imposes its own deterministic order downstream.
+        rows.Sort(static (a, b) => a.CreatedRevision.CompareTo(b.CreatedRevision));
+
+        return new DatastoreGrainState
+        {
+            HeadRevision = meta.HeadRevision,
+            Relationships = rows.ToImmutableList(),
+            Schemas = meta.Schemas,
+            Counters = meta.Counters,
+            GcFloor = floor,
+        };
     }
 
     /// <inheritdoc />
     /// <remarks>
-    /// [AlwaysInterleave]. Reads <see cref="_storedMeta"/> — the storage-side publication unit (see
-    /// <see cref="ApplyUpdatesToStorage"/>) — so an interleaved call landing mid-write sees, AT WORST,
-    /// the previous commit; it can never observe a write's in-flight intermediate state.
+    /// [AlwaysInterleave]. Reads the confirmed state, so an interleaved call landing mid-write sees, AT
+    /// WORST, the previous commit; it can never observe a write's in-flight intermediate state.
     /// </remarks>
     public Task<DatastoreHeadWire> GetHead()
     {
         _metrics?.RecordGetHead();
-        var s = _storedMeta;
+        var s = State.Value;
         return Task.FromResult(new DatastoreHeadWire(s.HeadRevision, s.SchemaHashAt(s.HeadRevision), s.GcFloor));
     }
 
@@ -477,7 +278,7 @@ public sealed class DatastoreGrain :
     public Task<byte[]?> ReadSchemaAt(long revision)
     {
         _metrics?.RecordReadSchemaAt();
-        var s = _storedMeta;
+        var s = State.Value;
         // Below the GC floor the schema history has been collected, so "no schema at this revision" is
         // indistinguishable from "collected away" — a silent null here would make callers fall back to
         // the seed schema and evaluate WRONG results under a stale token. Reject loudly instead (the
@@ -491,17 +292,22 @@ public sealed class DatastoreGrain :
     }
 
     /// <inheritdoc />
-    /// <remarks>
-    /// [AlwaysInterleave]. One <see cref="CurrentShardState"/> resolution: the dirty entry, or the stored
-    /// row relabeled to the CURRENT head (the sharding fact), or empty-at-head — with the current GC
-    /// floor applied in every branch. The reply's <see cref="GraphShardState.AppliedRevision"/> is the
-    /// current head, exactly the watermark contract a hydrating shard grain expects.
-    /// </remarks>
+    /// <remarks>[AlwaysInterleave]. One <see cref="CurrentShardState"/> resolution at the current head.</remarks>
     public Task<GraphShardState> ReadShard(GraphShardKeyWire key)
+    {
+        ArgumentNullException.ThrowIfNull(key);
+        return CurrentShardState(State.Value, GraphShardGrainKey.Build(key));
+    }
+
+    /// <inheritdoc />
+    /// <remarks>[AlwaysInterleave]. Synchronous over the confirmed state.</remarks>
+    public Task<ShardTailWire> ReadShardTail(GraphShardKeyWire key)
     {
         _metrics?.RecordReadShard();
         ArgumentNullException.ThrowIfNull(key);
-        return CurrentShardState(GraphShardGrainKey.Build(key));
+        var meta = State.Value;
+        var events = meta.Pending.Where(ev => ShardFold.Touches(ev, key)).ToImmutableList();
+        return Task.FromResult(new ShardTailWire(events, meta.HeadRevision, meta.GcFloor));
     }
 
     /// <inheritdoc />
@@ -510,11 +316,10 @@ public sealed class DatastoreGrain :
     /// base-transact-CAS loop) into the sequencer: because writes never interleave writes, the head read at
     /// the top of this method cannot move before the append at the bottom — the transaction executor IS the
     /// serialization point, so a declarative commit (null <see cref="CommitRequest.ExpectedHead"/>) needs
-    /// no retry. Under the thin-sequencer layout the write base is no longer the whole fold: candidate-key
-    /// resolution assembles a PARTIAL base from exactly the shard keys the request can read (see the
-    /// soundness argument inline). The storage protocol (<see cref="ApplyUpdatesToStorage"/> and the
-    /// event-application path through <see cref="TransitionState"/>) is byte-for-byte the one the retired
-    /// whole-state path drove. All rejections return as reply data (<see cref="CommitReply.Failure"/>)
+    /// no retry. The write base is not the whole fold: candidate-key resolution assembles a PARTIAL base
+    /// from exactly the shard keys the request can read (see the soundness argument inline), each the
+    /// key's projected state with the pending tail folded over. All rejections return as reply data
+    /// (<see cref="CommitReply.Failure"/>)
     /// with NOTHING applied — the staged <see cref="MvccReadWriteTransaction"/> is simply abandoned,
     /// exactly as the caller-side lambda abandonment worked.
     /// </remarks>
@@ -543,8 +348,8 @@ public sealed class DatastoreGrain :
     /// public entry can bracket it with the Phase 0 duration measurement.</summary>
     private async Task<CommitReply> CommitCore(CommitRequest request)
     {
-        // The confirmed small state: in a write turn this equals _storedMeta (all prior confirms have
-        // fully completed), and it is the view RaiseConditionalEvent's own version check pairs with.
+        // The confirmed small state: in a write turn all prior confirms have fully completed, and it is
+        // the view RaiseConditionalEvent's own version check pairs with.
         var meta = State.Value;
         var head = meta.HeadRevision;
 
@@ -595,18 +400,17 @@ public sealed class DatastoreGrain :
         foreach (var update in request.Updates)
             candidates.Add(MetaFold.ForwardKeyOf(update.Relationship));
         foreach (var precondition in request.Preconditions)
-            AddFilterCandidates(precondition.Filter, meta, candidates);
+            await AddFilterCandidates(precondition.Filter, meta, candidates).ConfigureAwait(ContinueOnCapturedContext);
         if (request.DeleteByFilter is { } df)
-            AddFilterCandidates(df.Filter, meta, candidates);
+            await AddFilterCandidates(df.Filter, meta, candidates).ConfigureAwait(ContinueOnCapturedContext);
         _metrics?.RecordCommitCandidates(candidates.Count);
 
-        var loaded = new Dictionary<string, GraphShardState>(StringComparer.Ordinal);
+        var shards = await InBatches(candidates, candidate => CurrentShardState(meta, candidate))
+            .ConfigureAwait(ContinueOnCapturedContext);
         var candidateRows = new List<StoredRelationshipWire>();
         var seen = new Dictionary<CandidateRowIdentity, long?>();
-        foreach (var candidate in candidates)
+        foreach (var shard in shards)
         {
-            var shard = await CurrentShardState(candidate).ConfigureAwait(ContinueOnCapturedContext);
-            loaded[candidate] = shard;
             foreach (var row in shard.Rows)
             {
                 var identity = CandidateRowIdentity.From(row);
@@ -614,14 +418,10 @@ public sealed class DatastoreGrain :
                 {
                     // The INTENDED collision: the same stored row contributed by both its forward and
                     // its reverse key — identical stamps by the sharding lemma, so dropping the
-                    // duplicate is exact. With version-qualified write-once shard rows a crashed flush
-                    // can no longer leave a same-revision live row AND tombstone for one identity in
-                    // the reachable rows (the old in-place-rewrite crash window this dedup used to
-                    // collapse WRONGLY — a rolled-back tombstone silently shadowing, or being
-                    // shadowed by, the live row). If the stamps nonetheless disagree, that state is
-                    // impossible by construction: it means storage corruption or a fold bug, and
-                    // silently preferring either row would reintroduce the collapsed-verdict blocker.
-                    // Fail loudly instead of guessing.
+                    // duplicate is exact. If the stamps disagree, that state is impossible by
+                    // construction: it means storage corruption or a fold bug, and silently preferring
+                    // either row would reintroduce the collapsed-verdict blocker. Fail loudly instead
+                    // of guessing.
                     if (deletedRevision != row.DeletedRevision)
                     {
                         throw new InvalidOperationException(
@@ -758,28 +558,13 @@ public sealed class DatastoreGrain :
         if (request.ExpectedHead is not null && request.CounterChanges.Count > 0)
             ev = ev with { CounterChanges = request.CounterChanges };
 
-        // 12. PRE-SEED the dirty buffer for every key the event touches (the seeding rule): the forward
-        //     candidates are already loaded; reverse keys of updated/deleted rows' subjects may not be —
-        //     load the missing ones now (async is fine, still before the append). The merge into the
-        //     shared buffer is SYNCHRONOUS (no await between the merge and RaiseConditionalEvent's own
-        //     bookkeeping), so an interleaved reader sees either no entry or a complete, content-correct
-        //     seed — never a partial one. Seeds left behind by a later failure are content-correct.
-        var touched = MetaFold.TouchedKeys(ev);
-        foreach (var key in touched)
-        {
-            if (!loaded.ContainsKey(key) && !_dirty.ContainsKey(key))
-                loaded[key] = await CurrentShardState(key).ConfigureAwait(ContinueOnCapturedContext);
-        }
-        foreach (var key in touched)
-        {
-            if (!_dirty.ContainsKey(key))
-                _dirty[key] = loaded[key];
-        }
-
-        // RaiseConditionalEvent's own version check is a secondary guard behind the CAS above. It
+        // 12. Append: the event joins the pending tail, from which the shard grains and Watch read it
+        //     until a projection flush persists it into the shard grains it touches.
+        //     RaiseConditionalEvent's own version check is a secondary guard behind the CAS above. It
         // cannot lose here — this activation is the only writer and no write interleaves a write — but
         // keep the identical false-branch handling (reported as a moved head) rather than assume.
-        var raised = await RaiseConditionalEvent(ev).ConfigureAwait(ContinueOnCapturedContext);
+        var raised = await RaiseConditionalEvent(new DatastoreJournalEntry.Committed(ev))
+            .ConfigureAwait(ContinueOnCapturedContext);
         if (!raised)
             return Rejected(CommitFailureKind.HeadMoved, "conditional append reported a concurrent head advance");
         await ConfirmEvents().ConfigureAwait(ContinueOnCapturedContext);
@@ -814,6 +599,9 @@ public sealed class DatastoreGrain :
             }
         }
 
+        if (State.Value.Pending.Count >= FlushInterval)
+            await TryFlushProjection().ConfigureAwait(ContinueOnCapturedContext);
+
         return new CommitReply(newRevision, null, deletedCount, reachedLimit);
 
         static CommitReply Rejected(CommitFailureKind kind, string? detail) =>
@@ -823,13 +611,16 @@ public sealed class DatastoreGrain :
     /// <summary>
     /// Resolves a filter to the shard keys able to hold ANY row it matches — deliberately a SUPERSET
     /// (over-inclusion only adds rows the filter then ignores; under-inclusion would silently break
-    /// MustNotMatch/delete completeness). Resource-side constraints (type/ids/prefix) resolve against the
-    /// forward index; a filter constraining ONLY subjects resolves its selectors against the reverse
-    /// index; a filter constraining neither (relation-only or empty) resolves every forward key, because
-    /// every row lives in exactly one forward key. Row-level constraints (relation, caveat, expiration,
-    /// subject-relation) never narrow KEYS and are left to the transaction's own filter evaluation.
+    /// MustNotMatch/delete completeness). A filter naming an explicit resource type and ids determines
+    /// its keys by construction; other resource-side constraints (type/ids/prefix) enumerate the forward
+    /// keys of the constrained type (every type when none is named); a filter constraining ONLY subjects
+    /// resolves its selectors the same way on the reverse side; a filter constraining neither
+    /// (relation-only or empty) resolves every forward key, because every row lives in exactly one
+    /// forward key. Enumeration reads the shard index plus the pending tail's keys. Row-level
+    /// constraints (relation, caveat, expiration, subject-relation) never narrow KEYS and are left to the
+    /// transaction's own filter evaluation.
     /// </summary>
-    private static void AddFilterCandidates(
+    private async Task AddFilterCandidates(
         FullRelationshipsFilterWire filter, DatastoreMetaState meta, HashSet<string> candidates)
     {
         var resourceConstrained = filter.OptionalResourceType is not null
@@ -839,35 +630,27 @@ public sealed class DatastoreGrain :
         if (resourceConstrained)
         {
             // Exact-key fast path: a filter naming an explicit resource type + explicit ids (no prefix)
-            // determines its candidate keys by CONSTRUCTION — O(#ids) dictionary probes, never a scan.
-            // The index scan below is O(all keys) with a string parse per key, which the measurement
-            // harness showed making an exact-key precondition cost scale linearly with graph cardinality
-            // (docs/scalability-program.md 3.3 trigger note); it remains only for the shapes that
-            // genuinely cannot name their keys (type-only, prefix). An id absent from the index simply
-            // contributes no candidate: no key means no rows, which evaluates preconditions identically.
+            // determines its candidate keys by CONSTRUCTION — O(#ids), never an enumeration. A key with
+            // no rows resolves to an empty shard, which evaluates preconditions identically.
             if (filter is { OptionalResourceType: { } exactType, OptionalResourceIds.Count: > 0, OptionalResourceIdPrefix: null })
             {
                 foreach (var id in filter.OptionalResourceIds)
-                {
-                    var key = GraphShardGrainKey.Build(GraphShardKeyWire.ForResource(exactType, id));
-                    if (meta.ForwardKeys.ContainsKey(key))
-                        candidates.Add(key);
-                }
+                    candidates.Add(GraphShardGrainKey.Build(GraphShardKeyWire.ForResource(exactType, id)));
                 return;
             }
 
-            foreach (var key in meta.ForwardKeys.Keys)
+            IEnumerable<string> types = filter.OptionalResourceType is { } type ? [type] : meta.ForwardTypes;
+            foreach (var t in types)
             {
-                var parsed = GraphShardGrainKey.Parse(key);
-                if (filter.OptionalResourceType is { } type
-                    && !string.Equals(parsed.ObjectType, type, StringComparison.Ordinal))
-                    continue;
-                if (filter.OptionalResourceIds is { Count: > 0 } ids && !ids.Contains(parsed.ObjectId))
-                    continue;
-                if (filter.OptionalResourceIdPrefix is { } prefix
-                    && !parsed.ObjectId.StartsWith(prefix, StringComparison.Ordinal))
-                    continue;
-                candidates.Add(key);
+                foreach (var key in await KeysOf(meta, GraphShardDirection.Forward, t).ConfigureAwait(ContinueOnCapturedContext))
+                {
+                    if (filter.OptionalResourceIds is { Count: > 0 } ids && !ids.Contains(key.ObjectId))
+                        continue;
+                    if (filter.OptionalResourceIdPrefix is { } prefix
+                        && !key.ObjectId.StartsWith(prefix, StringComparison.Ordinal))
+                        continue;
+                    candidates.Add(GraphShardGrainKey.Build(key));
+                }
             }
             return;
         }
@@ -876,38 +659,43 @@ public sealed class DatastoreGrain :
         {
             // Same fast path on the reverse side: when EVERY selector names an explicit subject type +
             // explicit ids, the reverse keys are constructible; one broader selector falls the whole
-            // filter back to the scan (selectors are OR'd, so a scan-shaped one covers the others too).
+            // filter back to enumeration (selectors are OR'd, so an enumerated one covers the others).
             if (selectors.All(static s => s is { OptionalSubjectType: not null, OptionalSubjectIds.Count: > 0 }))
             {
                 foreach (var selector in selectors)
                 foreach (var id in selector.OptionalSubjectIds!)
-                {
-                    var key = GraphShardGrainKey.Build(GraphShardKeyWire.ForSubject(selector.OptionalSubjectType!, id));
-                    if (meta.ReverseKeys.ContainsKey(key))
-                        candidates.Add(key);
-                }
+                    candidates.Add(GraphShardGrainKey.Build(GraphShardKeyWire.ForSubject(selector.OptionalSubjectType!, id)));
                 return;
             }
 
-            foreach (var key in meta.ReverseKeys.Keys)
+            IEnumerable<string> subjectTypes = selectors.Any(static s => s.OptionalSubjectType is null)
+                ? meta.ReverseTypes
+                : selectors.Select(static s => s.OptionalSubjectType!).Distinct(StringComparer.Ordinal);
+            foreach (var t in subjectTypes)
             {
-                var parsed = GraphShardGrainKey.Parse(key);
-                foreach (var selector in selectors)
+                foreach (var key in await KeysOf(meta, GraphShardDirection.Reverse, t).ConfigureAwait(ContinueOnCapturedContext))
                 {
-                    if (selector.OptionalSubjectType is { } subjectType
-                        && !string.Equals(parsed.ObjectType, subjectType, StringComparison.Ordinal))
-                        continue;
-                    if (selector.OptionalSubjectIds is { Count: > 0 } subjectIds
-                        && !subjectIds.Contains(parsed.ObjectId))
-                        continue;
-                    candidates.Add(key);
-                    break;
+                    foreach (var selector in selectors)
+                    {
+                        if (selector.OptionalSubjectType is { } subjectType
+                            && !string.Equals(key.ObjectType, subjectType, StringComparison.Ordinal))
+                            continue;
+                        if (selector.OptionalSubjectIds is { Count: > 0 } subjectIds
+                            && !subjectIds.Contains(key.ObjectId))
+                            continue;
+                        candidates.Add(GraphShardGrainKey.Build(key));
+                        break;
+                    }
                 }
             }
             return;
         }
 
-        candidates.UnionWith(meta.ForwardKeys.Keys);
+        foreach (var t in meta.ForwardTypes)
+        {
+            foreach (var key in await KeysOf(meta, GraphShardDirection.Forward, t).ConfigureAwait(ContinueOnCapturedContext))
+                candidates.Add(GraphShardGrainKey.Build(key));
+        }
     }
 
     /// <summary>
@@ -945,22 +733,18 @@ public sealed class DatastoreGrain :
 
         // Mint the new revision exactly like Commit (monotonic over the observed head) — a GC event
         // is minted by the grain itself, not by a caller-supplied expectedHead CAS. It touches no shard
-        // keys, so no dirty-buffer seeding is needed: the fold applies it to every entry already present,
-        // and clean keys compact lazily (their next dirty+flush; every serve path re-applies the floor).
+        // keys: projected rows compact lazily (at their key's next projection), and every serve path
+        // re-applies the floor.
         var newRevision = now > head ? now : head + 1;
         var ev = new LogEvent(
             newRevision, Array.Empty<RelationshipUpdateWire>(), SchemaChange: null,
             Array.Empty<CounterDeltaWire>(), GcFloor: floor);
 
-        var raised = await RaiseConditionalEvent(ev).ConfigureAwait(ContinueOnCapturedContext);
+        var raised = await RaiseConditionalEvent(new DatastoreJournalEntry.Committed(ev))
+            .ConfigureAwait(ContinueOnCapturedContext);
         if (!raised)
             return null; // lost a race with a concurrent turn; the next reminder tick (or caller) retries.
         await ConfirmEvents().ConfigureAwait(ContinueOnCapturedContext);
-
-        // Keep the in-memory log-tail retention (ReadFrom) in lockstep with the collected state floor: a
-        // cursor below the floor is no longer a meaningful re-bootstrap point either.
-        _recentFloorRevision = Math.Max(_recentFloorRevision, floor);
-        _recent.RemoveAll(e => e.Revision <= _recentFloorRevision);
 
         // Same best-effort notify pattern as Commit: the GC result never depends on this succeeding,
         // and the GC event itself carries no relationship/schema content so a Watch consumer parked before
@@ -973,6 +757,9 @@ public sealed class DatastoreGrain :
         {
             // Defunct observers are pruned by ObserverManager; nothing else to do.
         }
+
+        if (State.Value.Pending.Count >= FlushInterval)
+            await TryFlushProjection().ConfigureAwait(ContinueOnCapturedContext);
 
         return floor;
     }
@@ -997,1045 +784,111 @@ public sealed class DatastoreGrain :
 
     /// <inheritdoc />
     /// <remarks>
-    /// This is one of the [AlwaysInterleave] pure reads, so it can run while a write is parked at an
-    /// await. It reads the head from <c>_storedMeta.HeadRevision</c> — so the served head and
-    /// <see cref="_recent"/>/<see cref="_recentFloorRevision"/> all come from the SAME publication unit
-    /// (see <see cref="ApplyUpdatesToStorage"/>): the returned <see cref="LogSegment"/> is internally
-    /// consistent (its head is &gt;= every event it serves) even if this call lands mid-write.
+    /// One of the [AlwaysInterleave] pure reads. The tail it serves is the pending tail of the
+    /// confirmed state, so the served head and events come from one immutable state and the returned
+    /// <see cref="LogSegment"/> is internally consistent (its head is &gt;= every event it serves) even
+    /// if this call lands mid-write. Retention starts at the projection boundary (and the GC floor): an
+    /// older cursor cannot be served COMPLETELY, so it is rejected rather than silently answered with a
+    /// short tail — a shard re-bootstraps from its projection, a Watch consumer from a fresh snapshot.
     /// </remarks>
     public Task<LogSegment> ReadFrom(long afterRevision, int maxCount)
     {
         _metrics?.RecordReadFrom();
-        var head = _storedMeta.HeadRevision;
+        var meta = State.Value;
 
-        // The in-memory window retains only events strictly above the flush/GC floor; an older cursor
-        // cannot be served COMPLETELY (some events in (afterRevision, floor] were compacted), so we must
-        // reject rather than silently return a short tail — the consumer re-bootstraps via ReadState /
-        // ReadShard.
-        if (afterRevision < _recentFloorRevision)
+        if (afterRevision < Math.Max(meta.ProjectedThrough, meta.GcFloor))
             throw new RevisionNotFoundException(new TimestampRevision(afterRevision));
 
-        var events = _recent
+        var events = meta.Pending
             .Where(e => e.Revision > afterRevision)
-            .OrderBy(e => e.Revision)
             .Take(maxCount < 0 ? int.MaxValue : maxCount)
             .ToList();
 
-        return Task.FromResult(new LogSegment(events, head));
+        return Task.FromResult(new LogSegment(events, meta.HeadRevision));
     }
 
-    // --- ICustomStorageInterface (WE own persistence; no application SQL) ---
-
-    /// <summary>
-    /// PUBLICATION DISCIPLINE (both this method and <see cref="ApplyUpdatesToStorage"/>): storage reads/writes
-    /// are awaited into purely LOCAL variables; the shared fields (<see cref="_storedMeta"/>, <see cref="_dirty"/>,
-    /// <see cref="_recent"/>, <see cref="_recentFloorRevision"/>, <see cref="_logVersion"/>,
-    /// <see cref="_metaVersion"/>) are only ever assigned in a single synchronous block with no <c>await</c>
-    /// in between. Because an <c>[AlwaysInterleave]</c> read can only run while THIS call is parked at an
-    /// await, a read landing mid-method sees either the fields wholly untouched (still whatever the previous
-    /// publish left) or, once this method's synchronous tail runs, the fully-updated fields — never a
-    /// partially-applied batch.
-    /// </summary>
-    /// <remarks>
-    /// RECOVERY is O(index reconstruction + tail + touched keys), never O(graph) row content: load the
-    /// head row, load the <c>meta/{SnapshotVersion}</c> small state, reconstruct the key index from its
-    /// chunked rows (all 2B bucket rows fanned out in parallel, then the pending delta rows overlaid in
-    /// ascending version order — bounded by 2B reads plus at most one rotation of deltas; see
-    /// <see cref="ReconstructIndex"/> for why the overlay cannot double-apply), then replay the log tail
-    /// (<c>FlushedThroughLogVersion</c>, <c>logVersion</c>] — folding the small state via the SAME
-    /// <see cref="MetaFold"/>, rebuilding the dirty buffer (each touched key's row seeded from storage as
-    /// first encountered, then <see cref="ShardFold"/>), and rebuilding <see cref="_recent"/> so
-    /// <see cref="ReadFrom"/> serves the tail exactly as before (its floor is the flush boundary — the
-    /// same cadence the retired snapshot boundary had, so shard grains and Watch see an unchanged
-    /// retention contract). MIGRATION, one-time, both legacy layouts landing on v2: a v1 store (meta row
-    /// carrying the key maps INLINE, null <see cref="DatastoreMetaEntry.IndexLayout"/>) has its maps
-    /// split into bucket rows in place (<see cref="MigrateInlineIndex"/>); a v0 store (whole-state
-    /// <c>snapshot/{version}</c> row where the meta row is missing) is split ONCE into per-key shard
-    /// rows (both directions) + bucket rows + slim meta, persisted, and the legacy snapshot cleared
-    /// best-effort (a crash mid-migration simply re-migrates — the versioned-row writes go
-    /// read-then-write, so re-writing an existing row is ETag-correct; a crash between the meta write
-    /// and the legacy clear leaks the one legacy row, harmlessly, exactly like a failed compaction
-    /// clear).
-    /// </remarks>
-    /// <inheritdoc />
-    public async Task<KeyValuePair<int, DatastoreMetaHolder>> ReadStateFromStorage()
-    {
-        await _storage.ReadStateAsync(HeadStateName, this.GetGrainId(), _headState)
-            .ConfigureAwait(ContinueOnCapturedContext);
-
-        if (!_headState.RecordExists || _headState.State is null)
-        {
-            // No durable head yet: seed an empty state at a monotonic timestamp (mirrors ReferenceDatastore's
-            // initial Empty(NowNanos)) and PERSIST the seed, so the pre-first-write revision floor is stable
-            // across reactivation (a re-seed with a fresh, larger NowNanos would silently move the head).
-            // A fresh store is born on durable layout v2: the bucket count is FIXED here for the
-            // store's whole life (recorded in the meta entry; the bucket assignment is part of the
-            // durable contract) and no bucket rows exist yet — the rotation writes them as flushes
-            // happen, and DeltaFloorVersion stays 0 (deltas bounded by one full rotation) until every
-            // bucket has been written once.
-            var seeded = DatastoreMetaState.Empty(NowNanos());
-            var seededLayout = KeyIndexLayout.CreateEmpty(CreationBucketCount);
-            await WriteMeta(0, new DatastoreMetaEntry(seeded, 0, seededLayout))
-                .ConfigureAwait(ContinueOnCapturedContext);
-            await WriteHead(new LogHeadEntry(0, seeded.HeadRevision, 0)).ConfigureAwait(ContinueOnCapturedContext);
-
-            // Publish (no await below this point in the branch).
-            _logVersion = 0;
-            _metaVersion = 0;
-            _storedMeta = seeded;
-            _indexLayout = seededLayout;
-            _dirty = new Dictionary<string, GraphShardState>(StringComparer.Ordinal);
-            _recent.Clear();
-            _recentFloorRevision = seeded.HeadRevision;
-            return new KeyValuePair<int, DatastoreMetaHolder>(0, new DatastoreMetaHolder { Value = seeded });
-        }
-
-        var headEntry = _headState.State;
-        var logVersion = headEntry.LogVersion;
-        var metaVersion = headEntry.SnapshotVersion;
-
-        // Load the small state the head points at — reconstructing the key index from its chunked v2
-        // rows — or MIGRATE a store written by either legacy layout in place:
-        //   v2 (current): meta row with IndexLayout — maps rebuilt from bucket rows + pending deltas.
-        //   v1 (retired): meta row with the maps INLINE (null IndexLayout) — chunked once, in place.
-        //   v0 (retired): whole-state snapshot row where the meta row is missing — split + chunked
-        //                 directly to v2 in one activation (never through a transient v1 shape).
-        var metaEntry = await ReadMeta(metaVersion).ConfigureAwait(ContinueOnCapturedContext);
-        DatastoreMetaState meta;
-        KeyIndexLayout layout;
-        if (metaEntry is null)
-        {
-            var legacy = await ReadLegacySnapshot(metaVersion).ConfigureAwait(ContinueOnCapturedContext);
-            if (legacy is not null)
-            {
-                (meta, layout) = await MigrateLegacySnapshot(metaVersion, legacy)
-                    .ConfigureAwait(ContinueOnCapturedContext);
-            }
-            else
-            {
-                // Mirrors the retired layout's missing-snapshot tolerance (?? Empty(0)); an in-range
-                // missing LOG entry below still fails loudly as corruption.
-                meta = DatastoreMetaState.Empty(0);
-                layout = KeyIndexLayout.CreateEmpty(CreationBucketCount);
-            }
-        }
-        else if (metaEntry.IndexLayout is null)
-        {
-            (meta, layout) = await MigrateInlineIndex(metaVersion, metaEntry)
-                .ConfigureAwait(ContinueOnCapturedContext);
-        }
-        else
-        {
-            layout = metaEntry.IndexLayout;
-            var (forward, reverse) = await ReconstructIndex(layout).ConfigureAwait(ContinueOnCapturedContext);
-            meta = metaEntry.Meta with { ForwardKeys = forward, ReverseKeys = reverse };
-        }
-
-        // Replay the log tail (metaVersion .. logVersion] folding the small state AND the dirty buffer.
-        // The range is contiguous by construction (head is written last, the commit point), so a missing
-        // in-range entry is corruption — fail loudly rather than silently fold a lossy state (which would
-        // pass the durability negative control while having lost data).
-        var dirty = new Dictionary<string, GraphShardState>(StringComparer.Ordinal);
-        var recent = new List<LogEvent>();
-        var floor = meta.HeadRevision;
-        for (var v = metaVersion + 1; v <= logVersion; v++)
-        {
-            var ev = await ReadLogEvent(v).ConfigureAwait(ContinueOnCapturedContext)
-                ?? throw new InvalidOperationException(
-                    $"datastore log corruption: missing log entry {v} in [{metaVersion + 1}..{logVersion}]");
-
-            if (ev.GcFloor is null)
-            {
-                // SEEDING RULE (recovery form): every key the event touches gets an entry seeded from
-                // its storage row as FIRST encountered — resolved through the CURRENT fold point's
-                // index map, exactly like the serve path. A key that is unindexed (or indexed at
-                // NoRowVersion) seeds Empty even if a physical row exists somewhere: rows are
-                // version-qualified, so a leaked row (crashed best-effort clear) or an abandoned flush
-                // attempt's orphan is unreferenced dead history and must not resurrect.
-                //
-                // NO DOUBLE-FOLD IS POSSIBLE: the seeds come from rows the OLD meta references, and the
-                // index versions used here stay the OLD meta's throughout the replay (MetaFold only
-                // ADDS keys at NoRowVersion and never bumps a version — bumps happen only at flushes).
-                // Every referenced row was written by the flush that produced that meta, so it contains
-                // NOTHING above the meta's FlushedThroughLogVersion — in particular no content from the
-                // tail events replayed here, even when a later flush crashed after writing ahead-of-head
-                // rows (those live at a version the old meta never references). Each tail event
-                // therefore folds into a base that strictly predates it, exactly once.
-                foreach (var key in MetaFold.TouchedKeys(ev))
-                {
-                    if (dirty.ContainsKey(key))
-                        continue;
-                    var stored = TryGetRowVersion(meta, key, out var rowVersion) && rowVersion >= 0
-                        ? await ReadShardRow(rowVersion, key).ConfigureAwait(ContinueOnCapturedContext)
-                        : null;
-                    dirty[key] = stored ?? GraphShardState.Empty;
-                }
-                foreach (var key in MetaFold.TouchedKeys(ev))
-                    dirty[key] = ShardFold.ApplyEvent(dirty[key], ev, GraphShardGrainKey.Parse(key));
-            }
-            else
-            {
-                // A GC event touches no keys; it folds into every entry already present (clean keys
-                // compact lazily — see the class remarks).
-                foreach (var key in dirty.Keys.ToList())
-                    dirty[key] = ShardFold.ApplyEvent(dirty[key], ev, GraphShardGrainKey.Parse(key));
-            }
-
-            meta = MetaFold.ApplyEvent(meta, ev);
-            AddPending(recent, ref floor, ev, meta.HeadRevision);
-        }
-
-        // Publish (no await below this point in the branch).
-        _logVersion = logVersion;
-        _metaVersion = metaVersion;
-        _storedMeta = meta;
-        _indexLayout = layout;
-        _dirty = dirty;
-        _recent.Clear();
-        _recent.AddRange(recent);
-        _recentFloorRevision = floor;
-        return new KeyValuePair<int, DatastoreMetaHolder>(logVersion, new DatastoreMetaHolder { Value = meta });
-    }
-
-    /// <summary>
-    /// One-time in-place migration of a store written by the retired whole-state layout (v0), landing
-    /// DIRECTLY on durable layout v2 (never through a transient v1 shape): split the legacy snapshot's
-    /// rows into per-key <see cref="GraphShardState"/> rows (BOTH directions), build the key index,
-    /// persist ALL its bucket rows at the migration version (empties included, so DeltaFloorVersion
-    /// starts at the migration version and deltas never wait on a first full rotation), persist the
-    /// SLIM <c>meta/{version}</c> row, then clear the legacy snapshot best-effort. One-time O(N).
-    /// Crash-safe: every versioned row goes read-then-write (re-migration after a crash overwrites its
-    /// own orphans), the meta row is the migration's commit point (once it exists this method is never
-    /// entered again), and a crash between meta write and legacy clear leaks one unreferenced row,
-    /// exactly like a failed compaction clear.
-    /// </summary>
-    private async Task<(DatastoreMetaState Meta, KeyIndexLayout Layout)> MigrateLegacySnapshot(
-        int version, DatastoreGrainState legacy)
-    {
-        _logger.LogInformation(
-            "datastore grain: migrating legacy whole-state snapshot v{Version} ({RowCount} rows) to the per-key shard layout",
-            version, legacy.Relationships.Count);
-
-        var byKey = new Dictionary<string, List<StoredRelationshipWire>>(StringComparer.Ordinal);
-        // The migrated rows are written under the migration's own meta version, and the index maps
-        // point every key at it — the same version-qualified discipline as a flush.
-        var forward = ImmutableDictionary.CreateBuilder<string, int>(StringComparer.Ordinal);
-        var reverse = ImmutableDictionary.CreateBuilder<string, int>(StringComparer.Ordinal);
-        foreach (var row in legacy.Relationships)
-        {
-            var forwardKey = MetaFold.ForwardKeyOf(row.Relationship);
-            var reverseKey = MetaFold.ReverseKeyOf(row.Relationship);
-            forward[forwardKey] = version;
-            reverse[reverseKey] = version;
-            AddRow(byKey, forwardKey, row);
-            AddRow(byKey, reverseKey, row);
-        }
-
-        static void AddRow(
-            Dictionary<string, List<StoredRelationshipWire>> byKey, string key, StoredRelationshipWire row)
-        {
-            if (!byKey.TryGetValue(key, out var rows))
-                byKey[key] = rows = new List<StoredRelationshipWire>();
-            rows.Add(row);
-        }
-
-        foreach (var (key, rows) in byKey)
-        {
-            await WriteShardRow(version, key, new GraphShardState(legacy.HeadRevision, legacy.GcFloor, rows.ToImmutableList()))
-                .ConfigureAwait(ContinueOnCapturedContext);
-        }
-
-        var meta = new DatastoreMetaState
-        {
-            HeadRevision = legacy.HeadRevision,
-            Schemas = legacy.Schemas,
-            Counters = legacy.Counters,
-            GcFloor = legacy.GcFloor,
-            ForwardKeys = forward.ToImmutable(),
-            ReverseKeys = reverse.ToImmutable(),
-        };
-
-        // Chunk the freshly built index into v2 bucket rows + the slim meta (all before the meta write,
-        // which is the commit point — bucket rows orphaned by a crash are overwritten on re-migration).
-        var layout = await WriteFullIndexCoverage(version, meta).ConfigureAwait(ContinueOnCapturedContext);
-        await WriteMeta(version, SlimMetaEntry(meta, version, layout)).ConfigureAwait(ContinueOnCapturedContext);
-
-        try
-        {
-            await ClearLegacySnapshot(version).ConfigureAwait(ContinueOnCapturedContext);
-        }
-        catch
-        {
-            // Best-effort, like compaction: the meta row already supersedes the legacy snapshot, so a
-            // failed clear only leaks one unreferenced storage row.
-        }
-
-        return (meta, layout);
-    }
-
-    /// <summary>
-    /// One-time in-place migration of a v1 meta row (key maps INLINE, null
-    /// <see cref="DatastoreMetaEntry.IndexLayout"/>) to durable layout v2: write ALL bucket rows at the
-    /// migration version from the inline maps (empties included, so DeltaFloorVersion starts at the
-    /// migration version), then OVERWRITE <c>meta/{version}</c> in place with the slim v2 entry — the
-    /// migration's commit point, and the one deliberate exception to the meta row's write-once rule
-    /// (ETag-correct via the read-then-write in <see cref="WriteMeta"/>). One-time O(N). A crash before
-    /// the meta overwrite leaves the v1 row intact and only orphans bucket rows the retried migration
-    /// overwrites; a crash after it is a committed v2 store. The "old meta clear" is subsumed by the
-    /// in-place overwrite — nothing is left to clear. Shard rows are untouched: only the index's
-    /// durable representation changes, never row content or versions.
-    /// </summary>
-    private async Task<(DatastoreMetaState Meta, KeyIndexLayout Layout)> MigrateInlineIndex(
-        int version, DatastoreMetaEntry v1)
-    {
-        var meta = v1.Meta;
-        _logger.LogInformation(
-            "datastore grain: migrating v1 inline key-index meta v{Version} ({ForwardKeys} forward / {ReverseKeys} reverse keys) to the chunked v2 layout",
-            version, meta.ForwardKeys.Count, meta.ReverseKeys.Count);
-
-        var layout = await WriteFullIndexCoverage(version, meta).ConfigureAwait(ContinueOnCapturedContext);
-        await WriteMeta(version, SlimMetaEntry(meta, version, layout)).ConfigureAwait(ContinueOnCapturedContext);
-        return (meta, layout);
-    }
-
-    /// <summary>The slim v2 <c>meta/{version}</c> entry: the meta with its key maps STRIPPED (they live
-    /// in the bucket/delta rows the layout describes), so the row is cardinality-independent.</summary>
-    private static DatastoreMetaEntry SlimMetaEntry(DatastoreMetaState meta, int version, KeyIndexLayout layout) =>
-        new(
-            meta with
-            {
-                ForwardKeys = ImmutableDictionary<string, int>.Empty,
-                ReverseKeys = ImmutableDictionary<string, int>.Empty,
-            },
-            version,
-            layout);
-
-    /// <summary>
-    /// Migration helper: writes ALL 2B bucket rows from the meta's in-memory key maps (empty buckets
-    /// included — full coverage is what lets DeltaFloorVersion start at the migration version instead
-    /// of waiting a whole rotation), fanned out in bounded chunks (independent write-once keys, same
-    /// batching argument as the flush), and returns the layout describing them: every bucket at
-    /// <c>Math.Max(version, 1)</c> (never the <see cref="KeyIndexLayout.NoBucketRow"/> sentinel; see
-    /// the body), rotation cursor at 0, no pending deltas.
-    /// </summary>
-    private async Task<KeyIndexLayout> WriteFullIndexCoverage(int version, DatastoreMetaState meta)
-    {
-        var bucketCount = CreationBucketCount;
-        var forwardBuckets = PartitionIntoBuckets(meta.ForwardKeys, bucketCount);
-        var reverseBuckets = PartitionIntoBuckets(meta.ReverseKeys, bucketCount);
-
-        // A migration can run at meta version 0 (a legacy store that never crossed a flush boundary).
-        // Bucket rows are written — and their versions recorded — at Math.Max(version, 1) so a recorded
-        // bucket version can never equal the never-written NoBucketRow (0) sentinel: recording 0 would
-        // make the next recovery treat every freshly written bucket row as "never written" and silently
-        // reconstruct an empty index. Version 1 cannot collide with any real flush version (flushes land
-        // on FlushInterval boundaries, all >= FlushInterval).
-        var bucketVersion = Math.Max(version, 1);
-
-        // Bounded fan-out: full coverage is 2B rows, and a single 2B-wide WhenAll would ask an
-        // ADO.NET-backed provider for that many concurrent commands at migration time — chunk the
-        // batch instead (each chunk's writes are still independent write-once keys).
-        const int migrationWriteConcurrency = 64;
-        var writes = new List<Task>(migrationWriteConcurrency);
-        for (var bucket = 0; bucket < bucketCount; bucket++)
-        {
-            writes.Add(WriteIndexBucket(
-                bucketVersion, forward: true, bucket, new KeyIndexBucketEntry(forwardBuckets[bucket].ToImmutable())));
-            writes.Add(WriteIndexBucket(
-                bucketVersion, forward: false, bucket, new KeyIndexBucketEntry(reverseBuckets[bucket].ToImmutable())));
-            if (writes.Count >= migrationWriteConcurrency)
-            {
-                await Task.WhenAll(writes).ConfigureAwait(ContinueOnCapturedContext);
-                writes.Clear();
-            }
-        }
-        await Task.WhenAll(writes).ConfigureAwait(ContinueOnCapturedContext);
-
-        var versions = Enumerable.Repeat(bucketVersion, bucketCount).ToImmutableArray();
-        return new KeyIndexLayout(
-            bucketCount, versions, versions, NextBucket: 0, DeltaFloorVersion: bucketVersion,
-            ImmutableList<int>.Empty);
-    }
-
-    /// <summary>Partitions one direction's key map into its per-bucket builders (every bucket present,
-    /// empty ones included).</summary>
-    private static ImmutableDictionary<string, int>.Builder[] PartitionIntoBuckets(
-        ImmutableDictionary<string, int> index, int bucketCount)
-    {
-        var buckets = new ImmutableDictionary<string, int>.Builder[bucketCount];
-        for (var b = 0; b < bucketCount; b++)
-            buckets[b] = ImmutableDictionary.CreateBuilder<string, int>(StringComparer.Ordinal);
-        foreach (var (key, rowVersion) in index)
-            buckets[KeyIndexLayout.BucketOf(key, bucketCount)][key] = rowVersion;
-        return buckets;
-    }
-
-    /// <summary>One bucket's full current entries selected from one direction's in-memory map (the
-    /// flush-rotation form of <see cref="PartitionIntoBuckets"/> — an O(N) CPU-only scan).</summary>
-    private static KeyIndexBucketEntry BucketEntries(
-        ImmutableDictionary<string, int> index, int bucket, int bucketCount)
-    {
-        var entries = ImmutableDictionary.CreateBuilder<string, int>(StringComparer.Ordinal);
-        foreach (var (key, rowVersion) in index)
-        {
-            if (KeyIndexLayout.BucketOf(key, bucketCount) == bucket)
-                entries[key] = rowVersion;
-        }
-        return new KeyIndexBucketEntry(entries.ToImmutable());
-    }
-
-    /// <summary>
-    /// Reconstructs the full in-memory key-index maps from the chunked v2 rows: all 2B bucket rows read
-    /// at their recorded versions (fanned out with <c>Task.WhenAll</c>; a bucket at
-    /// <see cref="KeyIndexLayout.NoBucketRow"/> has never been written and is empty), then the pending
-    /// delta rows overlaid in ascending version order — entries applied last-wins, tombstones deleting.
-    /// </summary>
-    /// <remarks>
-    /// NO DOUBLE-APPLY IS POSSIBLE: bucket rows and delta rows both carry ABSOLUTE key->rowVersion
-    /// entries (never increments), so the overlay is idempotent last-wins. A delta at version W applied
-    /// over a bucket at version X &gt;= W merely rewrites values the bucket already reflects (the
-    /// bucket's entries at X include every dirtying up to X, W's among them); a delta at W &gt; X
-    /// strictly supersedes the bucket's entries for its keys (the bucket predates it). And no PRUNED
-    /// delta can ever be needed over a PENDING one: pending deltas are all &gt; DeltaFloorVersion and
-    /// pruned deltas all &lt;= it, so for any key a pending delta at W touches, every later touch Y of
-    /// that key has Y &gt; W &gt; floor — meaning delta Y is also pending and, applied after W in
-    /// ascending order, wins. The replay therefore converges on exactly the maps as of
-    /// FlushedThroughLogVersion regardless of how stale each individual bucket is.
-    /// </remarks>
-    private async Task<(ImmutableDictionary<string, int> Forward, ImmutableDictionary<string, int> Reverse)>
-        ReconstructIndex(KeyIndexLayout layout)
-    {
-        var forwardReads = new Task<KeyIndexBucketEntry?>[layout.BucketCount];
-        var reverseReads = new Task<KeyIndexBucketEntry?>[layout.BucketCount];
-        for (var bucket = 0; bucket < layout.BucketCount; bucket++)
-        {
-            forwardReads[bucket] = layout.ForwardBucketVersions[bucket] == KeyIndexLayout.NoBucketRow
-                ? Task.FromResult<KeyIndexBucketEntry?>(null)
-                : ReadIndexBucket(layout.ForwardBucketVersions[bucket], forward: true, bucket);
-            reverseReads[bucket] = layout.ReverseBucketVersions[bucket] == KeyIndexLayout.NoBucketRow
-                ? Task.FromResult<KeyIndexBucketEntry?>(null)
-                : ReadIndexBucket(layout.ReverseBucketVersions[bucket], forward: false, bucket);
-        }
-        await Task.WhenAll(forwardReads.Concat(reverseReads)).ConfigureAwait(ContinueOnCapturedContext);
-
-        var forward = ImmutableDictionary.CreateBuilder<string, int>(StringComparer.Ordinal);
-        var reverse = ImmutableDictionary.CreateBuilder<string, int>(StringComparer.Ordinal);
-        for (var bucket = 0; bucket < layout.BucketCount; bucket++)
-        {
-            // A recorded version whose row is missing is corruption (referenced bucket rows are never
-            // cleared — only superseded versions are) — fail loudly like a missing in-range log entry.
-            if (layout.ForwardBucketVersions[bucket] != KeyIndexLayout.NoBucketRow)
-            {
-                var entry = forwardReads[bucket].Result?.Entries
-                    ?? throw new InvalidOperationException(
-                        $"datastore index corruption: missing bucket row indexb/{layout.ForwardBucketVersions[bucket]}/f/{bucket}");
-                foreach (var (key, rowVersion) in entry)
-                    forward[key] = rowVersion; // buckets are disjoint (key -> bucket is a function)
-            }
-            if (layout.ReverseBucketVersions[bucket] != KeyIndexLayout.NoBucketRow)
-            {
-                var entry = reverseReads[bucket].Result?.Entries
-                    ?? throw new InvalidOperationException(
-                        $"datastore index corruption: missing bucket row indexb/{layout.ReverseBucketVersions[bucket]}/r/{bucket}");
-                foreach (var (key, rowVersion) in entry)
-                    reverse[key] = rowVersion;
-            }
-        }
-
-        // Overlay the pending deltas in ascending version order (the list is maintained ascending: the
-        // flush appends its strictly-increasing version and pruning preserves order). The order is
-        // LOAD-BEARING for tombstone-then-recreate — an earlier delta's tombstone must be applied
-        // before a later delta's re-add of the same key, or the live key would be deleted — so verify
-        // the invariant defensively before replaying: a violated order means a corrupted layout, and
-        // replaying it would produce a WRONG index rather than a loud failure (the same corruption
-        // stance as a missing in-range log entry).
-        for (var i = 1; i < layout.DeltaVersions.Count; i++)
-        {
-            if (layout.DeltaVersions[i] <= layout.DeltaVersions[i - 1])
-                throw new InvalidOperationException(
-                    "datastore index corruption: pending delta versions are not strictly ascending "
-                    + $"({layout.DeltaVersions[i - 1]} followed by {layout.DeltaVersions[i]}) — "
-                    + "replaying them in this order would reconstruct a wrong index");
-        }
-        foreach (var deltaVersion in layout.DeltaVersions)
-        {
-            var delta = await ReadIndexDelta(deltaVersion).ConfigureAwait(ContinueOnCapturedContext)
-                ?? throw new InvalidOperationException(
-                    $"datastore index corruption: missing delta row indexd/{deltaVersion}");
-            ApplyDelta(forward, delta.ForwardEntries);
-            ApplyDelta(reverse, delta.ReverseEntries);
-        }
-
-        return (forward.ToImmutable(), reverse.ToImmutable());
-
-        static void ApplyDelta(
-            ImmutableDictionary<string, int>.Builder index, ImmutableDictionary<string, int> entries)
-        {
-            foreach (var (key, rowVersion) in entries)
-            {
-                if (rowVersion == KeyIndexDeltaEntry.Tombstone)
-                    index.Remove(key);
-                else
-                    index[key] = rowVersion;
-            }
-        }
-    }
+    // --- projection ---
 
     /// <inheritdoc />
-    public async Task<bool> ApplyUpdatesToStorage(IReadOnlyList<LogEvent> updates, int expectedVersion)
-    {
-        ArgumentNullException.ThrowIfNull(updates);
-
-        // Optimistic concurrency on the CONTIGUOUS LOG VERSION (distinct from the timestamp head revision):
-        // refuse if storage has moved on. The grain-storage providers enforce a per-entry ETag check too;
-        // this contiguous-version gate is the log-level guard the adaptor relies on.
-        if (_logVersion != expectedVersion)
-            return false;
-
-        // Fold forward into LOCALS only (never touch JournaledGrain.State here — that would re-enter the
-        // consistency adaptor mid-confirm — and never touch the shared _dirty/_recent/_storedMeta fields
-        // yet either; see the publication-discipline remark on ReadStateFromStorage). The dirty buffer is
-        // folded here (not in TransitionState) so a flush below can write rows that already include this
-        // batch, and so the buffer and the small state publish as ONE unit at the commit point.
-        var foldedMeta = _storedMeta;
-        var foldedDirty = updates.Count > 0 ? new Dictionary<string, GraphShardState>(_dirty, StringComparer.Ordinal) : null;
-        var version = _logVersion;
-        var pending = new List<LogEvent>();
-        foreach (var ev in updates)
-        {
-            version++;
-            // Log entries are write-once per COMMITTED version, but a crashed append attempt (row
-            // written, head never advanced) leaves an orphan at this exact versioned name that the
-            // boundary's retry must overwrite — WriteLogEntry attempts the single-RTT fresh write and
-            // falls back to ETag-tolerant read-then-write only on that orphan collision.
-            await WriteLogEntry(version, ev).ConfigureAwait(ContinueOnCapturedContext);
-
-            if (ev.GcFloor is null)
-            {
-                foreach (var key in MetaFold.TouchedKeys(ev))
-                {
-                    if (!foldedDirty!.TryGetValue(key, out var entry))
-                    {
-                        // Belt-and-braces: the seeding rule says Commit pre-seeded every touched key, so
-                        // this read should never run; if a future caller breaches the contract, seeding
-                        // here (from the pre-event index, exactly like recovery) is still correct.
-                        var stored = TryGetRowVersion(foldedMeta, key, out var rowVersion) && rowVersion >= 0
-                            ? await ReadShardRow(rowVersion, key).ConfigureAwait(ContinueOnCapturedContext)
-                            : null;
-                        entry = stored ?? GraphShardState.Empty;
-                    }
-                    foldedDirty[key] = ShardFold.ApplyEvent(entry, ev, GraphShardGrainKey.Parse(key));
-                }
-            }
-            else
-            {
-                foreach (var key in foldedDirty!.Keys.ToList())
-                    foldedDirty[key] = ShardFold.ApplyEvent(foldedDirty[key], ev, GraphShardGrainKey.Parse(key));
-            }
-
-            foldedMeta = MetaFold.ApplyEvent(foldedMeta, ev);
-            pending.Add(ev);
-        }
-
-        // Periodically FLUSH + compact: bound the replay tail on reactivation and the in-memory window.
-        //
-        // FLUSH WRITE ORDER AND CRASH WINDOWS (durable layout v2). Shard rows, key-index bucket rows
-        // and the per-flush index delta row are all VERSION-QUALIFIED and write-once per version —
-        // shard/{flushVersion}/{key}, indexb/{flushVersion}/{dir}/{bucket}, indexd/{flushVersion} —
-        // and a row of ANY of those families is reachable only through the meta row's layout (the
-        // bucket-version arrays + pending-delta list) or, transitively, through the index entries
-        // those rows reconstruct. The order is:
-        //   1. log rows              — already written above, one per event (unchanged by the flush).
-        //   2. IN PARALLEL (Task.WhenAll — the 3.3-item-3 write batching): all dirty shard rows,
-        //      the indexd/{flushVersion} delta row (this flush window's dirtied index entries, with
-        //      dropped keys as explicit tombstones), and exactly ONE bucket row per direction in
-        //      round-robin rotation (that bucket's FULL current entries from the in-memory maps).
-        //      These are independent write-once storage keys with NO ordering requirement among them
-        //      — none is reachable until step 4 commits, so the provider may land them in any order —
-        //      which is what makes the fan-out provider-safe. Each write is the same ETag-tolerant
-        //      read-then-write the versioned rows have always used: a crashed flush attempt's orphan
-        //      at the same versioned name is cleanly overwritten when this same boundary is retried
-        //      (log versions are contiguous, so the boundary version recurs).
-        //   3. meta/{flushVersion}   — the SLIM v2 meta: head/schemas/counters/floor plus the index
-        //      LAYOUT (bucket versions bumped for the two rewritten buckets, the new flush appended
-        //      to the pending-delta list, DeltaFloorVersion = min over both directions' bucket
-        //      versions — every delta at or below it is fully covered by bucket rows). NO inline key
-        //      maps: the meta row's size is independent of graph cardinality. Also ETag-tolerant
-        //      read-then-write, for the same orphan-retry reason.
-        //   4. head                  — THE commit point (the only in-place row).
-        //   5. post-commit, best-effort: clear each rewritten/dropped key's PREVIOUS version shard
-        //      row (versions captured from the PRE-flush index), the two rewritten buckets' previous
-        //      version rows, the delta rows at or below the new DeltaFloorVersion, the superseded
-        //      meta row, and the log rows at or below the new FlushedThroughLogVersion; then clear
-        //      the dirty buffer.
-        //
-        // CRASH BEFORE STEP 4: the durable head still names the OLD meta, whose layout references
-        // only OLD-version bucket/delta rows and whose reconstructed index references only
-        // OLD-version shard rows — and step 2 never touched any of those (it wrote new storage names
-        // only; the rotation bumps a bucket's version rather than rewriting its row in place). So the
-        // in-flight batch's content is UNREACHABLE in ALL THREE row families: recovery restores the
-        // old meta, rebuilds the old index from the old bucket/delta rows, and replays the old tail
-        // over exactly the pre-flush shard rows — no later head advance can ever surface a
-        // rolled-back, unacknowledged write, and no half-written index chunk can ever be read (the
-        // in-place layout's crash window — rows rewritten under a stable name becoming visible before
-        // the commit point — cannot recur for buckets or deltas for the same reason it cannot for
-        // shard rows). The new-version shard/bucket/delta/meta rows the crash orphaned are referenced
-        // by nothing; the retry of the same boundary overwrites them via the read-then-write in steps
-        // 2-3, and if the boundary is never retried they remain bounded, unreferenced garbage.
-        //
-        // CRASH AT/AFTER STEP 4: committed. A crash inside step 5 at worst leaks superseded
-        // rows/buckets/deltas/meta/log entries — unreferenced by the new head+layout and invisible to
-        // every read path (shard rows resolve only through the index maps; bucket/delta rows resolve
-        // only through the layout) — exactly like any other failed best-effort clear. Physical clears
-        // must never run before step 4: clearing a previous-version row first would LOSE data on
-        // crash (the old meta still references it, and the events that superseded it may already be
-        // compacted).
-        var oldMetaVersion = _metaVersion;
-        var newMetaVersion = _metaVersion;
-        var flushBoundaryRevision = -1L;
-        List<(string Key, int RowVersion)>? supersededRows = null;
-        List<int>? deadDeltaVersions = null;
-        var rotatedBucket = -1;
-        var supersededForwardBucketVersion = KeyIndexLayout.NoBucketRow;
-        var supersededReverseBucketVersion = KeyIndexLayout.NoBucketRow;
-        KeyIndexLayout? newLayout = null;
-        var flushing = updates.Count > 0 && version / FlushInterval > _metaVersion / FlushInterval;
-        if (flushing)
-            await _shardIo.WaitAsync().ConfigureAwait(ContinueOnCapturedContext);
-        try
-        {
-            if (flushing)
-            {
-                // Lazy GC materializes here: every dirty entry is collected at the CURRENT floor before
-                // its row is written, so flushed rows never carry sub-floor dead history.
-                var flushVersion = version;
-                var layout = _indexLayout;
-                var forwardIndex = foldedMeta.ForwardKeys;
-                var reverseIndex = foldedMeta.ReverseKeys;
-                supersededRows = new List<(string, int)>();
-                var deltaForward = ImmutableDictionary.CreateBuilder<string, int>(StringComparer.Ordinal);
-                var deltaReverse = ImmutableDictionary.CreateBuilder<string, int>(StringComparer.Ordinal);
-                // Step 2's parallel batch (the 3.3-item-3 write batching; see the write-order comment
-                // above): every task targets its OWN write-once versioned storage key, so there is no
-                // ordering requirement among them and no shared wrapper/ETag — the commit point is
-                // still the head row alone. The awaits inside each read-then-write interleave on the
-                // grain's scheduler, which is safe because the tasks touch disjoint storage names.
-                var batch = new List<Task>(foldedDirty!.Count + 3);
-                foreach (var (key, entry) in foldedDirty!)
-                {
-                    var collected = ShardFold.CollectBelow(entry, foldedMeta.HeadRevision, foldedMeta.GcFloor);
-
-                    // The key's previous durable row (if any) is superseded whether the key is
-                    // rewritten under the new version or dropped as empty. Its version comes from the
-                    // PRE-flush index — the only place it survives the bump/removal below — and its
-                    // physical clear is deferred to step 5 (post-commit).
-                    var hadRow = TryGetRowVersion(foldedMeta, key, out var previousVersion) && previousVersion >= 0;
-                    if (hadRow)
-                        supersededRows.Add((key, previousVersion));
-
-                    var isForward = GraphShardGrainKey.Parse(key).Direction == GraphShardDirection.Forward;
-                    if (collected.Rows.IsEmpty)
-                    {
-                        // The key's current state is empty: drop it from the index (making any old row
-                        // unreachable at the commit point), write nothing at the new version, and
-                        // record an explicit TOMBSTONE in the delta — a recovery whose bucket row for
-                        // this key predates this flush must delete it on replay, or the dropped key
-                        // would resurrect into the reconstructed index.
-                        if (isForward)
-                        {
-                            forwardIndex = forwardIndex.Remove(key);
-                            deltaForward[key] = KeyIndexDeltaEntry.Tombstone;
-                        }
-                        else
-                        {
-                            reverseIndex = reverseIndex.Remove(key);
-                            deltaReverse[key] = KeyIndexDeltaEntry.Tombstone;
-                        }
-                        continue;
-                    }
-
-                    batch.Add(WriteShardRow(flushVersion, key, collected));
-
-                    // The flush is where index VERSIONS move (the fold only adds keys at NoRowVersion):
-                    // bump the written key's entry to the flush version, and mirror the bump into the
-                    // delta row so recovery sees it even when the key's bucket is not rotated for many
-                    // more flushes.
-                    if (isForward)
-                    {
-                        forwardIndex = forwardIndex.SetItem(key, flushVersion);
-                        deltaForward[key] = flushVersion;
-                    }
-                    else
-                    {
-                        reverseIndex = reverseIndex.SetItem(key, flushVersion);
-                        deltaReverse[key] = flushVersion;
-                    }
-                }
-
-                foldedMeta = foldedMeta with { ForwardKeys = forwardIndex, ReverseKeys = reverseIndex };
-
-                // Round-robin bucket rotation: one bucket per direction is rewritten with its FULL
-                // current entries from the POST-flush in-memory maps (all versions real — every dirty
-                // key was just bumped or dropped, and no other key can sit at NoRowVersion after a
-                // flush). Selecting the bucket's members is an in-memory O(N) scan with a stable hash
-                // per key — CPU only, never serialization or IO of the full maps (the honest residual
-                // stated in the class doc is the ~N/B ENTRIES actually written).
-                rotatedBucket = layout.NextBucket;
-                supersededForwardBucketVersion = layout.ForwardBucketVersions[rotatedBucket];
-                supersededReverseBucketVersion = layout.ReverseBucketVersions[rotatedBucket];
-                batch.Add(WriteIndexBucket(
-                    flushVersion, forward: true, rotatedBucket,
-                    BucketEntries(forwardIndex, rotatedBucket, layout.BucketCount)));
-                batch.Add(WriteIndexBucket(
-                    flushVersion, forward: false, rotatedBucket,
-                    BucketEntries(reverseIndex, rotatedBucket, layout.BucketCount)));
-                batch.Add(WriteIndexDelta(
-                    flushVersion, new KeyIndexDeltaEntry(deltaForward.ToImmutable(), deltaReverse.ToImmutable())));
-
-                await Task.WhenAll(batch).ConfigureAwait(ContinueOnCapturedContext);
-
-                // The new layout: bucket versions bumped for the rotated pair; DeltaFloorVersion is
-                // the min over BOTH directions' bucket versions (a delta at or below it is covered by
-                // every bucket row and is dead — until the rotation has written every bucket once the
-                // floor stays 0 and pending deltas are bounded by one full rotation); the pending list
-                // gains this flush and sheds everything at or below the floor (those rows are cleared
-                // post-commit in step 5).
-                var forwardVersions = layout.ForwardBucketVersions.SetItem(rotatedBucket, flushVersion);
-                var reverseVersions = layout.ReverseBucketVersions.SetItem(rotatedBucket, flushVersion);
-                var deltaFloor = Math.Min(forwardVersions.Min(), reverseVersions.Min());
-                var pendingDeltas = layout.DeltaVersions.Add(flushVersion);
-                deadDeltaVersions = pendingDeltas.Where(v => v <= deltaFloor).ToList();
-                pendingDeltas = pendingDeltas.RemoveAll(v => v <= deltaFloor);
-                newLayout = layout with
-                {
-                    ForwardBucketVersions = forwardVersions,
-                    ReverseBucketVersions = reverseVersions,
-                    NextBucket = (rotatedBucket + 1) % layout.BucketCount,
-                    DeltaFloorVersion = deltaFloor,
-                    DeltaVersions = pendingDeltas,
-                };
-
-                // The SLIM v2 meta row: the key maps are stripped (they live in the bucket/delta rows
-                // the layout describes), so this row's size is independent of graph cardinality.
-                await WriteMeta(flushVersion, new DatastoreMetaEntry(
-                        foldedMeta with
-                        {
-                            ForwardKeys = ImmutableDictionary<string, int>.Empty,
-                            ReverseKeys = ImmutableDictionary<string, int>.Empty,
-                        },
-                        flushVersion,
-                        newLayout))
-                    .ConfigureAwait(ContinueOnCapturedContext);
-                newMetaVersion = flushVersion;
-                flushBoundaryRevision = foldedMeta.HeadRevision;
-
-                // Phase 0 observability: one flush boundary written (dirty rows + meta durable) — the
-                // every-64th-commit sawtooth observable (docs/scalability-program.md P5).
-                _metrics?.RecordFlush();
-            }
-
-            // The head pointer is the commit point: write it AFTER the log entries (+ flushed rows/meta)
-            // so a crash mid-write never advertises a version whose log entries are missing or a flush
-            // not yet durable.
-            await WriteHead(new LogHeadEntry(version, foldedMeta.HeadRevision, newMetaVersion))
-                .ConfigureAwait(ContinueOnCapturedContext);
-
-            // COMMITTED. Publish in one synchronous block — no await from here until the next statement
-            // with an await — so an interleaved [AlwaysInterleave] read either sees the pre-commit fields
-            // (still the PREVIOUS commit) or, once this block runs, the fully-applied new commit: the
-            // small state, the dirty buffer and the recent window advance as ONE unit. This IS the
-            // atomicity argument for the read side: there is no yield point inside the block for a read
-            // to land on.
-            _logVersion = version;
-            _storedMeta = foldedMeta;
-            if (newLayout is not null)
-                _indexLayout = newLayout;
-            if (foldedDirty is not null)
-                _dirty = foldedDirty;
-            _recent.AddRange(pending);
-            TrimRecent(foldedMeta.HeadRevision);
-
-            // Post-commit compaction: the flush subsumes log entries up to AND INCLUDING its own version,
-            // the previous meta row is no longer referenced, and rows whose keys emptied are unindexed.
-            // Clearing after the commit point keeps a crash recoverable (the worst case leaks an entry,
-            // never loses one). This runs AFTER publication, so it has its own awaits — an interleaved
-            // read landing between publication and here still observes the fully-committed state above;
-            // compaction only ever shrinks in-memory retention and storage, it never changes what's
-            // already been published as committed.
-            if (newMetaVersion > oldMetaVersion)
-            {
-                // BEST-EFFORT, same stance as the post-commit watch notify in Commit: the head entry
-                // written above already references the new meta version, so a failed clear only leaks a
-                // storage row — it must NEVER surface as a failed append. An exception escaping here would
-                // make the log-consistency adaptor retry ApplyUpdatesToStorage, hit the version guard, and
-                // report the (fully committed) conditional event as failed — the caller would then re-run
-                // its whole transaction against a base that already contains its own write.
-                try
-                {
-                    for (var v = oldMetaVersion + 1; v <= newMetaVersion; v++)
-                        await ClearLogEntry(v).ConfigureAwait(ContinueOnCapturedContext);
-                    await ClearMeta(oldMetaVersion).ConfigureAwait(ContinueOnCapturedContext);
-                    foreach (var (key, rowVersion) in supersededRows!)
-                        await ClearShardRow(rowVersion, key).ConfigureAwait(ContinueOnCapturedContext);
-                    // The rotated buckets' previous version rows are superseded by the pair written
-                    // under the new flush version; deltas at or below the new DeltaFloorVersion are
-                    // covered by bucket rows and dead. Both were captured before the layout advanced.
-                    if (supersededForwardBucketVersion != KeyIndexLayout.NoBucketRow)
-                        await ClearIndexBucket(supersededForwardBucketVersion, forward: true, rotatedBucket)
-                            .ConfigureAwait(ContinueOnCapturedContext);
-                    if (supersededReverseBucketVersion != KeyIndexLayout.NoBucketRow)
-                        await ClearIndexBucket(supersededReverseBucketVersion, forward: false, rotatedBucket)
-                            .ConfigureAwait(ContinueOnCapturedContext);
-                    foreach (var deltaVersion in deadDeltaVersions!)
-                        await ClearIndexDelta(deltaVersion).ConfigureAwait(ContinueOnCapturedContext);
-                }
-                catch
-                {
-                    // A leaked entry/meta/row is unreferenced by the committed head+index and harmless to
-                    // recovery (unindexed rows are never read — see CurrentShardState / the seeding rule).
-                }
-
-                // Its own contiguous synchronous field group. Unconditional: the committed head already
-                // points at the new meta, so in-memory retention advances whether or not the clears
-                // succeeded. The dirty buffer clears because every entry's row (or absence) is now
-                // durable and current — the buffer's content is byte-identical to what a fresh read
-                // would serve, so dropping it only releases memory.
-                _metaVersion = newMetaVersion;
-                // Retention now starts at the flush boundary (consistent with the post-reactivation
-                // rebuild, which can only replay the post-flush tail).
-                _recentFloorRevision = Math.Max(_recentFloorRevision, flushBoundaryRevision);
-                _recent.RemoveAll(e => e.Revision <= _recentFloorRevision);
-                _dirty = new Dictionary<string, GraphShardState>(StringComparer.Ordinal);
-            }
-        }
-        finally
-        {
-            if (flushing)
-                _shardIo.Release();
-        }
-
-        return true;
-    }
-
-    /// <inheritdoc />
-    public Task ClearStoredState() =>
-        _storage.ClearStateAsync(HeadStateName, this.GetGrainId(), _headState);
-
-    // --- storage helpers ---
-
-    private async Task<LogEvent?> ReadLogEvent(int version)
-    {
-        var entry = new GrainState<LogEvent>();
-        await _storage.ReadStateAsync($"{LogStatePrefix}{version}", this.GetGrainId(), entry)
-            .ConfigureAwait(ContinueOnCapturedContext);
-        return entry.RecordExists ? entry.State : null;
-    }
-
-    // The head entry is rewritten in place through the held wrapper so its ETag carries across writes
-    // (the commit point). Log entries, meta entries and shard rows are version-qualified — write-once
-    // per COMMITTED version — but a crashed attempt can orphan an entry at a versioned name a retry
-    // must write again (a crashed append leaves a log row with no head advance; a crashed flush leaves
-    // shard/meta rows no meta references), so all three tolerate an existing row with no long-lived
-    // wrapper (a per-row wrapper cache would grow O(touched keys) memory). Meta and shard rows go
-    // read-then-write; log entries — the per-commit hot path — attempt the single-RTT fresh write
-    // first and pay the read only on the rare orphan collision (see WriteLogEntry) — the same
-    // providers-enforce-etags lesson as the read-then-clear helpers below.
-
-    private async Task WriteLogEntry(int version, LogEvent ev)
-    {
-        var name = $"{LogStatePrefix}{version}";
-        // HOT PATH — one storage RTT: in the overwhelmingly common case this versioned name has never
-        // been written, so a fresh empty-ETag wrapper is a valid insert and the write succeeds first
-        // try. Only when a CRASHED prior append attempt orphaned a row at this exact name (row written,
-        // head never advanced) does the provider reject the empty ETag; then, and only then, fall back
-        // to the ETag-tolerant read-then-write so the retry overwrites the orphan. Any other failure
-        // propagates unchanged.
-        var entry = new GrainState<LogEvent> { State = ev };
-        try
-        {
-            await _storage.WriteStateAsync(name, this.GetGrainId(), entry).ConfigureAwait(ContinueOnCapturedContext);
-        }
-        catch (InconsistentStateException)
-        {
-            var existing = new GrainState<LogEvent>();
-            await _storage.ReadStateAsync(name, this.GetGrainId(), existing).ConfigureAwait(ContinueOnCapturedContext);
-            existing.State = ev;
-            await _storage.WriteStateAsync(name, this.GetGrainId(), existing).ConfigureAwait(ContinueOnCapturedContext);
-        }
-    }
-
-    private Task WriteHead(LogHeadEntry entry)
-    {
-        _headState.State = entry;
-        return _storage.WriteStateAsync(HeadStateName, this.GetGrainId(), _headState);
-    }
-
-    private async Task WriteMeta(int version, DatastoreMetaEntry entry)
-    {
-        var name = $"{MetaStatePrefix}{version}";
-        var state = new GrainState<DatastoreMetaEntry>();
-        await _storage.ReadStateAsync(name, this.GetGrainId(), state).ConfigureAwait(ContinueOnCapturedContext);
-        state.State = entry;
-        await _storage.WriteStateAsync(name, this.GetGrainId(), state).ConfigureAwait(ContinueOnCapturedContext);
-    }
-
-    private async Task<DatastoreMetaEntry?> ReadMeta(int version)
-    {
-        var entry = new GrainState<DatastoreMetaEntry>();
-        await _storage.ReadStateAsync($"{MetaStatePrefix}{version}", this.GetGrainId(), entry)
-            .ConfigureAwait(ContinueOnCapturedContext);
-        return entry.RecordExists ? entry.State : null;
-    }
-
-    private async Task<GraphShardState?> ReadShardRow(int rowVersion, string shardKey)
-    {
-        var entry = new GrainState<GraphShardState>();
-        await _storage.ReadStateAsync(ShardRowName(rowVersion, shardKey), this.GetGrainId(), entry)
-            .ConfigureAwait(ContinueOnCapturedContext);
-        return entry.RecordExists ? entry.State : null;
-    }
-
-    private async Task WriteShardRow(int rowVersion, string shardKey, GraphShardState state)
-    {
-        var name = ShardRowName(rowVersion, shardKey);
-        var entry = new GrainState<GraphShardState>();
-        await _storage.ReadStateAsync(name, this.GetGrainId(), entry).ConfigureAwait(ContinueOnCapturedContext);
-        entry.State = state;
-        await _storage.WriteStateAsync(name, this.GetGrainId(), entry).ConfigureAwait(ContinueOnCapturedContext);
-    }
-
-    // Key-index bucket/delta rows: version-qualified and write-once per committed version, with the
-    // same ETag-tolerant read-then-write as shard rows (a crashed flush attempt can orphan one at the
-    // same versioned name that the boundary's retry must overwrite).
-
-    private async Task<KeyIndexBucketEntry?> ReadIndexBucket(int version, bool forward, int bucket)
-    {
-        var entry = new GrainState<KeyIndexBucketEntry>();
-        await _storage.ReadStateAsync(IndexBucketRowName(version, forward, bucket), this.GetGrainId(), entry)
-            .ConfigureAwait(ContinueOnCapturedContext);
-        return entry.RecordExists ? entry.State : null;
-    }
-
-    private async Task WriteIndexBucket(int version, bool forward, int bucket, KeyIndexBucketEntry state)
-    {
-        var name = IndexBucketRowName(version, forward, bucket);
-        var entry = new GrainState<KeyIndexBucketEntry>();
-        await _storage.ReadStateAsync(name, this.GetGrainId(), entry).ConfigureAwait(ContinueOnCapturedContext);
-        entry.State = state;
-        await _storage.WriteStateAsync(name, this.GetGrainId(), entry).ConfigureAwait(ContinueOnCapturedContext);
-    }
-
-    private async Task<KeyIndexDeltaEntry?> ReadIndexDelta(int version)
-    {
-        var entry = new GrainState<KeyIndexDeltaEntry>();
-        await _storage.ReadStateAsync(IndexDeltaRowName(version), this.GetGrainId(), entry)
-            .ConfigureAwait(ContinueOnCapturedContext);
-        return entry.RecordExists ? entry.State : null;
-    }
-
-    private async Task WriteIndexDelta(int version, KeyIndexDeltaEntry state)
-    {
-        var name = IndexDeltaRowName(version);
-        var entry = new GrainState<KeyIndexDeltaEntry>();
-        await _storage.ReadStateAsync(name, this.GetGrainId(), entry).ConfigureAwait(ContinueOnCapturedContext);
-        entry.State = state;
-        await _storage.WriteStateAsync(name, this.GetGrainId(), entry).ConfigureAwait(ContinueOnCapturedContext);
-    }
-
-    private async Task ClearIndexBucket(int version, bool forward, int bucket)
-    {
-        var name = IndexBucketRowName(version, forward, bucket);
-        var entry = new GrainState<KeyIndexBucketEntry>();
-        await _storage.ReadStateAsync(name, this.GetGrainId(), entry).ConfigureAwait(ContinueOnCapturedContext);
-        await _storage.ClearStateAsync(name, this.GetGrainId(), entry).ConfigureAwait(ContinueOnCapturedContext);
-    }
-
-    private async Task ClearIndexDelta(int version)
-    {
-        var name = IndexDeltaRowName(version);
-        var entry = new GrainState<KeyIndexDeltaEntry>();
-        await _storage.ReadStateAsync(name, this.GetGrainId(), entry).ConfigureAwait(ContinueOnCapturedContext);
-        await _storage.ClearStateAsync(name, this.GetGrainId(), entry).ConfigureAwait(ContinueOnCapturedContext);
-    }
-
-    private async Task<DatastoreGrainState?> ReadLegacySnapshot(int version)
-    {
-        var entry = new GrainState<DatastoreGrainState>();
-        await _storage.ReadStateAsync($"{LegacySnapshotStatePrefix}{version}", this.GetGrainId(), entry)
-            .ConfigureAwait(ContinueOnCapturedContext);
-        return entry.RecordExists ? entry.State : null;
-    }
-
-    // Clears go through a read-then-clear so the wrapper carries the CURRENT storage ETag: providers
-    // enforce the etag on delete too (MemoryStorage throws MemoryStorageEtagMismatchException for a
-    // null-etag delete of an existing row), and these version-qualified entries were written through
-    // transient wrappers whose minted etags were discarded. Reading a missing/already-cleared entry
-    // yields a null etag, which every provider accepts for a no-op clear.
-
-    private async Task ClearMeta(int version)
-    {
-        var entry = new GrainState<DatastoreMetaEntry>();
-        await _storage.ReadStateAsync($"{MetaStatePrefix}{version}", this.GetGrainId(), entry)
-            .ConfigureAwait(ContinueOnCapturedContext);
-        await _storage.ClearStateAsync($"{MetaStatePrefix}{version}", this.GetGrainId(), entry)
-            .ConfigureAwait(ContinueOnCapturedContext);
-    }
-
-    private async Task ClearShardRow(int rowVersion, string shardKey)
-    {
-        var name = ShardRowName(rowVersion, shardKey);
-        var entry = new GrainState<GraphShardState>();
-        await _storage.ReadStateAsync(name, this.GetGrainId(), entry).ConfigureAwait(ContinueOnCapturedContext);
-        await _storage.ClearStateAsync(name, this.GetGrainId(), entry).ConfigureAwait(ContinueOnCapturedContext);
-    }
-
-    private async Task ClearLegacySnapshot(int version)
-    {
-        var entry = new GrainState<DatastoreGrainState>();
-        await _storage.ReadStateAsync($"{LegacySnapshotStatePrefix}{version}", this.GetGrainId(), entry)
-            .ConfigureAwait(ContinueOnCapturedContext);
-        await _storage.ClearStateAsync($"{LegacySnapshotStatePrefix}{version}", this.GetGrainId(), entry)
-            .ConfigureAwait(ContinueOnCapturedContext);
-    }
-
-    private async Task ClearLogEntry(int version)
-    {
-        var entry = new GrainState<LogEvent>();
-        await _storage.ReadStateAsync($"{LogStatePrefix}{version}", this.GetGrainId(), entry)
-            .ConfigureAwait(ContinueOnCapturedContext);
-        await _storage.ClearStateAsync($"{LogStatePrefix}{version}", this.GetGrainId(), entry)
-            .ConfigureAwait(ContinueOnCapturedContext);
-    }
-
-    // --- recent-events window ---
+    public Task FlushProjection() => FlushProjectionCore();
 
     /// <summary>
-    /// The LOCAL-list counterpart of <see cref="TrimRecent"/>, used by <see cref="ReadStateFromStorage"/>
-    /// while it is still folding into locals (before its single publish block) — never touches the shared
-    /// <see cref="_recent"/>/<see cref="_recentFloorRevision"/> fields.
+    /// The flush a write turn runs when the pending tail reaches <see cref="FlushInterval"/>. A failure is
+    /// logged and left for the next flush to retry — the events stay pending, which is always correct —
+    /// because the write that triggered it has already committed and must not be reported as failed.
     /// </summary>
-    private void AddPending(List<LogEvent> pending, ref long floor, LogEvent ev, long head)
+    private async Task TryFlushProjection()
     {
-        pending.Add(ev);
-        var newFloor = Math.Max(floor, head - _gcWindowNanos);
-        if (newFloor <= floor)
+        try
+        {
+            await FlushProjectionCore().ConfigureAwait(ContinueOnCapturedContext);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(
+                ex,
+                "datastore grain: projecting {Count} pending events failed; they stay pending and the next flush retries",
+                State.Value.Pending.Count);
+        }
+    }
+
+    /// <summary>
+    /// Projects the whole pending tail (see the class remarks): every touched shard grain persists its
+    /// events, the populated keys are added to the shard index, and only then is the projection
+    /// journaled. Runs in a write turn, so no commit interleaves it.
+    /// </summary>
+    private async Task FlushProjectionCore()
+    {
+        var meta = State.Value;
+        if (meta.Pending.IsEmpty)
             return;
-        floor = newFloor;
-        var floorValue = newFloor;
-        pending.RemoveAll(e => e.Revision <= floorValue);
+        var through = meta.Pending[^1].Revision;
+
+        var eventsByKey = new Dictionary<string, ImmutableList<LogEvent>.Builder>(StringComparer.Ordinal);
+        foreach (var ev in meta.Pending)
+        {
+            foreach (var key in MetaFold.TouchedKeys(ev))
+            {
+                if (!eventsByKey.TryGetValue(key, out var events))
+                    eventsByKey[key] = events = ImmutableList.CreateBuilder<LogEvent>();
+                events.Add(ev);
+            }
+        }
+
+        var projected = await InBatches(eventsByKey.ToList(), async pair =>
+        {
+            var populated = await GrainFactory.GetGrain<IGraphShardGrain>(pair.Key)
+                .Project(pair.Value.ToImmutable(), through, meta.GcFloor)
+                .ConfigureAwait(ContinueOnCapturedContext);
+            return (Key: GraphShardGrainKey.Parse(pair.Key), Populated: populated);
+        }).ConfigureAwait(ContinueOnCapturedContext);
+
+        var buckets = projected
+            .Where(p => p.Populated)
+            .GroupBy(p => ShardIndexKey.For(p.Key), StringComparer.Ordinal)
+            .ToList();
+        await InBatches(buckets, async bucket =>
+        {
+            await GrainFactory.GetGrain<IShardIndexGrain>(bucket.Key)
+                .Add(bucket.Select(p => p.Key.ObjectId).ToImmutableList())
+                .ConfigureAwait(ContinueOnCapturedContext);
+            return true;
+        }).ConfigureAwait(ContinueOnCapturedContext);
+
+        RaiseEvent(new DatastoreJournalEntry.Projected(through));
+        await ConfirmEvents().ConfigureAwait(ContinueOnCapturedContext);
     }
 
-    // Raise the floor for anything aged past the GC window (never lower it — compaction may have set it
-    // higher), and drop the now-unretained events. _recent always holds exactly the events above the floor.
-    // Only ever called from within a synchronous publish block (see ApplyUpdatesToStorage) or from RunGc's
-    // own append (which mints and confirms its own event via the normal write path, same guarantee).
-    private void TrimRecent(long head)
+    /// <summary>
+    /// Runs <paramref name="call"/> over <paramref name="items"/> with at most
+    /// <see cref="MaxConcurrentShardCalls"/> in flight, on the grain's own scheduler.
+    /// </summary>
+    private static async Task<TResult[]> InBatches<T, TResult>(IReadOnlyCollection<T> items, Func<T, Task<TResult>> call)
     {
-        var floor = Math.Max(_recentFloorRevision, head - _gcWindowNanos);
-        if (floor <= _recentFloorRevision)
-            return;
-        _recentFloorRevision = floor;
-        _recent.RemoveAll(e => e.Revision <= _recentFloorRevision);
+        var results = new List<TResult>(items.Count);
+        foreach (var batch in items.Chunk(MaxConcurrentShardCalls))
+            results.AddRange(await Task.WhenAll(batch.Select(call)).ConfigureAwait(ContinueOnCapturedContext));
+        return results.ToArray();
     }
 
     private static long NowNanos() => (DateTimeOffset.UtcNow - DateTimeOffset.UnixEpoch).Ticks * 100L;

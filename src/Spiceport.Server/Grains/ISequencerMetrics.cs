@@ -34,7 +34,7 @@ public interface ISequencerMetrics
     /// <summary>One inbound <see cref="DatastoreGrain.ReadFrom"/> (log-tail) call — the P2 fan-in observable.</summary>
     void RecordReadFrom();
 
-    /// <summary>One inbound <see cref="DatastoreGrain.ReadShard"/> (cold-shard hydration) call.</summary>
+    /// <summary>One inbound <see cref="DatastoreGrain.ReadShardTail"/> (cold-shard hydration) call.</summary>
     void RecordReadShard();
 
     /// <summary>One inbound <see cref="DatastoreGrain.GetHead"/> call.</summary>

@@ -46,60 +46,74 @@ grain-sharded adjacency families, and a storage-direct scan seam.**
 ## 2. Architecture as realized
 
 ```
-                DatastoreGrain (grain, cluster singleton — the THIN sequencer)
-                 - Commit: declarative wire contract; mints revisions (the one total order)
-                 - holds only the small state (head/schemas/counters/floor/key index)
-                   plus a dirty buffer of keys touched since their rows last flushed
-                 - Watch feed (unchanged: grain observer + heartbeat backstop)
-                 - ReadShard: per-key snapshot for shard hydration; ReadFrom: log tail
-                        |
-        durable log + per-key shard rows + meta rows (stock Orleans grain storage)
-                        |
-        +---------------+----------------------+
-        |                                      |
-  GraphShardGrain (forward key)         GraphShardGrain (reverse key)
-  key: (objectType, objectId)           key: (subjectType, subjectId)
-  versioned usersets of ONE object      versioned back-references of ONE subject
-  serves: RowsAt(rev)                   serves: RowsAt(rev)
-  consumers: CheckGrain, Expand,        consumers: MembershipWalkGrain,
-  LookupSubjects                        LookupResources, SubjectFrontierGrain
+              DatastoreGrain (journaled grain, cluster singleton -- the sequencer)
+               - Commit: declarative wire contract; mints revisions (the one total order)
+               - journaled state: head/schemas/counters/floor/types seen + the PENDING TAIL
+                 (committed events not yet projected) -- bounded by the flush interval
+               - Watch feed and shard catch-up: ReadFrom serves the pending tail
+               - every FlushInterval events: project the tail, then journal "Projected"
+                      |
+       state-storage log consistency over stock Orleans grain storage
+                      |                      (projection: shards persist themselves)
+        +-------------+---------------+----------------------------+
+        |                             |                            |
+  GraphShardGrain (forward key)  GraphShardGrain (reverse key)  ShardIndexGrain
+  key: (objectType, objectId)    key: (subjectType, subjectId)  key: (dir, type, bucket)
+  persisted: the key's projected persisted: the key's projected  persisted: the object ids
+  MVCC rows, labelled with the   back-references, labelled      of one direction/type
+  revision the projection        likewise                       that hold or held rows
+  reached
+  served: projected + pending    served: likewise
+  consumers: CheckGrain, Expand, consumers: MembershipWalkGrain, consumers: candidate-key
+  LookupSubjects                 LookupResources,               resolution, ReadState
+                                 SubjectFrontierGrain
 ```
 
-This is a distributed LSM expressed in grains: the sequencer is the WAL owner, shard grains
-are the sorted runs (each holds its key's MVCC history within the GC window), and "flush" is
-shards advancing their watermarks by folding the tail. The fold is reused, not rewritten: a
-shard's state is the existing `LogFold`/`MvccSnapshotReader` fold **restricted to one key**
-(`ShardFold`). Because the fold is already a pure function of the log, sharding it is a
-filter — this is the deep reason the refactor was tractable, and it yields the checkable
-sharding lemma (§7 step 2): `fold(log) == merge(fold(log | key) for all keys)`.
+The sequencer is an ordinary journaled grain. Each commit journals a canonical `LogEvent`; its
+journaled state is the small state plus the pending tail -- the committed events no shard has
+persisted yet. Every `FlushInterval` (64) events it PROJECTS the tail: each shard grain an event
+touches folds its events over its persisted state and persists the result (`Project`), the
+populated keys are added to the bucketed shard index, and only then does the sequencer journal a
+`Projected(through)` entry, which drops those events from the tail. A crash anywhere before that
+entry leaves them pending and the next flush replays them; projection is idempotent by its label.
+So every committed event is, at every instant, either projected into each shard it touches or
+pending in the journaled state. The fold is reused, not rewritten: a shard's projected state is
+the existing `LogFold`/`MvccSnapshotReader` fold **restricted to one key** (`ShardFold`). Because
+the fold is already a pure function of the log, sharding it is a filter -- the deep reason the
+design is tractable, and the checkable sharding lemma (§7 step 2):
+`fold(log) == merge(fold(log | key) for all keys)`.
 
 **Reads.** A read pinned at `rev` goes to the shard (`ShardedGraphReader` resolves the grain;
-`IGraphReaderSource` hands the engines the pinned reader). If the shard's watermark ≥ `rev`
-it serves from local state — the closed-timestamp gate, per-shard instead of per-silo. If
-not, the shard pulls the log tail (catch-up-on-demand); a cold shard always hydrates via the
-sequencer's per-key `ReadShard` snapshot first, never a from-zero log replay (the retained
-tail starts at the compaction floor). The evaluation contract is untouched: a Check remains a
-pure function of `(schema@rev, tuples@rev, request)`; only *who holds the tuples* changed.
+`IGraphReaderSource` hands the engines the pinned reader). If the shard's watermark >= `rev` it
+serves from local state -- the closed-timestamp gate, per shard. If not, it pulls the log tail
+(catch-up-on-demand). A cold shard hydrates from its own projected state plus the sequencer's
+pending events for its key (`ReadShardTail`), relabeled to the head -- exact by the sharding
+fact: any event touching the key is either projected (at or below the label) or pending. The
+ORDER RULE makes that safe while a flush interleaves: take the pending tail first, read the
+projected state second, and fold only the pending events above the projected label. The
+evaluation contract is untouched: a Check remains a pure function of
+`(schema@rev, tuples@rev, request)`; only *who holds the tuples* changed.
 
 **Writes.** The sequencer is the sole serialization point; the single ordered log and the
 new-enemy defence are unchanged. `DatastoreGrain.Commit` is the declarative wire contract:
-preconditions, updates, delete-by-filter, schema writes (guarded by `ExpectedSchemaHash`),
-and counter changes are evaluated and executed inside the single-threaded, non-reentrant
-activation. The single-writer activation makes head-moved conflicts near-impossible — it
-cannot lose its own conditional append — but the client still carries a bounded `HeadMoved`
-retry, because a stale duplicate activation during cluster-membership churn can briefly race
-the storage version check. Every rejection returns as a typed `CommitReply` failure with
-nothing applied. The fold has left the grain: a commit assembles a PARTIAL base from exactly
-the shard keys its updates/preconditions/delete filter can read (candidate-key resolution
-over the key index — sound by the sharding lemma; the argument is inline at the assembly
-site in `DatastoreGrain.Commit`), evaluates against it, and pre-seeds the dirty buffer for
-every key the resulting event touches before the append. `ReadWriteTx`
-survives only as the `ExpectedHead` compatibility path — the caller-evaluated CAS shape —
-over the same `Commit` contract.
+preconditions, updates, delete-by-filter, schema writes (guarded by `ExpectedSchemaHash`), and
+counter changes are evaluated and executed inside the single-threaded, non-reentrant activation.
+A commit assembles a PARTIAL base from exactly the shard keys its updates/preconditions/delete
+filter can read -- each the key's projected state with the pending tail folded over -- resolving
+keys by construction where a filter names them and through the shard index (plus the pending
+tail's keys) where it does not; the soundness argument is inline at the assembly site. Every
+rejection returns as a typed `CommitReply` failure with nothing applied. `ReadWriteTx` survives
+only as the `ExpectedHead` compatibility path -- the caller-evaluated CAS shape -- over the same
+`Commit` contract.
 
-**Activation state = the hot set.** Cold keys' shards deactivate under Orleans idle
-collection; cold keys never activate at all until touched. Silo memory is O(hot working
-set), not O(graph).
+**Persistence.** Everything persists through stock Orleans grain storage: the sequencer through
+the state-storage log-consistency provider (each commit writes the small state and the pending
+tail, which the flush interval bounds), and each shard and index grain its own state. There is
+no application SQL and no storage layout of the application's own: no log rows, row versions,
+key-index buckets or migrations.
+
+**Activation state = the hot set.** Cold keys' shards deactivate under Orleans idle collection;
+cold keys activate only to be projected. Silo memory is O(hot working set), not O(graph).
 
 ---
 
@@ -232,11 +246,11 @@ Ceilings, honestly stated:
   mattered.
 - **Silo cold-start warmup — gone.** Silo start hydrates nothing; shards hydrate on first
   touch.
-- **Sequencer state ceiling — gone.** The thin-sequencer flush protocol (§7 step 6) removed
-  the materialized fold from the `DatastoreGrain`: its memory is the small state plus a
-  dirty buffer bounded by write rate x the flush interval, and its recovery is O(log tail +
-  touched keys), never O(graph). The one deliberately O(graph) surface left is the
-  admin-plane `ReadState` assembly (scan seam, compatibility writes, equivalence gates).
+- **Sequencer state ceiling — gone.** The `DatastoreGrain` holds the small state plus the
+  pending tail, which the flush interval bounds; recovery is reading that state back, never
+  O(graph). Shard rows live in the shard grains that serve them. The one deliberately O(graph)
+  surface left is the admin-plane `ReadState` assembly (scan seam, compatibility writes,
+  equivalence gates), which enumerates the shard index.
 - **Write ceiling — deliberately retained.** One sequencer, one total order: the new-enemy
   invariant and the recorded non-goal. The ceiling is a design stance, not a casualty. What
   happens AT the ceiling is governed: a per-silo admission gate (`SequencerAdmission`,
@@ -285,31 +299,17 @@ Realized (the built system):
    `CommitReply` failures; `ReadWriteTx` survives as the `ExpectedHead` compatibility path.
 5. **Scans go through `ISnapshotScanner`**, schema-at-revision through `ISchemaSource`, and
    the per-silo whole-graph projection is deleted — sharded reads are the only engine path.
-6. **The thin-sequencer flush protocol.** The fold has left the grain. The sequencer's
-   journaled state is only the small `DatastoreMetaState` (head, schemas, counters, GC
-   floor, and the key index of populated forward/reverse keys); rows persist per adjacency
-   key as `shard/f|r/{type}/{id}` `GraphShardState` rows in the same stock grain storage,
-   rewritten from an in-memory dirty buffer at the same 64-event cadence the whole-state
-   snapshots used (write-once `meta/{version}` rows version the flushes; the `head` row
-   stays the commit point; clears stay best-effort post-commit). The load-bearing fact is
-   the sharding lemma's corollary: a clean key's stored row content is complete — only its
-   `AppliedRevision` label is stale and is relabeled to head on serve — so clean keys need
-   NO per-key tail replay, and recovery is O(tail + touched keys). Row GC is lazy (rows
-   compact when next dirtied+flushed; every serve path re-applies the floor, and reads
-   below the floor are rejected anyway). `Commit` evaluates over a partial base assembled
-   by candidate-key resolution; `ReadState` survives as the admin plane's on-demand
-   whole-state assembly. A legacy whole-state `snapshot/{version}` store migrates in place
-   on first activation.
-
-   The key index's own durable form is chunked (per-direction bucket rows rewritten one per
-   flush in rotation, plus per-flush delta rows; the meta row carries only the layout
-   descriptor, never the maps inline), and stores written by the earlier inline-map layout
-   migrate to it in place on first activation. **That migration is ONE-WAY — rollback across
-   it is forbidden.** A binary predating the chunked index, activated against a migrated
-   store, deserializes the meta row without the layout field it does not know, sees the
-   (deliberately empty) inline maps, and silently reads the store as EMPTY — every
-   relationship unreachable — and its first flush persists that emptiness durably. Roll
-   forward only; recover a wrongly rolled-back store from backup, not by re-upgrading.
+6. **The projection.** The fold has left the sequencer. It is an ordinary journaled grain whose
+   state is the small state plus the pending tail; every `FlushInterval` events it projects the
+   tail into the shard grains (each persists its own projected state, idempotently by label) and
+   the bucketed shard index, then journals `Projected`. A key's current state is its projected
+   state with its pending events folded over (`ShardFold.Overlay`), relabeled to the head --
+   no per-key log replay, because a key nothing pending touches is complete as projected. Row GC
+   is lazy (rows compact when their key is next projected; every serve path re-applies the
+   floor, and reads below the floor are rejected anyway). `Commit` evaluates over a partial base
+   assembled by candidate-key resolution; `ReadState` survives as the admin plane's on-demand
+   whole-state assembly. Projection writes restore their previous state when the write fails,
+   so a replay is never mistaken for one already persisted.
 
 7. **The co-placement director** (§5) — built as `GraphLocalityPlacement`, default ON:
    the locality hint is proven by a multi-silo co-location gate, and the default was decided
@@ -328,8 +328,8 @@ Realized (the built system):
 - **GC as a log event.** Every shard applies `GcApplied(floor)` in its fold identically.
 - **The corpus stays green, unweakened**, and `authzed.api.v1` compatibility (cursors and
   token formats included) is unchanged.
-- **No application SQL.** The log, the per-key shard rows and the meta rows all persist
-  through stock Orleans grain storage.
+- **No application SQL.** The sequencer's journaled state, the shard projections and the index
+  buckets all persist through stock Orleans grain storage.
 
 This reshape also strengthens rather than spends the other analyzed directions:
 incrementally-materialized reachability (`future-work.md` §2.2) becomes another shard family

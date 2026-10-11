@@ -43,4 +43,38 @@ public interface IGraphShardGrain : IGrainWithStringKey
     /// </summary>
     [AlwaysInterleave]
     Task<GraphShardRowsReply> RowsAt(long revision, FullRelationshipsFilterWire? filter, CancellationToken cancellationToken);
+
+    /// <summary>
+    /// The sequencer's projection write: folds <paramref name="events"/> (each touching this shard's
+    /// key, ascending by revision) over the shard's PERSISTED state, applies <paramref name="gcFloor"/>,
+    /// labels the result <paramref name="through"/>, and persists it before returning. Idempotent: events
+    /// at or below the persisted label were already projected and are skipped, so the sequencer may
+    /// replay a projection it is unsure completed. Returns whether the key holds any rows afterwards.
+    /// </summary>
+    Task<bool> Project(ImmutableList<LogEvent> events, long through, long gcFloor);
+
+    /// <summary>
+    /// The shard's PERSISTED projected state: its rows as of its label, which is complete for every
+    /// event at or below the label and missing only the sequencer's pending events for this key.
+    /// Marked <see cref="AlwaysInterleaveAttribute"/>: a pure read of state loaded at activation.
+    /// </summary>
+    [AlwaysInterleave]
+    Task<GraphShardState> ReadProjected();
+}
+
+/// <summary>
+/// One bucket of the shard index: the object ids of one direction and type, hashed into a fixed number
+/// of buckets, whose shard grains have ever been projected. Enumerating the bucket grains of a type
+/// lists every key of that type that may hold rows (a superset: a key whose rows were all deleted
+/// stays listed). It replaces enumerating a key index held by the sequencer, so no single grain's
+/// state grows with the graph.
+/// </summary>
+public interface IShardIndexGrain : IGrainWithStringKey
+{
+    /// <summary>Adds <paramref name="ids"/> to the bucket and persists it before returning. Idempotent.</summary>
+    Task Add(ImmutableList<string> ids);
+
+    /// <summary>The ids in the bucket. A pure read of state loaded at activation.</summary>
+    [AlwaysInterleave]
+    Task<ImmutableList<string>> ReadIds();
 }

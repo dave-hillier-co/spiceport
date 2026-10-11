@@ -80,7 +80,7 @@ public sealed class DatastoreGrainDurabilityTests
                 })
                 .Build();
             siloBuilder.AddDatastoreGrainStorage(config);
-            siloBuilder.AddCustomStorageBasedLogConsistencyProvider("CustomStorage");
+            siloBuilder.AddStateStorageBasedLogConsistencyProvider("StateStorage");
             siloBuilder.ConfigureServices(services =>
             {
                 services.AddSpiceportGrainServices(SchemaText);
@@ -138,7 +138,7 @@ public sealed class DatastoreGrainDurabilityTests
                 })
                 .Build();
             siloBuilder.AddDatastoreGrainStorage(config);
-            siloBuilder.AddCustomStorageBasedLogConsistencyProvider("CustomStorage");
+            siloBuilder.AddStateStorageBasedLogConsistencyProvider("StateStorage");
             siloBuilder.ConfigureServices(services =>
             {
                 services.AddSpiceportGrainServices(SchemaText);

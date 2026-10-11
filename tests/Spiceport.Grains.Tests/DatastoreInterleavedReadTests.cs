@@ -15,8 +15,8 @@ namespace Spiceport.Grains.Tests;
 /// <see cref="IDatastoreGrain.ReadState"/>, <see cref="IDatastoreLog.ReadFrom"/>) past an in-flight
 /// <see cref="IDatastoreGrain.Commit"/> on the cluster-singleton <see cref="DatastoreGrain"/>. Drives
 /// the REAL grain through an Orleans <see cref="TestCluster"/>, with the keyed "datastore" storage provider
-/// swapped for <see cref="PausableGrainStorage"/> so a write can be parked mid-flight (at the <c>head</c>
-/// write, or at a <c>log/{n}</c> write) while a read is issued concurrently.
+/// swapped for <see cref="PausableGrainStorage"/> so the sequencer's state write (the commit point) can
+/// be parked mid-flight while a read is issued concurrently, and so a write can be made to fail once.
 /// </summary>
 [Collection(MeshClusterCollection.Name)]
 public sealed class DatastoreInterleavedReadTests
@@ -65,25 +65,23 @@ public sealed class DatastoreInterleavedReadTests
     {
         public static TaskCompletionSource<bool>? HeadWriteBlock;
         public static TaskCompletionSource<bool>? HeadWriteParked;
-        public static TaskCompletionSource<bool>? LogWriteBlock;
-        public static TaskCompletionSource<bool>? LogWriteParked;
         public static volatile bool ThrowOnceOnHeadWrite;
+        public static volatile bool ThrowOnceOnShardWrite;
 
         public static void Reset()
         {
             HeadWriteBlock = null;
             HeadWriteParked = null;
-            LogWriteBlock = null;
-            LogWriteParked = null;
             ThrowOnceOnHeadWrite = false;
+            ThrowOnceOnShardWrite = false;
         }
     }
 
     /// <summary>
-    /// Wraps the in-memory grain-storage provider so a test can park a <c>head</c> or <c>log/{n}</c> write
-    /// mid-flight (an await that only resumes once the test releases the corresponding <see cref="Gate"/>
-    /// TCS), or make the next <c>head</c> write throw once. Reads (<c>ReadStateAsync</c>) are never gated —
-    /// only the write path is under test here.
+    /// Wraps the in-memory grain-storage provider so a test can park the sequencer's state write — its
+    /// commit point — mid-flight (an await that only resumes once the test releases the
+    /// <see cref="Gate"/> TCS), or make the next sequencer or shard-projection write throw once. Reads
+    /// (<c>ReadStateAsync</c>) are never gated — only the write path is under test here.
     /// </summary>
     private sealed class PausableGrainStorage(IGrainStorage inner) : IGrainStorage
     {
@@ -92,7 +90,14 @@ public sealed class DatastoreInterleavedReadTests
 
         public async Task WriteStateAsync<T>(string stateName, GrainId grainId, IGrainState<T> grainState)
         {
-            if (stateName == "head")
+            var grainType = grainId.Type.ToString()!;
+            if (grainType == "graphshard" && Gate.ThrowOnceOnShardWrite)
+            {
+                Gate.ThrowOnceOnShardWrite = false;
+                throw new InvalidOperationException("injected shard-projection write failure (test seam)");
+            }
+
+            if (grainType == "datastore")
             {
                 if (Gate.ThrowOnceOnHeadWrite)
                 {
@@ -105,11 +110,6 @@ public sealed class DatastoreInterleavedReadTests
                     Gate.HeadWriteParked?.TrySetResult(true);
                     await headGate.Task;
                 }
-            }
-            else if (stateName.StartsWith("log/", StringComparison.Ordinal) && Gate.LogWriteBlock is { } logGate)
-            {
-                Gate.LogWriteParked?.TrySetResult(true);
-                await logGate.Task;
             }
 
             await inner.WriteStateAsync(stateName, grainId, grainState);
@@ -125,11 +125,14 @@ public sealed class DatastoreInterleavedReadTests
         {
             // The pausable wrapper must sit over a provider with the binary grain-storage serializer
             // (production parity — the memory provider's Newtonsoft-JSON default cannot round-trip the
-            // meta state's ImmutableDictionary key index; see AddDatastoreGrainStorage).
+            // journaled state's immutable collections; see AddDatastoreGrainStorage).
             b.AddMemoryGrainStorage("datastore-inner", optionsBuilder =>
                 optionsBuilder.Configure<Serializer>((options, serializer) =>
                     options.GrainStorageSerializer = new OrleansGrainStorageSerializer(serializer)));
-            b.AddCustomStorageBasedLogConsistencyProvider("CustomStorage");
+            b.AddStateStorageBasedLogConsistencyProvider("StateStorage");
+            // The sequencer reads and projects through the shard grains, whose placement strategy needs
+            // its director wherever they can activate.
+            b.AddGraphLocalityPlacement();
             b.ConfigureServices(services => services.AddKeyedSingleton<IGrainStorage>(
                 "datastore",
                 (sp, _) => new PausableGrainStorage(sp.GetRequiredKeyedService<IGrainStorage>("datastore-inner"))));
@@ -137,7 +140,7 @@ public sealed class DatastoreInterleavedReadTests
     }
 
     /// <summary>
-    /// Gate 1: with a write parked at the <c>head</c> storage write (the commit point), <c>GetHead</c> and
+    /// Gate 1: with a write parked at the sequencer's state write (the commit point), <c>GetHead</c> and
     /// <c>ReadFrom</c> must still complete promptly — proving the pure reads interleave past the blocking
     /// write turn rather than queuing behind it on the non-reentrant activation. MUST FAIL on the
     /// unmodified grain (reads queue behind the parked write and the assertion times out) — verified red
@@ -175,10 +178,9 @@ public sealed class DatastoreInterleavedReadTests
     }
 
     /// <summary>
-    /// Gate 2: a write parked mid-flight must never be observable by an interleaved reader — neither at the
-    /// <c>head</c> write (log entries already durable) nor at a <c>log/{n}</c> write (nothing durable yet
-    /// for this commit). Once the write completes, the event and the advanced head become visible together
-    /// (one consistent publication).
+    /// Gate 2: a write parked mid-flight must never be observable by an interleaved reader. Once the
+    /// write completes, the event and the advanced head become visible together (one consistent
+    /// publication: both come from the one confirmed state).
     /// </summary>
     [Fact]
     public async Task Parked_write_is_invisible_until_the_head_commit()
@@ -187,7 +189,7 @@ public sealed class DatastoreInterleavedReadTests
         var grain = Grain(scope.Cluster);
         var oldHead = (await grain.GetHead()).Head;
 
-        // Phase 1: park at the head write itself.
+        // Park at the sequencer's state write itself.
         Gate.HeadWriteBlock = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
         Gate.HeadWriteParked = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
         var append1 = grain.Commit(TouchCommit("a", "alice", oldHead));
@@ -214,47 +216,13 @@ public sealed class DatastoreInterleavedReadTests
         var committedEvent = Assert.Single(segmentAfterCommit.Events);
         Assert.Equal(newHead1, committedEvent.Revision);
         Assert.Equal(newHead1, segmentAfterCommit.HeadRevision);
-
-        // Phase 2: repeat, this time parking at the log-entry write (nothing durable for this commit yet).
-        Gate.HeadWriteBlock = null;
-        Gate.HeadWriteParked = null;
-        Gate.LogWriteBlock = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
-        Gate.LogWriteParked = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
-        var append2 = grain.Commit(TouchCommit("b", "bob", newHead1!.Value));
-        long? newHead2;
-        try
-        {
-            await Gate.LogWriteParked.Task.WaitAsync(Timeout);
-
-            var segmentDuringLogPark = await grain.ReadFrom(newHead1.Value, -1).WaitAsync(Timeout);
-            Assert.Empty(segmentDuringLogPark.Events);
-
-            var headDuringLogPark = await grain.GetHead().WaitAsync(Timeout);
-            Assert.Equal(newHead1, headDuringLogPark.Head);
-        }
-        finally
-        {
-            Gate.LogWriteBlock.TrySetResult(true);
-            newHead2 = (await append2).Revision;
-        }
-
-        Assert.NotNull(newHead2);
-        var segmentFinal = await grain.ReadFrom(newHead1.Value, -1);
-        var finalEvent = Assert.Single(segmentFinal.Events);
-        Assert.Equal(newHead2, finalEvent.Revision);
-        Assert.Equal(newHead2, segmentFinal.HeadRevision);
     }
 
     /// <summary>
-    /// Gate 3: a commit whose <c>head</c> write fails transiently must never leak a spurious event — and,
-    /// because the log-row writes tolerate overwriting their own orphan (the write-first, ETag-tolerant-
-    /// fallback discipline), the storage adaptor's internal retry now RECOVERS the commit: it re-writes
-    /// the same log entry over the orphan, retries the head write, and the caller's <c>Commit</c>
+    /// Gate 3: a commit whose state write fails transiently must never leak a spurious event, and the
+    /// log-consistency adaptor's internal retry RECOVERS the commit: the caller's <c>Commit</c>
     /// completes with the minted revision. This pins three things at once: the commit succeeds despite
-    /// the one-shot fault, exactly ONE event surfaces (the orphan overwrite duplicated nothing), and the
-    /// datastore is writable afterwards. An earlier version of this gate pinned the pre-recovery
-    /// behavior instead — the retry wedged forever on its own write-once orphan, so it could only assert
-    /// the stuck-but-not-leaking half of this contract and had to document the wedge as a known wart.
+    /// the one-shot fault, exactly ONE event surfaces, and the datastore is writable afterwards.
     /// </summary>
     [Fact]
     public async Task Failed_head_write_recovers_without_leaking_or_duplicating_events()
@@ -283,23 +251,20 @@ public sealed class DatastoreInterleavedReadTests
     }
 
     /// <summary>
-    /// Gate 3b: the same one-shot head-write fault as Gate 3, landed exactly ON a FLUSH BOUNDARY (the
-    /// 64th commit). The failed attempt has already written its shard rows, the rotated index-bucket
-    /// pair, the delta row and the meta row — all orphans at versioned names — and the adaptor's retry
-    /// re-runs the SAME boundary: same log slot, same flush version, same rotated bucket, overwriting
-    /// its own orphans via the read-then-write discipline. Pins that the boundary commit succeeds and
-    /// that the index the retried flush committed is CORRECT: after a forced deactivation, recovery
-    /// reconstructs the store THROUGH that index, and every pre-boundary key must still be served (a
-    /// referenced-but-wrong bucket/delta/shard row would lose keys or fail the recovery loudly).
+    /// Gate 3b: a shard-projection write that fails at the FLUSH BOUNDARY (the 64th commit) must not fail
+    /// the commit that triggered the flush — that commit is already journaled — and must lose nothing:
+    /// the events stay pending (reads fold them over the partial projection), and the next flush replays
+    /// them, idempotently for the shards that did persist. After a forced deactivation every key is
+    /// still served from the projection.
     /// </summary>
     [Fact]
-    public async Task Failed_head_write_at_a_flush_boundary_retries_the_same_bucket_and_commits_a_correct_index()
+    public async Task Failed_projection_write_at_a_flush_boundary_keeps_events_pending_until_a_later_flush()
     {
         await using var scope = new Scope(await NewClusterAsync());
         var grain = Grain(scope.Cluster);
         var head = (await grain.GetHead()).Head;
 
-        // 63 commits bring the contiguous log to version 63 — the next commit is the flush boundary.
+        // 63 commits — the next commit fills the pending tail to the flush interval.
         for (var i = 0; i < 63; i++)
         {
             var reply = await grain.Commit(TouchCommit($"k{i}", $"u{i}", head));
@@ -307,22 +272,23 @@ public sealed class DatastoreInterleavedReadTests
             head = reply.Revision!.Value;
         }
 
-        Gate.ThrowOnceOnHeadWrite = true;
+        Gate.ThrowOnceOnShardWrite = true;
         var boundary = await grain.Commit(TouchCommit("k63", "u63", head)).WaitAsync(Timeout);
         Assert.Null(boundary.Failure);
         Assert.NotNull(boundary.Revision);
+        Assert.False(Gate.ThrowOnceOnShardWrite); // the fault really fired
 
-        // The flush really committed on the retry: the durable head names the boundary as its flush.
-        var storage = ((InProcessSiloHandle)scope.Cluster.Primary!).SiloHost.Services
-            .GetRequiredKeyedService<IGrainStorage>("datastore");
-        var grainId = ((GrainReference)grain).GrainId;
-        var headRow = new GrainState<LogHeadEntry>();
-        await storage.ReadStateAsync("head", grainId, headRow);
-        Assert.True(headRow.RecordExists);
-        Assert.Equal(64, headRow.State!.LogVersion);
-        Assert.Equal(64, headRow.State.SnapshotVersion);
+        // Nothing projected yet: the tail is still served from the pending state.
+        var tail = await grain.ReadFrom(head - 1, -1);
+        Assert.Contains(tail.Events, e => e.Revision == boundary.Revision);
+        for (var i = 0; i < 64; i++)
+        {
+            var shard = await grain.ReadShard(GraphShardKeyWire.ForResource("doc", $"k{i}"));
+            Assert.Equal($"u{i}", Assert.Single(shard.Rows, r => r.DeletedRevision is null).Relationship.SubjectId);
+        }
 
-        // Recovery THROUGH the retried flush's index: drop the activation and re-read every key.
+        // A later flush replays the whole tail; then recovery reads every key back from projections.
+        await grain.FlushProjection();
         var management = scope.Cluster.GrainFactory.GetGrain<IManagementGrain>(0);
         await management.ForceActivationCollection(TimeSpan.Zero);
 
@@ -330,8 +296,10 @@ public sealed class DatastoreInterleavedReadTests
         Assert.Equal(boundary.Revision, headAfter.Head);
         for (var i = 0; i < 64; i++)
         {
-            var shard = await grain.ReadShard(GraphShardKeyWire.ForResource("doc", $"k{i}"));
-            var live = Assert.Single(shard.Rows, r => r.DeletedRevision is null);
+            var projected = await scope.Cluster.GrainFactory
+                .GetGrain<IGraphShardGrain>(GraphShardGrainKey.Build(GraphShardKeyWire.ForResource("doc", $"k{i}")))
+                .ReadProjected();
+            var live = Assert.Single(projected.Rows, r => r.DeletedRevision is null);
             Assert.Equal($"u{i}", live.Relationship.SubjectId);
         }
     }

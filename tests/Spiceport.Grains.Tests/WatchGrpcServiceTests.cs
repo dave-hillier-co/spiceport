@@ -186,7 +186,7 @@ public class WatchGrpcServiceTests
             // ImmutableDictionary key index (and silently corrupts boxed-JsonElement caveat context) —
             // see AddDatastoreGrainStorage.
             b.AddDatastoreGrainStorage(new ConfigurationBuilder().Build());
-            b.AddCustomStorageBasedLogConsistencyProvider("CustomStorage");
+            b.AddStateStorageBasedLogConsistencyProvider("StateStorage");
             b.ConfigureServices(services =>
             {
                 services.AddSpiceportGrainServices(Schema);

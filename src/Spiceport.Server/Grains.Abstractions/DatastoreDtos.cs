@@ -85,20 +85,3 @@ public sealed record ProposedWrite(
     [property: Id(0)] IReadOnlyList<RelationshipUpdateWire> RelationshipChanges,
     [property: Id(1)] byte[]? SchemaBytes,
     [property: Id(2)] IReadOnlyList<CounterDeltaWire> CounterChanges);
-
-/// <summary>
-/// The durable "head" pointer entry for the event-sourced datastore grain (a single grain-storage row).
-/// It records the two distinct counters: the contiguous append-only log <see cref="LogVersion"/> (the
-/// CustomStorage optimistic-concurrency version, = the number of confirmed events), and the latest
-/// timestamp <see cref="HeadRevision"/> (the MVCC / zedtoken revision carried in the events).
-/// <see cref="SnapshotVersion"/> names the current flush boundary: under the thin-sequencer layout it is
-/// the version of the current <c>meta/{version}</c> row (see <see cref="DatastoreMetaEntry"/>), so a
-/// cold read loads the small state plus per-key shard rows and replays only the log tail above it. On a
-/// store written by the retired whole-state layout the same field named the <c>snapshot/{version}</c>
-/// row; activation migrates such a store in place (split into per-key rows + meta) on first read.
-/// </summary>
-[GenerateSerializer]
-public sealed record LogHeadEntry(
-    [property: Id(0)] int LogVersion,
-    [property: Id(1)] long HeadRevision,
-    [property: Id(2)] int SnapshotVersion);
