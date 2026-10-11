@@ -83,7 +83,7 @@ internal sealed class MvccReadWriteTransaction : IReadWriteTransaction
         if (limit is { } lim && (ulong)matched.Count > lim)
         {
             // The subset a truncating limit removes must be a pure function of the MATCHED SET, never of
-            // the base state's internal row order: the thin-sequencer write path assembles its base from
+            // the base state's internal row order: the sequencer's write path assembles its base from
             // per-key shard states (whose concatenation order differs from the reference model's
             // insertion order), and the fold-equivalence gates require both backends to delete the SAME
             // rows. Order canonically by the full six-tuple identity before truncating. When the limit
