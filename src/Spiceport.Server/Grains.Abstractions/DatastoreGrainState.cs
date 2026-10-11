@@ -4,8 +4,8 @@ namespace Spiceport.Grains.Abstractions;
 
 /// <summary>
 /// The Orleans-serializable mirror of the in-memory MVCC <c>DatastoreState</c>: the full committed
-/// state of the datastore at a head revision. Under the thin-sequencer layout this is no longer what
-/// the datastore grain persists (rows live per key in <see cref="GraphShardState"/> rows, the rest in
+/// state of the datastore at a head revision. This is not what the datastore grain
+/// persists (rows live per key in each <see cref="GraphShardState"/> projection, the rest in
 /// <see cref="DatastoreMetaState"/>); it survives as the ASSEMBLED whole-state reply of
 /// <c>IDatastoreGrain.ReadState</c> — small state plus every indexed forward key's current rows — which
 /// the <c>GrainBackedDatastore</c>/scan seam convert to the in-memory state to reuse the

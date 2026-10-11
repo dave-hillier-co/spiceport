@@ -52,10 +52,10 @@ public static class DatastoreStorageConfig
             // The in-memory fallback must force the SAME binary serializer as the AdoNet path below. The
             // memory provider's default (JsonGrainStorageSerializer) silently loses boxed JsonElement
             // caveat context: a round-tripped element comes back as ValueKind.Undefined, so the first
-            // read of a flushed shard row carrying caveat context would serve corrupted context (and
-            // deep-copying it throws InvalidOperationException from JsonElement.Clone). Under the
-            // thin-sequencer layout the grain reads its own flushed rows back in STEADY STATE (a clean
-            // key's serve path), not just on reactivation — so this is load-bearing, not cosmetic.
+            // read of a projected shard carrying caveat context would serve corrupted context (and
+            // deep-copying it throws InvalidOperationException from JsonElement.Clone). Shard and index
+            // grains read their persisted projections back in STEADY STATE (every cold activation),
+            // not just on reactivation — so this is load-bearing, not cosmetic.
             return silo.AddMemoryGrainStorage(ProviderName, optionsBuilder =>
                 optionsBuilder.Configure<Serializer>((options, serializer) =>
                     options.GrainStorageSerializer = new OrleansGrainStorageSerializer(serializer)));

@@ -205,12 +205,13 @@ object, reverse by subject), each the per-key restriction of the same log fold (
 activation-as-hot-set-cache with a per-shard closed-timestamp watermark; writes are declarative
 `DatastoreGrain.Commit` requests executed at the serialization point with typed `CommitReply`
 failures; broad scans and schema-at-revision go storage-direct (`ISnapshotScanner` /
-`ISchemaSource`); the **thin-sequencer flush protocol** removed the fold from the sequencer
-grain itself (slim meta state + dirty-buffer flush to version-qualified per-key rows, the head
-row as the sole commit point, O(tail) recovery, in-place migration from the whole-state
-layout); and the **co-placement director** (`GraphLocalityPlacement`) is built as a
-default-off locality hint whose enablement is gated on measurement. No component holds the
-whole graph: silo memory is O(hot shards), sequencer memory O(tail + dirty keys + metadata).
+`ISchemaSource`); the **projection protocol** removed the fold from the sequencer grain
+itself (an ordinary journaled grain holding small state plus the pending tail, projected every
+64 events into the shard grains' own persisted state and the bucketed shard index, then
+confirmed by a `Projected` journal entry, so recovery is O(tail)); and the **co-placement
+director** (`GraphLocalityPlacement`) is built as a default-off locality hint whose enablement
+is gated on measurement. No component holds the whole graph: silo memory is O(hot shards),
+sequencer memory O(pending tail + metadata).
 The single-writer total order is deliberately retained. Design, interfaces, the §3.1
 objections, and the staging are in [`graph-sharded-datastore.md`](graph-sharded-datastore.md).
 
@@ -328,7 +329,7 @@ write demand, not taste:
    the write ceiling ever fires.
 2. **The Corfu split: order without data.** The sequencer becomes a ticket dispenser —
    assigns positions, touches no payload; log storage moves to sharded segment rows/actors.
-   The thin sequencer is already halfway there (the flush protocol removed the fold); this
+   The projecting sequencer is already halfway there (projection removed the fold); this
    removes the data path. A near-stateless counter actor can ticket orders of magnitude more
    commits than it can execute.
 3. **Calvin-style deterministic execution.** Deterministic databases showed that if a
@@ -461,7 +462,7 @@ instrument for measuring it.
    in place and the dispatcher seam is clean: error mapping and depth enforcement are native,
    and the wire contract is minimal (sub-problem + cancellation).
 2. **1.13 graph-sharded datastore** — realized in full (per-key shard grains, declarative
-   `Commit`, storage-direct scans, the thin-sequencer flush protocol, the default-off
+   `Commit`, storage-direct scans, the projection protocol, the default-off
    co-placement director), dissolving 1.12 along the way.
 3. **1.14 scalability program** — the standing next step: the measurement harness is
    unconditional; every optimization behind it is trigger-gated

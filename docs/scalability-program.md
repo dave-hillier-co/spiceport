@@ -273,37 +273,27 @@ reads), with degraded p99 while the activation queue was deep.
 
 ### 3.4 Key-index chunking (answers P5)
 
-**Sketch.** Split the index maps into per-type rows (`index/{v}/f/{type}`,
-`index/{v}/r/{type}`), version-qualified and committed by the head row exactly like shard
-rows; `meta/{v}` shrinks to the type list plus per-type row versions. A flush writes only the
-types it dirtied. Recovery reads the referenced index rows. The crash-window analysis extends
-by the same argument the shard rows use — old meta references only old index versions.
+**Sketch.** Keep the key index out of the sequencer's own state: per-key membership lives in
+bucketed `ShardIndexGrain`s (16 buckets per direction and object type, bucket = stable hash %
+`BucketCount`), each persisting its own id set. A projection adds only the keys it touched, to
+only the buckets they hash to; the sequencer's journaled state carries just the type lists.
 
-**Gates.** Durability + migration suites extended for the layout change (a second in-place
-migration, meta-v1 to meta-v2).
+**Gates.** The durability suites (projection across a true reactivation) and the
+projection-sequencer suites, including idempotent re-projection after a crash between the shard
+writes and the `Projected` entry.
 
-**Cost.** Moderate — a second versioned-row family and a migration.
+**Cost.** Moderate — one more grain family and a fan-out bound on the projection.
 
-**Trigger.** Meta-row serialization visible in flush latency, or meta row size beyond
-storage-row comfort at the deployment's object cardinality.
+**Trigger.** Index serialization visible in commit or projection latency, or index state size
+beyond storage-row comfort at the deployment's object cardinality.
 
-**Trigger status: FIRED, then BUILT — goal substantially met.** The re-baseline's
-cardinality sweep showed bare-commit p50 flat but throughput collapsing severalfold and p99
-growing linearly with object cardinality, the entire excess being the flush turn serializing
-the whole index. As built, the durable index is delta rows (O(dirty) per flush, dropped keys
-as explicit tombstones) plus a round-robin bucket rotation (one bucket per direction per
-flush; bucket assignment = stable hash % BucketCount is part of the durable contract), a
-cardinality-independent slim meta, and batched parallel flush writes (3.3 item 3). Post-build
-the sweep's throughput degradation across a 30x cardinality range collapsed from severalfold
-to a modest residual — the documented O(N/BucketCount) bucket-rewrite term plus a CPU-only
-bucket-selection scan — and absolute throughput ROSE at every cardinality (the write
-batching pays everywhere). Recovery is bounded (all buckets + one rotation of deltas) with a
-fail-loud ascending-order guard; migrations from both legacy layouts are in-place and
-one-way (rollback across the index migration is forbidden — see
-`graph-sharded-datastore.md`); the crash-window analysis was adversarially reviewed with no
-blockers, and the pruned-delta and tombstone-then-recreate paths are test-reachable via a
-test-injectable bucket count. Tighten the residual (larger BucketCount, per-bucket dirty
-tracking) only if a deployment's cardinality demands it.
+**Trigger status: FIRED, then BUILT.** The re-baseline's cardinality sweep showed bare-commit
+p50 flat but throughput collapsing severalfold and p99 growing linearly with object
+cardinality, the entire excess being the sequencer serializing the whole index. As built, the
+index is the bucketed grains above, written only for touched buckets during a projection; the
+sequencer never holds it. Shard and index calls in a projection are bounded (16 in flight) so a
+flush cannot exhaust the storage provider's connections. Tighten further (larger
+`BucketCount`) only if a deployment's cardinality demands it.
 
 ### 3.5 Enablement decisions (answers P4 — decisions, not code)
 
