@@ -4,18 +4,18 @@ using Spiceport.Grains.Abstractions;
 namespace Spiceport.Grains;
 
 /// <summary>
-/// The SMALL-STATE restriction of <see cref="LogFold"/>: folds the same committed <see cref="LogEvent"/>
+/// The SMALL-STATE restriction of the whole-state log fold (the tests' <c>LogFold</c> reference): folds the same committed <see cref="LogEvent"/>
 /// sequence, but keeps only what <see cref="DatastoreMetaState"/> carries — head, schema versions,
 /// counter versions, GC floor, the types seen, and the pending (not yet projected) tail. Relationship
 /// row content is deliberately NOT folded here; it belongs to the per-key <see cref="ShardFold"/> (the
 /// shard grains' projections). Together,
-/// <c>MetaFold + ShardFold-per-touched-key</c> is exactly <see cref="LogFold"/> split along the sharding
+/// <c>MetaFold + ShardFold-per-touched-key</c> is exactly the whole-state fold split along the sharding
 /// lemma: <c>fold(log) == merge(fold(log | key) for all keys)</c> for the rows, plus this fold for
 /// everything else.
 /// </summary>
 /// <remarks>
 /// Counter versions are appended DIRECTLY from the event's net deltas (never replayed through the
-/// guarded register/unregister ops) — the same direct-append stance <see cref="LogFold"/> takes, for the
+/// guarded register/unregister ops) — the same direct-append stance the whole-state fold takes, for the
 /// same reason: a same-commit register+unregister nets to a delta whose guard is false in the fold base.
 /// Schema versions append the event's self-contained <see cref="LogEvent.SchemaChange"/> as-is (revision
 /// + bytes + hash), which is byte-identical to what the whole fold's transaction replay produces. GC

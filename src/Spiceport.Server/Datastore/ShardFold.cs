@@ -4,7 +4,7 @@ using Spiceport.Grains.Abstractions;
 namespace Spiceport.Grains;
 
 /// <summary>
-/// The per-key restriction of <see cref="LogFold"/>: folds the same committed <see cref="LogEvent"/>
+/// The per-key restriction of the whole-state log fold (the tests' <c>LogFold</c> reference): folds the same committed <see cref="LogEvent"/>
 /// sequence, but keeps only the relationship rows of one adjacency slice (<see cref="GraphShardKeyWire"/>).
 /// The sharding lemma — <c>fold(log) == merge over keys of fold(log|key)</c> — is what makes this a
 /// filter rather than a re-derivation, and it is pinned by <c>ShardFoldLemmaTests</c>: per key, a

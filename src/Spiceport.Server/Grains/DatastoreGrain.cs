@@ -720,7 +720,7 @@ public sealed class DatastoreGrain :
         //      this exact base (race-free under the CAS). It must NOT replay through the guards — a
         //      same-commit register+unregister nets to a tombstone whose DeleteCounter guard is false in
         //      the base (and the inverse trips AlreadyRegistered) — so it is appended directly, exactly
-        //      the direct-append stance LogFold.ApplyEvent/MetaFold take for the same reason. The deltas
+        //      the direct-append stance MetaFold (and the tests' whole-state LogFold) take for the same reason. The deltas
         //      are instead carried straight onto the appended event below.
         if (request.ExpectedHead is null)
         {

@@ -78,7 +78,8 @@ populated keys are added to the bucketed shard index, and only then does the seq
 entry leaves them pending and the next flush replays them; projection is idempotent by its label.
 So every committed event is, at every instant, either projected into each shard it touches or
 pending in the journaled state. The fold is reused, not rewritten: a shard's projected state is
-the existing `LogFold`/`MvccSnapshotReader` fold **restricted to one key** (`ShardFold`). Because
+the whole-state `MvccSnapshotReader` fold **restricted to one key** (`ShardFold`); the tests keep
+the unrestricted fold (`LogFold`) as the reference the restriction is checked against. Because
 the fold is already a pure function of the log, sharding it is a filter -- the deep reason the
 design is tractable, and the checkable sharding lemma (§7 step 2):
 `fold(log) == merge(fold(log | key) for all keys)`.
