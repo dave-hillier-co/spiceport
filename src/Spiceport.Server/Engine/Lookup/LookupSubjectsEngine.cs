@@ -73,7 +73,7 @@ public sealed class LookupSubjectsEngine
         ImmutableHashSet<string> visited,
         [EnumeratorCancellation] CancellationToken ct)
     {
-        var collected = await Collect(reader, resource, subjectType, subjectRelation, now, depthRemaining, visited, ct).ConfigureAwait(false);
+        var collected = await Collect(reader, resource, subjectType, subjectRelation, now, depthRemaining, visited, ct).ConfigureAwait(true);
         foreach (var found in collected.ToFoundSubjects())
         {
             ct.ThrowIfCancellationRequested();
@@ -113,12 +113,12 @@ public sealed class LookupSubjectsEngine
 
         if (relation.UsersetRewrite is { } rewrite)
         {
-            var rewritten = await CollectRewrite(reader, resource, rewrite.Operation, subjectType, subjectRelation, now, depthRemaining, visited, ct).ConfigureAwait(false);
+            var rewritten = await CollectRewrite(reader, resource, rewrite.Operation, subjectType, subjectRelation, now, depthRemaining, visited, ct).ConfigureAwait(true);
             result.UnionWith(rewritten);
         }
         else
         {
-            var direct = await CollectDirect(reader, resource, relation.Name, subjectType, subjectRelation, now, depthRemaining, visited, ct).ConfigureAwait(false);
+            var direct = await CollectDirect(reader, resource, relation.Name, subjectType, subjectRelation, now, depthRemaining, visited, ct).ConfigureAwait(true);
             result.UnionWith(direct);
         }
 
@@ -145,7 +145,7 @@ public sealed class LookupSubjectsEngine
         };
 
         var result = new SubjectSet();
-        await foreach (var rel in reader.QueryRelationships(filter, ct).ConfigureAwait(false))
+        await foreach (var rel in reader.QueryRelationships(filter, ct).ConfigureAwait(true))
         {
             if (IsExpired(rel, now))
                 continue;
@@ -164,7 +164,7 @@ public sealed class LookupSubjectsEngine
             // Non-terminal subrelation (not ellipsis, not wildcard): recurse and AND-in this tuple's caveat.
             if (subject.Relation != CoreConstants.Ellipsis && !subject.IsPublicWildcard)
             {
-                var nested = await Collect(reader, subject, subjectType, subjectRelation, now, depthRemaining - 1, visited, ct).ConfigureAwait(false);
+                var nested = await Collect(reader, subject, subjectType, subjectRelation, now, depthRemaining - 1, visited, ct).ConfigureAwait(true);
                 result.UnionWith(nested.WithAndedCaveat(tupleCaveat));
             }
         }
@@ -186,7 +186,7 @@ public sealed class LookupSubjectsEngine
     {
         var childSets = new List<SubjectSet>(operation.Children.Count);
         foreach (var child in operation.Children)
-            childSets.Add(await CollectChild(reader, resource, child, subjectType, subjectRelation, now, depthRemaining, visited, ct).ConfigureAwait(false));
+            childSets.Add(await CollectChild(reader, resource, child, subjectType, subjectRelation, now, depthRemaining, visited, ct).ConfigureAwait(true));
 
         return operation.Type switch
         {
@@ -212,7 +212,7 @@ public sealed class LookupSubjectsEngine
         switch (child)
         {
             case SetOperationChild.This:
-                return await CollectDirect(reader, resource, resource.Relation, subjectType, subjectRelation, now, depthRemaining, visited, ct).ConfigureAwait(false);
+                return await CollectDirect(reader, resource, resource.Relation, subjectType, subjectRelation, now, depthRemaining, visited, ct).ConfigureAwait(true);
 
             case SetOperationChild.Nil:
                 return new SubjectSet();
@@ -227,20 +227,20 @@ public sealed class LookupSubjectsEngine
             }
 
             case SetOperationChild.ComputedUsersetChild(var cu):
-                return await Collect(reader, resource.WithRelation(cu.Relation), subjectType, subjectRelation, now, depthRemaining - 1, visited, ct).ConfigureAwait(false);
+                return await Collect(reader, resource.WithRelation(cu.Relation), subjectType, subjectRelation, now, depthRemaining - 1, visited, ct).ConfigureAwait(true);
 
             case SetOperationChild.TupleToUsersetChild(var ttu):
                 return await CollectTupleToUserset(
                     reader, resource, ttu.TuplesetRelation, ttu.ComputedUserset,
-                    TupleToUsersetFunction.Any, subjectType, subjectRelation, now, depthRemaining, visited, ct).ConfigureAwait(false);
+                    TupleToUsersetFunction.Any, subjectType, subjectRelation, now, depthRemaining, visited, ct).ConfigureAwait(true);
 
             case SetOperationChild.FunctionedTupleToUsersetChild(var fttu):
                 return await CollectTupleToUserset(
                     reader, resource, fttu.TuplesetRelation, fttu.ComputedUserset,
-                    fttu.Function, subjectType, subjectRelation, now, depthRemaining, visited, ct).ConfigureAwait(false);
+                    fttu.Function, subjectType, subjectRelation, now, depthRemaining, visited, ct).ConfigureAwait(true);
 
             case SetOperationChild.NestedRewrite(var nested):
-                return await CollectRewrite(reader, resource, nested.Operation, subjectType, subjectRelation, now, depthRemaining, visited, ct).ConfigureAwait(false);
+                return await CollectRewrite(reader, resource, nested.Operation, subjectType, subjectRelation, now, depthRemaining, visited, ct).ConfigureAwait(true);
 
             default:
                 return new SubjectSet();
@@ -274,7 +274,7 @@ public sealed class LookupSubjectsEngine
         };
 
         var perTarget = new List<SubjectSet>();
-        await foreach (var rel in reader.QueryRelationships(filter, ct).ConfigureAwait(false))
+        await foreach (var rel in reader.QueryRelationships(filter, ct).ConfigureAwait(true))
         {
             if (IsExpired(rel, now))
                 continue;
@@ -287,7 +287,7 @@ public sealed class LookupSubjectsEngine
                 ? new ObjectAndRelation(resource.ObjectType, resource.ObjectId, computed.Relation)
                 : new ObjectAndRelation(reached.ObjectType, reached.ObjectId, computed.Relation);
 
-            var nested = await Collect(reader, target, subjectType, subjectRelation, now, depthRemaining - 1, visited, ct).ConfigureAwait(false);
+            var nested = await Collect(reader, target, subjectType, subjectRelation, now, depthRemaining - 1, visited, ct).ConfigureAwait(true);
             perTarget.Add(nested.WithAndedCaveat(CaveatOf(rel)));
         }
 

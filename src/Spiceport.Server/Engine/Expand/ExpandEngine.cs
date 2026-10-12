@@ -75,8 +75,8 @@ public sealed class ExpandEngine
             return new PermissionTreeNode.Leaf(resource, []);
 
         return relation.UsersetRewrite is { } rewrite
-            ? await ExpandRewrite(reader, resource, rewrite.Operation, mode, now, depthRemaining, visited, ct).ConfigureAwait(false)
-            : await ExpandDirect(reader, resource, mode, now, depthRemaining, visited, ct).ConfigureAwait(false);
+            ? await ExpandRewrite(reader, resource, rewrite.Operation, mode, now, depthRemaining, visited, ct).ConfigureAwait(true)
+            : await ExpandDirect(reader, resource, mode, now, depthRemaining, visited, ct).ConfigureAwait(true);
     }
 
     /// <summary>Expands a base relation's directly-written tuples (port of <c>expandDirect</c>).</summary>
@@ -99,7 +99,7 @@ public sealed class ExpandEngine
         var allSubjects = new List<DirectSubject>();
         var nonTerminal = new List<DirectSubject>();
 
-        await foreach (var rel in reader.QueryRelationships(filter, ct).ConfigureAwait(false))
+        await foreach (var rel in reader.QueryRelationships(filter, ct).ConfigureAwait(true))
         {
             if (IsExpired(rel, now))
                 continue;
@@ -120,7 +120,7 @@ public sealed class ExpandEngine
         var children = new List<PermissionTreeNode>();
         foreach (var ds in nonTerminal)
         {
-            var child = await Expand(reader, ds.Subject, mode, now, depthRemaining - 1, visited, ct).ConfigureAwait(false);
+            var child = await Expand(reader, ds.Subject, mode, now, depthRemaining - 1, visited, ct).ConfigureAwait(true);
             children.Add(DecorateWithCaveat(child, ds.Caveat));
         }
         children.Add(new PermissionTreeNode.Leaf(resource, allSubjects));
@@ -141,7 +141,7 @@ public sealed class ExpandEngine
     {
         var children = new List<PermissionTreeNode>();
         foreach (var child in operation.Children)
-            children.Add(await ExpandChild(reader, resource, child, mode, now, depthRemaining, visited, ct).ConfigureAwait(false));
+            children.Add(await ExpandChild(reader, resource, child, mode, now, depthRemaining, visited, ct).ConfigureAwait(true));
 
         return new PermissionTreeNode.SetOp(resource, operation.Type, children);
     }
@@ -160,7 +160,7 @@ public sealed class ExpandEngine
         switch (child)
         {
             case SetOperationChild.This:
-                return await ExpandDirect(reader, resource, mode, now, depthRemaining, visited, ct).ConfigureAwait(false);
+                return await ExpandDirect(reader, resource, mode, now, depthRemaining, visited, ct).ConfigureAwait(true);
 
             case SetOperationChild.Nil:
                 return new PermissionTreeNode.Leaf(resource, []);
@@ -172,20 +172,20 @@ public sealed class ExpandEngine
                     [new DirectSubject(new ObjectAndRelation(resource.ObjectType, resource.ObjectId, CoreConstants.Ellipsis))]);
 
             case SetOperationChild.ComputedUsersetChild(var cu):
-                return await Expand(reader, resource.WithRelation(cu.Relation), mode, now, depthRemaining - 1, visited, ct).ConfigureAwait(false);
+                return await Expand(reader, resource.WithRelation(cu.Relation), mode, now, depthRemaining - 1, visited, ct).ConfigureAwait(true);
 
             case SetOperationChild.TupleToUsersetChild(var ttu):
                 return await ExpandTupleToUserset(
                     reader, resource, ttu.TuplesetRelation, ttu.ComputedUserset,
-                    TupleToUsersetFunction.Any, mode, now, depthRemaining, visited, ct).ConfigureAwait(false);
+                    TupleToUsersetFunction.Any, mode, now, depthRemaining, visited, ct).ConfigureAwait(true);
 
             case SetOperationChild.FunctionedTupleToUsersetChild(var fttu):
                 return await ExpandTupleToUserset(
                     reader, resource, fttu.TuplesetRelation, fttu.ComputedUserset,
-                    fttu.Function, mode, now, depthRemaining, visited, ct).ConfigureAwait(false);
+                    fttu.Function, mode, now, depthRemaining, visited, ct).ConfigureAwait(true);
 
             case SetOperationChild.NestedRewrite(var nested):
-                return await ExpandRewrite(reader, resource, nested.Operation, mode, now, depthRemaining, visited, ct).ConfigureAwait(false);
+                return await ExpandRewrite(reader, resource, nested.Operation, mode, now, depthRemaining, visited, ct).ConfigureAwait(true);
 
             default:
                 return new PermissionTreeNode.Leaf(resource, []);
@@ -218,7 +218,7 @@ public sealed class ExpandEngine
         };
 
         var children = new List<PermissionTreeNode>();
-        await foreach (var rel in reader.QueryRelationships(filter, ct).ConfigureAwait(false))
+        await foreach (var rel in reader.QueryRelationships(filter, ct).ConfigureAwait(true))
         {
             if (IsExpired(rel, now))
                 continue;
@@ -233,7 +233,7 @@ public sealed class ExpandEngine
                 ? new ObjectAndRelation(resource.ObjectType, resource.ObjectId, computed.Relation)
                 : new ObjectAndRelation(reached.ObjectType, reached.ObjectId, computed.Relation);
 
-            var child = await Expand(reader, target, mode, now, depthRemaining - 1, visited, ct).ConfigureAwait(false);
+            var child = await Expand(reader, target, mode, now, depthRemaining - 1, visited, ct).ConfigureAwait(true);
             children.Add(DecorateWithCaveat(child, CaveatOf(rel)));
         }
 

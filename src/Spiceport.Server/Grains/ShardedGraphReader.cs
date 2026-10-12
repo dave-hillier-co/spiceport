@@ -69,7 +69,7 @@ public sealed class ShardedGraphReader : IGraphReader
             cancellationToken.ThrowIfCancellationRequested();
             var shard = _grainFactory.GetGrain<IGraphShardGrain>(
                 GraphShardGrainKey.Build(GraphShardKeyWire.ForResource(filter.OptionalResourceType, id)));
-            var reply = await shard.RowsAt(_revisionNanos, wireFilter, cancellationToken).ConfigureAwait(false);
+            var reply = await shard.RowsAt(_revisionNanos, wireFilter, cancellationToken).ConfigureAwait(true);
 
             foreach (var row in reply.Rows)
             {
@@ -107,7 +107,7 @@ public sealed class ShardedGraphReader : IGraphReader
             {
                 cancellationToken.ThrowIfCancellationRequested();
                 var reply = await RowsOfSubject(subjectsFilter.SubjectType, id, cancellationToken)
-                    .ConfigureAwait(false);
+                    .ConfigureAwait(true);
                 foreach (var row in reply.Rows)
                 {
                     cancellationToken.ThrowIfCancellationRequested();
@@ -129,7 +129,7 @@ public sealed class ShardedGraphReader : IGraphReader
         {
             cancellationToken.ThrowIfCancellationRequested();
             var reply = await RowsOfSubject(subjectsFilter.SubjectType, id, cancellationToken)
-                .ConfigureAwait(false);
+                .ConfigureAwait(true);
             foreach (var row in reply.Rows)
             {
                 cancellationToken.ThrowIfCancellationRequested();

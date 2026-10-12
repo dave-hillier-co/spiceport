@@ -42,13 +42,13 @@ public sealed class CheckDispatchOutgoingCallFilter : IOutgoingGrainCallFilter
 
         if (!CheckDispatchFilter.Matches(context.InterfaceMethod))
         {
-            await context.Invoke().ConfigureAwait(false);
+            await context.Invoke().ConfigureAwait(true);
             return;
         }
 
         try
         {
-            await context.Invoke().ConfigureAwait(false);
+            await context.Invoke().ConfigureAwait(true);
         }
         catch (Exception ex)
         {
@@ -88,7 +88,7 @@ public sealed class CheckDispatchIncomingCallFilter : IIncomingGrainCallFilter
 
         if (!CheckDispatchFilter.Matches(context.InterfaceMethod))
         {
-            await context.Invoke().ConfigureAwait(false);
+            await context.Invoke().ConfigureAwait(true);
             return;
         }
 
@@ -101,6 +101,6 @@ public sealed class CheckDispatchIncomingCallFilter : IIncomingGrainCallFilter
         if (DispatchContext.RequireDepthRemaining() <= 0)
             throw new MaxDepthExceededException();
 
-        await context.Invoke().ConfigureAwait(false);
+        await context.Invoke().ConfigureAwait(true);
     }
 }

@@ -175,7 +175,7 @@ public sealed class LookupResourcesEngine
                 var resource = new ObjectAndRelation(resourceType, resourceId, permission);
                 var result = await _check
                     .Check(reader, resource, terminalSubject, caveatContext, now, null, cancellationToken)
-                    .ConfigureAwait(false);
+                    .ConfigureAwait(true);
                 if (result.Verdict == Membership.Member)
                     yield return new FoundResource(resourceId, [subjectId], Membership.Member);
                 else if (result.Verdict == Membership.Caveated)
@@ -306,7 +306,7 @@ public sealed class LookupResourcesEngine
                 if (!entrypoint.IsDirectResult)
                     candidates = await FilterByCheck(
                         reader, entrypoint.ContainingRelation, candidates, terminalSubject, caveatContext, now, ct)
-                        .ConfigureAwait(false);
+                        .ConfigureAwait(true);
                 if (candidates.Count == 0)
                     continue;
 
@@ -314,7 +314,7 @@ public sealed class LookupResourcesEngine
                 var section = new LookupResourcesCursorSection(epIndex);
                 await foreach (var found in LookupRec(
                     reader, entrypoint.ContainingRelation, candidates, target, terminalSubject, caveatContext, now,
-                    depthRemaining - 1, visited, innerSections, ct).ConfigureAwait(false))
+                    depthRemaining - 1, visited, innerSections, ct).ConfigureAwait(true))
                 {
                     yield return Prepend(found, section);
                 }
@@ -331,13 +331,13 @@ public sealed class LookupResourcesEngine
 
             await foreach (var chunk in StreamCandidateChunks(
                 reader, entrypoint, subjectRel, subjectIds, subjects, caveatContext, afterKeyset, ct)
-                .ConfigureAwait(false))
+                .ConfigureAwait(true))
             {
                 var candidates = chunk.Candidates;
                 if (candidates.Count > 0 && !entrypoint.IsDirectResult)
                     candidates = await FilterByCheck(
                         reader, entrypoint.ContainingRelation, candidates, terminalSubject, caveatContext, now, ct)
-                        .ConfigureAwait(false);
+                        .ConfigureAwait(true);
 
                 if (candidates.Count > 0)
                 {
@@ -345,7 +345,7 @@ public sealed class LookupResourcesEngine
                     var section = new LookupResourcesCursorSection(epIndex, AfterKeyset: sectionKeyset);
                     await foreach (var found in LookupRec(
                         reader, entrypoint.ContainingRelation, candidates, target, terminalSubject, caveatContext, now,
-                        depthRemaining - 1, visited, innerSections, ct).ConfigureAwait(false))
+                        depthRemaining - 1, visited, innerSections, ct).ConfigureAwait(true))
                     {
                         yield return Prepend(found, section);
                     }
@@ -395,7 +395,7 @@ public sealed class LookupResourcesEngine
         RelationshipReference? last = null;
         var count = 0;
 
-        await foreach (var rel in reader.ReverseQueryRelationships(filter, options, ct).ConfigureAwait(false))
+        await foreach (var rel in reader.ReverseQueryRelationships(filter, options, ct).ConfigureAwait(true))
         {
             AddCandidate(current, rel, subjects, caveatContext);
             last = rel.Reference;
@@ -449,7 +449,7 @@ public sealed class LookupResourcesEngine
             var result = await _check.Check(
                 reader,
                 new ObjectAndRelation(containingRelation.Namespace, resourceId, containingRelation.Relation),
-                terminalSubject, caveatContext, now, cancellationToken: ct).ConfigureAwait(false);
+                terminalSubject, caveatContext, now, cancellationToken: ct).ConfigureAwait(true);
 
             if (result.Verdict == Membership.Member)
             {

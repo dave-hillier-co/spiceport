@@ -61,7 +61,7 @@ public static class MembershipWalk
 
         var results = new List<ResourceNode>();
         await foreach (var rel in reader.ReverseQueryRelationships(filter, options: null, cancellationToken)
-            .ConfigureAwait(false))
+            .ConfigureAwait(true))
         {
             // Belt-and-braces exact match on the subject relation: SubjectRelationFilter's ellipsis branch
             // (see its remarks) does not itself exclude non-ellipsis rows, so re-check exactly here rather
@@ -101,7 +101,7 @@ public static class MembershipWalk
         {
             cancellationToken.ThrowIfCancellationRequested();
             var current = queue.Dequeue();
-            var parents = await DirectParents(reader, coverage, current, cancellationToken).ConfigureAwait(false);
+            var parents = await DirectParents(reader, coverage, current, cancellationToken).ConfigureAwait(true);
             foreach (var node in parents)
             {
                 found.Add(node);

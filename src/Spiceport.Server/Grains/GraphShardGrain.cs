@@ -18,8 +18,8 @@ namespace Spiceport.Grains;
 /// </summary>
 /// <remarks>
 /// The incremental bootstrap-then-tail-fold shape (the pattern the retired per-silo whole-graph
-/// projection carried, restricted here to one key): a single-flight <see cref="SemaphoreSlim"/> gate, a
-/// fast path (serve when the watermark already covers the pinned revision), and a catch-up-on-demand
+/// projection carried, restricted here to one key): a single-flight catch-up shared by every waiting
+/// reader, a fast path (serve when the watermark already covers the pinned revision), and a catch-up-on-demand
 /// pull loop with re-bootstrap on <see cref="RevisionNotFoundException"/> (compaction GC'd past our
 /// watermark). The per-shard <see cref="GraphShardState.AppliedRevision"/> watermark is the
 /// closed-timestamp gate — valid because every shard folds EVERY log event (the watermark advances even
@@ -55,10 +55,13 @@ public sealed class GraphShardGrain(
     /// <summary>Log-tail page size for catch-up pulls (matches the Watch feed's page size).</summary>
     private const int BatchSize = 256;
 
-    // Single-flight gate: only one hydration/catch-up runs at a time. RowsAt is [AlwaysInterleave], so
-    // concurrent readers whose revision the watermark already covers skip the gate entirely (the fast
-    // path); the rest queue here and re-check after acquiring.
-    private readonly SemaphoreSlim _gate = new(1, 1);
+    // Orleans grain code must not ConfigureAwait(false); keep the captured context.
+    private const ConfigureAwaitOptions ContinueOnCapturedContext = ConfigureAwaitOptions.ContinueOnCapturedContext;
+
+    // The hydration/catch-up in flight, or null: single-flight. RowsAt is [AlwaysInterleave], so
+    // concurrent readers whose revision the watermark already covers never touch it (the fast path);
+    // the rest await the one in flight and re-check, starting another only if it fell short.
+    private Task? _catchUp;
 
     private GraphShardState _state = GraphShardState.Empty;
     private bool _hydrated;
@@ -96,65 +99,85 @@ public sealed class GraphShardGrain(
         if (_hydrated && _state.AppliedRevision >= revision && ShardFold.IsReadableAt(_state, revision))
             return Serve(revision, filter);
 
-        await _gate.WaitAsync(cancellationToken);
-        try
+        while (!(_hydrated && _state.AppliedRevision >= revision))
         {
-            if (!_hydrated)
+            var catchUp = _catchUp;
+            var started = catchUp is null;
+            if (catchUp is null)
+                _catchUp = catchUp = CatchUp(revision);
+            try
             {
-                // ALWAYS hydrate from the projection plus the pending tail first — never rely on
-                // ReadFrom(0) semantics for a cold shard (see the class remarks).
-                _state = await Hydrate();
-                _hydrated = true;
+                // The catch-up belongs to no one caller: a reader's cancellation abandons only its own
+                // wait, and the others keep the pull it started.
+                await catchUp.WaitAsync(cancellationToken).ConfigureAwait(ContinueOnCapturedContext);
             }
-
-            // Watermark as of the last re-hydrate, or null when no re-hydrate has happened yet in
-            // this catch-up. Guards the compaction-window spin: right after the singleton commits,
-            // its post-commit compaction can briefly leave the hydrated head below the retained
-            // recent-tail floor, so ReadFrom keeps rejecting the freshly re-hydrated watermark.
-            long? lastRehydrateWatermark = null;
-
-            while (_state.AppliedRevision < revision)
+            catch (Exception) when (!started && !cancellationToken.IsCancellationRequested)
             {
-                cancellationToken.ThrowIfCancellationRequested();
-
-                LogSegment seg;
-                try
-                {
-                    seg = await _datastore.ReadFrom(_state.AppliedRevision, BatchSize);
-                }
-                catch (RevisionNotFoundException)
-                {
-                    // Fell below the grain's retained log window; re-hydrate from a fresh per-key
-                    // snapshot and continue. If we
-                    // must re-hydrate AGAIN without the watermark having advanced, we are inside the
-                    // compaction window described above — back off briefly instead of hot-spinning
-                    // against the singleton until its compaction settles.
-                    if (lastRehydrateWatermark == _state.AppliedRevision)
-                        await Task.Delay(TimeSpan.FromMilliseconds(10), cancellationToken);
-                    _state = await Hydrate();
-                    lastRehydrateWatermark = _state.AppliedRevision;
-                    continue;
-                }
-
-                foreach (var ev in seg.Events)
-                    _state = ShardFold.ApplyEvent(_state, ev, _key);
-
-                if (seg.Events.Count < BatchSize)
-                {
-                    // A short page proves we drained to the observed head; jump the watermark to it
-                    // (covers the seed/change-free-head case where head > the last event's revision).
-                    // The pinned revision is always <= the grain head, so the loop condition now
-                    // releases us.
-                    _state = _state with { AppliedRevision = Math.Max(_state.AppliedRevision, seg.HeadRevision) };
-                    break;
-                }
+                // Another reader's catch-up failed: run one of our own rather than share its failure.
             }
-
-            return Serve(revision, filter);
+            finally
+            {
+                if (ReferenceEquals(_catchUp, catchUp) && catchUp.IsCompleted)
+                    _catchUp = null;
+            }
         }
-        finally
+
+        return Serve(revision, filter);
+    }
+
+    /// <summary>
+    /// Hydrates if cold, then folds the log tail until the watermark covers <paramref name="revision"/>:
+    /// the one catch-up <see cref="RowsAt"/> readers share.
+    /// </summary>
+    private async Task CatchUp(long revision)
+    {
+        if (!_hydrated)
         {
-            _gate.Release();
+            // ALWAYS hydrate from the projection plus the pending tail first — never rely on
+            // ReadFrom(0) semantics for a cold shard (see the class remarks).
+            _state = await Hydrate().ConfigureAwait(ContinueOnCapturedContext);
+            _hydrated = true;
+        }
+
+        // Watermark as of the last re-hydrate, or null when no re-hydrate has happened yet in
+        // this catch-up. Guards the compaction-window spin: right after the singleton commits,
+        // its post-commit compaction can briefly leave the hydrated head below the retained
+        // recent-tail floor, so ReadFrom keeps rejecting the freshly re-hydrated watermark.
+        long? lastRehydrateWatermark = null;
+
+        while (_state.AppliedRevision < revision)
+        {
+            LogSegment seg;
+            try
+            {
+                seg = await _datastore.ReadFrom(_state.AppliedRevision, BatchSize).ConfigureAwait(ContinueOnCapturedContext);
+            }
+            catch (RevisionNotFoundException)
+            {
+                // Fell below the grain's retained log window; re-hydrate from a fresh per-key
+                // snapshot and continue. If we
+                // must re-hydrate AGAIN without the watermark having advanced, we are inside the
+                // compaction window described above — back off briefly instead of hot-spinning
+                // against the singleton until its compaction settles.
+                if (lastRehydrateWatermark == _state.AppliedRevision)
+                    await Task.Delay(TimeSpan.FromMilliseconds(10)).ConfigureAwait(ContinueOnCapturedContext);
+                _state = await Hydrate().ConfigureAwait(ContinueOnCapturedContext);
+                lastRehydrateWatermark = _state.AppliedRevision;
+                continue;
+            }
+
+            foreach (var ev in seg.Events)
+                _state = ShardFold.ApplyEvent(_state, ev, _key);
+
+            if (seg.Events.Count < BatchSize)
+            {
+                // A short page proves we drained to the observed head; jump the watermark to it
+                // (covers the seed/change-free-head case where head > the last event's revision).
+                // The pinned revision is always <= the grain head, so the loop condition now
+                // releases us.
+                _state = _state with { AppliedRevision = Math.Max(_state.AppliedRevision, seg.HeadRevision) };
+                break;
+            }
         }
     }
 

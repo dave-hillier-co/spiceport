@@ -101,7 +101,7 @@ public sealed class OrleansDispatcher : IDispatcher
         // call faults the grain call itself with an OperationCanceledException the outgoing filter
         // observes and classifies exactly like any other dispatch failure — no separate bridging catch
         // is needed here.
-        var reply = await grain.DispatchCheck(ct).ConfigureAwait(false);
+        var reply = await grain.DispatchCheck(ct).ConfigureAwait(true);
 
         var result = new DispatchCheckResult(
             reply.Member, CaveatWire.FromWire(reply.Caveat), reply.CycleCut, reply.DepthRequired);
