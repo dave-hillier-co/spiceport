@@ -497,11 +497,14 @@ public sealed class DatastoreGrain :
             await NotifyCommitted(events).ConfigureAwait(ContinueOnCapturedContext);
         }
 
-        foreach (var e in evaluated)
-            e.Commit.Reply.TrySetResult(e.Reply);
-
+        // The flush a full tail triggers runs BEFORE the replies, so a caller that sees its reply sees
+        // the flush attempted. TryFlushProjection never throws (a failed flush leaves the events
+        // pending), so the replies below always complete.
         if (State.Value.Pending.Count >= FlushInterval)
             await TryFlushProjection().ConfigureAwait(ContinueOnCapturedContext);
+
+        foreach (var e in evaluated)
+            e.Commit.Reply.TrySetResult(e.Reply);
     }
 
     /// <summary>
