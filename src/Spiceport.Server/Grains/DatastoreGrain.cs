@@ -19,16 +19,27 @@ namespace Spiceport.Grains;
 /// the journaled state is only the SMALL state (<see cref="DatastoreMetaState"/> — head, schemas,
 /// counters, GC floor, the types seen, and the pending tail of events not yet projected). Relationship
 /// rows are owned by the per-key <see cref="GraphShardGrain"/> projections, which persist their own
-/// state, and listed by the <see cref="ShardIndexGrain"/> buckets. It is a single non-reentrant
-/// activation; WRITES (<see cref="Commit"/>, <see cref="RunGc"/>, <see cref="FlushProjection"/> — no
-/// interleave attribute) never interleave EACH OTHER, so a write's turn runs to completion before the
-/// next write's, keeping the head-compare-and-append atomic. The PURE reads (<see cref="ReadState"/>,
+/// state, and listed by the <see cref="ShardIndexGrain"/> buckets. It is a single activation whose
+/// WRITES (commit batches, <see cref="RunGc"/>, <see cref="FlushProjection"/>) never interleave EACH
+/// OTHER: each is a work item in the one write queue, which a single <see cref="BatchWorker"/> drains
+/// in arrival order, so a write runs to completion before the next, keeping every
+/// head-compare-and-append atomic. The PURE reads (<see cref="ReadState"/>,
 /// <see cref="GetHead"/>, <see cref="ReadSchemaAt"/>, <see cref="ReadShard"/>,
 /// <see cref="ReadShardTail"/>, <see cref="IDatastoreLog.ReadFrom"/>) are <c>[AlwaysInterleave]</c> on
 /// the grain interface and may run DURING a write's await — never concurrently with it, and never
 /// observing a write's intermediate state, because they read the confirmed view.
 /// </summary>
 /// <remarks>
+/// <para>
+/// GROUP COMMIT. <see cref="Commit"/> interleaves: it queues its request and awaits its reply. The
+/// writer takes each run of adjacent queued commits as one batch, evaluating each request in arrival order
+/// against the confirmed state with the events of the requests before it in the batch folded on
+/// (<see cref="MetaFold.ApplyEntry"/>), so each sees exactly the state a serial run would have shown
+/// it. The accepted events are then appended with ONE conditional raise and ONE confirm, so a batch
+/// costs one storage write however many commits it carries. Every commit still mints its own
+/// revision and gets its own reply, sent only once the batch is durable; rejected requests append
+/// nothing. Commits that arrive while a batch is being written form the next batch.
+/// </para>
 /// <para>
 /// THE PROJECTION. Every <see cref="FlushInterval"/> pending events, the sequencer projects them: each
 /// shard grain an event touches folds its events over its persisted state and persists the result
@@ -107,6 +118,16 @@ public sealed class DatastoreGrain :
     /// </summary>
     private readonly ObserverManager<IDatastoreWatcher> _watchers;
 
+    /// <summary>
+    /// Writes waiting their turn, in arrival order: commits, GC rounds and projection flushes. Every write
+    /// call interleaves and only enqueues; <see cref="_writer"/> is the one thing that executes writes, so
+    /// no two writes interleave and none waits in the activation's own request queue.
+    /// </summary>
+    private readonly List<QueuedWrite> _writes = [];
+
+    /// <summary>The single writer: one work cycle at a time, on the activation's scheduler.</summary>
+    private readonly BatchWorkerFromDelegate _writer;
+
     public DatastoreGrain(
         ILogger<DatastoreGrain> logger,
         IOptions<DatastoreGcOptions>? gcOptions = null,
@@ -115,6 +136,7 @@ public sealed class DatastoreGrain :
         _logger = logger;
         _metrics = metrics;
         _watchers = new ObserverManager<IDatastoreWatcher>(WatcherExpiry, logger);
+        _writer = new BatchWorkerFromDelegate(DrainWrites);
         // Optional so a host/test that never registers DatastoreGcOptions in DI still activates the grain
         // with sane defaults (24h window, 1h reminder, enabled) — only a host that wants non-default GC
         // behaviour needs to configure the options.
@@ -327,16 +349,18 @@ public sealed class DatastoreGrain :
     {
         ArgumentNullException.ThrowIfNull(request);
 
-        // Duration measured around the WHOLE serialized write turn (candidate loads, staging, append,
-        // confirm) and recorded in a finally so every inbound call — accepted, rejected, or thrown —
+        // Duration measured from arrival to reply — queueing, evaluation, the batch's append and
+        // confirm — and recorded in a finally so every inbound call, accepted, rejected, or thrown,
         // counts exactly once. GetTimestamp/GetElapsedTime rather than Stopwatch.StartNew: the same
         // clock with no per-commit Stopwatch allocation on the sequencer's hot path. The
-        // candidate-key-count buckets are recorded inside CommitCore at the point candidate
+        // candidate-key-count buckets are recorded inside EvaluateCommit at the point candidate
         // resolution completes.
         var startTimestamp = Stopwatch.GetTimestamp();
         try
         {
-            return await CommitCore(request).ConfigureAwait(ContinueOnCapturedContext);
+            var queued = new QueuedCommit(request);
+            Enqueue(queued);
+            return await queued.Reply.Task.ConfigureAwait(ContinueOnCapturedContext);
         }
         finally
         {
@@ -344,20 +368,195 @@ public sealed class DatastoreGrain :
         }
     }
 
-    /// <summary>The whole Commit body (see the <see cref="Commit"/> remarks); split out only so the
-    /// public entry can bracket it with the Phase 0 duration measurement.</summary>
-    private async Task<CommitReply> CommitCore(CommitRequest request)
+    /// <summary>A write waiting in <see cref="_writes"/>.</summary>
+    private abstract record QueuedWrite;
+
+    /// <summary>A commit waiting for its batch, and where its reply goes.</summary>
+    private sealed record QueuedCommit(CommitRequest Request) : QueuedWrite
     {
-        // The confirmed small state: in a write turn all prior confirms have fully completed, and it is
-        // the view RaiseConditionalEvent's own version check pairs with.
+        public TaskCompletionSource<CommitReply> Reply { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+    }
+
+    /// <summary>A GC round or a projection flush, run alone between batches; it completes its own caller.</summary>
+    private sealed record QueuedRun(Func<Task> Run) : QueuedWrite;
+
+    /// <summary>Queues a write and wakes the writer.</summary>
+    private void Enqueue(QueuedWrite write)
+    {
+        _writes.Add(write);
+        _writer.Notify();
+    }
+
+    /// <summary>Queues a GC round or a projection flush and waits for its outcome.</summary>
+    private Task<T> EnqueueRun<T>(Func<Task<T>> run)
+    {
+        var done = new TaskCompletionSource<T>(TaskCreationOptions.RunContinuationsAsynchronously);
+        Enqueue(new QueuedRun(async () =>
+        {
+            try
+            {
+                done.TrySetResult(await run().ConfigureAwait(ContinueOnCapturedContext));
+            }
+            catch (Exception ex)
+            {
+                done.TrySetException(ex);
+            }
+        }));
+        return done.Task;
+    }
+
+    /// <summary>
+    /// The writer's work cycle: drains <see cref="_writes"/> in arrival order. Each run of adjacent
+    /// commits is one batch; a GC round or a flush runs alone. Runs on the activation's scheduler, so
+    /// taking from the queue cannot race an enqueue, and the worker never runs two cycles at once.
+    /// </summary>
+    private async Task DrainWrites()
+    {
+        while (_writes.Count > 0)
+        {
+            if (_writes[0] is QueuedCommit)
+            {
+                var batch = _writes.TakeWhile(w => w is QueuedCommit).Cast<QueuedCommit>().ToArray();
+                _writes.RemoveRange(0, batch.Length);
+                await CommitBatch(batch).ConfigureAwait(ContinueOnCapturedContext);
+            }
+            else
+            {
+                var run = (QueuedRun)_writes[0];
+                _writes.RemoveAt(0);
+                await run.Run().ConfigureAwait(ContinueOnCapturedContext);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Evaluates a batch in order, appends its accepted events in one write, and
+    /// only then replies to every member. Never throws: every outcome, including a failed append, goes
+    /// to the members' replies.
+    /// </summary>
+    private async Task CommitBatch(IReadOnlyList<QueuedCommit> batch)
+    {
+        // The confirmed small state, with each accepted request's event folded on in turn, so a later
+        // request sees the earlier ones exactly as a serial run would have shown them.
         var meta = State.Value;
+        var evaluated = new List<(QueuedCommit Commit, CommitReply Reply, LogEvent? Event)>(batch.Count);
+        foreach (var queued in batch)
+        {
+            try
+            {
+                var (reply, ev) = await EvaluateCommit(queued.Request, meta).ConfigureAwait(ContinueOnCapturedContext);
+                if (ev is not null)
+                    meta = MetaFold.ApplyEntry(meta, new DatastoreJournalEntry.Committed(ev));
+                evaluated.Add((queued, reply, ev));
+            }
+            catch (Exception ex)
+            {
+                // An evaluation fault (an invariant violation) fails only its own request, which
+                // appended nothing, so it cannot have influenced the requests after it.
+                queued.Reply.TrySetException(ex);
+            }
+        }
+
+        var events = evaluated.Where(e => e.Event is not null).Select(e => e.Event!).ToList();
+        if (events.Count > 0)
+        {
+            // Append: the batch's events join the pending tail in one write, from which the shard
+            // grains and Watch read them until a projection flush persists them into the shard grains
+            // they touch. The conditional raise is a secondary guard behind the per-request CAS: this
+            // activation is the only writer and the write queue runs one write at a time, so it
+            // cannot lose here, but a loss is still reported as a moved head rather than assumed away.
+            //
+            // EVERY member's reply waits for this write, rejections included: a rejection may rest on
+            // an earlier member's event (two creates of one relationship), so it is only true once
+            // that event is durable. A failed write fails the whole batch.
+            bool raised;
+            try
+            {
+                raised = await RaiseConditionalEvents(
+                        events.Select(ev => (DatastoreJournalEntry)new DatastoreJournalEntry.Committed(ev)))
+                    .ConfigureAwait(ContinueOnCapturedContext);
+                if (raised)
+                    await ConfirmEvents().ConfigureAwait(ContinueOnCapturedContext);
+            }
+            catch (Exception ex)
+            {
+                foreach (var e in evaluated)
+                    e.Commit.Reply.TrySetException(ex);
+                return;
+            }
+
+            if (!raised)
+            {
+                foreach (var e in evaluated)
+                    e.Commit.Reply.TrySetResult(Rejected(
+                        CommitFailureKind.HeadMoved, "conditional append reported a concurrent head advance"));
+                return;
+            }
+
+            await NotifyCommitted(events).ConfigureAwait(ContinueOnCapturedContext);
+        }
+
+        foreach (var e in evaluated)
+            e.Commit.Reply.TrySetResult(e.Reply);
+
+        if (State.Value.Pending.Count >= FlushInterval)
+            await TryFlushProjection().ConfigureAwait(ContinueOnCapturedContext);
+    }
+
+    /// <summary>
+    /// Pushes a confirmed batch to the per-silo watch hubs: the new head once, and every schema change in
+    /// revision order. Best-effort and isolated: the notifications are [OneWay] and any failure is
+    /// swallowed — the commit result must never depend on the notify; a missed push is recovered by the
+    /// hubs' heartbeat.
+    /// </summary>
+    private async Task NotifyCommitted(IReadOnlyList<LogEvent> committed)
+    {
+        try
+        {
+            await _watchers.Notify(w => w.HeadAdvanced(committed[^1].Revision)).ConfigureAwait(ContinueOnCapturedContext);
+        }
+        catch
+        {
+            // Defunct observers are pruned by ObserverManager; nothing else to do.
+        }
+
+        // A schema change committed: push the bytes to every silo's watch hub alongside the head advance.
+        // Without this, a WriteSchema landing on THIS silo's grain activation only swaps ISchemaProvider
+        // locally on the silo that ran it — every other silo keeps serving its stale Current schema hash
+        // (a live divergence, not just a cache-miss latency cost) until its own hub heartbeat notices the
+        // stored hash moved.
+        foreach (var schemaChange in committed.Select(ev => ev.SchemaChange).OfType<SchemaVersionWire>())
+        {
+            try
+            {
+                await _watchers.Notify(w => w.SchemaAdvanced(schemaChange.Bytes, schemaChange.Hash))
+                    .ConfigureAwait(ContinueOnCapturedContext);
+            }
+            catch
+            {
+                // Defunct observers are pruned by ObserverManager; nothing else to do.
+            }
+        }
+    }
+
+    private static CommitReply Rejected(CommitFailureKind kind, string? detail) =>
+        new(null, new CommitFailureWire(kind, detail), 0, false);
+
+    /// <summary>
+    /// Evaluates one commit (see the <see cref="Commit"/> remarks) against <paramref name="meta"/> — the
+    /// confirmed state with the earlier members of its batch folded on — and returns its reply and the
+    /// event to append, or a rejection and no event. Appends nothing itself.
+    /// </summary>
+    private async Task<(CommitReply Reply, LogEvent? Event)> EvaluateCommit(CommitRequest request, DatastoreMetaState meta)
+    {
         var head = meta.HeadRevision;
 
         // 1. Compatibility CAS (the lambda ReadWriteTx path evaluated its preconditions caller-side
         //    against this head): reject if the head moved — the load-bearing CAS compare, atomic with the
         //    append because writes never interleave writes.
         if (request.ExpectedHead is { } expectedHead && head != expectedHead)
-            return Rejected(CommitFailureKind.HeadMoved, $"expected head {expectedHead} but head is {head}");
+            return (Rejected(CommitFailureKind.HeadMoved, $"expected head {expectedHead} but head is {head}"), null);
 
         // 2. Schema-write serializability: the caller validated its schema change against the schema it
         //    saw; reject if another schema landed since. A null current hash is the pre-first-schema seed
@@ -369,9 +568,9 @@ public sealed class DatastoreGrain :
                 ? expectedSchemaHash.Length == 0
                 : string.Equals(currentHash, expectedSchemaHash, StringComparison.Ordinal);
             if (!unchanged)
-                return Rejected(
+                return (Rejected(
                     CommitFailureKind.SchemaHashMoved,
-                    $"expected schema hash '{expectedSchemaHash}' but schema hash at head is '{currentHash}'");
+                    $"expected schema hash '{expectedSchemaHash}' but schema hash at head is '{currentHash}'"), null);
         }
 
         // 3. Mint the new revision monotonically over the observed head (mirrors ReferenceDatastore).
@@ -476,9 +675,9 @@ public sealed class DatastoreGrain :
             }
 
             if (precondition.MustMatch && !matched)
-                return Rejected(CommitFailureKind.PreconditionFailed, PreconditionMessages.MustMatchFailed(i, filter));
+                return (Rejected(CommitFailureKind.PreconditionFailed, PreconditionMessages.MustMatchFailed(i, filter)), null);
             if (!precondition.MustMatch && matched)
-                return Rejected(CommitFailureKind.PreconditionFailed, PreconditionMessages.MustNotMatchFailed(i, filter));
+                return (Rejected(CommitFailureKind.PreconditionFailed, PreconditionMessages.MustNotMatchFailed(i, filter)), null);
         }
 
         // 7. Relationship updates, preserving Create so the create-conflict check fires here (the reply
@@ -492,7 +691,7 @@ public sealed class DatastoreGrain :
             }
             catch (CreateRelationshipExistsException ex)
             {
-                return Rejected(CommitFailureKind.CreateAlreadyExists, ex.Relationship);
+                return (Rejected(CommitFailureKind.CreateAlreadyExists, ex.Relationship), null);
             }
         }
 
@@ -537,11 +736,11 @@ public sealed class DatastoreGrain :
                 }
                 catch (CounterAlreadyRegisteredException ex)
                 {
-                    return Rejected(CommitFailureKind.CounterAlreadyRegistered, ex.CounterName);
+                    return (Rejected(CommitFailureKind.CounterAlreadyRegistered, ex.CounterName), null);
                 }
                 catch (CounterNotRegisteredException ex)
                 {
-                    return Rejected(CommitFailureKind.CounterNotRegistered, ex.CounterName);
+                    return (Rejected(CommitFailureKind.CounterNotRegistered, ex.CounterName), null);
                 }
             }
         }
@@ -558,54 +757,7 @@ public sealed class DatastoreGrain :
         if (request.ExpectedHead is not null && request.CounterChanges.Count > 0)
             ev = ev with { CounterChanges = request.CounterChanges };
 
-        // 12. Append: the event joins the pending tail, from which the shard grains and Watch read it
-        //     until a projection flush persists it into the shard grains it touches.
-        //     RaiseConditionalEvent's own version check is a secondary guard behind the CAS above. It
-        // cannot lose here — this activation is the only writer and no write interleaves a write — but
-        // keep the identical false-branch handling (reported as a moved head) rather than assume.
-        var raised = await RaiseConditionalEvent(new DatastoreJournalEntry.Committed(ev))
-            .ConfigureAwait(ContinueOnCapturedContext);
-        if (!raised)
-            return Rejected(CommitFailureKind.HeadMoved, "conditional append reported a concurrent head advance");
-        await ConfirmEvents().ConfigureAwait(ContinueOnCapturedContext);
-
-        // Push the new head to the per-silo watch hubs. Best-effort and isolated:
-        // HeadAdvanced is [OneWay] and any failure is swallowed — the commit result must never depend on
-        // the notify; a missed push is recovered by the hubs' heartbeat.
-        try
-        {
-            await _watchers.Notify(w => w.HeadAdvanced(newRevision)).ConfigureAwait(ContinueOnCapturedContext);
-        }
-        catch
-        {
-            // Defunct observers are pruned by ObserverManager; nothing else to do.
-        }
-
-        // A schema change committed this revision: push the bytes to every silo's watch hub alongside the
-        // head advance. Without this, a WriteSchema landing on THIS silo's grain activation only swaps
-        // ISchemaProvider locally on the silo that ran it — every other silo keeps serving its stale
-        // Current schema hash (a live divergence, not just a cache-miss latency cost) until its own hub
-        // heartbeat notices the stored hash moved. Same best-effort/isolated stance as HeadAdvanced above.
-        if (ev.SchemaChange is { } schemaChange)
-        {
-            try
-            {
-                await _watchers.Notify(w => w.SchemaAdvanced(schemaChange.Bytes, schemaChange.Hash))
-                    .ConfigureAwait(ContinueOnCapturedContext);
-            }
-            catch
-            {
-                // Defunct observers are pruned by ObserverManager; nothing else to do.
-            }
-        }
-
-        if (State.Value.Pending.Count >= FlushInterval)
-            await TryFlushProjection().ConfigureAwait(ContinueOnCapturedContext);
-
-        return new CommitReply(newRevision, null, deletedCount, reachedLimit);
-
-        static CommitReply Rejected(CommitFailureKind kind, string? detail) =>
-            new(null, new CommitFailureWire(kind, detail), 0, false);
+        return (new CommitReply(newRevision, null, deletedCount, reachedLimit), ev);
     }
 
     /// <summary>
@@ -719,7 +871,10 @@ public sealed class DatastoreGrain :
     }
 
     /// <inheritdoc />
-    public async Task<long?> RunGc()
+    public Task<long?> RunGc() => EnqueueRun(RunGcCore);
+
+    /// <summary>The GC round <see cref="RunGc"/> queues as one write.</summary>
+    private async Task<long?> RunGcCore()
     {
         var head = State.Value.HeadRevision;
         var currentFloor = State.Value.GcFloor;
@@ -810,10 +965,14 @@ public sealed class DatastoreGrain :
     // --- projection ---
 
     /// <inheritdoc />
-    public Task FlushProjection() => FlushProjectionCore();
+    public Task FlushProjection() => EnqueueRun(async () =>
+    {
+        await FlushProjectionCore().ConfigureAwait(ContinueOnCapturedContext);
+        return true;
+    });
 
     /// <summary>
-    /// The flush a write turn runs when the pending tail reaches <see cref="FlushInterval"/>. A failure is
+    /// The flush a write runs when the pending tail reaches <see cref="FlushInterval"/>. A failure is
     /// logged and left for the next flush to retry — the events stay pending, which is always correct —
     /// because the write that triggered it has already committed and must not be reported as failed.
     /// </summary>
@@ -835,7 +994,7 @@ public sealed class DatastoreGrain :
     /// <summary>
     /// Projects the whole pending tail (see the class remarks): every touched shard grain persists its
     /// events, the populated keys are added to the shard index, and only then is the projection
-    /// journaled. Runs in a write turn, so no commit interleaves it.
+    /// journaled. Runs as or inside a queued write, so no commit batch interleaves it.
     /// </summary>
     private async Task FlushProjectionCore()
     {

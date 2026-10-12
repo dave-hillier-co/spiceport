@@ -620,7 +620,7 @@ public sealed class AuthzedPermissionsV1Service(
         // a genuine write-write serialization conflict maps to Aborted so the client retries.
         // Cost of the one-commit shape, accepted with eyes open: the buffered rows cross the grain
         // boundary as ONE Orleans message (subject to the runtime's message-size and response-timeout
-        // limits) and the import executes as one commit turn on the sequencer's single non-reentrant
+        // limits) and the import executes as one commit on the sequencer's single-writer
         // activation, serializing against every other cluster write for its duration. A truly huge
         // import that hits those limits should be split by the CALLER into idempotent-safe disjoint
         // streams; chunking here would silently forfeit the observed whole-stream atomicity.

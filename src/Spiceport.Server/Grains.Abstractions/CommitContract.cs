@@ -31,7 +31,7 @@ public sealed record DeleteByFilterWire(
 /// <summary>
 /// The write wire contract of the graph-sharded design (docs/graph-sharded-datastore.md section 3):
 /// a fully DECLARATIVE description of one commit, executed inside the sequencer grain
-/// (<see cref="IDatastoreGrain.Commit"/>) whose single-threaded, non-reentrant activation is the
+/// (<see cref="IDatastoreGrain.Commit"/>) whose single-writer activation is the
 /// serialization point — the request replaces the caller-side read-transact-CAS loop, so a declarative
 /// commit needs no retry. The lambda compatibility path (<c>GrainBackedDatastore.ReadWriteTx</c>)
 /// survives by passing <see cref="ExpectedHead"/>, keeping the old caller-evaluated CAS semantics.

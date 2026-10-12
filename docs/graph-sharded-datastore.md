@@ -97,7 +97,9 @@ evaluation contract is untouched: a Check remains a pure function of
 **Writes.** The sequencer is the sole serialization point; the single ordered log and the
 new-enemy defence are unchanged. `DatastoreGrain.Commit` is the declarative wire contract:
 preconditions, updates, delete-by-filter, schema writes (guarded by `ExpectedSchemaHash`), and
-counter changes are evaluated and executed inside the single-threaded, non-reentrant activation.
+counter changes are evaluated and executed inside the sequencer's single-writer activation,
+group-committed: commits that arrive while a batch is being written are evaluated in order, each
+against the state the ones before it left, and appended together in one write.
 A commit assembles a PARTIAL base from exactly the shard keys its updates/preconditions/delete
 filter can read -- each the key's projected state with the pending tail folded over -- resolving
 keys by construction where a filter names them and through the shard index (plus the pending

@@ -355,7 +355,7 @@ public sealed class RelationshipsGrain(
     /// Submits a declarative commit (null <c>ExpectedHead</c>) with a bounded retry on
     /// <see cref="CommitFailureKind.HeadMoved"/> ONLY; every other outcome (success or failure) returns
     /// to the caller for its own mapping. HeadMoved is near-impossible here — a declarative commit
-    /// carries no head CAS and the sequencer's single-writer, non-reentrant activation cannot lose its
+    /// carries no head CAS and the sequencer's single-writer activation cannot lose its
     /// own conditional append — it exists only for duplicate-activation churn during cluster membership
     /// changes, when a second activation of the singleton briefly races the storage version check. That
     /// is a transient condition the pre-declarative write path retried (its ReadWriteTx CAS loop), so
