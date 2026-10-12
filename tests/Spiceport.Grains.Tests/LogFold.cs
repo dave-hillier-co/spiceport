@@ -2,16 +2,17 @@ using Spiceport.Core;
 using Spiceport.Datastore;
 using Spiceport.Grains.Abstractions;
 
-namespace Spiceport.Grains;
+namespace Spiceport.Grains.Tests;
 
 /// <summary>
-/// The event-log fold and its inverse (the proposal diff). This is the single definition of "apply a
-/// committed <see cref="LogEvent"/> to the datastore state", used by the event-sourced
-/// <c>DatastoreGrain</c>'s <c>TransitionState</c> (replay + live append) and by the storage replay on
-/// reactivation. It is deliberately implemented by REUSING the in-memory MVCC
+/// The whole-state reference fold and its inverse (the proposal diff): "apply a committed
+/// <see cref="LogEvent"/> to the full datastore state". Production never folds the whole state -- the
+/// sequencer folds the small state (<see cref="MetaFold"/>) and each shard folds its own key
+/// (<see cref="ShardFold"/>) -- so this lives with the tests as the oracle those restrictions are checked
+/// against (<c>ShardFoldLemmaTests</c>). It is deliberately implemented by REUSING the in-memory MVCC
 /// <see cref="MvccReadWriteTransaction"/> (the same mechanics the write path runs through), so the
-/// fold is provably equal to the in-memory <c>Commit()</c> rather than a divergent re-derivation of the
-/// MVCC visibility rules.
+/// reference is provably equal to the in-memory <c>Commit()</c> rather than a divergent re-derivation of
+/// the MVCC visibility rules.
 /// </summary>
 internal static class LogFold
 {
@@ -80,3 +81,15 @@ internal static class LogFold
         return new LogEvent(revision, write.RelationshipChanges, schemaChange, write.CounterChanges, GcFloor: null);
     }
 }
+
+/// <summary>
+/// A revision-less net commit diff: the resolved relationship changes (Touch / Delete on full
+/// payloads), an optional new schema (bytes), and the counter deltas (a null
+/// <see cref="CounterDeltaWire.Filter"/> being a tombstone) -- the same net diff a
+/// <see cref="CommitRequest"/> carries field-by-field, without a revision. The input of
+/// <see cref="LogFold.EventFromProposal"/>, which stamps the minted one.
+/// </summary>
+internal sealed record ProposedWrite(
+    IReadOnlyList<RelationshipUpdateWire> RelationshipChanges,
+    byte[]? SchemaBytes,
+    IReadOnlyList<CounterDeltaWire> CounterChanges);

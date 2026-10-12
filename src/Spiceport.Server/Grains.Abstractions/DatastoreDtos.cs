@@ -71,17 +71,3 @@ public sealed record DatastoreHeadWire(
     [property: Id(0)] long Head,
     [property: Id(1)] string? SchemaHash,
     [property: Id(2)] long GcFloor = 0);
-
-/// <summary>
-/// A revision-less net commit diff: the resolved relationship changes (Touch / Delete on full
-/// payloads), an optional new schema (bytes), and the counter deltas (a null
-/// <see cref="CounterDeltaWire.Filter"/> being a tombstone). Once the wire shape of the retired
-/// two-step propose/append write path, it survives as the input of the log-fold helper that stamps a
-/// minted revision onto a canonical <c>LogEvent</c> (<c>LogFold.EventFromProposal</c>) — the same net
-/// diff a <see cref="CommitRequest"/> carries field-by-field.
-/// </summary>
-[GenerateSerializer]
-public sealed record ProposedWrite(
-    [property: Id(0)] IReadOnlyList<RelationshipUpdateWire> RelationshipChanges,
-    [property: Id(1)] byte[]? SchemaBytes,
-    [property: Id(2)] IReadOnlyList<CounterDeltaWire> CounterChanges);

@@ -161,7 +161,7 @@ internal sealed record DatastoreState(
 
     /// <summary>
     /// Collects MVCC history strictly below <paramref name="floor"/>: this is the ONE fold definition GC
-    /// events apply (see <c>LogFold.ApplyEvent</c> in Spiceport.Server), so the grain state and any
+    /// events apply (see <c>MetaFold</c> and <c>ShardFold</c> in Spiceport.Server), so the grain state and any
     /// other fold of the same log all converge on the identical collected state.
     /// A no-op (returns <see langword="this"/>) when <paramref name="floor"/> does not advance the current
     /// <see cref="GcFloor"/> — GC only ever moves forward. <see cref="HeadRevision"/> is untouched: the
