@@ -72,6 +72,8 @@ public sealed class DatastoreInterleavedReadTests
     {
         public static TaskCompletionSource<bool>? HeadWriteBlock;
         public static TaskCompletionSource<bool>? HeadWriteParked;
+        public static TaskCompletionSource<bool>? ShardWriteBlock;
+        public static TaskCompletionSource<bool>? ShardWriteParked;
         public static volatile bool ThrowOnceOnHeadWrite;
         public static volatile bool ThrowOnceOnShardWrite;
         public static int DatastoreWrites;
@@ -81,6 +83,8 @@ public sealed class DatastoreInterleavedReadTests
             DatastoreWrites = 0;
             HeadWriteBlock = null;
             HeadWriteParked = null;
+            ShardWriteBlock = null;
+            ShardWriteParked = null;
             ThrowOnceOnHeadWrite = false;
             ThrowOnceOnShardWrite = false;
         }
@@ -104,6 +108,12 @@ public sealed class DatastoreInterleavedReadTests
             {
                 Gate.ThrowOnceOnShardWrite = false;
                 throw new InvalidOperationException("injected shard-projection write failure (test seam)");
+            }
+
+            if (grainType == "graphshard" && Gate.ShardWriteBlock is { } shardGate)
+            {
+                Gate.ShardWriteParked?.TrySetResult(true);
+                await shardGate.Task;
             }
 
             if (grainType == "datastore")
@@ -258,6 +268,45 @@ public sealed class DatastoreInterleavedReadTests
         Assert.Null(reply2.Failure);
         Assert.NotNull(reply2.Revision);
         Assert.True(reply2.Revision > reply.Revision);
+    }
+
+    /// <summary>
+    /// The commit that fills the pending tail to the flush interval replies only once the flush it
+    /// triggered has run: a caller that sees the reply sees the flush attempted, as it did before
+    /// commits were batched. Parks the flush's first shard write and checks the boundary reply waits
+    /// for it, then completes once the write is released.
+    /// </summary>
+    [Fact]
+    public async Task The_flush_boundary_commit_replies_after_its_flush()
+    {
+        await using var scope = new Scope(await NewClusterAsync());
+        var grain = Grain(scope.Cluster);
+        var head = (await grain.GetHead()).Head;
+
+        for (var i = 0; i < 63; i++)
+        {
+            var reply = await grain.Commit(TouchCommit($"k{i}", $"u{i}", head));
+            Assert.Null(reply.Failure);
+            head = reply.Revision!.Value;
+        }
+
+        Gate.ShardWriteBlock = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        Gate.ShardWriteParked = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var boundary = grain.Commit(TouchCommit("k63", "u63", head));
+        try
+        {
+            await Gate.ShardWriteParked.Task.WaitAsync(Timeout);
+            var winner = await Task.WhenAny(boundary, Task.Delay(TimeSpan.FromMilliseconds(500)));
+            Assert.False(ReferenceEquals(winner, boundary), "the boundary commit replied before its flush ran");
+        }
+        finally
+        {
+            Gate.ShardWriteBlock.TrySetResult(true);
+        }
+
+        var replied = await boundary.WaitAsync(Timeout);
+        Assert.Null(replied.Failure);
+        Assert.NotNull(replied.Revision);
     }
 
     /// <summary>
