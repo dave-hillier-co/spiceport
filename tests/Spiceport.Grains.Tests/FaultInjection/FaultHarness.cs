@@ -1,4 +1,5 @@
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Options;
 using Orleans.Hosting;
 using Orleans.Runtime;
 using Orleans.Serialization;
@@ -15,13 +16,33 @@ public sealed record FaultHarnessOptions(int Seed, int Steps)
 {
     /// <summary>Plants a lost-write bug in storage, for the harness's own gate.</summary>
     public bool LoseShardWrites { get; init; }
+
+    /// <summary>The number of silos in the cluster.</summary>
+    public int Silos { get; init; } = 1;
+
+    /// <summary>
+    /// Hard-kills secondary silos at seeded points, always leaving the primary and one secondary. Killed
+    /// silos are not replaced: an in-process silo started on a killed one's address finds the zombie
+    /// still in membership, and Orleans treats that as fatal for the whole process.
+    /// </summary>
+    public bool KillSilos { get; init; }
+
+    /// <summary>When set, runs GC rounds at seeded points under this retention window.</summary>
+    public TimeSpan? GcWindow { get; init; }
 }
 
 /// <summary>
-/// A completed run: the trace (one line per step and per commit outcome, independent of timing) and how
-/// many injected write failures actually fired, as opposed to being armed.
+/// A completed run: the trace (one line per step and per commit outcome, independent of timing), how
+/// many injected write failures actually fired (as opposed to being armed), how many silos were killed
+/// and how many of those held the sequencer's activation, and how many GC rounds advanced the floor.
 /// </summary>
-public sealed record FaultHarnessRun(IReadOnlyList<string> Trace, int SequencerFaultsFired, int ShardFaultsFired);
+public sealed record FaultHarnessRun(
+    IReadOnlyList<string> Trace,
+    int SequencerFaultsFired,
+    int ShardFaultsFired,
+    int SilosKilled,
+    int SequencerKills,
+    int GcRounds);
 
 /// <summary>The real system and the reference disagreed. The message names the seed and the trace.</summary>
 public sealed class FaultHarnessDivergenceException(string message) : Exception(message);
@@ -30,7 +51,9 @@ public sealed class FaultHarnessDivergenceException(string message) : Exception(
 /// The deterministic fault-injection harness. A seeded workload of declarative commits (touches, creates,
 /// deletes, preconditions, delete-by-filter) runs against the real sequencer and shard mesh in a
 /// <see cref="TestCluster"/>, sequentially and in concurrent groups, with sequencer and shard-projection
-/// write failures, explicit projection flushes and whole-cluster deactivations injected at seeded points.
+/// write failures, explicit projection flushes and whole-cluster deactivations injected at seeded points,
+/// and optionally hard silo kills and GC rounds. Storage is <see cref="SharedMemoryGrainStorage"/>, which
+/// survives a killed silo as a database would.
 /// Every commit is replayed against <see cref="ReferenceDatastore"/> in the order the sequencer assigned
 /// and must reach the same outcome; reads through the shard mesh at every committed revision must
 /// return what the reference returns at the matching revision.
@@ -40,6 +63,8 @@ public sealed class FaultHarnessDivergenceException(string message) : Exception(
 /// commits in one group touch disjoint resources, so every outcome is the same whatever order the
 /// sequencer gives them, and the trace (which records outcomes, never revisions or timings) reproduces
 /// exactly. The reference is replayed in the sequencer's order, so the state checks hold for any order.
+/// Kills and GC rounds happen between steps, never under an in-flight call, so no commit's outcome is
+/// ever unknown. Reads compare only at revisions at or above the GC floor.
 /// </remarks>
 public static class FaultHarness
 {
@@ -51,8 +76,10 @@ public static class FaultHarness
     public static async Task<FaultHarnessRun> RunAsync(FaultHarnessOptions options)
     {
         StorageFaults.Reset();
+        SharedMemoryGrainStorage.Reset();
         StorageFaults.LoseShardWrites = options.LoseShardWrites;
-        var builder = new TestClusterBuilder(initialSilosCount: 1);
+        HarnessSiloConfigurator.GcWindow = options.GcWindow;
+        var builder = new TestClusterBuilder(initialSilosCount: (short)options.Silos);
         builder.AddSiloBuilderConfigurator<HarnessSiloConfigurator>();
         var cluster = builder.Build();
         await cluster.DeployAsync();
@@ -60,12 +87,15 @@ public static class FaultHarness
         {
             var run = new Run(options, cluster);
             await run.Execute();
-            return new FaultHarnessRun(run.Trace, StorageFaults.InjectedSequencerFaults, StorageFaults.InjectedShardFaults);
+            return new FaultHarnessRun(
+                run.Trace, StorageFaults.InjectedSequencerFaults, StorageFaults.InjectedShardFaults,
+                run.SilosKilled, run.SequencerKills, run.GcRounds);
         }
         finally
         {
             StorageFaults.Reset();
             await cluster.DisposeAsync();
+            SharedMemoryGrainStorage.Reset();
         }
     }
 
@@ -75,13 +105,25 @@ public static class FaultHarness
         private readonly ReferenceDatastore _reference = new();
         private readonly List<long> _revisions = [];
         private readonly Dictionary<long, IRevision> _referenceAt = [];
+        private long _gcFloor;
 
         public List<string> Trace { get; } = [];
 
-        private IDatastoreGrain Sequencer => cluster.GrainFactory.GetGrain<IDatastoreGrain>(IDatastoreGrain.Key);
+        public int SilosKilled { get; private set; }
 
-        private IDatastore Datastore =>
-            ((InProcessSiloHandle)cluster.Primary).SiloHost.Services.GetRequiredService<IDatastore>();
+        public int SequencerKills { get; private set; }
+
+        public int GcRounds { get; private set; }
+
+        // Every call goes from inside the primary silo, which is never killed, as production callers do:
+        // the external test client keeps a killed silo in its gateway list for a while.
+        private IServiceProvider PrimaryServices => ((InProcessSiloHandle)cluster.Primary).SiloHost.Services;
+
+        private IGrainFactory Grains => PrimaryServices.GetRequiredService<IGrainFactory>();
+
+        private IDatastoreGrain Sequencer => Grains.GetGrain<IDatastoreGrain>(IDatastoreGrain.Key);
+
+        private IDatastore Datastore => PrimaryServices.GetRequiredService<IDatastore>();
 
         public async Task Execute()
         {
@@ -93,10 +135,24 @@ public static class FaultHarness
             var sequencerFaultAt = _rng.Next(options.Steps);
             var shardFaultAt = _rng.Next(options.Steps);
             var deactivateAt = _rng.Next(options.Steps);
+            var killAt = options.KillSilos ? _rng.Next(options.Steps) : -1;
+            var gcAt = options.GcWindow is null ? -1 : _rng.Next(options.Steps / 2, options.Steps);
 
             for (var step = 0; step < options.Steps; step++)
             {
                 var roll = _rng.NextDouble();
+                var extra = _rng.NextDouble();
+                // Random kills leave a silo for the seeded kill that takes the sequencer down.
+                if (step == killAt && cluster.SecondarySilos.Count > 1)
+                    await KillSilo(withSequencer: true);
+                else if (options.KillSilos && extra < 0.04 && cluster.SecondarySilos.Count > 2)
+                    await KillSilo(withSequencer: false);
+
+                if (step == gcAt || (options.GcWindow is not null && extra > 0.9))
+                {
+                    await RunGc();
+                }
+
                 if (step == sequencerFaultAt || (step != shardFaultAt && roll < 0.06))
                 {
                     Trace.Add("fault sequencer-write");
@@ -194,11 +250,69 @@ public static class FaultHarness
             }
         }
 
+        /// <summary>
+        /// Hard-kills a secondary silo, whatever activations it held, and waits until the cluster has noticed
+        /// and the sequencer answers again. With <paramref name="withSequencer"/>, the sequencer is first
+        /// migrated onto the victim, so the kill takes the serialization point down with it.
+        /// </summary>
+        private async Task KillSilo(bool withSequencer)
+        {
+            Trace.Add(withSequencer ? "kill silo with the sequencer" : "kill silo");
+            var secondaries = cluster.SecondarySilos.ToList();
+            var victim = secondaries[_rng.Next(secondaries.Count)];
+            var management = Grains.GetGrain<IManagementGrain>(0);
+            if (withSequencer)
+            {
+                // Migration completes once the activation is idle, so wait to see it land.
+                await Call(Sequencer.GetHead());
+                await Call(cluster.MigrateAsync(Sequencer, victim.SiloAddress));
+                var migrateBy = DateTime.UtcNow + CallTimeout;
+                while (await Call(management.GetActivationAddress(Sequencer).AsTask()) != victim.SiloAddress)
+                {
+                    if (DateTime.UtcNow > migrateBy)
+                        Diverge("the sequencer did not migrate onto the silo chosen to kill");
+                    await Call(Sequencer.GetHead());
+                    await Task.Delay(50);
+                }
+            }
+
+            if (await Call(management.GetActivationAddress(Sequencer).AsTask()) == victim.SiloAddress)
+                SequencerKills++;
+            await cluster.KillSiloAsync(victim);
+            await cluster.WaitForLivenessToStabilizeAsync();
+            SilosKilled++;
+
+            // GetHead is a pure read, so retrying it while the directory forgets the dead silo is safe.
+            var deadline = DateTime.UtcNow + CallTimeout;
+            while (true)
+            {
+                try
+                {
+                    await Sequencer.GetHead().WaitAsync(TimeSpan.FromSeconds(5));
+                    return;
+                }
+                catch (Exception) when (DateTime.UtcNow < deadline)
+                {
+                    await Task.Delay(100);
+                }
+            }
+        }
+
+        private async Task RunGc()
+        {
+            Trace.Add("gc");
+            if (await Call(Sequencer.RunGc()) is { } floor)
+            {
+                _gcFloor = floor;
+                GcRounds++;
+            }
+        }
+
         private async Task DeactivateAll(bool record = true)
         {
             if (record)
                 Trace.Add("deactivate");
-            var management = cluster.GrainFactory.GetGrain<IManagementGrain>(0);
+            var management = Grains.GetGrain<IManagementGrain>(0);
             await Call(management.ForceActivationCollection(TimeSpan.Zero));
         }
 
@@ -258,6 +372,8 @@ public static class FaultHarness
             int revisionIndex, string what, Func<IDatastoreReader, IAsyncEnumerable<Relationship>> query)
         {
             var revision = _revisions[revisionIndex];
+            if (revision < _gcFloor)
+                return; // collected: the floor no longer serves this revision
             var actual = await Call(Collect(query(Datastore.SnapshotReader(new TimestampRevision(revision)))));
             var expected = await Collect(query(_reference.SnapshotReader(_referenceAt[revision])));
             if (!actual.SequenceEqual(expected))
@@ -385,23 +501,29 @@ public static class FaultHarness
 
     private sealed class HarnessSiloConfigurator : ISiloConfigurator
     {
+        /// <summary>The run's GC retention window, handed to the in-process silos (runs are serialized).</summary>
+        public static TimeSpan? GcWindow;
+
         public void Configure(ISiloBuilder silo)
         {
-            // Production registrations, with the "datastore" provider wrapped in the fault injector over the
-            // same in-memory provider and binary serializer AddDatastoreGrainStorage uses.
-            silo.AddMemoryGrainStorage("datastore-inner", optionsBuilder =>
-                optionsBuilder.Configure<Serializer>((options, serializer) =>
-                    options.GrainStorageSerializer = new OrleansGrainStorageSerializer(serializer)));
+            // Production registrations, with the "datastore" provider replaced by the fault injector over
+            // storage every silo shares.
             silo.AddStateStorageBasedLogConsistencyProvider("StateStorage");
             silo.AddGraphLocalityPlacement();
             silo.ConfigureServices(services =>
             {
                 services.AddKeyedSingleton<IGrainStorage>(
                     "datastore",
-                    (sp, _) => new FaultInjectingGrainStorage(sp.GetRequiredKeyedService<IGrainStorage>("datastore-inner")));
+                    (sp, _) => new FaultInjectingGrainStorage(new SharedMemoryGrainStorage(sp.GetRequiredService<Serializer>())));
                 services.AddSpiceportGrainServices(Schema);
                 services.AddSingleton<IDatastore>(sp =>
                     new GrainBackedDatastore(sp.GetRequiredService<IGrainFactory>(), sp.GetRequiredService<LogWatchHub>()));
+                if (GcWindow is { } window)
+                {
+                    // GC runs only when the harness calls RunGc, never on the grain's own reminder.
+                    services.AddSingleton<IOptions<DatastoreGcOptions>>(Options.Create(
+                        new DatastoreGcOptions { Window = window, ReminderEnabled = false }));
+                }
             });
         }
     }

@@ -121,8 +121,8 @@ dotnet test tests/Spiceport.Conformance.Tests  # the SpiceDB conformance corpus 
   run share the same engine (agreement proves the distribution layer, not engine semantics), and it
   tests one static snapshot (no MVCC/revision/write-race behavior). Correctness beyond it rests on
   the property-based, metamorphic, and differential gates, and the seeded fault-injection harness
-  (`tests/Spiceport.Grains.Tests/FaultInjection`), which replays storage failures and deactivations
-  against `ReferenceDatastore`. `tests/Spiceport.Differential.Tests` is
+  (`tests/Spiceport.Grains.Tests/FaultInjection`), which checks the grain mesh against
+  `ReferenceDatastore` under storage failures, deactivations, GC rounds and silo kills. `tests/Spiceport.Differential.Tests` is
   the genuinely external one — it runs seeded random worlds through both a real `authzed/spicedb`
   container and Spiceport's in-process grain mesh and asserts Check/Lookup verdicts agree; it needs
   Docker and skips (not fails) without it.
