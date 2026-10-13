@@ -1,0 +1,120 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    runs-on: self-hosted
+    # A wedged test must fail the run, not hold the shared runner indefinitely.
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # The runner service starts from a minimal PATH, so Homebrew's bin — where
+      # docker lives — is added explicitly. Via GITHUB_PATH rather than a
+      # workflow-level `env.PATH`, because that would override what `setup-dotnet`
+      # puts on the path.
+      - name: Add Homebrew to PATH
+        run: echo "/opt/homebrew/bin" >> "$GITHUB_PATH"
+
+      # The SDK comes from the action rather than whatever the runner happens to
+      # have installed, so CI builds with the framework the solution targets.
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      # Fails loudly and early when the runner is missing a tool. Docker is not
+      # optional here: the durability and differential suites SKIP without it, so
+      # a runner that lost its daemon would turn them into silent passes.
+      - name: Tool versions
+        run: |
+          dotnet --version
+          docker --version
+          docker info --format "{{.ServerVersion}}"
+
+      # THE ORPHANED-HOST GUARD, first half. CLAUDE.md forbids starting a host
+      # (`dotnet run`, Kestrel) from a test or from CI, because a backgrounded host
+      # orphans and runs forever — on a self-hosted runner, on a real machine,
+      # holding its ports. The ports are the API host's Kestrel defaults and
+      # Orleans localhost clustering's silo and gateway ports.
+      #
+      # A snapshot, not a bare "nothing is listening" assertion: the runner is a
+      # shared machine, so anything bound before the job started is somebody
+      # else's. Only a port that APPEARS across the job is evidence that the job
+      # started a host. The test clusters bind and release their own ports within
+      # the run, so they do not trip it.
+      - name: Record listening ports
+        run: |
+          for port in 5249 7022 11111 30000; do
+            lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1 && echo "$port"
+          done > "$RUNNER_TEMP/ports-before.txt" || true
+          cat "$RUNNER_TEMP/ports-before.txt"
+
+      - name: Restore
+        run: dotnet restore Spiceport.slnx
+
+      - name: Build
+        run: dotnet build Spiceport.slnx --no-restore
+
+      # One step per project, so a failure names its suite. The hang timeout turns
+      # a wedged test into a failure with a dump, rather than a run that sits until
+      # the job timeout with no indication of where it stopped.
+      - name: Core
+        run: dotnet test tests/Spiceport.Core.Tests --no-build --blame-hang-timeout 10m
+
+      - name: Schema
+        run: dotnet test tests/Spiceport.Schema.Tests --no-build --blame-hang-timeout 10m
+
+      - name: Datastore
+        run: dotnet test tests/Spiceport.Datastore.Tests --no-build --blame-hang-timeout 10m
+
+      - name: Engine
+        run: dotnet test tests/Spiceport.Engine.Tests --no-build --blame-hang-timeout 10m
+
+      - name: Conformance
+        run: dotnet test tests/Spiceport.Conformance.Tests --no-build --blame-hang-timeout 10m
+
+      # Includes the Testcontainers durability suite, which needs the daemon the
+      # tool check above asserted.
+      - name: Grains
+        run: dotnet test tests/Spiceport.Grains.Tests --no-build --blame-hang-timeout 10m
+
+      # The only external oracle: seeded random worlds through a real
+      # authzed/spicedb container and the in-process grain mesh.
+      - name: Differential
+        run: dotnet test tests/Spiceport.Differential.Tests --no-build --blame-hang-timeout 10m
+
+      - name: No host was left running
+        if: always()
+        run: |
+          # No snapshot means the job failed before it could take one, so nothing
+          # here can be attributed to it.
+          if [ ! -f "$RUNNER_TEMP/ports-before.txt" ]; then
+            echo "no snapshot was taken; skipping the orphan check"
+            exit 0
+          fi
+          appeared=""
+          for port in 5249 7022 11111 30000; do
+            if lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1 &&
+               ! grep -qx "$port" "$RUNNER_TEMP/ports-before.txt"; then
+              appeared="$appeared $port"
+              lsof -nP -iTCP:"$port" -sTCP:LISTEN
+            fi
+          done
+          if [ -n "$appeared" ]; then
+            echo "::error::a host is listening on$appeared and was not before this job — CI started one"
+            exit 1
+          fi
+          echo "no host port was opened by this job"
