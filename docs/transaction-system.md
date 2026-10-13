@@ -52,11 +52,21 @@ a move rather than a rewrite.
    singleton. A per-silo batcher, FoundationDB's GRV proxies, lets concurrent requests on one
    silo share one fetch. Sharing is safe: a head fetched after a request began is never older
    than one fetched at its start.
-3. **A deterministic fault-injection harness.** FoundationDB's simulation testing in
-   TestCluster form: seeded scheduling, injected storage failures, deactivations and silo
-   kills at chosen points, every run checked against `ReferenceDatastore`. The interleaved-read
-   and failed-projection-write gates are hand-written instances of it. It comes before step 4
-   and before any split, not after.
+3. **A deterministic fault-injection harness (built for storage faults and deactivations).**
+   FoundationDB's simulation testing in TestCluster form. `FaultHarness`
+   (`tests/Spiceport.Grains.Tests/FaultInjection`) runs a seeded workload of declarative
+   commits (touches, creates, deletes, preconditions, delete-by-filter) against the real
+   sequencer and shard mesh, one at a time and in concurrent groups, and injects sequencer and
+   shard-projection write failures, projection flushes and whole-cluster deactivations at
+   seeded points. Every commit is replayed against `ReferenceDatastore` in the order the
+   sequencer assigned and must reach the same outcome; reads through the shard mesh at every
+   committed revision must match the reference at the same point. The seed fixes the workload
+   and the fault schedule, not the silo's thread interleaving: commits in one concurrent group
+   touch disjoint resources, so their outcomes do not depend on the order the sequencer picks,
+   and a seed's trace reproduces exactly. The harness gates itself with a planted lost-write
+   fault it must report. Silo kills and GC rounds are not yet injected. The interleaved-read
+   and failed-projection-write gates are hand-written instances of the same idea. It comes
+   before step 4 and before any split, not after.
 4. **Conflict checking in the sequencer, evaluation by the callers.** `GrainBackedDatastore`
    evaluates a request against the shard grains at a read version and sends concrete
    mutations plus its read set. The sequencer keeps an in-memory window of recent writes and
@@ -131,7 +141,7 @@ must cover every role.
 |---|---|---|---|
 | 0 | Group commit | Built | Batched commits share one write; batch members see earlier members; CAS exact under concurrency |
 | 1 | Read-version batching | Head reads visible in sequencer call rates | One `GetHead` per silo per batch window; consistency suites unchanged |
-| 2 | Fault-injection harness | Before stage 3 or §2 step 4 | Seeded runs reproduce; equivalence to `ReferenceDatastore` under injected faults |
+| 2 | Fault-injection harness | Built for storage faults and deactivations; silo kills and GC rounds next | Seeded runs reproduce; equivalence to `ReferenceDatastore` under injected faults |
 | 3 | Logs out of the sequencer | Cold-activation or projection load on the sequencer measured | Shards pull from logs; empty-version advance; durability suites across reactivation |
 | 4 | Version-only sequencer and commit proxies, one resolver | Write demand past group commit's ceiling | Epoch fencing; recovery under the harness |
 | 5 | Optimistic commits, partitioned resolvers | Resolver CPU is the bound | §4 mapping exact under the conformance corpus, the differential suite and the harness |
