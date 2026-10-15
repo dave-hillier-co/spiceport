@@ -161,7 +161,9 @@ public sealed class AuthzedPermissionsV1Service(
         V1::WriteRelationshipsRequest request, ServerCallContext context)
     {
         // Reject over-limit/duplicate/oversized-context requests up front (SpiceDB validates the request
-        // shape before applying it). All of these are InvalidArgument, not FailedPrecondition.
+        // shape before applying it, the transaction metadata first). All of these are InvalidArgument, not
+        // FailedPrecondition.
+        RequestCeilings.ValidateTransactionMetadata(request.OptionalTransactionMetadata);
         RequestLimits.ValidateWriteRelationships(request);
 
         var updates = request.Updates.Select(ToWire).ToList();
@@ -200,26 +202,56 @@ public sealed class AuthzedPermissionsV1Service(
         _ => StatusCode.Aborted,
     };
 
+    /// <summary>
+    /// Throws SpiceDB's <c>CouldNotTransactionallyDeleteErr</c> (InvalidArgument) when more than
+    /// <paramref name="limit"/> relationships match <paramref name="filter"/> at a fully-consistent snapshot.
+    /// </summary>
+    private async Task RejectIfMoreThan(RelationshipsFilterWire filter, ulong limit, CancellationToken cancellationToken)
+    {
+        var matched = 0UL;
+        await foreach (var _ in relationshipReads.ReadRelationships(
+            new ReadRelationshipsArgs(filter, null, null, WireConsistency.FullyConsistent), cancellationToken))
+        {
+            if (++matched > limit)
+            {
+                throw new RpcException(new Status(
+                    StatusCode.InvalidArgument,
+                    $"found more than {limit} relationships to be deleted and partial deletion was not requested"));
+            }
+        }
+    }
+
     public override async Task ReadRelationships(
         V1::ReadRelationshipsRequest request,
         IServerStreamWriter<V1::ReadRelationshipsResponse> responseStream,
         ServerCallContext context)
     {
+        RequestCeilings.ValidateLimit(request.OptionalLimit, RequestCeilings.MaxReadRelationshipsLimit);
+
         var filter = ToWire(request.RelationshipFilter);
         var consistency = ToWire(request.Consistency);
+        var limit = request.OptionalLimit == 0 ? (int?)null : (int)request.OptionalLimit;
+        var cursor = request.OptionalCursor is { Token.Length: > 0 } c ? c.Token : null;
 
         // One in-process read over one pinned snapshot (the grain hop and page loop are both gone). Each
-        // item carries the per-message read-at token, exactly as every page-message did before.
+        // item carries the per-message read-at token and, as in SpiceDB, an after_result_cursor that
+        // optional_cursor resumes from; optional_limit stops the stream after that many relationships.
+        var emitted = 0;
         try
         {
             await foreach (var item in relationshipReads.ReadRelationships(
-                new ReadRelationshipsArgs(filter, null, null, consistency), context.CancellationToken))
+                new ReadRelationshipsArgs(filter, limit, cursor, consistency), context.CancellationToken))
             {
                 await responseStream.WriteAsync(new V1::ReadRelationshipsResponse
                 {
                     ReadAt = new V1::ZedToken { Token = item.ReadAtToken },
                     Relationship = ToProto(item.Relationship),
+                    AfterResultCursor = new V1::Cursor { Token = item.ResumeCursor },
                 });
+
+                emitted++;
+                if (limit is { } cap && emitted >= cap)
+                    break;
             }
         }
         catch (InvalidConsistencyTokenException ex)
@@ -242,17 +274,33 @@ public sealed class AuthzedPermissionsV1Service(
     public override async Task<V1::DeleteRelationshipsResponse> DeleteRelationships(
         V1::DeleteRelationshipsRequest request, ServerCallContext context)
     {
+        RequestCeilings.ValidateTransactionMetadata(request.OptionalTransactionMetadata);
+        RequestCeilings.ValidateLimit(request.OptionalLimit, RequestCeilings.MaxDeleteRelationshipsLimit);
+
+        var filter = ToWire(request.RelationshipFilter);
+        ulong? limit = request.OptionalLimit == 0 ? null : request.OptionalLimit;
+
+        // A limit without optional_allow_partial_deletions is a transactional cap: SpiceDB rejects the
+        // request (CouldNotTransactionallyDeleteErr) when more than `limit` relationships match, deleting
+        // nothing. The count runs at a fully-consistent snapshot just before the commit, which still
+        // carries the limit, so a write racing in between can at worst make the commit stop at `limit`.
+        if (limit is { } cap && !request.OptionalAllowPartialDeletions)
+            await RejectIfMoreThan(filter, cap, context.CancellationToken);
+
         try
         {
             var reply = await Relationships.DeleteRelationships(new DeleteRelationshipsArgs(
-                ToWire(request.RelationshipFilter),
-                null,
+                filter,
+                limit,
                 ToWire(request.OptionalPreconditions)));
 
-            // v1 DeleteRelationshipsResponse carries only deleted_at in this snapshot; count/limit discarded.
             return new V1::DeleteRelationshipsResponse
             {
                 DeletedAt = new V1::ZedToken { Token = reply.DeletedAtToken },
+                DeletionProgress = reply.ReachedLimit
+                    ? V1::DeleteRelationshipsResponse.Types.DeletionProgress.Partial
+                    : V1::DeleteRelationshipsResponse.Types.DeletionProgress.Complete,
+                RelationshipsDeletedCount = reply.DeletedCount,
             };
         }
         catch (PreconditionFailedException ex)
@@ -315,6 +363,8 @@ public sealed class AuthzedPermissionsV1Service(
         var subjectRelation = string.IsNullOrEmpty(request.Subject.OptionalRelation)
             ? CoreConstants.Ellipsis
             : request.Subject.OptionalRelation;
+
+        RequestCeilings.ValidateLimit(request.OptionalLimit, RequestCeilings.MaxLookupResourcesLimit);
 
         // Reject an oversized request caveat context (SpiceDB: GetCaveatContext) -> InvalidArgument.
         var context5 = StructToDict(RequestLimits.ValidateCaveatContextSize(request.Context));
@@ -679,6 +729,8 @@ public sealed class AuthzedPermissionsV1Service(
     {
         ArgumentNullException.ThrowIfNull(request);
         ArgumentNullException.ThrowIfNull(responseStream);
+
+        RequestCeilings.ValidateLimit(request.OptionalLimit, RequestCeilings.MaxBulkExportRelationshipsLimit);
 
         var filter = request.OptionalRelationshipFilter is { } f ? ToWire(f) : EmptyFilter;
         var limit = (int)request.OptionalLimit;

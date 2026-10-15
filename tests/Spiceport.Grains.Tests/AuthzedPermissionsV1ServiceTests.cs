@@ -989,6 +989,193 @@ public class AuthzedPermissionsV1ServiceTests
         Assert.Equal(Google.Protobuf.WellKnownTypes.Timestamp.FromDateTimeOffset(expiresAt), only.Relationship.OptionalExpiresAt);
     }
 
+    // --- issue #46: limit ceilings and the transaction-metadata cap ---
+
+    private static V1::RelationshipFilter ReadmeFilter() =>
+        new() { ResourceType = "document", OptionalResourceId = "readme" };
+
+    private static Google.Protobuf.WellKnownTypes.Struct MetadataOfBytes(int approximateBytes) => new()
+    {
+        Fields = { ["blob"] = Google.Protobuf.WellKnownTypes.Value.ForString(new string('x', approximateBytes)) },
+    };
+
+    [Fact]
+    public async Task LookupResources_limit_above_1000_is_invalid_argument()
+    {
+        // SpiceDB MaxLookupResourcesLimit (default 1000) -> ExceedsMaximumLimitErr, INVALID_ARGUMENT.
+        await using var cluster = await MeshTestCluster.CreateAsync(Schema);
+
+        var request = AliceViewLookup();
+        request.OptionalLimit = 1001;
+        var ex = await Assert.ThrowsAsync<RpcException>(() => Service(cluster).LookupResources(
+            request, new CollectingStreamWriter<V1::LookupResourcesResponse>(), FakeServerCallContext.Default));
+
+        Assert.Equal(StatusCode.InvalidArgument, ex.StatusCode);
+        Assert.Equal("provided limit 1001 is greater than maximum allowed of 1000", ex.Status.Detail);
+    }
+
+    [Fact]
+    public async Task ReadRelationships_limit_above_1000_is_invalid_argument()
+    {
+        await using var cluster = await MeshTestCluster.CreateAsync(Schema);
+
+        var ex = await Assert.ThrowsAsync<RpcException>(() => Service(cluster).ReadRelationships(
+            new V1::ReadRelationshipsRequest { RelationshipFilter = ReadmeFilter(), OptionalLimit = 1001 },
+            new CollectingStreamWriter<V1::ReadRelationshipsResponse>(), FakeServerCallContext.Default));
+
+        Assert.Equal(StatusCode.InvalidArgument, ex.StatusCode);
+        Assert.Equal("provided limit 1001 is greater than maximum allowed of 1000", ex.Status.Detail);
+    }
+
+    [Fact]
+    public async Task DeleteRelationships_limit_above_1000_is_invalid_argument()
+    {
+        await using var cluster = await MeshTestCluster.CreateAsync(Schema);
+
+        var ex = await Assert.ThrowsAsync<RpcException>(() => Service(cluster).DeleteRelationships(
+            new V1::DeleteRelationshipsRequest { RelationshipFilter = ReadmeFilter(), OptionalLimit = 1001 },
+            FakeServerCallContext.Default));
+
+        Assert.Equal(StatusCode.InvalidArgument, ex.StatusCode);
+        Assert.Equal("provided limit 1001 is greater than maximum allowed of 1000", ex.Status.Detail);
+    }
+
+    [Fact]
+    public async Task ExportBulkRelationships_limit_above_10000_is_invalid_argument()
+    {
+        // SpiceDB MaxBulkExportRelationshipsLimit (default 10000).
+        await using var cluster = await MeshTestCluster.CreateAsync(Schema);
+
+        var ex = await Assert.ThrowsAsync<RpcException>(() => Service(cluster).ExportBulkRelationships(
+            new V1::ExportBulkRelationshipsRequest { OptionalLimit = 10_001 },
+            new CollectingStreamWriter<V1::ExportBulkRelationshipsResponse>(), FakeServerCallContext.Default));
+
+        Assert.Equal(StatusCode.InvalidArgument, ex.StatusCode);
+        Assert.Equal("provided limit 10001 is greater than maximum allowed of 10000", ex.Status.Detail);
+    }
+
+    [Fact]
+    public async Task ReadRelationships_honours_optional_limit_and_resumes_from_after_result_cursor()
+    {
+        // SpiceDB returns at most optional_limit relationships, each with an after_result_cursor that
+        // optional_cursor resumes from.
+        await using var cluster = await MeshTestCluster.CreateAsync(Schema);
+        await SeedAsync(cluster.Datastore,
+            ("readme", "viewer", "alice"), ("readme", "viewer", "bob"), ("readme", "viewer", "carol"));
+
+        var first = new CollectingStreamWriter<V1::ReadRelationshipsResponse>();
+        await Service(cluster).ReadRelationships(
+            new V1::ReadRelationshipsRequest { RelationshipFilter = ReadmeFilter(), OptionalLimit = 2 },
+            first, FakeServerCallContext.Default);
+
+        Assert.Equal(2, first.Collected.Count);
+        Assert.All(first.Collected, r => Assert.False(string.IsNullOrEmpty(r.AfterResultCursor?.Token)));
+
+        var rest = new CollectingStreamWriter<V1::ReadRelationshipsResponse>();
+        await Service(cluster).ReadRelationships(
+            new V1::ReadRelationshipsRequest
+            {
+                RelationshipFilter = ReadmeFilter(),
+                OptionalLimit = 2,
+                OptionalCursor = first.Collected[^1].AfterResultCursor,
+            },
+            rest, FakeServerCallContext.Default);
+
+        var subjects = first.Collected.Concat(rest.Collected).Select(r => r.Relationship.Subject.Object.ObjectId);
+        Assert.Equal(new[] { "alice", "bob", "carol" }, subjects.Order(StringComparer.Ordinal));
+    }
+
+    [Fact]
+    public async Task DeleteRelationships_partial_deletion_honours_optional_limit()
+    {
+        await using var cluster = await MeshTestCluster.CreateAsync(Schema);
+        await SeedAsync(cluster.Datastore,
+            ("readme", "viewer", "alice"), ("readme", "viewer", "bob"), ("readme", "viewer", "carol"));
+
+        var partial = await Service(cluster).DeleteRelationships(new V1::DeleteRelationshipsRequest
+        {
+            RelationshipFilter = ReadmeFilter(),
+            OptionalLimit = 2,
+            OptionalAllowPartialDeletions = true,
+        }, FakeServerCallContext.Default);
+
+        Assert.Equal(2UL, partial.RelationshipsDeletedCount);
+        Assert.Equal(V1::DeleteRelationshipsResponse.Types.DeletionProgress.Partial, partial.DeletionProgress);
+        Assert.Equal(1, await CountStoredAsync(cluster, "document"));
+
+        var complete = await Service(cluster).DeleteRelationships(new V1::DeleteRelationshipsRequest
+        {
+            RelationshipFilter = ReadmeFilter(),
+            OptionalLimit = 2,
+            OptionalAllowPartialDeletions = true,
+        }, FakeServerCallContext.Default);
+
+        Assert.Equal(1UL, complete.RelationshipsDeletedCount);
+        Assert.Equal(V1::DeleteRelationshipsResponse.Types.DeletionProgress.Complete, complete.DeletionProgress);
+        Assert.Equal(0, await CountStoredAsync(cluster, "document"));
+    }
+
+    [Fact]
+    public async Task DeleteRelationships_over_limit_without_partial_deletion_is_invalid_argument_and_deletes_nothing()
+    {
+        // SpiceDB CouldNotTransactionallyDeleteErr -> INVALID_ARGUMENT, nothing deleted.
+        await using var cluster = await MeshTestCluster.CreateAsync(Schema);
+        await SeedAsync(cluster.Datastore,
+            ("readme", "viewer", "alice"), ("readme", "viewer", "bob"), ("readme", "viewer", "carol"));
+
+        var ex = await Assert.ThrowsAsync<RpcException>(() => Service(cluster).DeleteRelationships(
+            new V1::DeleteRelationshipsRequest { RelationshipFilter = ReadmeFilter(), OptionalLimit = 2 },
+            FakeServerCallContext.Default));
+
+        Assert.Equal(StatusCode.InvalidArgument, ex.StatusCode);
+        Assert.Equal("found more than 2 relationships to be deleted and partial deletion was not requested", ex.Status.Detail);
+        Assert.Equal(3, await CountStoredAsync(cluster, "document"));
+
+        // At or under the limit, the transactional delete removes everything and reports COMPLETE.
+        var resp = await Service(cluster).DeleteRelationships(
+            new V1::DeleteRelationshipsRequest { RelationshipFilter = ReadmeFilter(), OptionalLimit = 3 },
+            FakeServerCallContext.Default);
+        Assert.Equal(3UL, resp.RelationshipsDeletedCount);
+        Assert.Equal(V1::DeleteRelationshipsResponse.Types.DeletionProgress.Complete, resp.DeletionProgress);
+    }
+
+    [Fact]
+    public async Task WriteRelationships_transaction_metadata_over_65000_bytes_is_invalid_argument()
+    {
+        // SpiceDB MaximumTransactionMetadataSize: TransactionMetadataTooLargeErr -> INVALID_ARGUMENT.
+        await using var cluster = await MeshTestCluster.CreateAsync(Schema);
+
+        var request = WriteReq(V1::RelationshipUpdate.Types.Operation.Touch, "readme", "alice");
+        request.OptionalTransactionMetadata = MetadataOfBytes(65_000);
+        var ex = await Assert.ThrowsAsync<RpcException>(() =>
+            Service(cluster).WriteRelationships(request, FakeServerCallContext.Default));
+
+        Assert.Equal(StatusCode.InvalidArgument, ex.StatusCode);
+        Assert.Matches("^metadata size of [0-9]+ is greater than maximum allowed of 65000$", ex.Status.Detail);
+        Assert.Equal(0, await CountStoredAsync(cluster, "document"));
+
+        // Metadata under the cap is accepted.
+        request.OptionalTransactionMetadata = MetadataOfBytes(100);
+        await Service(cluster).WriteRelationships(request, FakeServerCallContext.Default);
+    }
+
+    [Fact]
+    public async Task DeleteRelationships_transaction_metadata_over_65000_bytes_is_invalid_argument()
+    {
+        await using var cluster = await MeshTestCluster.CreateAsync(Schema);
+
+        var ex = await Assert.ThrowsAsync<RpcException>(() => Service(cluster).DeleteRelationships(
+            new V1::DeleteRelationshipsRequest
+            {
+                RelationshipFilter = ReadmeFilter(),
+                OptionalTransactionMetadata = MetadataOfBytes(65_000),
+            },
+            FakeServerCallContext.Default));
+
+        Assert.Equal(StatusCode.InvalidArgument, ex.StatusCode);
+        Assert.Matches("^metadata size of [0-9]+ is greater than maximum allowed of 65000$", ex.Status.Detail);
+    }
+
     [Fact]
     public async Task DeleteRelationships_deletes_matching_and_returns_token()
     {
