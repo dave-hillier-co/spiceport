@@ -72,6 +72,10 @@ internal static class StructuralEquality
                 return JsonElement.DeepEquals(x, y);
             case (IReadOnlyDictionary<string, object?> x, IReadOnlyDictionary<string, object?> y):
                 return ContextEqual(x, y);
+            // A map is never equal to a list (a protobuf Struct and ListValue differ even when both are
+            // empty), so a map only reaches the sequence comparison below when both sides are maps.
+            case (IReadOnlyDictionary<string, object?>, _) or (_, IReadOnlyDictionary<string, object?>):
+                return false;
             case (string x, string y):
                 return string.Equals(x, y, StringComparison.Ordinal);
             case (IEnumerable x, IEnumerable y) when a is not string && b is not string:

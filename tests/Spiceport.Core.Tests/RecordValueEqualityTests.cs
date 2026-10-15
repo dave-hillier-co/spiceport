@@ -166,6 +166,17 @@ public class RecordValueEqualityTests
     }
 
     [Fact]
+    public void ContextualizedCaveat_does_not_equate_an_empty_map_with_an_empty_list()
+    {
+        // A context is a protobuf Struct: {} (a struct) and [] (a list) are different values.
+        var map = new ContextualizedCaveat("c", new Dictionary<string, object?> { ["x"] = new Dictionary<string, object?>() });
+        var list = new ContextualizedCaveat("c", new Dictionary<string, object?> { ["x"] = new List<object?>() });
+
+        Assert.NotEqual(map, list);
+        Assert.NotEqual(list, map);
+    }
+
+    [Fact]
     public void CaveatDefinition_equality_ignores_parameter_insertion_order_and_sees_nested_child_types()
     {
         static CaveatDefinition Make(string listElement, bool reverseInsertion)
