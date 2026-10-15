@@ -15,8 +15,11 @@ namespace Spiceport.Engine;
 /// definitions, ordered by name so the result is independent of enumeration order. The rendering walks
 /// the full model (relations, type information, userset rewrites and their nested set operations) so
 /// that two schemas sharing namespace names but differing in their relations/permissions hash
-/// differently. (The default record <c>ToString()</c> cannot be relied on here: it renders nested
-/// <see cref="ImmutableList{T}"/> properties as their type name rather than their contents.)
+/// differently. Caveats are rendered structurally too: the name, the serialized expression bytes (hex),
+/// and the parameters ordered by name with their full (possibly generic) type references, so that a
+/// caveat body or parameter-type edit changes the hash. (The default record <c>ToString()</c> cannot be
+/// relied on here: it renders <c>byte[]</c>, dictionary and nested <see cref="ImmutableList{T}"/>
+/// properties as their type name rather than their contents.)
 /// </remarks>
 public static class SchemaHash
 {
@@ -41,7 +44,7 @@ public static class SchemaHash
         {
             foreach (var c in caveats.OrderBy(c => c.Name, StringComparer.Ordinal))
             {
-                sb.Append(c).Append('\n');
+                AppendCaveat(sb, c);
             }
         }
 
@@ -54,6 +57,41 @@ public static class SchemaHash
         ImmutableDictionary<string, NamespaceDefinition> namespaces,
         IEnumerable<CaveatDefinition>? caveats = null) =>
         Compute(namespaces.Values, caveats);
+
+    private static void AppendCaveat(StringBuilder sb, CaveatDefinition caveat)
+    {
+        sb.Append("caveat ").Append(caveat.Name)
+          .Append(" expr=").Append(Convert.ToHexString(caveat.SerializedExpression))
+          .Append('\n');
+        foreach (var (name, type) in caveat.ParameterTypes.OrderBy(p => p.Key, StringComparer.Ordinal))
+        {
+            sb.Append("  param ").Append(name).Append(' ');
+            AppendCaveatType(sb, type);
+            sb.Append('\n');
+        }
+    }
+
+    private static void AppendCaveatType(StringBuilder sb, CaveatTypeReference type)
+    {
+        sb.Append(type.TypeName);
+        if (type.ChildTypes is not { Count: > 0 } children)
+        {
+            return;
+        }
+
+        sb.Append('<');
+        for (var i = 0; i < children.Count; i++)
+        {
+            if (i > 0)
+            {
+                sb.Append(',');
+            }
+
+            AppendCaveatType(sb, children[i]);
+        }
+
+        sb.Append('>');
+    }
 
     private static void AppendNamespace(StringBuilder sb, NamespaceDefinition ns)
     {
