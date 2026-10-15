@@ -13,7 +13,9 @@ namespace Spiceport.Grains;
 /// LookupResources resumes from the engine's <see cref="LookupResourcesCursor"/> (one ordered section
 /// per nesting level). LookupSubjects has no engine cursor — its results are deterministically ordered
 /// by subject id, so a cursor is simply the last id already returned and resumption skips ids at or
-/// before it. Both encode to a URL-safe base64 string; an empty/whitespace token means "from the start".
+/// before it. Both encode to a standard-alphabet base64 string (<c>+</c>, <c>/</c> and <c>=</c> padding,
+/// as SpiceDB's own cursors use <c>base64.StdEncoding</c>), so a token placed in a URL must be
+/// percent-encoded; an empty/whitespace token means "from the start".
 /// </remarks>
 internal static class ReverseOpsCursorCodec
 {
