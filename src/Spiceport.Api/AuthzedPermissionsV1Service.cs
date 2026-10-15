@@ -321,10 +321,9 @@ public sealed class AuthzedPermissionsV1Service(
         var consistency = ToWire(request.Consistency);
 
         // v1 contract: optional_limit (field 6) caps the resources returned; optional_cursor (field 7)
-        // resumes after a prior page. SpiceDB disables cursors entirely when no limit is set, so we
-        // only attach after_result_cursor when a limit was requested.
+        // resumes after a prior page. Like SpiceDB, every streamed item carries after_result_cursor
+        // whether or not a limit was set, so an unlimited stream can be resumed from any item.
         var limit = request.OptionalLimit == 0 ? (int?)null : (int)request.OptionalLimit;
-        var emitCursors = limit is not null;
         string? cursor = request.OptionalCursor is { } oc && !string.IsNullOrEmpty(oc.Token) ? oc.Token : null;
 
         // Validate the resource definition+permission and subject definition+relation up front
@@ -336,8 +335,8 @@ public sealed class AuthzedPermissionsV1Service(
 
         // One in-process stream. A limited request takes at most `limit` items then stops (the RPC stream
         // terminates; the client resumes via the last item's cursor). An unlimited request drains the whole
-        // reachable set. `limit` also drives the engine path: a limited walk is cursor-bearing (so every item
-        // has a resume cursor), an unlimited/cursorless walk may take the Leopard fast path.
+        // reachable set. `limit` also drives the engine path: a limited walk runs the live traversal, an
+        // unlimited/cursorless walk may take the Leopard fast path; both give every item a resume cursor.
         var emitted = 0;
         try
         {
@@ -366,7 +365,7 @@ public sealed class AuthzedPermissionsV1Service(
                     partial.MissingRequiredContext.AddRange(r.Permissionship.MissingContextParams);
                     resp.PartialCaveatInfo = partial;
                 }
-                if (emitCursors && !string.IsNullOrEmpty(r.AfterResultCursor))
+                if (!string.IsNullOrEmpty(r.AfterResultCursor))
                     resp.AfterResultCursor = new V1::Cursor { Token = r.AfterResultCursor };
                 await responseStream.WriteAsync(resp);
 

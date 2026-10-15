@@ -11,7 +11,9 @@ namespace Spiceport.Grains;
 /// </summary>
 /// <remarks>
 /// LookupResources resumes from the engine's <see cref="LookupResourcesCursor"/> (one ordered section
-/// per nesting level). LookupSubjects has no engine cursor — its results are deterministically ordered
+/// per nesting level) when the live traversal produced the stream, or from a candidate-resume cursor
+/// (tag <c>C</c> plus the last resource id) when the Leopard accelerator did: that stream is the
+/// covered candidates in ordinal id order, so resumption skips ids at or before the last one. LookupSubjects has no engine cursor — its results are deterministically ordered
 /// by subject id, so a cursor is simply the last id already returned and resumption skips ids at or
 /// before it. Both encode to a URL-safe base64 string; an empty/whitespace token means "from the start".
 /// </remarks>
@@ -24,6 +26,30 @@ internal static class ReverseOpsCursorCodec
     private const string TagLeaf = "L";        // Portion-1 self-match: LastResourceId follows.
     private const string TagQuery = "Q";       // Query entrypoint: a six-field keyset follows.
     private const string TagStructural = "S";  // Structural rewrite / query first-chunk: no payload.
+    private const string TagCandidate = "C";   // Whole-token candidate resume: the last resource id follows.
+
+    /// <summary>
+    /// Encodes a LookupResources candidate-resume cursor: the stream it resumes is ordered ordinally by
+    /// resource id, so the last id emitted positions it completely.
+    /// </summary>
+    public static string EncodeCandidateResume(string lastResourceId) =>
+        ToToken(TagCandidate + FieldSeparator + Uri.EscapeDataString(lastResourceId));
+
+    /// <summary>
+    /// Decodes a LookupResources token as a candidate-resume cursor; false (with no exception) when the
+    /// token is empty or is an engine cursor, which <see cref="DecodeResources"/> then handles.
+    /// </summary>
+    public static bool TryDecodeCandidateResume(string? token, out string lastResourceId)
+    {
+        lastResourceId = string.Empty;
+        var raw = FromToken(token);
+        const string prefix = TagCandidate + ":";
+        if (raw is null || !raw.StartsWith(prefix, StringComparison.Ordinal))
+            return false;
+
+        lastResourceId = Uri.UnescapeDataString(raw[prefix.Length..]);
+        return true;
+    }
 
     /// <summary>Encodes a LookupResources engine cursor to an opaque token, or null when there is none.</summary>
     public static string? Encode(LookupResourcesCursor? cursor)

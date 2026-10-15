@@ -192,10 +192,11 @@ public sealed class ReverseOps(
 
     /// <summary>
     /// Streams the resources (of the requested type) on which the subject holds the permission, one at a
-    /// time, each with the opaque cursor positioned immediately after it. When <see cref="LookupResourcesArgs.Limit"/>
-    /// is set this runs the cursor-bearing live traversal (so every item carries a resume cursor); an
-    /// unlimited, cursorless enumeration may take the Leopard fast path (a complete candidate set confirmed
-    /// by Check). The caller applies any client limit by stopping.
+    /// time, each with the opaque cursor positioned immediately after it — on every path, limited or not,
+    /// as SpiceDB does. When <see cref="LookupResourcesArgs.Limit"/> or an engine cursor is set this runs
+    /// the live traversal, whose cursors are engine positions; an unlimited, cursorless enumeration may
+    /// take the Leopard fast path (a complete candidate set confirmed by Check, streamed in ordinal id
+    /// order), whose cursors are candidate-resume cursors. The caller applies any client limit by stopping.
     /// </summary>
     public async IAsyncEnumerable<FoundResourceWire> StreamLookupResources(
         LookupResourcesArgs args,
@@ -213,35 +214,146 @@ public sealed class ReverseOps(
         // all come from the same schema, even if a concurrent write swaps the ambient current mid-call.
         var snapshot = await ResolveSchema(schemaHash, revision, cancellationToken);
         var engine = new LookupResourcesEngine(snapshot.Namespaces, snapshot.Caveats, snapshot.ReachabilityFirst);
-        var startCursor = ReverseOpsCursorCodec.DecodeResources(args.Cursor);
-
-        // A supplied client limit means the caller needs per-item resume cursors: pass the limit into the
-        // engine so it runs the cursor-bearing live traversal (the Leopard fast path yields no per-item
-        // cursor and is reachable only for an unlimited, cursorless enumeration, where the caller wants no
-        // cursors). This mirrors the retired grain's engine-invocation decision exactly.
+        var reader = readerSource.GraphReaderAt(revision);
         var limit = args.Limit is { } l && l > 0 ? l : (int?)null;
 
-        // The Leopard accelerator (null unless it decides this request is a fresh, unpaged enumeration of
-        // a covered shape). Dispatches the membership-walk grain mesh and confirms every candidate with
-        // Check, so verdicts are unchanged from the live traversal.
+        // A candidate-resume cursor continues a stream the Leopard accelerator produced: that stream is the
+        // covered candidates in ordinal id order, so the resume re-derives the same ordered set and skips
+        // ids at or before the last one emitted. Any limit is applied by the caller stopping.
+        if (ReverseOpsCursorCodec.TryDecodeCandidateResume(args.Cursor, out var lastCandidate))
+        {
+            await foreach (var item in CandidateOrderedStream(
+                    engine, reader, snapshot, args, revision, now, token, lastCandidate, cancellationToken)
+                .WithCancellation(cancellationToken))
+            {
+                yield return item;
+            }
+            yield break;
+        }
+
+        var startCursor = ReverseOpsCursorCodec.DecodeResources(args.Cursor);
+
+        // A client limit or an engine cursor runs the cursor-bearing live traversal (a paged walk must
+        // resume where the engine left off). An unlimited, cursorless enumeration may take the Leopard
+        // accelerator (null unless it decides this shape is covered): it dispatches the membership-walk
+        // grain mesh and confirms every candidate with Check, so verdicts are unchanged from the live
+        // traversal, and each item carries a candidate-resume cursor.
         var candidates = await ReverseOpsSupport.AcquireCoveredCandidates(
             grainFactory, membershipWalkOptions, snapshot,
             args.SubjectType, args.SubjectId, args.SubjectRelation, args.ResourceType, args.Permission,
             revision, hasCursorOrLimit: args.Cursor is not null || limit is not null, cancellationToken);
 
+        if (candidates is not null)
+        {
+            await foreach (var item in ConfirmCandidates(
+                    engine, reader, args, OrdinalAfter(candidates, after: null), now, token, cancellationToken)
+                .WithCancellation(cancellationToken))
+            {
+                yield return item;
+            }
+            yield break;
+        }
+
         // The engine traversal reads through the IGraphReaderSource seam at the same pinned revision;
         // token minting stays on PinRevision, schema resolution on the ISchemaSource seam, and cursor
         // handling on the codec above.
         await foreach (var found in engine.LookupResources(
-                readerSource.GraphReaderAt(revision), args.SubjectType, args.SubjectId, args.SubjectRelation,
-                args.ResourceType, args.Permission, candidates, args.Context, now, startCursor, limit, cancellationToken)
+                reader, args.SubjectType, args.SubjectId, args.SubjectRelation,
+                args.ResourceType, args.Permission, args.Context, now, startCursor, limit, cancellationToken)
             .WithCancellation(cancellationToken))
         {
-            var permissionship = found.Membership == Membership.Caveated
-                ? Permissionship.Caveated(found.MissingContextParams)
-                : Permissionship.Member;
             yield return new FoundResourceWire(
-                found.ResourceId, permissionship, ReverseOpsCursorCodec.Encode(found.AfterCursor), token);
+                found.ResourceId, ToPermissionship(found), ReverseOpsCursorCodec.Encode(found.AfterCursor), token);
         }
     }
+
+    /// <summary>
+    /// Resumes a candidate-ordered stream after <paramref name="lastCandidate"/>. The accelerator is asked
+    /// again as for a fresh enumeration; if it declines (disabled, uncovered, or an incomplete walk), the
+    /// live traversal is drained instead, deduplicated by resource id, and put in the same ordinal order,
+    /// so the resume is positioned identically either way.
+    /// </summary>
+    private async IAsyncEnumerable<FoundResourceWire> CandidateOrderedStream(
+        LookupResourcesEngine engine,
+        IGraphReader reader,
+        SchemaSnapshot snapshot,
+        LookupResourcesArgs args,
+        IRevision revision,
+        DateTimeOffset now,
+        string token,
+        string lastCandidate,
+        [EnumeratorCancellation] CancellationToken cancellationToken)
+    {
+        var candidates = await ReverseOpsSupport.AcquireCoveredCandidates(
+            grainFactory, membershipWalkOptions, snapshot,
+            args.SubjectType, args.SubjectId, args.SubjectRelation, args.ResourceType, args.Permission,
+            revision, hasCursorOrLimit: false, cancellationToken);
+
+        if (candidates is not null)
+        {
+            await foreach (var item in ConfirmCandidates(
+                    engine, reader, args, OrdinalAfter(candidates, lastCandidate), now, token, cancellationToken)
+                .WithCancellation(cancellationToken))
+            {
+                yield return item;
+            }
+            yield break;
+        }
+
+        // Live fallback: one result per resource id. A resource reached through several entrypoints is
+        // a member if any path makes it one; otherwise it keeps the first caveated result's missing params.
+        var byId = new Dictionary<string, FoundResource>(StringComparer.Ordinal);
+        await foreach (var found in engine.LookupResources(
+                reader, args.SubjectType, args.SubjectId, args.SubjectRelation,
+                args.ResourceType, args.Permission, args.Context, now, cursor: null, limit: null, cancellationToken)
+            .WithCancellation(cancellationToken))
+        {
+            if (!byId.TryGetValue(found.ResourceId, out var existing)
+                || (existing.Membership != Membership.Member && found.Membership == Membership.Member))
+            {
+                byId[found.ResourceId] = found;
+            }
+        }
+
+        foreach (var id in OrdinalAfter(byId.Keys, lastCandidate))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            yield return new FoundResourceWire(
+                id, ToPermissionship(byId[id]), ReverseOpsCursorCodec.EncodeCandidateResume(id), token);
+        }
+    }
+
+    /// <summary>Confirms ordered covered candidates with Check, each item carrying a candidate-resume cursor.</summary>
+    private static async IAsyncEnumerable<FoundResourceWire> ConfirmCandidates(
+        LookupResourcesEngine engine,
+        IGraphReader reader,
+        LookupResourcesArgs args,
+        IReadOnlyList<string> orderedCandidates,
+        DateTimeOffset now,
+        string token,
+        [EnumeratorCancellation] CancellationToken cancellationToken)
+    {
+        await foreach (var found in engine.LookupResources(
+                reader, args.SubjectType, args.SubjectId, args.SubjectRelation,
+                args.ResourceType, args.Permission, orderedCandidates, args.Context, now,
+                cursor: null, limit: null, cancellationToken)
+            .WithCancellation(cancellationToken))
+        {
+            yield return new FoundResourceWire(
+                found.ResourceId, ToPermissionship(found),
+                ReverseOpsCursorCodec.EncodeCandidateResume(found.ResourceId), token);
+        }
+    }
+
+    /// <summary>The distinct ids in ordinal order, keeping only those strictly after <paramref name="after"/>.</summary>
+    private static List<string> OrdinalAfter(IEnumerable<string> ids, string? after) =>
+        ids.Distinct(StringComparer.Ordinal)
+            .Where(id => after is null || string.CompareOrdinal(id, after) > 0)
+            .Order(StringComparer.Ordinal)
+            .ToList();
+
+    private static Permissionship ToPermissionship(FoundResource found) =>
+        found.Membership == Membership.Caveated
+            ? Permissionship.Caveated(found.MissingContextParams)
+            : Permissionship.Member;
 }

@@ -1055,6 +1055,113 @@ public class AuthzedPermissionsV1ServiceTests
         Assert.All(writer.Collected, r => Assert.False(string.IsNullOrEmpty(r.LookedUpAt.Token)));
     }
 
+    private static readonly (string res, string rel, string subj)[] LookupSeed =
+    [
+        ("doc1", "viewer", "alice"),
+        ("doc2", "editor", "alice"),
+        ("doc3", "viewer", "bob"),
+        ("doc4", "viewer", "alice"),
+        ("doc5", "editor", "alice"),
+        ("doc6", "viewer", "alice"),
+        ("doc6", "editor", "alice"),
+        ("doc7", "viewer", "alice"),
+    ];
+
+    private static V1::LookupResourcesRequest AliceViewLookup(string? cursor = null)
+    {
+        var req = new V1::LookupResourcesRequest
+        {
+            Consistency = new V1::Consistency { FullyConsistent = true },
+            ResourceObjectType = "document",
+            Permission = "view",
+            Subject = UserSubject("alice"),
+        };
+        if (cursor is not null)
+            req.OptionalCursor = new V1::Cursor { Token = cursor };
+        return req;
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task LookupResources_without_limit_emits_after_result_cursor_on_every_item(bool useMembershipWalk)
+    {
+        // Issue #47: SpiceDB populates after_result_cursor on every streamed item whenever cursor sections
+        // exist, with no limit condition (internal/services/v1/permissions.go). An unlimited stream must be
+        // resumable from any item — on the Leopard path (walk on) as well as the live traversal.
+        await using var cluster = await MeshTestCluster.CreateAsync(Schema, useMembershipWalk: useMembershipWalk);
+        await SeedAsync(cluster.Datastore, LookupSeed);
+
+        var writer = new CollectingStreamWriter<V1::LookupResourcesResponse>();
+        await Service(cluster).LookupResources(AliceViewLookup(), writer, FakeServerCallContext.Default);
+
+        Assert.NotEmpty(writer.Collected);
+        Assert.All(writer.Collected, r => Assert.False(string.IsNullOrEmpty(r.AfterResultCursor?.Token)));
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task LookupResources_unlimited_resume_from_mid_stream_cursor_yields_the_remainder(bool useMembershipWalk)
+    {
+        await using var cluster = await MeshTestCluster.CreateAsync(Schema, useMembershipWalk: useMembershipWalk);
+        await SeedAsync(cluster.Datastore, LookupSeed);
+
+        var full = new CollectingStreamWriter<V1::LookupResourcesResponse>();
+        await Service(cluster).LookupResources(AliceViewLookup(), full, FakeServerCallContext.Default);
+        var fullIds = full.Collected.Select(r => r.ResourceObjectId).ToHashSet(StringComparer.Ordinal);
+        Assert.Equal(new[] { "doc1", "doc2", "doc4", "doc5", "doc6", "doc7" }, fullIds.Order(StringComparer.Ordinal));
+
+        for (var k = 1; k < full.Collected.Count; k++)
+        {
+            var resumed = new CollectingStreamWriter<V1::LookupResourcesResponse>();
+            await Service(cluster).LookupResources(
+                AliceViewLookup(full.Collected[k - 1].AfterResultCursor.Token), resumed, FakeServerCallContext.Default);
+
+            var union = full.Collected.Take(k).Select(r => r.ResourceObjectId)
+                .Concat(resumed.Collected.Select(r => r.ResourceObjectId))
+                .ToHashSet(StringComparer.Ordinal);
+            Assert.Equal(fullIds.Order(StringComparer.Ordinal), union.Order(StringComparer.Ordinal));
+
+            // Resuming never re-emits an item already delivered before the cursor (beyond the per-entrypoint
+            // repeats the live traversal emits within one stream).
+            Assert.All(resumed.Collected, r => Assert.True(
+                full.Collected.Skip(k).Any(f => f.ResourceObjectId == r.ResourceObjectId)));
+        }
+    }
+
+    [Fact]
+    public async Task LookupResources_candidate_cursor_resumes_when_the_walk_declines_on_resume()
+    {
+        // A cursor minted on the Leopard path must stay resumable when the accelerator is unavailable on
+        // the resuming request (here: a cluster with the walk disabled, over the same data).
+        string cursor;
+        List<string> firstIds;
+        await using (var walkOn = await MeshTestCluster.CreateAsync(Schema, useMembershipWalk: true))
+        {
+            await SeedAsync(walkOn.Datastore, LookupSeed);
+            var full = new CollectingStreamWriter<V1::LookupResourcesResponse>();
+            await Service(walkOn).LookupResources(AliceViewLookup(), full, FakeServerCallContext.Default);
+            cursor = full.Collected[2].AfterResultCursor.Token;
+            firstIds = full.Collected.Take(3).Select(r => r.ResourceObjectId).ToList();
+        }
+
+        // The stream came from the accelerator: its cursors are candidate-resume cursors.
+        Assert.StartsWith("C:", System.Text.Encoding.UTF8.GetString(Convert.FromBase64String(cursor)), StringComparison.Ordinal);
+
+        await using var walkOff = await MeshTestCluster.CreateAsync(Schema, useMembershipWalk: false);
+        await SeedAsync(walkOff.Datastore, LookupSeed);
+        var resumed = new CollectingStreamWriter<V1::LookupResourcesResponse>();
+        await Service(walkOff).LookupResources(AliceViewLookup(cursor), resumed, FakeServerCallContext.Default);
+
+        var resumedIds = resumed.Collected.Select(r => r.ResourceObjectId).ToList();
+        Assert.Empty(resumedIds.Intersect(firstIds));
+        Assert.Equal(
+            new[] { "doc1", "doc2", "doc4", "doc5", "doc6", "doc7" },
+            firstIds.Concat(resumedIds).Order(StringComparer.Ordinal));
+        Assert.All(resumed.Collected, r => Assert.False(string.IsNullOrEmpty(r.AfterResultCursor?.Token)));
+    }
+
     [Fact]
     public async Task LookupSubjects_populates_modern_and_deprecated_fields()
     {
