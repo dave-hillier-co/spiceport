@@ -46,6 +46,33 @@ public class TupleStringsExpirationTests
         Assert.Equal(TimeSpan.Zero, rel.OptionalExpiration!.Value.Offset);
     }
 
+    [Theory]
+    [InlineData("2025-01-02T03:04:05-15:00", "2025-01-02T18:04:05Z")]
+    [InlineData("2025-01-02T03:04:05-23:59", "2025-01-03T03:03:05Z")]
+    public void Offset_beyond_fourteen_hours_is_accepted_as_go_does(string expiration, string expectedUtc)
+    {
+        // Go's RFC3339 parser bounds the offset at 23:59, wider than .NET's +/-14:00.
+        var rel = TupleStrings.ParseRelationship($"{Prefix}[expiration:{expiration}]");
+
+        Assert.Equal(DateTimeOffset.Parse(expectedUtc, System.Globalization.CultureInfo.InvariantCulture),
+            rel.OptionalExpiration);
+        Assert.Equal(TimeSpan.Zero, rel.OptionalExpiration!.Value.Offset);
+    }
+
+    [Theory]
+    [InlineData("2025-01-02T03:04:05-24:00")]
+    [InlineData("2025-01-02T03:04:05-01:60")]
+    [InlineData("2025-13-02T03:04:05Z")]
+    [InlineData("2025-02-29T03:04:05Z")]
+    [InlineData("2025-01-02T24:04:05Z")]
+    // Valid to Go, but not representable as a DateTimeOffset: year 0, and a UTC instant past 9999.
+    [InlineData("0000-01-01T00:00:00Z")]
+    [InlineData("9999-12-31T23:30:00-01:00")]
+    public void Out_of_range_expiration_is_rejected_without_throwing(string expiration)
+    {
+        Assert.False(TupleStrings.TryParseRelationship($"{Prefix}[expiration:{expiration}]", out _));
+    }
+
     [Fact]
     public void Formatted_expiration_round_trips()
     {

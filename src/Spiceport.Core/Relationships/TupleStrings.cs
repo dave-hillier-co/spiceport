@@ -205,26 +205,52 @@ public static partial class TupleStrings
     /// <summary>
     /// Parses an RFC3339 timestamp strictly, as upstream SpiceDB does with Go's
     /// <c>time.Parse(time.RFC3339, ...)</c>: a full date, a full time, an optional fraction of at
-    /// least one digit, and a mandatory <c>Z</c> or numeric offset. Fractions beyond the seven
-    /// digits a tick can hold are truncated. The result is normalised to UTC.
+    /// least one digit, and a mandatory <c>Z</c> or numeric offset of at most 23:59 (Go's bound,
+    /// wider than the +/-14:00 a <see cref="DateTimeOffset"/> offset allows, so the offset is
+    /// applied arithmetically). Fractions beyond the seven digits a tick can hold are truncated.
+    /// The result is normalised to UTC. Go also accepts year 0000 and instants whose UTC form
+    /// falls outside 0001..9999; a <see cref="DateTimeOffset"/> cannot represent those, so they
+    /// are rejected.
     /// </summary>
     private static bool TryParseRfc3339(string value, out DateTimeOffset result)
     {
+        result = default;
         var match = Rfc3339Regex().Match(value);
         if (!match.Success)
         {
-            result = default;
             return false;
         }
 
         var fraction = match.Groups["fraction"].Value;
         fraction = fraction.Length > 7 ? fraction[..7] : fraction.PadRight(7, '0');
-        var zone = match.Groups["zone"].Value;
-        var normalized = $"{match.Groups["dateTime"].Value}.{fraction}{(zone == "Z" ? "+00:00" : zone)}";
+        if (!DateTime.TryParseExact(
+                $"{match.Groups["dateTime"].Value}.{fraction}", "yyyy-MM-dd'T'HH:mm:ss.fffffff",
+                CultureInvariant, DateTimeStyles.None, out var local))
+        {
+            return false;
+        }
 
-        return DateTimeOffset.TryParseExact(
-            normalized, "yyyy-MM-dd'T'HH:mm:ss.fffffffzzz", CultureInvariant,
-            DateTimeStyles.AdjustToUniversal, out result);
+        var zone = match.Groups["zone"].Value;
+        var offsetTicks = 0L;
+        if (zone != "Z")
+        {
+            var hours = int.Parse(zone.AsSpan(1, 2), CultureInvariant);
+            var minutes = int.Parse(zone.AsSpan(4, 2), CultureInvariant);
+            if (hours > 23 || minutes > 59)
+            {
+                return false;
+            }
+            offsetTicks = (zone[0] == '-' ? -1 : 1) * new TimeSpan(hours, minutes, 0).Ticks;
+        }
+
+        var utcTicks = local.Ticks - offsetTicks;
+        if (utcTicks < DateTime.MinValue.Ticks || utcTicks > DateTime.MaxValue.Ticks)
+        {
+            return false;
+        }
+
+        result = new DateTimeOffset(utcTicks, TimeSpan.Zero);
+        return true;
     }
 
     /// <summary>Validates a resource object id (1..1024 chars, allowed character set).</summary>
