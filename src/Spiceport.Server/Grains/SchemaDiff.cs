@@ -230,7 +230,9 @@ public static class SchemaDiff
                 continue;
             }
 
-            if (!CaveatTypeEquals(nextType, existingType))
+            // CaveatTypeReference compares its child types element-wise, so two separate
+            // parses of the same list<int> are equal.
+            if (nextType != existingType)
                 deltas.Add(new SchemaDelta.CaveatParameterTypeChanged(next.Name, name, nextType, existingType));
         }
     }
@@ -268,30 +270,6 @@ public static class SchemaDiff
         // All other child kinds hold only scalars/records without collection fields, so value equality holds.
         _ => a == b,
     };
-
-    /// <summary>
-    /// Structural equality of two caveat parameter types. Needed because <see cref="CaveatTypeReference"/>
-    /// holds an <see cref="System.Collections.Immutable.ImmutableList{T}"/> of child types whose
-    /// <c>Equals</c> is reference-based, so default record equality reports separately-compiled-but-identical
-    /// type references (e.g. two <c>list&lt;int&gt;</c> parses) as different.
-    /// </summary>
-    public static bool CaveatTypeEquals(CaveatTypeReference? a, CaveatTypeReference? b)
-    {
-        if (a is null || b is null)
-            return ReferenceEquals(a, b);
-        if (a.TypeName != b.TypeName)
-            return false;
-        if (a.ChildTypes is null || b.ChildTypes is null)
-            return a.ChildTypes is null && b.ChildTypes is null;
-        if (a.ChildTypes.Count != b.ChildTypes.Count)
-            return false;
-        for (var i = 0; i < a.ChildTypes.Count; i++)
-        {
-            if (!CaveatTypeEquals(a.ChildTypes[i], b.ChildTypes[i]))
-                return false;
-        }
-        return true;
-    }
 
     /// <summary>
     /// Identity equality of two allowed subject types via their canonical source string, which folds the
