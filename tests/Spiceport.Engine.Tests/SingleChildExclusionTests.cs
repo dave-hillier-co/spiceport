@@ -49,17 +49,20 @@ public class SingleChildExclusionTests
         return namespaces.SetItem("document", document with { Relations = document.Relations.Replace(view, replaced) });
     }
 
-    private static async Task<DispatchCheckResult> CheckView(ImmutableDictionary<string, NamespaceDefinition> namespaces)
+    private static Task<DispatchCheckResult> CheckView(ImmutableDictionary<string, NamespaceDefinition> namespaces) =>
+        CheckView(namespaces, "alice", Relationship.Create(Onr("document", "readme", "viewer"), Onr("user", "alice")));
+
+    private static async Task<DispatchCheckResult> CheckView(
+        ImmutableDictionary<string, NamespaceDefinition> namespaces, string userId, params Relationship[] rels)
     {
-        var (store, reader) = await Seed(
-            Relationship.Create(Onr("document", "readme", "viewer"), Onr("user", "alice")));
+        var (store, reader) = await Seed(rels);
         var dispatcher = new LocalDispatcher(namespaces, _ => reader, DateTimeOffset.UtcNow);
         var meta = new ResolverMeta(
             (await store.HeadRevision()).Revision,
             CheckEngine.DefaultMaxDepth,
             ImmutableHashSet<VisitKey>.Empty);
         return await dispatcher.DispatchCheck(
-            new DispatchCheckRequest(Onr("document", "readme", "view"), Onr("user", "alice"), meta),
+            new DispatchCheckRequest(Onr("document", "readme", "view"), Onr("user", userId), meta),
             CancellationToken.None);
     }
 
@@ -88,5 +91,20 @@ public class SingleChildExclusionTests
         var result = await CheckView(WithViewRewrite(op => op));
 
         Assert.True(result.Member);
+    }
+
+    [Fact]
+    public async Task A_well_formed_exclusion_subtracts_its_second_operand()
+    {
+        Relationship[] rels =
+        [
+            Relationship.Create(Onr("document", "readme", "viewer"), Onr("user", "alice")),
+            Relationship.Create(Onr("document", "readme", "viewer"), Onr("user", "bob")),
+            Relationship.Create(Onr("document", "readme", "banned"), Onr("user", "bob")),
+        ];
+        var namespaces = WithViewRewrite(op => op);
+
+        Assert.True((await CheckView(namespaces, "alice", rels)).Member);
+        Assert.False((await CheckView(namespaces, "bob", rels)).Member);
     }
 }
