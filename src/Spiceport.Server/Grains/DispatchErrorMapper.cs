@@ -40,7 +40,7 @@ public static class DispatchErrorMapper
     /// </summary>
     /// <remarks>
     /// Order matters. Known domain exceptions are recognised FIRST so a domain failure that happens to be
-    /// wrapped is never mislabeled as a transport error. Then cancellation/deadline, then transport /
+    /// wrapped is never mislabeled as a transport error. Then cancellation, then transport /
     /// availability (retriable -> <see cref="DispatchErrorCode.Unavailable"/>), then everything else
     /// -> <see cref="DispatchErrorCode.Internal"/>.
     /// </remarks>
@@ -52,8 +52,10 @@ public static class DispatchErrorMapper
         if (IsDomainException(exception))
             return Classification.Domain;
 
-        // 2. Cancellation / deadline. A cancellation surfaced as a TimeoutException (a deadline elapsed)
-        //    is DeadlineExceeded; a plain caller cancellation is Cancelled.
+        // 2. Cancellation. An OperationCanceledException (including TaskCanceledException) is the
+        //    caller's own cancellation -> Cancelled. A TimeoutException is NOT treated as a deadline here:
+        //    Orleans raises it for a response timeout on one hop, a transient silo fault, so it falls
+        //    through to the transport branch below and maps to retriable Unavailable.
         if (exception is OperationCanceledException)
             return Classification.Mapped(DispatchErrorCode.Cancelled);
 
@@ -106,11 +108,9 @@ public static class DispatchErrorMapper
     /// Pure, given <see cref="Classify"/>.
     /// </summary>
     /// <remarks>
-    /// Shared by <see cref="CheckDispatchOutgoingCallFilter"/> (the normal path: every exception the
-    /// grain call itself produces) and <see cref="OrleansDispatcher"/>'s own cancellation-bridging catch
-    /// (the one case — the caller's own <c>CancellationToken</c> firing first inside
-    /// <c>Task.WaitAsync</c> — that never reaches the filter at all, because it is raised locally against
-    /// an abandoned await rather than surfaced from the grain call's own fault).
+    /// Called from <see cref="CheckDispatchOutgoingCallFilter"/>, which sees every exception the grain
+    /// call produces — caller cancellation included, since the caller's <c>CancellationToken</c> is
+    /// propagated into the grain call and faults it with an <see cref="OperationCanceledException"/>.
     /// </remarks>
     public static Exception Translate(Exception exception)
     {
@@ -124,6 +124,8 @@ public static class DispatchErrorMapper
                 "the permission check could not reach the silo that owns this sub-problem; the failure " +
                 "is transient and the request may be retried",
             DispatchErrorCode.Cancelled => "the permission check was cancelled",
+            // No producer: Classify never yields DeadlineExceeded today (a TimeoutException maps to
+            // Unavailable). The arm is kept so the enum's documented meaning stays wired end to end.
             DispatchErrorCode.DeadlineExceeded => "the permission check exceeded its deadline",
             _ => "the permission check failed with an unexpected dispatch error",
         };
