@@ -1086,6 +1086,86 @@ public class AuthzedPermissionsV1ServiceTests
     }
 
     [Fact]
+    public async Task ReadRelationships_cursor_that_is_not_base64_is_invalid_argument()
+    {
+        // SpiceDB: cursor.Decode fails -> InvalidCursorError (INVALID_ARGUMENT), never an empty OK stream.
+        await using var cluster = await MeshTestCluster.CreateAsync(Schema);
+        await SeedAsync(cluster.Datastore, ("readme", "viewer", "alice"));
+
+        var ex = await Assert.ThrowsAsync<RpcException>(() => Service(cluster).ReadRelationships(
+            new V1::ReadRelationshipsRequest
+            {
+                RelationshipFilter = ReadmeFilter(),
+                OptionalCursor = new V1::Cursor { Token = "zzz" },
+            },
+            new CollectingStreamWriter<V1::ReadRelationshipsResponse>(), FakeServerCallContext.Default));
+
+        Assert.Equal(StatusCode.InvalidArgument, ex.StatusCode);
+        Assert.StartsWith("error decoding cursor: ", ex.Status.Detail);
+    }
+
+    [Fact]
+    public async Task ReadRelationships_cursor_from_a_different_request_is_invalid_argument()
+    {
+        // SpiceDB binds the cursor to a hash of the request (filter, consistency, limit): a cursor minted
+        // for another call is rejected with ErrHashMismatch.
+        await using var cluster = await MeshTestCluster.CreateAsync(Schema);
+        await SeedAsync(cluster.Datastore, ("readme", "viewer", "alice"), ("readme", "viewer", "bob"));
+
+        var first = new CollectingStreamWriter<V1::ReadRelationshipsResponse>();
+        await Service(cluster).ReadRelationships(
+            new V1::ReadRelationshipsRequest { RelationshipFilter = ReadmeFilter(), OptionalLimit = 1 },
+            first, FakeServerCallContext.Default);
+
+        var ex = await Assert.ThrowsAsync<RpcException>(() => Service(cluster).ReadRelationships(
+            new V1::ReadRelationshipsRequest
+            {
+                RelationshipFilter = new V1::RelationshipFilter { ResourceType = "document" },
+                OptionalLimit = 1,
+                OptionalCursor = first.Collected[0].AfterResultCursor,
+            },
+            new CollectingStreamWriter<V1::ReadRelationshipsResponse>(), FakeServerCallContext.Default));
+
+        Assert.Equal(StatusCode.InvalidArgument, ex.StatusCode);
+        Assert.StartsWith("the cursor provided does not have the same arguments as the original API call", ex.Status.Detail);
+    }
+
+    [Fact]
+    public async Task ReadRelationships_cursor_without_a_parsable_resume_relationship_is_failed_precondition()
+    {
+        // SpiceDB: a cursor for this call whose section is not a relationship -> NewInvalidCursorErr
+        // ("could not parse resume relationship"), FAILED_PRECONDITION.
+        await using var cluster = await MeshTestCluster.CreateAsync(Schema);
+        var request = new V1::ReadRelationshipsRequest { RelationshipFilter = ReadmeFilter() };
+        request.OptionalCursor = new V1::Cursor
+        {
+            Token = ReadRelationshipsCursor.Encode(ReadRelationshipsCursor.RequestHash(request), "not a tuple"),
+        };
+
+        var ex = await Assert.ThrowsAsync<RpcException>(() => Service(cluster).ReadRelationships(
+            request, new CollectingStreamWriter<V1::ReadRelationshipsResponse>(), FakeServerCallContext.Default));
+
+        Assert.Equal(StatusCode.FailedPrecondition, ex.StatusCode);
+        Assert.Equal("the cursor provided is not valid: could not parse resume relationship", ex.Status.Detail);
+    }
+
+    [Fact]
+    public async Task ReadRelationships_after_result_cursor_is_opaque()
+    {
+        await using var cluster = await MeshTestCluster.CreateAsync(Schema);
+        await SeedAsync(cluster.Datastore, ("readme", "viewer", "alice"));
+
+        var read = new CollectingStreamWriter<V1::ReadRelationshipsResponse>();
+        await Service(cluster).ReadRelationships(
+            new V1::ReadRelationshipsRequest { RelationshipFilter = ReadmeFilter() },
+            read, FakeServerCallContext.Default);
+
+        var token = Assert.Single(read.Collected).AfterResultCursor.Token;
+        Assert.DoesNotContain("alice", token);
+        Assert.NotEmpty(Convert.FromBase64String(token));
+    }
+
+    [Fact]
     public async Task DeleteRelationships_partial_deletion_honours_optional_limit()
     {
         await using var cluster = await MeshTestCluster.CreateAsync(Schema);

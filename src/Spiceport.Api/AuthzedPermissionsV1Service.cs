@@ -212,11 +212,13 @@ public sealed class AuthzedPermissionsV1Service(
         var filter = ToWire(request.RelationshipFilter);
         var consistency = ToWire(request.Consistency);
         var limit = request.OptionalLimit == 0 ? (int?)null : (int)request.OptionalLimit;
-        var cursor = request.OptionalCursor is { Token.Length: > 0 } c ? c.Token : null;
+        var requestHash = ReadRelationshipsCursor.RequestHash(request);
+        var cursor = ReadRelationshipsCursor.Decode(request.OptionalCursor, requestHash);
 
         // One in-process read over one pinned snapshot (the grain hop and page loop are both gone). Each
-        // item carries the per-message read-at token and, as in SpiceDB, an after_result_cursor that
-        // optional_cursor resumes from; optional_limit stops the stream after that many relationships.
+        // item carries the per-message read-at token and, as in SpiceDB, an opaque after_result_cursor
+        // bound to this request that optional_cursor resumes from; optional_limit stops the stream after
+        // that many relationships.
         var emitted = 0;
         try
         {
@@ -227,7 +229,7 @@ public sealed class AuthzedPermissionsV1Service(
                 {
                     ReadAt = new V1::ZedToken { Token = item.ReadAtToken },
                     Relationship = ToProto(item.Relationship),
-                    AfterResultCursor = new V1::Cursor { Token = item.ResumeCursor },
+                    AfterResultCursor = new V1::Cursor { Token = ReadRelationshipsCursor.Encode(requestHash, item.ResumeCursor) },
                 });
 
                 emitted++;
