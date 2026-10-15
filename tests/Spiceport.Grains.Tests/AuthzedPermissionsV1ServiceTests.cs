@@ -1131,12 +1131,22 @@ public class AuthzedPermissionsV1ServiceTests
         Assert.Equal("found more than 2 relationships to be deleted and partial deletion was not requested", ex.Status.Detail);
         Assert.Equal(3, await CountStoredAsync(cluster, "document"));
 
-        // At or under the limit, the transactional delete removes everything and reports COMPLETE.
+        // Exactly at the limit, the transactional delete removes everything; like SpiceDB (whose datastores
+        // report LimitReached when the deleted count equals the limit) it reports PARTIAL.
         var resp = await Service(cluster).DeleteRelationships(
             new V1::DeleteRelationshipsRequest { RelationshipFilter = ReadmeFilter(), OptionalLimit = 3 },
             FakeServerCallContext.Default);
         Assert.Equal(3UL, resp.RelationshipsDeletedCount);
-        Assert.Equal(V1::DeleteRelationshipsResponse.Types.DeletionProgress.Complete, resp.DeletionProgress);
+        Assert.Equal(V1::DeleteRelationshipsResponse.Types.DeletionProgress.Partial, resp.DeletionProgress);
+        Assert.Equal(0, await CountStoredAsync(cluster, "document"));
+
+        // Under the limit it reports COMPLETE.
+        await SeedAsync(cluster.Datastore, ("readme", "viewer", "alice"));
+        var under = await Service(cluster).DeleteRelationships(
+            new V1::DeleteRelationshipsRequest { RelationshipFilter = ReadmeFilter(), OptionalLimit = 3 },
+            FakeServerCallContext.Default);
+        Assert.Equal(1UL, under.RelationshipsDeletedCount);
+        Assert.Equal(V1::DeleteRelationshipsResponse.Types.DeletionProgress.Complete, under.DeletionProgress);
     }
 
     [Fact]

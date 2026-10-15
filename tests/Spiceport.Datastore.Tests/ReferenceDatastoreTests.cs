@@ -422,6 +422,27 @@ public class ReferenceDatastoreTests
     }
 
     [Fact]
+    public async Task DeleteRelationships_ExactlyLimitMatches_ReportsLimitReached()
+    {
+        // SpiceDB's datastores report LimitReached when the deleted count equals the limit (memdb:
+        // `counter == limit`; postgres: `RowsAffected() == limit`), even if nothing is left behind.
+        var ds = new ReferenceDatastore();
+        await ds.ReadWriteTx(async tx => await tx.WriteRelationships(
+        [
+            new RelationshipUpdate(Rel("document", "doc1", "viewer", "user", "alice"), UpdateOperation.Create),
+            new RelationshipUpdate(Rel("document", "doc2", "viewer", "user", "bob"), UpdateOperation.Create),
+        ]));
+
+        (ulong Count, bool ReachedLimit) deleteResult = default;
+        var rev = await ds.ReadWriteTx(async tx =>
+            deleteResult = await tx.DeleteRelationships(new RelationshipsFilter { OptionalResourceType = "document" }, limit: 2));
+
+        Assert.Equal(2ul, deleteResult.Count);
+        Assert.True(deleteResult.ReachedLimit);
+        Assert.Empty(await Collect(ds.SnapshotReader(rev).QueryRelationships(new RelationshipsFilter())));
+    }
+
+    [Fact]
     public async Task SchemaWriteAndReadBack()
     {
         var ds = new ReferenceDatastore();

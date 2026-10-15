@@ -78,7 +78,11 @@ internal sealed class MvccReadWriteTransaction : IReadWriteTransaction
                 matched.Add(key);
         }
 
-        var reachedLimit = false;
+        // As in SpiceDB's datastores (memdb `counter == limit`, postgres `RowsAffected() == limit`), the
+        // limit counts as reached whenever the deletion removed exactly `limit` rows, even when nothing
+        // was left behind: the API reports DELETION_PROGRESS_PARTIAL from this flag.
+        var reachedLimit = limit is { } cap
+            && ((ulong)matched.Count > cap || (cap > 0 && (ulong)matched.Count == cap));
         var toRemove = matched;
         if (limit is { } lim && (ulong)matched.Count > lim)
         {
@@ -86,11 +90,10 @@ internal sealed class MvccReadWriteTransaction : IReadWriteTransaction
             // the base state's internal row order: the sequencer's write path assembles its base from
             // per-key shard states (whose concatenation order differs from the reference model's
             // insertion order), and the fold-equivalence gates require both backends to delete the SAME
-            // rows. Order canonically by the full six-tuple identity before truncating. When the limit
-            // is not reached every match dies, so ordering is irrelevant and skipped.
+            // rows. Order canonically by the full six-tuple identity before truncating. When no more
+            // than `limit` rows match every match dies, so ordering is irrelevant and skipped.
             matched.Sort(static (a, b) => CompareKeys(a, b));
             toRemove = matched.GetRange(0, (int)lim);
-            reachedLimit = true;
         }
 
         foreach (var key in toRemove)
