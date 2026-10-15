@@ -53,8 +53,8 @@ public readonly record struct VisitKey(
 
     /// <summary>
     /// Parses a canonical string produced by <see cref="ToCanonicalString"/>. Throws
-    /// <see cref="FormatException"/> on a malformed value (a bad or overrunning length prefix, a missing
-    /// part, or trailing characters) rather than silently defaulting any field.
+    /// <see cref="FormatException"/> on a malformed value (a bad, zero-padded or overrunning length
+    /// prefix, a missing part, or trailing characters) rather than silently defaulting any field.
     /// </summary>
     public static VisitKey FromCanonicalString(string value)
     {
@@ -68,7 +68,10 @@ public readonly record struct VisitKey(
                 throw new FormatException(
                     $"Malformed VisitKey canonical string: expected 6 length-prefixed parts, got {i}.");
             var prefix = value.AsSpan(at, mark - at);
-            if (!int.TryParse(prefix, NumberStyles.None, CultureInfo.InvariantCulture, out var length))
+            // ToCanonicalString never emits a leading zero, so rejecting one keeps parsing the exact
+            // inverse of rendering: each key has one canonical string and no other string parses to it.
+            if ((prefix.Length > 1 && prefix[0] == '0')
+                || !int.TryParse(prefix, NumberStyles.None, CultureInfo.InvariantCulture, out var length))
                 throw new FormatException($"Malformed VisitKey canonical string: bad length prefix for part {i}.");
             var start = mark + 1;
             if (length > value.Length - start)

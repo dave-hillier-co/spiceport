@@ -56,6 +56,8 @@ public class VisitKeyTests
     [InlineData("x")]
     [InlineData("8\u001Fdocument")]
     [InlineData("-1\u001F")]
+    [InlineData("08\u001Fdocument4\u001Fdoc14\u001Fview4\u001Fuser5\u001Falice3\u001F...")]
+    [InlineData("8\u001Fdocument4\u001Fdoc14\u001Fview4\u001Fuser5\u001Falice03\u001F...")]
     [InlineData("+8\u001Fdocument4\u001Fdoc14\u001Fview4\u001Fuser5\u001Falice3\u001F...")]
     [InlineData("99\u001Fdocument4\u001Fdoc14\u001Fview4\u001Fuser5\u001Falice3\u001F...")]
     [InlineData("8\u001Fdocument4\u001Fdoc14\u001Fview4\u001Fuser5\u001Falice")]
