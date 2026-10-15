@@ -17,7 +17,8 @@ namespace Spiceport.Grains.Tests;
 /// Drives the server-streaming <c>authzed.api.v1</c> <see cref="AuthzedWatchV1Service"/> IN-PROCESS (no
 /// Kestrel). Verifies: tailing from head sees a subsequent write with its changes_through token; resuming
 /// from a pre-write token replays the write exactly once; cancellation terminates the stream cleanly; the
-/// optional_object_types filter excludes updates of other resource types.
+/// optional_object_types filter excludes updates of other resource types; optional_relationship_filters
+/// emit only updates matching any filter, and cannot be combined with optional_object_types.
 /// </summary>
 [Collection(MeshClusterCollection.Name)]
 public class AuthzedWatchV1ServiceTests
@@ -180,6 +181,100 @@ public class AuthzedWatchV1ServiceTests
 
         Assert.All(writer.Collected,
             r => Assert.All(r.Updates, u => Assert.Equal("document", u.Relationship.Resource.ObjectType)));
+    }
+
+    [Fact]
+    public async Task Watch_with_relationship_filter_emits_only_matching_updates()
+    {
+        await using var cluster = await MeshTestCluster.CreateAsync(Schema);
+        var service = Service(cluster);
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        var writer = new CollectingStreamWriter<V1::WatchResponse>();
+        var ctx = new FakeServerCallContext(cts.Token);
+
+        var request = new V1::WatchRequest();
+        request.OptionalRelationshipFilters.Add(new V1::RelationshipFilter
+        {
+            ResourceType = "document",
+            OptionalRelation = "viewer",
+            OptionalSubjectFilter = new V1::SubjectFilter { SubjectType = "user", OptionalSubjectId = "alice" },
+        });
+        var watchTask = service.Watch(request, writer, ctx);
+
+        // Same resource type and relation, but a different subject: filtered out server-side.
+        await WriteViewer(cluster, "document", "doc1", "bob");
+        await WriteViewer(cluster, "document", "doc2", "alice");
+
+        var response = await writer.WaitForNext(TimeSpan.FromSeconds(10), watchTask);
+        cts.Cancel();
+        await watchTask;
+
+        var update = Assert.Single(response.Updates);
+        Assert.Equal("doc2", update.Relationship.Resource.ObjectId);
+        Assert.Equal("alice", update.Relationship.Subject.Object.ObjectId);
+        Assert.All(writer.Collected,
+            r => Assert.All(r.Updates, u => Assert.Equal("alice", u.Relationship.Subject.Object.ObjectId)));
+    }
+
+    [Fact]
+    public async Task Watch_with_multiple_relationship_filters_emits_updates_matching_any()
+    {
+        await using var cluster = await MeshTestCluster.CreateAsync(Schema);
+        var service = Service(cluster);
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        var writer = new CollectingStreamWriter<V1::WatchResponse>();
+        var ctx = new FakeServerCallContext(cts.Token);
+
+        var request = new V1::WatchRequest();
+        request.OptionalRelationshipFilters.Add(new V1::RelationshipFilter
+        {
+            ResourceType = "document",
+            OptionalResourceId = "doc1",
+        });
+        request.OptionalRelationshipFilters.Add(new V1::RelationshipFilter
+        {
+            ResourceType = "folder",
+            OptionalResourceIdPrefix = "f",
+        });
+        var watchTask = service.Watch(request, writer, ctx);
+
+        // doc2 matches neither filter; f1 matches the second; doc1 matches the first.
+        await WriteViewer(cluster, "document", "doc2", "alice");
+        await WriteViewer(cluster, "folder", "f1", "alice");
+        await WriteViewer(cluster, "document", "doc1", "alice");
+
+        var first = await writer.WaitForNext(TimeSpan.FromSeconds(10), watchTask);
+        var second = await writer.WaitForNext(TimeSpan.FromSeconds(10), watchTask);
+        cts.Cancel();
+        await watchTask;
+
+        Assert.Equal("f1", Assert.Single(first.Updates).Relationship.Resource.ObjectId);
+        Assert.Equal("doc1", Assert.Single(second.Updates).Relationship.Resource.ObjectId);
+        Assert.All(writer.Collected,
+            r => Assert.All(r.Updates, u => Assert.NotEqual("doc2", u.Relationship.Resource.ObjectId)));
+    }
+
+    [Fact]
+    public async Task Watch_with_both_object_types_and_relationship_filters_is_invalid_argument()
+    {
+        await using var cluster = await MeshTestCluster.CreateAsync(Schema);
+        var service = Service(cluster);
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        var writer = new CollectingStreamWriter<V1::WatchResponse>();
+        var ctx = new FakeServerCallContext(cts.Token);
+
+        var request = new V1::WatchRequest();
+        request.OptionalObjectTypes.Add("document");
+        request.OptionalRelationshipFilters.Add(new V1::RelationshipFilter { ResourceType = "document" });
+
+        var ex = await Assert.ThrowsAsync<RpcException>(() => service.Watch(request, writer, ctx));
+
+        Assert.Equal(StatusCode.InvalidArgument, ex.StatusCode);
+        Assert.Equal("cannot specify both object types and relationship filters", ex.Status.Detail);
+        Assert.Empty(writer.Collected);
     }
 
     [Fact]

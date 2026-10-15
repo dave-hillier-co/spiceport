@@ -12,8 +12,9 @@ namespace Spiceport.Api;
 /// silo-singleton <see cref="IDatastore.Watch"/> directly (a long-lived stream is a poor fit for a
 /// request/response grain). Each emitted <see cref="V1::WatchResponse"/> carries its own ZedToken
 /// (<c>changes_through</c>) so a client can resume exactly once after a disconnect. v1 deltas vs the
-/// internal Watch: filter emitted updates by <c>optional_object_types</c>; no <c>schema_updated</c> field
-/// (this snapshot watches relationships only).
+/// internal Watch: filter emitted updates by <c>optional_object_types</c> or, mutually exclusively, by
+/// <c>optional_relationship_filters</c> (an update is emitted when it matches any filter); no
+/// <c>schema_updated</c> field (this snapshot watches relationships only).
 /// </summary>
 public sealed class AuthzedWatchV1Service(IDatastore datastore, ISchemaProvider schemaProvider)
     : V1::WatchService.WatchServiceBase
@@ -26,6 +27,16 @@ public sealed class AuthzedWatchV1Service(IDatastore datastore, ISchemaProvider 
         ArgumentNullException.ThrowIfNull(request);
 
         var cancellationToken = context.CancellationToken;
+
+        // Upstream rejects object types combined with relationship filters whenever relationship
+        // updates are being watched, before the start cursor is resolved.
+        if (IncludesRelationshipUpdates(request) &&
+            request.OptionalObjectTypes.Count > 0 && request.OptionalRelationshipFilters.Count > 0)
+        {
+            throw new RpcException(new Status(
+                StatusCode.InvalidArgument,
+                "cannot specify both object types and relationship filters"));
+        }
 
         // Empty => no filter; otherwise emit only updates whose resource object type is in the set.
         var objectTypeFilter = request.OptionalObjectTypes.Count == 0
@@ -52,6 +63,12 @@ public sealed class AuthzedWatchV1Service(IDatastore datastore, ISchemaProvider 
             var head = await datastore.HeadRevision(cancellationToken);
             afterRevision = head.Revision;
         }
+
+        // Empty => no filter; otherwise emit only updates matching at least one filter. Built after
+        // the cursor is resolved, as upstream does, so a bad cursor is reported ahead of a bad filter.
+        IReadOnlyList<RelationshipsFilter>? relationshipFilters = request.OptionalRelationshipFilters.Count == 0
+            ? null
+            : request.OptionalRelationshipFilters.Select(ToCoreFilter).ToList();
 
         var datastoreId = await datastore.GetUniqueId(cancellationToken);
         var options = new WatchOptions(ResolveContent(request));
@@ -90,12 +107,12 @@ public sealed class AuthzedWatchV1Service(IDatastore datastore, ISchemaProvider 
                     break;
 
                 var change = enumerator.Current;
-                var response = ToResponse(change, datastoreId, objectTypeFilter);
+                var response = ToResponse(change, datastoreId, objectTypeFilter, relationshipFilters);
 
                 // Checkpoints always flow through (they carry revision-progress liveness for filtered
                 // consumers). Otherwise skip a content response whose every update was filtered out.
                 if (!change.IsCheckpoint && response.Updates.Count == 0 &&
-                    !change.SchemaChanged && objectTypeFilter is not null)
+                    !change.SchemaChanged && (objectTypeFilter is not null || relationshipFilters is not null))
                 {
                     continue;
                 }
@@ -110,7 +127,10 @@ public sealed class AuthzedWatchV1Service(IDatastore datastore, ISchemaProvider 
     }
 
     private V1::WatchResponse ToResponse(
-        RevisionChange change, string datastoreId, HashSet<string>? objectTypeFilter)
+        RevisionChange change,
+        string datastoreId,
+        HashSet<string>? objectTypeFilter,
+        IReadOnlyList<RelationshipsFilter>? relationshipFilters)
     {
         var token = ZedTokens.FromRevision(change.Revision, schemaProvider.Current.SchemaHash, datastoreId);
         var response = new V1::WatchResponse
@@ -132,11 +152,71 @@ public sealed class AuthzedWatchV1Service(IDatastore datastore, ISchemaProvider 
                 continue;
             }
 
+            if (relationshipFilters is not null &&
+                !relationshipFilters.Any(filter => filter.Matches(update.Relationship)))
+            {
+                continue;
+            }
+
             response.Updates.Add(ToProto(update));
         }
 
         return response;
     }
+
+    /// <summary>
+    /// True when the request watches relationship updates: an empty selector, or one naming
+    /// <c>WATCH_KIND_UNSPECIFIED</c> or <c>WATCH_KIND_INCLUDE_RELATIONSHIP_UPDATES</c>.
+    /// </summary>
+    private static bool IncludesRelationshipUpdates(V1::WatchRequest request) =>
+        request.OptionalUpdateKinds.Count == 0 ||
+        request.OptionalUpdateKinds.Any(kind =>
+            kind is V1::WatchKind.Unspecified or V1::WatchKind.IncludeRelationshipUpdates);
+
+    /// <summary>
+    /// Maps a v1 <see cref="V1::RelationshipFilter"/> to a core <see cref="RelationshipsFilter"/>, as
+    /// upstream's <c>RelationshipsFilterFromPublicFilter</c> does: an empty field places no constraint;
+    /// a subject filter's present-but-empty <c>optional_relation</c> selects only the ellipsis relation,
+    /// a non-empty one selects exactly that relation, and an absent one selects any relation.
+    /// </summary>
+    private static RelationshipsFilter ToCoreFilter(V1::RelationshipFilter f)
+    {
+        if (!string.IsNullOrEmpty(f.OptionalResourceId) && !string.IsNullOrEmpty(f.OptionalResourceIdPrefix))
+        {
+            throw new RpcException(new Status(
+                StatusCode.InvalidArgument,
+                "failed to parse relationship filter: cannot specify both OptionalResourceId and OptionalResourceIDPrefix"));
+        }
+
+        IReadOnlyList<SubjectsSelector>? selectors = null;
+        if (f.OptionalSubjectFilter is { } sub)
+        {
+            SubjectRelationFilter? relationFilter = sub.OptionalRelation switch
+            {
+                null => null,
+                { Relation.Length: 0 } => new SubjectRelationFilter(IncludeEllipsisRelation: true),
+                { Relation: var relation } => new SubjectRelationFilter(NonEllipsisRelation: relation),
+            };
+            selectors =
+            [
+                new SubjectsSelector(
+                    NullIfEmpty(sub.SubjectType),
+                    string.IsNullOrEmpty(sub.OptionalSubjectId) ? null : [sub.OptionalSubjectId],
+                    relationFilter),
+            ];
+        }
+
+        return new RelationshipsFilter
+        {
+            OptionalResourceType = NullIfEmpty(f.ResourceType),
+            OptionalResourceIds = string.IsNullOrEmpty(f.OptionalResourceId) ? null : [f.OptionalResourceId],
+            OptionalResourceIdPrefix = NullIfEmpty(f.OptionalResourceIdPrefix),
+            OptionalResourceRelation = NullIfEmpty(f.OptionalRelation),
+            OptionalSubjectsSelectors = selectors,
+        };
+    }
+
+    private static string? NullIfEmpty(string value) => string.IsNullOrEmpty(value) ? null : value;
 
     /// <summary>
     /// Maps the request's <c>optional_update_kinds</c> to the datastore's <see cref="WatchContent"/>.
