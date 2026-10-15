@@ -121,4 +121,72 @@ public class RecordValueEqualityTests
         Assert.Equal(Make(), Make());
         Assert.Single(new HashSet<Relationship> { Make(), Make() });
     }
+
+    private static Dictionary<string, object?> NestedContext(object? innerFlag, bool reverseInsertion)
+    {
+        var nested = new Dictionary<string, object?>
+        {
+            ["regions"] = new List<object?> { "eu", "us", 7L, null },
+            ["flag"] = innerFlag,
+        };
+        var entries = new List<KeyValuePair<string, object?>>
+        {
+            new("level", 7L),
+            new("name", "alice"),
+            new("missing", null),
+            new("nested", nested),
+            new("tags", new List<object?> { new Dictionary<string, object?> { ["k"] = "v" }, 1L }),
+        };
+        if (reverseInsertion)
+            entries.Reverse();
+        return new Dictionary<string, object?>(entries);
+    }
+
+    [Fact]
+    public void ContextualizedCaveat_compares_null_members_and_maps_inside_lists_by_content()
+    {
+        var a = new ContextualizedCaveat("c", NestedContext(innerFlag: true, reverseInsertion: false));
+        var b = new ContextualizedCaveat("c", NestedContext(innerFlag: true, reverseInsertion: true));
+
+        Assert.Equal(a, b);
+        Assert.True(a == b);
+        Assert.Equal(a.GetHashCode(), b.GetHashCode());
+    }
+
+    [Fact]
+    public void ContextualizedCaveat_differing_only_in_a_nested_value_is_not_equal()
+    {
+        var a = new ContextualizedCaveat("c", NestedContext(innerFlag: true, reverseInsertion: false));
+        var b = new ContextualizedCaveat("c", NestedContext(innerFlag: false, reverseInsertion: false));
+        var c = new ContextualizedCaveat("c", NestedContext(innerFlag: null, reverseInsertion: false));
+
+        Assert.NotEqual(a, b);
+        Assert.False(a == b);
+        Assert.NotEqual(a, c);
+    }
+
+    [Fact]
+    public void CaveatDefinition_equality_ignores_parameter_insertion_order_and_sees_nested_child_types()
+    {
+        static CaveatDefinition Make(string listElement, bool reverseInsertion)
+        {
+            var entries = new List<KeyValuePair<string, CaveatTypeReference>>
+            {
+                new("ip", new CaveatTypeReference("ipaddress")),
+                new("allowed", new CaveatTypeReference("list", [new CaveatTypeReference(listElement)])),
+                new("limits", new CaveatTypeReference("map", [new CaveatTypeReference("int")])),
+            };
+            if (reverseInsertion)
+                entries.Reverse();
+            return new CaveatDefinition("org/ip_allowed", [1, 2, 3, 4], new Dictionary<string, CaveatTypeReference>(entries));
+        }
+
+        var a = Make("string", reverseInsertion: false);
+        var b = Make("string", reverseInsertion: true);
+
+        Assert.Equal(a, b);
+        Assert.True(a == b);
+        Assert.Equal(a.GetHashCode(), b.GetHashCode());
+        Assert.NotEqual(a, Make("int", reverseInsertion: false));
+    }
 }
