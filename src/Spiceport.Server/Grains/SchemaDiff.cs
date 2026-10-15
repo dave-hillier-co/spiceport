@@ -270,28 +270,11 @@ public static class SchemaDiff
     };
 
     /// <summary>
-    /// Structural equality of two caveat parameter types. Needed because <see cref="CaveatTypeReference"/>
-    /// holds an <see cref="System.Collections.Immutable.ImmutableList{T}"/> of child types whose
-    /// <c>Equals</c> is reference-based, so default record equality reports separately-compiled-but-identical
-    /// type references (e.g. two <c>list&lt;int&gt;</c> parses) as different.
+    /// Structural equality of two caveat parameter types, including their nested child types (e.g. two
+    /// separately parsed <c>list&lt;int&gt;</c> references are equal). <see cref="CaveatTypeReference"/>'s own
+    /// record equality compares child types element-wise, so this delegates to it.
     /// </summary>
-    public static bool CaveatTypeEquals(CaveatTypeReference? a, CaveatTypeReference? b)
-    {
-        if (a is null || b is null)
-            return ReferenceEquals(a, b);
-        if (a.TypeName != b.TypeName)
-            return false;
-        if (a.ChildTypes is null || b.ChildTypes is null)
-            return a.ChildTypes is null && b.ChildTypes is null;
-        if (a.ChildTypes.Count != b.ChildTypes.Count)
-            return false;
-        for (var i = 0; i < a.ChildTypes.Count; i++)
-        {
-            if (!CaveatTypeEquals(a.ChildTypes[i], b.ChildTypes[i]))
-                return false;
-        }
-        return true;
-    }
+    public static bool CaveatTypeEquals(CaveatTypeReference? a, CaveatTypeReference? b) => Equals(a, b);
 
     /// <summary>
     /// Identity equality of two allowed subject types via their canonical source string, which folds the
