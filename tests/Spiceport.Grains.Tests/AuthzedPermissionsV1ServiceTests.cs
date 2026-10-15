@@ -813,6 +813,39 @@ public class AuthzedPermissionsV1ServiceTests
     }
 
     [Fact]
+    public async Task WriteRelationships_update_without_relationship_is_invalid_argument()
+    {
+        // An unset required submessage must reach the client as InvalidArgument (SpiceDB's protovalidate
+        // interceptor), never as the Internal/Unknown status a NullReferenceException in the wire mapping
+        // would produce. Driven through the handler so the validation-before-mapping order is pinned.
+        await using var cluster = await MeshTestCluster.CreateAsync(Schema);
+
+        var req = new V1::WriteRelationshipsRequest
+        {
+            Updates = { new V1::RelationshipUpdate { Operation = V1::RelationshipUpdate.Types.Operation.Touch } },
+        };
+
+        var ex = await Assert.ThrowsAsync<RpcException>(() =>
+            Service(cluster).WriteRelationships(req, FakeServerCallContext.Default));
+        Assert.Equal(StatusCode.InvalidArgument, ex.StatusCode);
+        Assert.Contains("updates[0].relationship: value is required", ex.Status.Detail);
+    }
+
+    [Fact]
+    public async Task WriteRelationships_precondition_without_filter_is_invalid_argument()
+    {
+        await using var cluster = await MeshTestCluster.CreateAsync(Schema);
+
+        var req = WriteReq(V1::RelationshipUpdate.Types.Operation.Touch, "readme", "alice");
+        req.OptionalPreconditions.Add(new V1::Precondition { Operation = V1::Precondition.Types.Operation.MustMatch });
+
+        var ex = await Assert.ThrowsAsync<RpcException>(() =>
+            Service(cluster).WriteRelationships(req, FakeServerCallContext.Default));
+        Assert.Equal(StatusCode.InvalidArgument, ex.StatusCode);
+        Assert.Contains("optional_preconditions[0].filter: value is required", ex.Status.Detail);
+    }
+
+    [Fact]
     public async Task LookupResources_streams_accessible_resources()
     {
         await using var cluster = await MeshTestCluster.CreateAsync(Schema);
