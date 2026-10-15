@@ -55,6 +55,18 @@ public sealed class AuthzedPermissionsV1Service(
             },
             ex.Message));
 
+    /// <summary>
+    /// Maps a write-time schema violation onto SpiceDB's status: an unknown definition or relation
+    /// (NamespaceNotFound / RelationNotFound) is <c>FailedPrecondition</c>; a write to a permission or a
+    /// disallowed subject type (CannotWriteToPermission / InvalidSubjectType) is <c>InvalidArgument</c>.
+    /// </summary>
+    private static RpcException ToRpc(RelationshipValidationException ex) =>
+        new(new Status(
+            ex.Kind == RelationshipValidationErrorKind.NotFound
+                ? StatusCode.FailedPrecondition
+                : StatusCode.InvalidArgument,
+            ex.Message));
+
     public override async Task<V1::CheckPermissionResponse> CheckPermission(
         V1::CheckPermissionRequest request, ServerCallContext context)
     {
@@ -149,7 +161,9 @@ public sealed class AuthzedPermissionsV1Service(
         V1::WriteRelationshipsRequest request, ServerCallContext context)
     {
         // Reject over-limit/duplicate/oversized-context requests up front (SpiceDB validates the request
-        // shape before applying it). All of these are InvalidArgument, not FailedPrecondition.
+        // shape before applying it, the transaction metadata first). All of these are InvalidArgument, not
+        // FailedPrecondition.
+        RequestCeilings.ValidateTransactionMetadata(request.OptionalTransactionMetadata);
         RequestLimits.ValidateWriteRelationships(request);
 
         var updates = request.Updates.Select(ToWire).ToList();
@@ -158,6 +172,10 @@ public sealed class AuthzedPermissionsV1Service(
         {
             var reply = await Relationships.WriteRelationships(new WriteRelationshipsArgs(updates, preconditions));
             return new V1::WriteRelationshipsResponse { WrittenAt = new V1::ZedToken { Token = reply.WrittenAtToken } };
+        }
+        catch (RelationshipValidationException ex)
+        {
+            throw ToRpc(ex);
         }
         catch (PreconditionFailedException ex)
         {
@@ -189,21 +207,34 @@ public sealed class AuthzedPermissionsV1Service(
         IServerStreamWriter<V1::ReadRelationshipsResponse> responseStream,
         ServerCallContext context)
     {
+        RequestCeilings.ValidateLimit(request.OptionalLimit, RequestCeilings.MaxReadRelationshipsLimit);
+
         var filter = ToWire(request.RelationshipFilter);
         var consistency = ToWire(request.Consistency);
+        var limit = request.OptionalLimit == 0 ? (int?)null : (int)request.OptionalLimit;
+        var requestHash = ReadRelationshipsCursor.RequestHash(request);
+        var cursor = ReadRelationshipsCursor.Decode(request.OptionalCursor, requestHash);
 
         // One in-process read over one pinned snapshot (the grain hop and page loop are both gone). Each
-        // item carries the per-message read-at token, exactly as every page-message did before.
+        // item carries the per-message read-at token and, as in SpiceDB, an opaque after_result_cursor
+        // bound to this request that optional_cursor resumes from; optional_limit stops the stream after
+        // that many relationships.
+        var emitted = 0;
         try
         {
             await foreach (var item in relationshipReads.ReadRelationships(
-                new ReadRelationshipsArgs(filter, null, null, consistency), context.CancellationToken))
+                new ReadRelationshipsArgs(filter, limit, cursor, consistency), context.CancellationToken))
             {
                 await responseStream.WriteAsync(new V1::ReadRelationshipsResponse
                 {
                     ReadAt = new V1::ZedToken { Token = item.ReadAtToken },
                     Relationship = ToProto(item.Relationship),
+                    AfterResultCursor = new V1::Cursor { Token = ReadRelationshipsCursor.Encode(requestHash, item.ResumeCursor) },
                 });
+
+                emitted++;
+                if (limit is { } cap && emitted >= cap)
+                    break;
             }
         }
         catch (InvalidConsistencyTokenException ex)
@@ -226,22 +257,40 @@ public sealed class AuthzedPermissionsV1Service(
     public override async Task<V1::DeleteRelationshipsResponse> DeleteRelationships(
         V1::DeleteRelationshipsRequest request, ServerCallContext context)
     {
+        RequestCeilings.ValidateTransactionMetadata(request.OptionalTransactionMetadata);
+        RequestCeilings.ValidateLimit(request.OptionalLimit, RequestCeilings.MaxDeleteRelationshipsLimit);
+
+        var filter = ToWire(request.RelationshipFilter);
+        ulong? limit = request.OptionalLimit == 0 ? null : request.OptionalLimit;
+
+        // A limit without optional_allow_partial_deletions is a transactional cap: SpiceDB rejects the
+        // request (CouldNotTransactionallyDeleteErr) when more than `limit` relationships match, deleting
+        // nothing. The sequencer counts at most limit+1 matches inside the commit itself, after the
+        // preconditions (SpiceDB's order), so no write can race between the count and the delete.
         try
         {
             var reply = await Relationships.DeleteRelationships(new DeleteRelationshipsArgs(
-                ToWire(request.RelationshipFilter),
-                null,
-                ToWire(request.OptionalPreconditions)));
+                filter,
+                limit,
+                ToWire(request.OptionalPreconditions),
+                RejectOverLimit: limit is not null && !request.OptionalAllowPartialDeletions));
 
-            // v1 DeleteRelationshipsResponse carries only deleted_at in this snapshot; count/limit discarded.
             return new V1::DeleteRelationshipsResponse
             {
                 DeletedAt = new V1::ZedToken { Token = reply.DeletedAtToken },
+                DeletionProgress = reply.ReachedLimit
+                    ? V1::DeleteRelationshipsResponse.Types.DeletionProgress.Partial
+                    : V1::DeleteRelationshipsResponse.Types.DeletionProgress.Complete,
+                RelationshipsDeletedCount = reply.DeletedCount,
             };
         }
         catch (PreconditionFailedException ex)
         {
             throw new RpcException(new Status(StatusCode.FailedPrecondition, ex.Message));
+        }
+        catch (DeleteLimitExceededException ex)
+        {
+            throw new RpcException(new Status(StatusCode.InvalidArgument, ex.Message));
         }
         catch (SequencerOverloadedException ex)
         {
@@ -300,15 +349,16 @@ public sealed class AuthzedPermissionsV1Service(
             ? CoreConstants.Ellipsis
             : request.Subject.OptionalRelation;
 
+        RequestCeilings.ValidateLimit(request.OptionalLimit, RequestCeilings.MaxLookupResourcesLimit);
+
         // Reject an oversized request caveat context (SpiceDB: GetCaveatContext) -> InvalidArgument.
         var context5 = StructToDict(RequestLimits.ValidateCaveatContextSize(request.Context));
         var consistency = ToWire(request.Consistency);
 
         // v1 contract: optional_limit (field 6) caps the resources returned; optional_cursor (field 7)
-        // resumes after a prior page. SpiceDB disables cursors entirely when no limit is set, so we
-        // only attach after_result_cursor when a limit was requested.
+        // resumes after a prior page. Like SpiceDB, every streamed item carries after_result_cursor
+        // whether or not a limit was set, so an unlimited stream can be resumed from any item.
         var limit = request.OptionalLimit == 0 ? (int?)null : (int)request.OptionalLimit;
-        var emitCursors = limit is not null;
         string? cursor = request.OptionalCursor is { } oc && !string.IsNullOrEmpty(oc.Token) ? oc.Token : null;
 
         // Validate the resource definition+permission and subject definition+relation up front
@@ -320,8 +370,8 @@ public sealed class AuthzedPermissionsV1Service(
 
         // One in-process stream. A limited request takes at most `limit` items then stops (the RPC stream
         // terminates; the client resumes via the last item's cursor). An unlimited request drains the whole
-        // reachable set. `limit` also drives the engine path: a limited walk is cursor-bearing (so every item
-        // has a resume cursor), an unlimited/cursorless walk may take the Leopard fast path.
+        // reachable set. `limit` also drives the engine path: a limited walk runs the live traversal, an
+        // unlimited/cursorless walk may take the Leopard fast path; both give every item a resume cursor.
         var emitted = 0;
         try
         {
@@ -350,7 +400,7 @@ public sealed class AuthzedPermissionsV1Service(
                     partial.MissingRequiredContext.AddRange(r.Permissionship.MissingContextParams);
                     resp.PartialCaveatInfo = partial;
                 }
-                if (emitCursors && !string.IsNullOrEmpty(r.AfterResultCursor))
+                if (!string.IsNullOrEmpty(r.AfterResultCursor))
                     resp.AfterResultCursor = new V1::Cursor { Token = r.AfterResultCursor };
                 await responseStream.WriteAsync(resp);
 
@@ -642,6 +692,10 @@ public sealed class AuthzedPermissionsV1Service(
             // v1 ImportBulkRelationshipsResponse carries only num_loaded (no token).
             return new V1::ImportBulkRelationshipsResponse { NumLoaded = reply.NumLoaded };
         }
+        catch (RelationshipValidationException ex)
+        {
+            throw ToRpc(ex);
+        }
         catch (WriteConflictException ex)
         {
             throw new RpcException(new Status(ToStatusCode(ex.Kind), ex.Message));
@@ -660,6 +714,8 @@ public sealed class AuthzedPermissionsV1Service(
     {
         ArgumentNullException.ThrowIfNull(request);
         ArgumentNullException.ThrowIfNull(responseStream);
+
+        RequestCeilings.ValidateLimit(request.OptionalLimit, RequestCeilings.MaxBulkExportRelationshipsLimit);
 
         var filter = request.OptionalRelationshipFilter is { } f ? ToWire(f) : EmptyFilter;
         var limit = (int)request.OptionalLimit;

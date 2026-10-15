@@ -22,11 +22,15 @@ public sealed record CommitPreconditionWire(
 /// A bulk delete-by-filter inside a <see cref="CommitRequest"/>: close every live relationship matching
 /// <see cref="Filter"/>, up to <see cref="Limit"/> rows when non-null (the reply reports the deleted
 /// count and whether the limit was reached, mirroring the DeleteRelationships RPC semantics).
+/// When <see cref="RejectOverLimit"/> is set and more than <see cref="Limit"/> rows match, the commit is
+/// rejected as <see cref="CommitFailureKind.DeleteLimitExceeded"/> instead (SpiceDB's transactional
+/// delete, a limit without partial deletion); the count runs after the preconditions, as in SpiceDB.
 /// </summary>
 [GenerateSerializer, Immutable]
 public sealed record DeleteByFilterWire(
     [property: Id(0)] FullRelationshipsFilterWire Filter,
-    [property: Id(1)] ulong? Limit);
+    [property: Id(1)] ulong? Limit,
+    [property: Id(2)] bool RejectOverLimit = false);
 
 /// <summary>
 /// The write wire contract of the graph-sharded design (docs/graph-sharded-datastore.md section 3):
@@ -105,6 +109,12 @@ public enum CommitFailureKind
 
     /// <summary>A counter unregister targeted a name that is not registered.</summary>
     CounterNotRegistered = 5,
+
+    /// <summary>
+    /// A <see cref="DeleteByFilterWire.RejectOverLimit"/> delete matched more than its limit; the
+    /// <see cref="CommitFailureWire.Detail"/> is the limit.
+    /// </summary>
+    DeleteLimitExceeded = 6,
 }
 
 /// <summary>

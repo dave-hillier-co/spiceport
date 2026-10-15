@@ -291,6 +291,215 @@ public class AuthzedPermissionsV1ServiceTests
         Assert.Equal(StatusCode.AlreadyExists, ex.StatusCode);
     }
 
+    /// <summary>
+    /// The schema from issue #56: <c>document#viewer</c> admits only <c>user</c>, so a
+    /// <c>group#member</c> subject is outside its allowed direct relations; plus a permission and a
+    /// caveat-only relation to exercise the other write-time rejections.
+    /// </summary>
+    private const string WriteValidationSchema = """
+        definition user {}
+
+        caveat only_on_tuesday(day string) {
+            day == "tuesday"
+        }
+
+        definition group {
+            relation member: user
+        }
+
+        definition document {
+            relation viewer: user
+            relation tuesday_viewer: user with only_on_tuesday
+            permission view = viewer
+        }
+        """;
+
+    private static V1::WriteRelationshipsRequest WriteOne(
+        V1::RelationshipUpdate.Types.Operation op,
+        string resourceType, string resourceId, string relation,
+        string subjectType, string subjectId, string? subjectRelation = null, string? caveat = null)
+    {
+        var rel = new V1::Relationship
+        {
+            Resource = new V1::ObjectReference { ObjectType = resourceType, ObjectId = resourceId },
+            Relation = relation,
+            Subject = new V1::SubjectReference
+            {
+                Object = new V1::ObjectReference { ObjectType = subjectType, ObjectId = subjectId },
+                OptionalRelation = subjectRelation ?? string.Empty,
+            },
+        };
+        if (caveat is not null)
+            rel.OptionalCaveat = new V1::ContextualizedCaveat { CaveatName = caveat };
+
+        var req = new V1::WriteRelationshipsRequest();
+        req.Updates.Add(new V1::RelationshipUpdate { Operation = op, Relationship = rel });
+        return req;
+    }
+
+    private static async Task<int> CountStoredAsync(MeshTestCluster cluster, string resourceType)
+    {
+        var writer = new CollectingStreamWriter<V1::ReadRelationshipsResponse>();
+        await Service(cluster).ReadRelationships(new V1::ReadRelationshipsRequest
+        {
+            Consistency = new V1::Consistency { FullyConsistent = true },
+            RelationshipFilter = new V1::RelationshipFilter { ResourceType = resourceType },
+        }, writer, FakeServerCallContext.Default);
+        return writer.Collected.Count;
+    }
+
+    [Fact]
+    public async Task WriteRelationships_subject_type_not_allowed_on_relation_is_invalid_argument()
+    {
+        // Issue #56: SpiceDB validates every update against the schema inside the write transaction
+        // (relationships.ValidateRelationshipUpdates) and rejects a subject type outside the relation's
+        // allowed direct relations with INVALID_ARGUMENT (InvalidSubjectTypeError). Nothing persists.
+        await using var cluster = await MeshTestCluster.CreateAsync(WriteValidationSchema);
+
+        var ex = await Assert.ThrowsAsync<RpcException>(() => Service(cluster).WriteRelationships(
+            WriteOne(V1::RelationshipUpdate.Types.Operation.Create,
+                "document", "doc", "viewer", "group", "eng", "member"),
+            FakeServerCallContext.Default));
+
+        Assert.Equal(StatusCode.InvalidArgument, ex.StatusCode);
+        Assert.Contains("subjects of type `group#member` are not allowed on relation `document#viewer`", ex.Status.Detail);
+        Assert.Equal(0, await CountStoredAsync(cluster, "document"));
+    }
+
+    [Fact]
+    public async Task WriteRelationships_unknown_definition_is_failed_precondition()
+    {
+        // An unknown object definition is SpiceDB's NamespaceNotFound, which the v1 services rewrite to
+        // FAILED_PRECONDITION (the same mapping SchemaValidation applies for Check).
+        await using var cluster = await MeshTestCluster.CreateAsync(WriteValidationSchema);
+
+        var ex = await Assert.ThrowsAsync<RpcException>(() => Service(cluster).WriteRelationships(
+            WriteOne(V1::RelationshipUpdate.Types.Operation.Touch,
+                "nonesuch", "doc", "viewer", "user", "alice"),
+            FakeServerCallContext.Default));
+
+        Assert.Equal(StatusCode.FailedPrecondition, ex.StatusCode);
+        Assert.Contains("object definition `nonesuch` not found", ex.Status.Detail);
+    }
+
+    [Fact]
+    public async Task WriteRelationships_unknown_relation_is_failed_precondition()
+    {
+        await using var cluster = await MeshTestCluster.CreateAsync(WriteValidationSchema);
+
+        var ex = await Assert.ThrowsAsync<RpcException>(() => Service(cluster).WriteRelationships(
+            WriteOne(V1::RelationshipUpdate.Types.Operation.Touch,
+                "document", "doc", "nonesuch", "user", "alice"),
+            FakeServerCallContext.Default));
+
+        Assert.Equal(StatusCode.FailedPrecondition, ex.StatusCode);
+        Assert.Contains("relation/permission `nonesuch` not found under definition `document`", ex.Status.Detail);
+    }
+
+    [Fact]
+    public async Task WriteRelationships_to_a_permission_is_invalid_argument()
+    {
+        // SpiceDB CannotWriteToPermissionError -> INVALID_ARGUMENT.
+        await using var cluster = await MeshTestCluster.CreateAsync(WriteValidationSchema);
+
+        var ex = await Assert.ThrowsAsync<RpcException>(() => Service(cluster).WriteRelationships(
+            WriteOne(V1::RelationshipUpdate.Types.Operation.Touch,
+                "document", "doc", "view", "user", "alice"),
+            FakeServerCallContext.Default));
+
+        Assert.Equal(StatusCode.InvalidArgument, ex.StatusCode);
+        Assert.Contains("cannot write a relationship to permission `view` under definition `document`", ex.Status.Detail);
+    }
+
+    [Fact]
+    public async Task WriteRelationships_caveat_not_allowed_on_relation_is_invalid_argument()
+    {
+        // `document#viewer` admits only an uncaveated `user`; a caveated subject is not an allowed type.
+        await using var cluster = await MeshTestCluster.CreateAsync(WriteValidationSchema);
+
+        var ex = await Assert.ThrowsAsync<RpcException>(() => Service(cluster).WriteRelationships(
+            WriteOne(V1::RelationshipUpdate.Types.Operation.Touch,
+                "document", "doc", "viewer", "user", "alice", caveat: "only_on_tuesday"),
+            FakeServerCallContext.Default));
+
+        Assert.Equal(StatusCode.InvalidArgument, ex.StatusCode);
+        Assert.Contains("subjects of type `user with only_on_tuesday` are not allowed on relation `document#viewer`", ex.Status.Detail);
+    }
+
+    [Fact]
+    public async Task WriteRelationships_uncaveated_subject_on_caveat_only_relation_names_the_required_caveat()
+    {
+        await using var cluster = await MeshTestCluster.CreateAsync(WriteValidationSchema);
+
+        var ex = await Assert.ThrowsAsync<RpcException>(() => Service(cluster).WriteRelationships(
+            WriteOne(V1::RelationshipUpdate.Types.Operation.Touch,
+                "document", "doc", "tuesday_viewer", "user", "alice"),
+            FakeServerCallContext.Default));
+
+        Assert.Equal(StatusCode.InvalidArgument, ex.StatusCode);
+        Assert.Contains(
+            "subjects of type `user` are not allowed on relation `document#tuesday_viewer` without one of the following caveats: only_on_tuesday",
+            ex.Status.Detail);
+    }
+
+    [Fact]
+    public async Task WriteRelationships_delete_ignores_an_unspecified_caveat()
+    {
+        // The DELETE rule (ValidateRelationshipForDeletion) ignores the caveat when none is given, so an
+        // uncaveated DELETE of a caveat-only relation is valid; a disallowed subject type still is not.
+        await using var cluster = await MeshTestCluster.CreateAsync(WriteValidationSchema);
+
+        await Service(cluster).WriteRelationships(
+            WriteOne(V1::RelationshipUpdate.Types.Operation.Delete,
+                "document", "doc", "tuesday_viewer", "user", "alice"),
+            FakeServerCallContext.Default);
+
+        var ex = await Assert.ThrowsAsync<RpcException>(() => Service(cluster).WriteRelationships(
+            WriteOne(V1::RelationshipUpdate.Types.Operation.Delete,
+                "document", "doc", "viewer", "group", "eng", "member"),
+            FakeServerCallContext.Default));
+        Assert.Equal(StatusCode.InvalidArgument, ex.StatusCode);
+    }
+
+    [Fact]
+    public async Task WriteRelationships_schema_valid_write_succeeds()
+    {
+        await using var cluster = await MeshTestCluster.CreateAsync(WriteValidationSchema);
+
+        await Service(cluster).WriteRelationships(
+            WriteOne(V1::RelationshipUpdate.Types.Operation.Create,
+                "group", "eng", "member", "user", "alice"),
+            FakeServerCallContext.Default);
+
+        Assert.Equal(1, await CountStoredAsync(cluster, "group"));
+    }
+
+    [Fact]
+    public async Task ImportBulkRelationships_disallowed_subject_is_invalid_argument_and_imports_nothing()
+    {
+        await using var cluster = await MeshTestCluster.CreateAsync(WriteValidationSchema);
+
+        var bad = new V1::ImportBulkRelationshipsRequest();
+        bad.Relationships.Add(new V1::Relationship
+        {
+            Resource = new V1::ObjectReference { ObjectType = "document", ObjectId = "doc" },
+            Relation = "viewer",
+            Subject = new V1::SubjectReference
+            {
+                Object = new V1::ObjectReference { ObjectType = "group", ObjectId = "eng" },
+                OptionalRelation = "member",
+            },
+        });
+        var reader = new FakeAsyncStreamReader<V1::ImportBulkRelationshipsRequest>(
+            ImportBatch(("doc1", "alice")), bad);
+
+        var ex = await Assert.ThrowsAsync<RpcException>(() =>
+            Service(cluster).ImportBulkRelationships(reader, FakeServerCallContext.Default));
+
+        Assert.Equal(StatusCode.InvalidArgument, ex.StatusCode);
+        Assert.Equal(0, await CountStoredAsync(cluster, "document"));
+    }
+
     [Fact]
     public async Task WriteRelationships_duplicate_relationship_is_invalid_argument()
     {
@@ -743,7 +952,17 @@ public class AuthzedPermissionsV1ServiceTests
     [Fact]
     public async Task WriteRelationships_then_ReadRelationships_round_trips_expiration()
     {
-        await using var cluster = await MeshTestCluster.CreateAsync(Schema);
+        // An expiring relationship must target a relation whose allowed type carries the expiration
+        // trait: the write is validated against the schema like any other.
+        await using var cluster = await MeshTestCluster.CreateAsync("""
+            use expiration
+
+            definition user {}
+
+            definition document {
+                relation viewer: user with expiration
+            }
+            """);
 
         var expiresAt = new DateTimeOffset(2099, 1, 1, 0, 0, 0, TimeSpan.Zero);
         var req = new V1::WriteRelationshipsRequest();
@@ -768,6 +987,328 @@ public class AuthzedPermissionsV1ServiceTests
 
         var only = Assert.Single(writer.Collected);
         Assert.Equal(Google.Protobuf.WellKnownTypes.Timestamp.FromDateTimeOffset(expiresAt), only.Relationship.OptionalExpiresAt);
+    }
+
+    // --- issue #46: limit ceilings and the transaction-metadata cap ---
+
+    private static V1::RelationshipFilter ReadmeFilter() =>
+        new() { ResourceType = "document", OptionalResourceId = "readme" };
+
+    private static Google.Protobuf.WellKnownTypes.Struct MetadataOfBytes(int approximateBytes) => new()
+    {
+        Fields = { ["blob"] = Google.Protobuf.WellKnownTypes.Value.ForString(new string('x', approximateBytes)) },
+    };
+
+    [Fact]
+    public async Task LookupResources_limit_above_1000_is_invalid_argument()
+    {
+        // SpiceDB MaxLookupResourcesLimit (default 1000) -> ExceedsMaximumLimitErr, INVALID_ARGUMENT.
+        await using var cluster = await MeshTestCluster.CreateAsync(Schema);
+
+        var request = AliceViewLookup();
+        request.OptionalLimit = 1001;
+        var ex = await Assert.ThrowsAsync<RpcException>(() => Service(cluster).LookupResources(
+            request, new CollectingStreamWriter<V1::LookupResourcesResponse>(), FakeServerCallContext.Default));
+
+        Assert.Equal(StatusCode.InvalidArgument, ex.StatusCode);
+        Assert.Equal("provided limit 1001 is greater than maximum allowed of 1000", ex.Status.Detail);
+    }
+
+    [Fact]
+    public async Task ReadRelationships_limit_above_1000_is_invalid_argument()
+    {
+        await using var cluster = await MeshTestCluster.CreateAsync(Schema);
+
+        var ex = await Assert.ThrowsAsync<RpcException>(() => Service(cluster).ReadRelationships(
+            new V1::ReadRelationshipsRequest { RelationshipFilter = ReadmeFilter(), OptionalLimit = 1001 },
+            new CollectingStreamWriter<V1::ReadRelationshipsResponse>(), FakeServerCallContext.Default));
+
+        Assert.Equal(StatusCode.InvalidArgument, ex.StatusCode);
+        Assert.Equal("provided limit 1001 is greater than maximum allowed of 1000", ex.Status.Detail);
+    }
+
+    [Fact]
+    public async Task DeleteRelationships_limit_above_1000_is_invalid_argument()
+    {
+        await using var cluster = await MeshTestCluster.CreateAsync(Schema);
+
+        var ex = await Assert.ThrowsAsync<RpcException>(() => Service(cluster).DeleteRelationships(
+            new V1::DeleteRelationshipsRequest { RelationshipFilter = ReadmeFilter(), OptionalLimit = 1001 },
+            FakeServerCallContext.Default));
+
+        Assert.Equal(StatusCode.InvalidArgument, ex.StatusCode);
+        Assert.Equal("provided limit 1001 is greater than maximum allowed of 1000", ex.Status.Detail);
+    }
+
+    [Fact]
+    public async Task ExportBulkRelationships_limit_above_10000_is_invalid_argument()
+    {
+        // SpiceDB MaxBulkExportRelationshipsLimit (default 10000).
+        await using var cluster = await MeshTestCluster.CreateAsync(Schema);
+
+        var ex = await Assert.ThrowsAsync<RpcException>(() => Service(cluster).ExportBulkRelationships(
+            new V1::ExportBulkRelationshipsRequest { OptionalLimit = 10_001 },
+            new CollectingStreamWriter<V1::ExportBulkRelationshipsResponse>(), FakeServerCallContext.Default));
+
+        Assert.Equal(StatusCode.InvalidArgument, ex.StatusCode);
+        Assert.Equal("provided limit 10001 is greater than maximum allowed of 10000", ex.Status.Detail);
+    }
+
+    [Fact]
+    public async Task ReadRelationships_honours_optional_limit_and_resumes_from_after_result_cursor()
+    {
+        // SpiceDB returns at most optional_limit relationships, each with an after_result_cursor that
+        // optional_cursor resumes from.
+        await using var cluster = await MeshTestCluster.CreateAsync(Schema);
+        await SeedAsync(cluster.Datastore,
+            ("readme", "viewer", "alice"), ("readme", "viewer", "bob"), ("readme", "viewer", "carol"));
+
+        var first = new CollectingStreamWriter<V1::ReadRelationshipsResponse>();
+        await Service(cluster).ReadRelationships(
+            new V1::ReadRelationshipsRequest { RelationshipFilter = ReadmeFilter(), OptionalLimit = 2 },
+            first, FakeServerCallContext.Default);
+
+        Assert.Equal(2, first.Collected.Count);
+        Assert.All(first.Collected, r => Assert.False(string.IsNullOrEmpty(r.AfterResultCursor?.Token)));
+
+        var rest = new CollectingStreamWriter<V1::ReadRelationshipsResponse>();
+        await Service(cluster).ReadRelationships(
+            new V1::ReadRelationshipsRequest
+            {
+                RelationshipFilter = ReadmeFilter(),
+                OptionalLimit = 2,
+                OptionalCursor = first.Collected[^1].AfterResultCursor,
+            },
+            rest, FakeServerCallContext.Default);
+
+        var subjects = first.Collected.Concat(rest.Collected).Select(r => r.Relationship.Subject.Object.ObjectId);
+        Assert.Equal(new[] { "alice", "bob", "carol" }, subjects.Order(StringComparer.Ordinal));
+    }
+
+    [Fact]
+    public async Task ReadRelationships_cursor_that_is_not_base64_is_invalid_argument()
+    {
+        // SpiceDB: cursor.Decode fails -> InvalidCursorError (INVALID_ARGUMENT), never an empty OK stream.
+        await using var cluster = await MeshTestCluster.CreateAsync(Schema);
+        await SeedAsync(cluster.Datastore, ("readme", "viewer", "alice"));
+
+        var ex = await Assert.ThrowsAsync<RpcException>(() => Service(cluster).ReadRelationships(
+            new V1::ReadRelationshipsRequest
+            {
+                RelationshipFilter = ReadmeFilter(),
+                OptionalCursor = new V1::Cursor { Token = "zzz" },
+            },
+            new CollectingStreamWriter<V1::ReadRelationshipsResponse>(), FakeServerCallContext.Default));
+
+        Assert.Equal(StatusCode.InvalidArgument, ex.StatusCode);
+        Assert.StartsWith("error decoding cursor: ", ex.Status.Detail);
+    }
+
+    [Fact]
+    public async Task ReadRelationships_cursor_from_a_different_request_is_invalid_argument()
+    {
+        // SpiceDB binds the cursor to a hash of the request (filter, consistency, limit): a cursor minted
+        // for another call is rejected with ErrHashMismatch.
+        await using var cluster = await MeshTestCluster.CreateAsync(Schema);
+        await SeedAsync(cluster.Datastore, ("readme", "viewer", "alice"), ("readme", "viewer", "bob"));
+
+        var first = new CollectingStreamWriter<V1::ReadRelationshipsResponse>();
+        await Service(cluster).ReadRelationships(
+            new V1::ReadRelationshipsRequest { RelationshipFilter = ReadmeFilter(), OptionalLimit = 1 },
+            first, FakeServerCallContext.Default);
+
+        var ex = await Assert.ThrowsAsync<RpcException>(() => Service(cluster).ReadRelationships(
+            new V1::ReadRelationshipsRequest
+            {
+                RelationshipFilter = new V1::RelationshipFilter { ResourceType = "document" },
+                OptionalLimit = 1,
+                OptionalCursor = first.Collected[0].AfterResultCursor,
+            },
+            new CollectingStreamWriter<V1::ReadRelationshipsResponse>(), FakeServerCallContext.Default));
+
+        Assert.Equal(StatusCode.InvalidArgument, ex.StatusCode);
+        Assert.StartsWith("the cursor provided does not have the same arguments as the original API call", ex.Status.Detail);
+    }
+
+    [Fact]
+    public async Task ReadRelationships_cursor_without_a_parsable_resume_relationship_is_failed_precondition()
+    {
+        // SpiceDB: a cursor for this call whose section is not a relationship -> NewInvalidCursorErr
+        // ("could not parse resume relationship"), FAILED_PRECONDITION.
+        await using var cluster = await MeshTestCluster.CreateAsync(Schema);
+        var request = new V1::ReadRelationshipsRequest { RelationshipFilter = ReadmeFilter() };
+        request.OptionalCursor = new V1::Cursor
+        {
+            Token = ReadRelationshipsCursor.Encode(ReadRelationshipsCursor.RequestHash(request), "not a tuple"),
+        };
+
+        var ex = await Assert.ThrowsAsync<RpcException>(() => Service(cluster).ReadRelationships(
+            request, new CollectingStreamWriter<V1::ReadRelationshipsResponse>(), FakeServerCallContext.Default));
+
+        Assert.Equal(StatusCode.FailedPrecondition, ex.StatusCode);
+        Assert.Equal("the cursor provided is not valid: could not parse resume relationship", ex.Status.Detail);
+    }
+
+    [Fact]
+    public async Task ReadRelationships_after_result_cursor_is_opaque()
+    {
+        await using var cluster = await MeshTestCluster.CreateAsync(Schema);
+        await SeedAsync(cluster.Datastore, ("readme", "viewer", "alice"));
+
+        var read = new CollectingStreamWriter<V1::ReadRelationshipsResponse>();
+        await Service(cluster).ReadRelationships(
+            new V1::ReadRelationshipsRequest { RelationshipFilter = ReadmeFilter() },
+            read, FakeServerCallContext.Default);
+
+        var token = Assert.Single(read.Collected).AfterResultCursor.Token;
+        Assert.DoesNotContain("alice", token);
+        Assert.NotEmpty(Convert.FromBase64String(token));
+    }
+
+    [Fact]
+    public async Task DeleteRelationships_partial_deletion_honours_optional_limit()
+    {
+        await using var cluster = await MeshTestCluster.CreateAsync(Schema);
+        await SeedAsync(cluster.Datastore,
+            ("readme", "viewer", "alice"), ("readme", "viewer", "bob"), ("readme", "viewer", "carol"));
+
+        var partial = await Service(cluster).DeleteRelationships(new V1::DeleteRelationshipsRequest
+        {
+            RelationshipFilter = ReadmeFilter(),
+            OptionalLimit = 2,
+            OptionalAllowPartialDeletions = true,
+        }, FakeServerCallContext.Default);
+
+        Assert.Equal(2UL, partial.RelationshipsDeletedCount);
+        Assert.Equal(V1::DeleteRelationshipsResponse.Types.DeletionProgress.Partial, partial.DeletionProgress);
+        Assert.Equal(1, await CountStoredAsync(cluster, "document"));
+
+        var complete = await Service(cluster).DeleteRelationships(new V1::DeleteRelationshipsRequest
+        {
+            RelationshipFilter = ReadmeFilter(),
+            OptionalLimit = 2,
+            OptionalAllowPartialDeletions = true,
+        }, FakeServerCallContext.Default);
+
+        Assert.Equal(1UL, complete.RelationshipsDeletedCount);
+        Assert.Equal(V1::DeleteRelationshipsResponse.Types.DeletionProgress.Complete, complete.DeletionProgress);
+        Assert.Equal(0, await CountStoredAsync(cluster, "document"));
+    }
+
+    [Fact]
+    public async Task DeleteRelationships_over_limit_without_partial_deletion_is_invalid_argument_and_deletes_nothing()
+    {
+        // SpiceDB CouldNotTransactionallyDeleteErr -> INVALID_ARGUMENT, nothing deleted.
+        await using var cluster = await MeshTestCluster.CreateAsync(Schema);
+        await SeedAsync(cluster.Datastore,
+            ("readme", "viewer", "alice"), ("readme", "viewer", "bob"), ("readme", "viewer", "carol"));
+
+        var ex = await Assert.ThrowsAsync<RpcException>(() => Service(cluster).DeleteRelationships(
+            new V1::DeleteRelationshipsRequest { RelationshipFilter = ReadmeFilter(), OptionalLimit = 2 },
+            FakeServerCallContext.Default));
+
+        Assert.Equal(StatusCode.InvalidArgument, ex.StatusCode);
+        Assert.Equal("found more than 2 relationships to be deleted and partial deletion was not requested", ex.Status.Detail);
+        Assert.Equal(3, await CountStoredAsync(cluster, "document"));
+
+        // Exactly at the limit, the transactional delete removes everything; like SpiceDB (whose datastores
+        // report LimitReached when the deleted count equals the limit) it reports PARTIAL.
+        var resp = await Service(cluster).DeleteRelationships(
+            new V1::DeleteRelationshipsRequest { RelationshipFilter = ReadmeFilter(), OptionalLimit = 3 },
+            FakeServerCallContext.Default);
+        Assert.Equal(3UL, resp.RelationshipsDeletedCount);
+        Assert.Equal(V1::DeleteRelationshipsResponse.Types.DeletionProgress.Partial, resp.DeletionProgress);
+        Assert.Equal(0, await CountStoredAsync(cluster, "document"));
+
+        // Under the limit it reports COMPLETE.
+        await SeedAsync(cluster.Datastore, ("readme", "viewer", "alice"));
+        var under = await Service(cluster).DeleteRelationships(
+            new V1::DeleteRelationshipsRequest { RelationshipFilter = ReadmeFilter(), OptionalLimit = 3 },
+            FakeServerCallContext.Default);
+        Assert.Equal(1UL, under.RelationshipsDeletedCount);
+        Assert.Equal(V1::DeleteRelationshipsResponse.Types.DeletionProgress.Complete, under.DeletionProgress);
+    }
+
+    [Fact]
+    public async Task DeleteRelationships_failed_precondition_wins_over_the_transactional_limit()
+    {
+        // SpiceDB evaluates optional_preconditions before the limit+1 count, so a request that fails
+        // both is FAILED_PRECONDITION, not CouldNotTransactionallyDelete's INVALID_ARGUMENT.
+        await using var cluster = await MeshTestCluster.CreateAsync(Schema);
+        await SeedAsync(cluster.Datastore,
+            ("readme", "viewer", "alice"), ("readme", "viewer", "bob"), ("readme", "viewer", "carol"));
+
+        var request = new V1::DeleteRelationshipsRequest { RelationshipFilter = ReadmeFilter(), OptionalLimit = 2 };
+        request.OptionalPreconditions.Add(new V1::Precondition
+        {
+            Operation = V1::Precondition.Types.Operation.MustMatch,
+            Filter = new V1::RelationshipFilter { ResourceType = "document", OptionalResourceId = "nonesuch" },
+        });
+
+        var ex = await Assert.ThrowsAsync<RpcException>(() =>
+            Service(cluster).DeleteRelationships(request, FakeServerCallContext.Default));
+
+        Assert.Equal(StatusCode.FailedPrecondition, ex.StatusCode);
+        Assert.Equal(3, await CountStoredAsync(cluster, "document"));
+    }
+
+    [Fact]
+    public async Task DeleteRelationships_transactional_limit_is_checked_after_a_passing_precondition()
+    {
+        await using var cluster = await MeshTestCluster.CreateAsync(Schema);
+        await SeedAsync(cluster.Datastore,
+            ("readme", "viewer", "alice"), ("readme", "viewer", "bob"), ("readme", "viewer", "carol"));
+
+        var request = new V1::DeleteRelationshipsRequest { RelationshipFilter = ReadmeFilter(), OptionalLimit = 2 };
+        request.OptionalPreconditions.Add(new V1::Precondition
+        {
+            Operation = V1::Precondition.Types.Operation.MustMatch,
+            Filter = ReadmeFilter(),
+        });
+
+        var ex = await Assert.ThrowsAsync<RpcException>(() =>
+            Service(cluster).DeleteRelationships(request, FakeServerCallContext.Default));
+
+        Assert.Equal(StatusCode.InvalidArgument, ex.StatusCode);
+        Assert.Equal("found more than 2 relationships to be deleted and partial deletion was not requested", ex.Status.Detail);
+        Assert.Equal(3, await CountStoredAsync(cluster, "document"));
+    }
+
+    [Fact]
+    public async Task WriteRelationships_transaction_metadata_over_65000_bytes_is_invalid_argument()
+    {
+        // SpiceDB MaximumTransactionMetadataSize: TransactionMetadataTooLargeErr -> INVALID_ARGUMENT.
+        await using var cluster = await MeshTestCluster.CreateAsync(Schema);
+
+        var request = WriteReq(V1::RelationshipUpdate.Types.Operation.Touch, "readme", "alice");
+        request.OptionalTransactionMetadata = MetadataOfBytes(65_000);
+        var ex = await Assert.ThrowsAsync<RpcException>(() =>
+            Service(cluster).WriteRelationships(request, FakeServerCallContext.Default));
+
+        Assert.Equal(StatusCode.InvalidArgument, ex.StatusCode);
+        Assert.Matches("^metadata size of [0-9]+ is greater than maximum allowed of 65000$", ex.Status.Detail);
+        Assert.Equal(0, await CountStoredAsync(cluster, "document"));
+
+        // Metadata under the cap is accepted.
+        request.OptionalTransactionMetadata = MetadataOfBytes(100);
+        await Service(cluster).WriteRelationships(request, FakeServerCallContext.Default);
+    }
+
+    [Fact]
+    public async Task DeleteRelationships_transaction_metadata_over_65000_bytes_is_invalid_argument()
+    {
+        await using var cluster = await MeshTestCluster.CreateAsync(Schema);
+
+        var ex = await Assert.ThrowsAsync<RpcException>(() => Service(cluster).DeleteRelationships(
+            new V1::DeleteRelationshipsRequest
+            {
+                RelationshipFilter = ReadmeFilter(),
+                OptionalTransactionMetadata = MetadataOfBytes(65_000),
+            },
+            FakeServerCallContext.Default));
+
+        Assert.Equal(StatusCode.InvalidArgument, ex.StatusCode);
+        Assert.Matches("^metadata size of [0-9]+ is greater than maximum allowed of 65000$", ex.Status.Detail);
     }
 
     [Fact]
@@ -834,6 +1375,149 @@ public class AuthzedPermissionsV1ServiceTests
         Assert.All(writer.Collected, r =>
             Assert.Equal(V1::LookupPermissionship.HasPermission, r.Permissionship));
         Assert.All(writer.Collected, r => Assert.False(string.IsNullOrEmpty(r.LookedUpAt.Token)));
+    }
+
+    private static readonly (string res, string rel, string subj)[] LookupSeed =
+    [
+        ("doc1", "viewer", "alice"),
+        ("doc2", "editor", "alice"),
+        ("doc3", "viewer", "bob"),
+        ("doc4", "viewer", "alice"),
+        ("doc5", "editor", "alice"),
+        ("doc6", "viewer", "alice"),
+        ("doc6", "editor", "alice"),
+        ("doc7", "viewer", "alice"),
+    ];
+
+    private static V1::LookupResourcesRequest AliceViewLookup(string? cursor = null)
+    {
+        var req = new V1::LookupResourcesRequest
+        {
+            Consistency = new V1::Consistency { FullyConsistent = true },
+            ResourceObjectType = "document",
+            Permission = "view",
+            Subject = UserSubject("alice"),
+        };
+        if (cursor is not null)
+            req.OptionalCursor = new V1::Cursor { Token = cursor };
+        return req;
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task LookupResources_without_limit_emits_after_result_cursor_on_every_item(bool useMembershipWalk)
+    {
+        // Issue #47: SpiceDB populates after_result_cursor on every streamed item whenever cursor sections
+        // exist, with no limit condition (internal/services/v1/permissions.go). An unlimited stream must be
+        // resumable from any item — on the Leopard path (walk on) as well as the live traversal.
+        await using var cluster = await MeshTestCluster.CreateAsync(Schema, useMembershipWalk: useMembershipWalk);
+        await SeedAsync(cluster.Datastore, LookupSeed);
+
+        var writer = new CollectingStreamWriter<V1::LookupResourcesResponse>();
+        await Service(cluster).LookupResources(AliceViewLookup(), writer, FakeServerCallContext.Default);
+
+        Assert.NotEmpty(writer.Collected);
+        Assert.All(writer.Collected, r => Assert.False(string.IsNullOrEmpty(r.AfterResultCursor?.Token)));
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task LookupResources_unlimited_resume_from_mid_stream_cursor_yields_the_remainder(bool useMembershipWalk)
+    {
+        await using var cluster = await MeshTestCluster.CreateAsync(Schema, useMembershipWalk: useMembershipWalk);
+        await SeedAsync(cluster.Datastore, LookupSeed);
+
+        var full = new CollectingStreamWriter<V1::LookupResourcesResponse>();
+        await Service(cluster).LookupResources(AliceViewLookup(), full, FakeServerCallContext.Default);
+        var fullIds = full.Collected.Select(r => r.ResourceObjectId).ToHashSet(StringComparer.Ordinal);
+        Assert.Equal(new[] { "doc1", "doc2", "doc4", "doc5", "doc6", "doc7" }, fullIds.Order(StringComparer.Ordinal));
+
+        for (var k = 1; k < full.Collected.Count; k++)
+        {
+            var resumed = new CollectingStreamWriter<V1::LookupResourcesResponse>();
+            await Service(cluster).LookupResources(
+                AliceViewLookup(full.Collected[k - 1].AfterResultCursor.Token), resumed, FakeServerCallContext.Default);
+
+            var union = full.Collected.Take(k).Select(r => r.ResourceObjectId)
+                .Concat(resumed.Collected.Select(r => r.ResourceObjectId))
+                .ToHashSet(StringComparer.Ordinal);
+            Assert.Equal(fullIds.Order(StringComparer.Ordinal), union.Order(StringComparer.Ordinal));
+
+            // Resuming never re-emits an item already delivered before the cursor (beyond the per-entrypoint
+            // repeats the live traversal emits within one stream).
+            Assert.All(resumed.Collected, r => Assert.True(
+                full.Collected.Skip(k).Any(f => f.ResourceObjectId == r.ResourceObjectId)));
+        }
+    }
+
+    [Fact]
+    public async Task LookupResources_candidate_cursor_resumes_when_the_walk_declines_on_resume()
+    {
+        // A cursor minted on the Leopard path must stay resumable when the accelerator is unavailable on
+        // the resuming request (here: a cluster with the walk disabled, over the same data).
+        string cursor;
+        List<string> firstIds;
+        await using (var walkOn = await MeshTestCluster.CreateAsync(Schema, useMembershipWalk: true))
+        {
+            await SeedAsync(walkOn.Datastore, LookupSeed);
+            var full = new CollectingStreamWriter<V1::LookupResourcesResponse>();
+            await Service(walkOn).LookupResources(AliceViewLookup(), full, FakeServerCallContext.Default);
+            cursor = full.Collected[2].AfterResultCursor.Token;
+            firstIds = full.Collected.Take(3).Select(r => r.ResourceObjectId).ToList();
+        }
+
+        // The stream came from the accelerator: its cursors are candidate-resume cursors.
+        Assert.StartsWith("C:", System.Text.Encoding.UTF8.GetString(Convert.FromBase64String(cursor)), StringComparison.Ordinal);
+
+        await using var walkOff = await MeshTestCluster.CreateAsync(Schema, useMembershipWalk: false);
+        await SeedAsync(walkOff.Datastore, LookupSeed);
+        var resumed = new CollectingStreamWriter<V1::LookupResourcesResponse>();
+        await Service(walkOff).LookupResources(AliceViewLookup(cursor), resumed, FakeServerCallContext.Default);
+
+        var resumedIds = resumed.Collected.Select(r => r.ResourceObjectId).ToList();
+        Assert.Empty(resumedIds.Intersect(firstIds));
+        Assert.Equal(
+            new[] { "doc1", "doc2", "doc4", "doc5", "doc6", "doc7" },
+            firstIds.Concat(resumedIds).Order(StringComparer.Ordinal));
+        Assert.All(resumed.Collected, r => Assert.False(string.IsNullOrEmpty(r.AfterResultCursor?.Token)));
+    }
+
+    [Fact]
+    public async Task LookupResources_candidate_cursor_pages_through_the_live_fallback_with_a_limit()
+    {
+        // The live fallback keeps only the `limit` lowest ids past the cursor: chained limited resumes
+        // over it must still return every remaining resource exactly once, in ordinal order.
+        string cursor;
+        await using (var walkOn = await MeshTestCluster.CreateAsync(Schema, useMembershipWalk: true))
+        {
+            await SeedAsync(walkOn.Datastore, LookupSeed);
+            var full = new CollectingStreamWriter<V1::LookupResourcesResponse>();
+            await Service(walkOn).LookupResources(AliceViewLookup(), full, FakeServerCallContext.Default);
+            Assert.Equal("doc1", full.Collected[0].ResourceObjectId);
+            cursor = full.Collected[0].AfterResultCursor.Token;
+        }
+
+        await using var walkOff = await MeshTestCluster.CreateAsync(Schema, useMembershipWalk: false);
+        await SeedAsync(walkOff.Datastore, LookupSeed);
+
+        var pages = new List<List<string>>();
+        for (var guard = 0; guard < 10; guard++)
+        {
+            var request = AliceViewLookup(cursor);
+            request.OptionalLimit = 2;
+            var page = new CollectingStreamWriter<V1::LookupResourcesResponse>();
+            await Service(walkOff).LookupResources(request, page, FakeServerCallContext.Default);
+            if (page.Collected.Count == 0)
+                break;
+            pages.Add(page.Collected.Select(r => r.ResourceObjectId).ToList());
+            cursor = page.Collected[^1].AfterResultCursor.Token;
+        }
+
+        Assert.Equal(
+            new[] { new[] { "doc2", "doc4" }, new[] { "doc5", "doc6" }, new[] { "doc7" } },
+            pages.Select(p => p.ToArray()));
     }
 
     [Fact]
