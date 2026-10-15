@@ -1485,6 +1485,42 @@ public class AuthzedPermissionsV1ServiceTests
     }
 
     [Fact]
+    public async Task LookupResources_candidate_cursor_pages_through_the_live_fallback_with_a_limit()
+    {
+        // The live fallback keeps only the `limit` lowest ids past the cursor: chained limited resumes
+        // over it must still return every remaining resource exactly once, in ordinal order.
+        string cursor;
+        await using (var walkOn = await MeshTestCluster.CreateAsync(Schema, useMembershipWalk: true))
+        {
+            await SeedAsync(walkOn.Datastore, LookupSeed);
+            var full = new CollectingStreamWriter<V1::LookupResourcesResponse>();
+            await Service(walkOn).LookupResources(AliceViewLookup(), full, FakeServerCallContext.Default);
+            Assert.Equal("doc1", full.Collected[0].ResourceObjectId);
+            cursor = full.Collected[0].AfterResultCursor.Token;
+        }
+
+        await using var walkOff = await MeshTestCluster.CreateAsync(Schema, useMembershipWalk: false);
+        await SeedAsync(walkOff.Datastore, LookupSeed);
+
+        var pages = new List<List<string>>();
+        for (var guard = 0; guard < 10; guard++)
+        {
+            var request = AliceViewLookup(cursor);
+            request.OptionalLimit = 2;
+            var page = new CollectingStreamWriter<V1::LookupResourcesResponse>();
+            await Service(walkOff).LookupResources(request, page, FakeServerCallContext.Default);
+            if (page.Collected.Count == 0)
+                break;
+            pages.Add(page.Collected.Select(r => r.ResourceObjectId).ToList());
+            cursor = page.Collected[^1].AfterResultCursor.Token;
+        }
+
+        Assert.Equal(
+            new[] { new[] { "doc2", "doc4" }, new[] { "doc5", "doc6" }, new[] { "doc7" } },
+            pages.Select(p => p.ToArray()));
+    }
+
+    [Fact]
     public async Task LookupSubjects_populates_modern_and_deprecated_fields()
     {
         await using var cluster = await MeshTestCluster.CreateAsync(Schema);

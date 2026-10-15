@@ -271,7 +271,8 @@ public sealed class ReverseOps(
     /// Resumes a candidate-ordered stream after <paramref name="lastCandidate"/>. The accelerator is asked
     /// again as for a fresh enumeration; if it declines (disabled, uncovered, or an incomplete walk), the
     /// live traversal is drained instead, deduplicated by resource id, and put in the same ordinal order,
-    /// so the resume is positioned identically either way.
+    /// so the resume is positioned identically either way; under a client limit the drain retains only the
+    /// page it can return.
     /// </summary>
     private async IAsyncEnumerable<FoundResourceWire> CandidateOrderedStream(
         LookupResourcesEngine engine,
@@ -302,17 +303,39 @@ public sealed class ReverseOps(
 
         // Live fallback: one result per resource id. A resource reached through several entrypoints is
         // a member if any path makes it one; otherwise it keeps the first caveated result's missing params.
+        // The traversal is unordered, so the whole result set is walked, but only ids after the cursor are
+        // kept and, under a client limit, only the `limit` lowest of them: retained memory is bounded by
+        // the page size. An id evicted for being above the retained maximum can never re-enter, because
+        // the retained set only ever gets lower, so later results for it are discarded the same way.
+        var cap = args.Limit is { } l && l > 0 ? l : (int?)null;
         var byId = new Dictionary<string, FoundResource>(StringComparer.Ordinal);
+        var retained = new SortedSet<string>(StringComparer.Ordinal);
         await foreach (var found in engine.LookupResources(
                 reader, args.SubjectType, args.SubjectId, args.SubjectRelation,
                 args.ResourceType, args.Permission, args.Context, now, cursor: null, limit: null, cancellationToken)
             .WithCancellation(cancellationToken))
         {
-            if (!byId.TryGetValue(found.ResourceId, out var existing)
-                || (existing.Membership != Membership.Member && found.Membership == Membership.Member))
+            var id = found.ResourceId;
+            if (string.CompareOrdinal(id, lastCandidate) <= 0)
+                continue;
+
+            if (byId.TryGetValue(id, out var existing))
             {
-                byId[found.ResourceId] = found;
+                if (existing.Membership != Membership.Member && found.Membership == Membership.Member)
+                    byId[id] = found;
+                continue;
             }
+
+            if (cap is { } c && retained.Count >= c)
+            {
+                if (string.CompareOrdinal(id, retained.Max) > 0)
+                    continue;
+                byId.Remove(retained.Max!);
+                retained.Remove(retained.Max!);
+            }
+
+            byId[id] = found;
+            retained.Add(id);
         }
 
         foreach (var id in OrdinalAfter(byId.Keys, lastCandidate))
