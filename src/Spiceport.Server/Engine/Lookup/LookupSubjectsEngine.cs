@@ -353,7 +353,7 @@ public sealed class LookupSubjectsEngine
             // Union the wildcard with this concrete (the wildcard's exclusion of this id, if any, is
             // weakened) and union the concrete with any existing same-id concrete.
             if (_concrete.TryGetValue(adding.Id, out var existing))
-                _concrete[adding.Id] = new Concrete(adding.Id, CaveatExpression.OrKeepOther(existing.Caveat, adding.Caveat));
+                _concrete[adding.Id] = new Concrete(adding.Id, CaveatExpression.CombineOr(existing.Caveat, adding.Caveat));
             else
                 _concrete[adding.Id] = adding;
 
@@ -562,7 +562,7 @@ public sealed class LookupSubjectsEngine
 
             // The union wildcard applies when either applies; its exclusions are those excluded by
             // BOTH (intersection of exclusion sets), since an exclusion only survives if both exclude it.
-            var caveat = CaveatExpression.OrKeepOther(existing.Caveat, adding.Caveat);
+            var caveat = CaveatExpression.CombineOr(existing.Caveat, adding.Caveat);
             var addingExclusions = adding.Excluded.ToDictionary(e => e.Id);
             var newExclusions = new List<Concrete>();
             foreach (var ex in existing.Excluded)
@@ -615,11 +615,11 @@ public sealed class LookupSubjectsEngine
             var exclusions = new Dictionary<string, Concrete>();
             foreach (var e in first.Excluded)
                 exclusions[e.Id] = exclusions.TryGetValue(e.Id, out var x)
-                    ? new Concrete(e.Id, CaveatExpression.OrKeepOther(x.Caveat, e.Caveat))
+                    ? new Concrete(e.Id, CaveatExpression.CombineOr(x.Caveat, e.Caveat))
                     : e;
             foreach (var e in second.Excluded)
                 exclusions[e.Id] = exclusions.TryGetValue(e.Id, out var x)
-                    ? new Concrete(e.Id, CaveatExpression.OrKeepOther(x.Caveat, e.Caveat))
+                    ? new Concrete(e.Id, CaveatExpression.CombineOr(x.Caveat, e.Caveat))
                     : e;
             return new Wildcard(CaveatExpression.CombineAnd(first.Caveat, second.Caveat), exclusions.Values.ToList());
         }

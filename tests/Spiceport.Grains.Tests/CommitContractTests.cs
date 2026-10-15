@@ -496,6 +496,39 @@ public class CommitContractTests
         Assert.Empty(await ReadViewers(cluster, "x"));
     }
 
+    // ---- 12b. A transactional DeleteByFilter rejects more than Limit matches, after preconditions. ----
+
+    [Fact]
+    public async Task Transactional_delete_by_filter_rejects_more_than_limit_matches_and_applies_nothing()
+    {
+        await using var cluster = await MeshTestCluster.CreateAsync(ViewerSchema);
+        var sequencer = Sequencer(cluster);
+        await cluster.Relationships.WriteRelationships(new WriteRelationshipsArgs(
+            new List<RelationshipUpdateWire> { Touch("x", "alice"), Touch("x", "bob"), Touch("x", "carol") }));
+        var headBefore = (await sequencer.GetHead()).Head;
+
+        // Over the limit: rejected as DeleteLimitExceeded with nothing applied.
+        var over = await sequencer.Commit(DirectCommit(
+            deleteByFilter: new DeleteByFilterWire(FullViewerFilter("x"), Limit: 2, RejectOverLimit: true)));
+        Assert.Null(over.Revision);
+        Assert.Equal(CommitFailureKind.DeleteLimitExceeded, over.Failure!.Kind);
+        Assert.Equal(headBefore, (await sequencer.GetHead()).Head);
+        Assert.Equal(3, (await ReadViewers(cluster, "x")).Count);
+
+        // A failing precondition is reported first (SpiceDB checks preconditions before the count).
+        var both = await sequencer.Commit(DirectCommit(
+            preconditions: new[] { new CommitPreconditionWire(FullViewerFilter("missing"), MustMatch: true) },
+            deleteByFilter: new DeleteByFilterWire(FullViewerFilter("x"), Limit: 2, RejectOverLimit: true)));
+        Assert.Equal(CommitFailureKind.PreconditionFailed, both.Failure!.Kind);
+
+        // At the limit the delete runs.
+        var at = await sequencer.Commit(DirectCommit(
+            deleteByFilter: new DeleteByFilterWire(FullViewerFilter("x"), Limit: 3, RejectOverLimit: true)));
+        Assert.Null(at.Failure);
+        Assert.Equal(3UL, at.DeletedCount);
+        Assert.Empty(await ReadViewers(cluster, "x"));
+    }
+
     // ---- 13. The empty ExpectedSchemaHash is a SEED-WINDOW claim, rejected once a schema is stored. ----
 
     [Fact]

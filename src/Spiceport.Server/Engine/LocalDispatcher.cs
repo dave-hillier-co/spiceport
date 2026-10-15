@@ -268,6 +268,11 @@ public sealed class LocalDispatcher : IDispatcher
             {
                 if (operation.Children.Count == 0)
                     return DispatchCheckResult.None;
+                // SpiceDB's difference treats a lone operand as a bug (MustBugf "difference requires more
+                // than a single child"). The schema parser never builds one, so reaching this means a
+                // malformed stored rewrite: fail loudly rather than quietly granting the base operand.
+                if (operation.Children.Count == 1)
+                    throw new InvalidOperationException("difference requires more than a single child");
 
                 var acc = await CheckChild(reader, resource, subject, operation.Children[0], meta, ct).ConfigureAwait(true);
                 var cut = acc.CycleCut;

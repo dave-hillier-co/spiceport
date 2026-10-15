@@ -100,7 +100,8 @@ public sealed record RelationshipsFilterWire(
 public sealed record DeleteRelationshipsArgs(
     [property: Id(0)] RelationshipsFilterWire Filter,
     [property: Id(1)] ulong? OptionalLimit,
-    [property: Id(2)] IReadOnlyList<PreconditionWire>? Preconditions = null);
+    [property: Id(2)] IReadOnlyList<PreconditionWire>? Preconditions = null,
+    [property: Id(3)] bool RejectOverLimit = false);
 
 /// <summary>Reply for <see cref="IRelationshipsGrain.DeleteRelationships"/>.</summary>
 [GenerateSerializer]
