@@ -41,6 +41,7 @@ public sealed class LogWatchHub : IDatastoreWatcher, IAsyncDisposable
     private readonly ILogger? _logger;
     private readonly CancellationTokenSource _cts = new();
     private readonly object _lock = new();
+    private readonly object _schemaApplyLock = new();
 
     private TaskCompletionSource _signal = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private long _observedHead;
@@ -96,33 +97,38 @@ public sealed class LogWatchHub : IDatastoreWatcher, IAsyncDisposable
     /// validation before ever committing — but a transient provider failure can); the failure is caught and
     /// logged so a bad push can never kill the heartbeat loop or this observer callback, and the hash is left
     /// unrecorded so the next push or heartbeat (<see cref="NeedsApply"/>) retries it. Recording it first
-    /// would pin the silo on its stale schema until a DIFFERENT schema was written. The apply runs outside the
-    /// lock; two concurrent applies of different hashes can at worst leave the older one recorded, which the
-    /// next heartbeat's hash comparison repairs.
+    /// would pin the silo on its stale schema until a DIFFERENT schema was written.
+    ///
+    /// The dedup check, the apply and the record run as one step under <c>_schemaApplyLock</c>. A push (observer
+    /// callback) and a heartbeat repair (background loop) can race with different hashes; if their applies and
+    /// records interleaved, the provider could end up holding one schema while the other's hash is recorded,
+    /// and every later push or heartbeat of the recorded hash would be deduplicated away — pinning the silo on
+    /// a stale schema. Serialized, the recorded hash always names the schema the provider holds, so a stale
+    /// apply that lands last is just a mismatch the next heartbeat's hash comparison repairs. The lock is
+    /// separate from <c>_lock</c> so a slow schema compile never blocks head pulses or Watch waiters.
     /// </summary>
     private void ApplySchema(byte[] schemaBytes, string storedHash)
     {
-        lock (_lock)
+        lock (_schemaApplyLock)
         {
-            if (storedHash == _lastAppliedSchemaHash)
+            if (storedHash == Volatile.Read(ref _lastAppliedSchemaHash))
                 return;
-        }
 
-        if (_applySchema is not null)
-        {
-            try
+            if (_applySchema is not null)
             {
-                _applySchema(Encoding.UTF8.GetString(schemaBytes));
+                try
+                {
+                    _applySchema(Encoding.UTF8.GetString(schemaBytes));
+                }
+                catch (Exception ex)
+                {
+                    _logger?.LogWarning(ex, "Schema apply failed (stored hash {StoredHash}); will retry on the next push or heartbeat", storedHash);
+                    return;
+                }
             }
-            catch (Exception ex)
-            {
-                _logger?.LogWarning(ex, "Schema apply failed (stored hash {StoredHash}); will retry on the next push or heartbeat", storedHash);
-                return;
-            }
-        }
 
-        lock (_lock)
-            _lastAppliedSchemaHash = storedHash;
+            Volatile.Write(ref _lastAppliedSchemaHash, storedHash);
+        }
     }
 
     /// <summary>Registers the observer reference and starts the heartbeat loop on first use (idempotent).</summary>
@@ -176,11 +182,7 @@ public sealed class LogWatchHub : IDatastoreWatcher, IAsyncDisposable
     }
 
     /// <summary>Cheap pre-check so the heartbeat only pays a <c>ReadSchemaAt</c> hop when the hash actually moved.</summary>
-    private bool NeedsApply(string storedHash)
-    {
-        lock (_lock)
-            return storedHash != _lastAppliedSchemaHash;
-    }
+    private bool NeedsApply(string storedHash) => storedHash != Volatile.Read(ref _lastAppliedSchemaHash);
 
     private async Task HeartbeatLoop(IDatastoreWatcher selfRef, CancellationToken ct)
     {

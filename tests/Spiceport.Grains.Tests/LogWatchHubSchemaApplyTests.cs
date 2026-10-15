@@ -74,6 +74,48 @@ public class LogWatchHubSchemaApplyTests
     }
 
     /// <summary>
+    /// Two applies of different hashes racing: the provider and the recorded hash must never disagree. If
+    /// apply and record interleave (A applies h2, B applies h1, B records h1, A records h2) the provider
+    /// serves h1 while h2 is recorded, and every later push or heartbeat of h2 is deduplicated away. With
+    /// apply and record atomic, whichever schema the provider ends up holding is the one recorded, so a
+    /// later push of h2 is applied.
+    /// </summary>
+    [Fact]
+    public async Task Racing_applies_of_different_hashes_leave_provider_and_record_consistent()
+    {
+        var current = "";
+        var h2Swapped = new ManualResetEventSlim();
+        var releaseH2 = new ManualResetEventSlim();
+        var hub = new LogWatchHub(grain: null!, grainFactory: null!, applySchema: text =>
+        {
+            current = text;
+            if (text == "schema-2" && !h2Swapped.IsSet)
+            {
+                h2Swapped.Set();
+                releaseH2.Wait(TimeSpan.FromSeconds(10));
+            }
+        });
+
+        // Push of h2 swaps the provider, then stalls before recording.
+        var pushH2 = Task.Run(() => hub.SchemaAdvanced(Bytes("schema-2"), "h2"));
+        Assert.True(h2Swapped.Wait(TimeSpan.FromSeconds(10)));
+
+        // A stale heartbeat-style apply of h1 runs meanwhile. Allow it to finish if it can; with apply and
+        // record atomic it waits for the h2 apply instead.
+        var applyH1 = Task.Run(() => hub.SchemaAdvanced(Bytes("schema-1"), "h1"));
+        await Task.WhenAny(applyH1, Task.Delay(TimeSpan.FromMilliseconds(300)));
+
+        releaseH2.Set();
+        await pushH2.WaitAsync(TimeSpan.FromSeconds(10));
+        await applyH1.WaitAsync(TimeSpan.FromSeconds(10));
+
+        // The next push (or heartbeat) of the current stored hash must leave the provider on h2.
+        await hub.SchemaAdvanced(Bytes("schema-2"), "h2");
+
+        Assert.Equal("schema-2", current);
+    }
+
+    /// <summary>
     /// An <see cref="IDatastoreGrain"/> whose heartbeat reply always reports the same head and stored schema
     /// hash, and whose <see cref="ReadSchemaAt"/> returns the matching bytes. Everything else is unused.
     /// </summary>
