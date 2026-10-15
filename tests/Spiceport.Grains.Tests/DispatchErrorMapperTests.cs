@@ -87,22 +87,18 @@ public class DispatchErrorMapperTests
     }
 
     [Fact]
-    public void TimeoutException_maps_to_Unavailable_not_DeadlineExceeded()
+    public void Translate_turns_a_TimeoutException_into_Unavailable_not_DeadlineExceeded()
     {
         // An Orleans response timeout is a transient silo fault on one hop, not the caller's own
-        // deadline elapsing, so it is retriable Unavailable rather than DeadlineExceeded.
-        var c = DispatchErrorMapper.Classify(new TimeoutException("response timed out"));
-
-        Assert.False(c.PassThrough);
-        Assert.Equal(DispatchErrorCode.Unavailable, c.Code);
-
+        // deadline elapsing, so it is retriable Unavailable rather than DeadlineExceeded. Classify's
+        // verdict is already pinned by the TransportFailures theory; this pins what Translate throws.
         var translated = Assert.IsType<DispatchFailedException>(
             DispatchErrorMapper.Translate(new TimeoutException("response timed out")));
         Assert.Equal(DispatchErrorCode.Unavailable, translated.Code);
     }
 
     [Fact]
-    public void OperationCanceledException_maps_to_Cancelled()
+    public void Translate_turns_an_OperationCanceledException_into_Cancelled()
     {
         var translated = Assert.IsType<DispatchFailedException>(
             DispatchErrorMapper.Translate(new OperationCanceledException()));
