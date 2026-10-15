@@ -202,25 +202,6 @@ public sealed class AuthzedPermissionsV1Service(
         _ => StatusCode.Aborted,
     };
 
-    /// <summary>
-    /// Throws SpiceDB's <c>CouldNotTransactionallyDeleteErr</c> (InvalidArgument) when more than
-    /// <paramref name="limit"/> relationships match <paramref name="filter"/> at a fully-consistent snapshot.
-    /// </summary>
-    private async Task RejectIfMoreThan(RelationshipsFilterWire filter, ulong limit, CancellationToken cancellationToken)
-    {
-        var matched = 0UL;
-        await foreach (var _ in relationshipReads.ReadRelationships(
-            new ReadRelationshipsArgs(filter, null, null, WireConsistency.FullyConsistent), cancellationToken))
-        {
-            if (++matched > limit)
-            {
-                throw new RpcException(new Status(
-                    StatusCode.InvalidArgument,
-                    $"found more than {limit} relationships to be deleted and partial deletion was not requested"));
-            }
-        }
-    }
-
     public override async Task ReadRelationships(
         V1::ReadRelationshipsRequest request,
         IServerStreamWriter<V1::ReadRelationshipsResponse> responseStream,
@@ -282,17 +263,15 @@ public sealed class AuthzedPermissionsV1Service(
 
         // A limit without optional_allow_partial_deletions is a transactional cap: SpiceDB rejects the
         // request (CouldNotTransactionallyDeleteErr) when more than `limit` relationships match, deleting
-        // nothing. The count runs at a fully-consistent snapshot just before the commit, which still
-        // carries the limit, so a write racing in between can at worst make the commit stop at `limit`.
-        if (limit is { } cap && !request.OptionalAllowPartialDeletions)
-            await RejectIfMoreThan(filter, cap, context.CancellationToken);
-
+        // nothing. The sequencer counts at most limit+1 matches inside the commit itself, after the
+        // preconditions (SpiceDB's order), so no write can race between the count and the delete.
         try
         {
             var reply = await Relationships.DeleteRelationships(new DeleteRelationshipsArgs(
                 filter,
                 limit,
-                ToWire(request.OptionalPreconditions)));
+                ToWire(request.OptionalPreconditions),
+                RejectOverLimit: limit is not null && !request.OptionalAllowPartialDeletions));
 
             return new V1::DeleteRelationshipsResponse
             {
@@ -306,6 +285,10 @@ public sealed class AuthzedPermissionsV1Service(
         catch (PreconditionFailedException ex)
         {
             throw new RpcException(new Status(StatusCode.FailedPrecondition, ex.Message));
+        }
+        catch (DeleteLimitExceededException ex)
+        {
+            throw new RpcException(new Status(StatusCode.InvalidArgument, ex.Message));
         }
         catch (SequencerOverloadedException ex)
         {

@@ -1150,6 +1150,51 @@ public class AuthzedPermissionsV1ServiceTests
     }
 
     [Fact]
+    public async Task DeleteRelationships_failed_precondition_wins_over_the_transactional_limit()
+    {
+        // SpiceDB evaluates optional_preconditions before the limit+1 count, so a request that fails
+        // both is FAILED_PRECONDITION, not CouldNotTransactionallyDelete's INVALID_ARGUMENT.
+        await using var cluster = await MeshTestCluster.CreateAsync(Schema);
+        await SeedAsync(cluster.Datastore,
+            ("readme", "viewer", "alice"), ("readme", "viewer", "bob"), ("readme", "viewer", "carol"));
+
+        var request = new V1::DeleteRelationshipsRequest { RelationshipFilter = ReadmeFilter(), OptionalLimit = 2 };
+        request.OptionalPreconditions.Add(new V1::Precondition
+        {
+            Operation = V1::Precondition.Types.Operation.MustMatch,
+            Filter = new V1::RelationshipFilter { ResourceType = "document", OptionalResourceId = "nonesuch" },
+        });
+
+        var ex = await Assert.ThrowsAsync<RpcException>(() =>
+            Service(cluster).DeleteRelationships(request, FakeServerCallContext.Default));
+
+        Assert.Equal(StatusCode.FailedPrecondition, ex.StatusCode);
+        Assert.Equal(3, await CountStoredAsync(cluster, "document"));
+    }
+
+    [Fact]
+    public async Task DeleteRelationships_transactional_limit_is_checked_after_a_passing_precondition()
+    {
+        await using var cluster = await MeshTestCluster.CreateAsync(Schema);
+        await SeedAsync(cluster.Datastore,
+            ("readme", "viewer", "alice"), ("readme", "viewer", "bob"), ("readme", "viewer", "carol"));
+
+        var request = new V1::DeleteRelationshipsRequest { RelationshipFilter = ReadmeFilter(), OptionalLimit = 2 };
+        request.OptionalPreconditions.Add(new V1::Precondition
+        {
+            Operation = V1::Precondition.Types.Operation.MustMatch,
+            Filter = ReadmeFilter(),
+        });
+
+        var ex = await Assert.ThrowsAsync<RpcException>(() =>
+            Service(cluster).DeleteRelationships(request, FakeServerCallContext.Default));
+
+        Assert.Equal(StatusCode.InvalidArgument, ex.StatusCode);
+        Assert.Equal("found more than 2 relationships to be deleted and partial deletion was not requested", ex.Status.Detail);
+        Assert.Equal(3, await CountStoredAsync(cluster, "document"));
+    }
+
+    [Fact]
     public async Task WriteRelationships_transaction_metadata_over_65000_bytes_is_invalid_argument()
     {
         // SpiceDB MaximumTransactionMetadataSize: TransactionMetadataTooLargeErr -> INVALID_ARGUMENT.

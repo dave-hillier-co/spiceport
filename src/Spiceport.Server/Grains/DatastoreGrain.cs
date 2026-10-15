@@ -703,6 +703,21 @@ public sealed class DatastoreGrain :
         var reachedLimit = false;
         if (request.DeleteByFilter is { } deleteByFilter)
         {
+            // A transactional delete (SpiceDB: a limit without partial deletion) counts at most limit+1
+            // matches after the preconditions and rejects, applying nothing, when the limit is exceeded.
+            if (deleteByFilter is { RejectOverLimit: true, Limit: { } cap })
+            {
+                var matches = 0UL;
+                await foreach (var _ in tx.QueryRelationships(WireConvert.ToCoreFilter(deleteByFilter.Filter)))
+                {
+                    if (++matches > cap)
+                    {
+                        return (Rejected(CommitFailureKind.DeleteLimitExceeded,
+                            cap.ToString(System.Globalization.CultureInfo.InvariantCulture)), null);
+                    }
+                }
+            }
+
             (deletedCount, reachedLimit) = await tx
                 .DeleteRelationships(WireConvert.ToCoreFilter(deleteByFilter.Filter), deleteByFilter.Limit)
                 .ConfigureAwait(ContinueOnCapturedContext);

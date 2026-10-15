@@ -290,7 +290,7 @@ public sealed class RelationshipsGrain(
         var reply = await CommitDeclarative(new CommitRequest(
             ToCommitPreconditions(args.Preconditions),
             Array.Empty<RelationshipUpdateWire>(),
-            new DeleteByFilterWire(WireConvert.ToFullFilter(ToFilter(args.Filter)), args.OptionalLimit),
+            new DeleteByFilterWire(WireConvert.ToFullFilter(ToFilter(args.Filter)), args.OptionalLimit, args.RejectOverLimit),
             SchemaBytes: null,
             ExpectedSchemaHash: null,
             CounterChanges: Array.Empty<CounterDeltaWire>(),
@@ -451,7 +451,8 @@ public sealed class RelationshipsGrain(
     /// create rethrows <see cref="WriteConflictException"/> with
     /// <see cref="WriteConflictKind.CreateExisting"/> carrying the message
     /// <see cref="CreateRelationshipExistsException"/> derives from the conflicting relationship (the
-    /// reply Detail). HeadMoved never reaches this mapper — <see cref="CommitDeclarative"/> retries it —
+    /// reply Detail), and a transactional delete over its limit throws
+    /// <see cref="DeleteLimitExceededException"/> for the limit in the reply Detail. HeadMoved never reaches this mapper — <see cref="CommitDeclarative"/> retries it —
     /// and no other kind can occur on a declarative relationship commit (there is no
     /// ExpectedHead and no counter delta, and SchemaHashMoved is retried by
     /// <see cref="CommitSchemaValidated"/>), so anything else is surfaced loudly.
@@ -462,6 +463,8 @@ public sealed class RelationshipsGrain(
         CommitFailureKind.CreateAlreadyExists => new WriteConflictException(
             WriteConflictKind.CreateExisting,
             new CreateRelationshipExistsException(failure.Detail ?? string.Empty).Message),
+        CommitFailureKind.DeleteLimitExceeded => new DeleteLimitExceededException(
+            ulong.Parse(failure.Detail ?? "0", System.Globalization.CultureInfo.InvariantCulture)),
         _ => new InvalidOperationException(
             $"unexpected relationship-commit failure {failure.Kind}: {failure.Detail}"),
     };
