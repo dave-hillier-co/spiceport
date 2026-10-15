@@ -39,6 +39,8 @@ internal static class RequestLimits
     /// </summary>
     internal static void ValidateWriteRelationships(V1::WriteRelationshipsRequest request)
     {
+        ValidateRequiredWriteFields(request);
+
         if (request.Updates.Count > MaxUpdatesPerWrite)
             throw new RpcException(new Status(
                 StatusCode.InvalidArgument,
@@ -89,6 +91,50 @@ internal static class RequestLimits
         }
 
         return context;
+    }
+
+    /// <summary>
+    /// Rejects a <c>WriteRelationships</c> request missing a submessage the <c>authzed.api.v1</c> protos mark
+    /// <c>(buf.validate.field).required</c>: an update's relationship, a relationship's resource or subject, a
+    /// subject's object, or a precondition's filter. An unset message field is <c>null</c> here, so without
+    /// this guard the request fails with a <see cref="NullReferenceException"/> (an Internal/Unknown status).
+    /// SpiceDB's protovalidate interceptor rejects the same request with <see cref="StatusCode.InvalidArgument"/>
+    /// before the handler runs; the detail text follows protovalidate's <c>ValidationError</c> format.
+    /// </summary>
+    private static void ValidateRequiredWriteFields(V1::WriteRelationshipsRequest request)
+    {
+        var violations = new List<string>();
+        for (var i = 0; i < request.Updates.Count; i++)
+        {
+            var rel = request.Updates[i].Relationship;
+            var path = $"updates[{i}].relationship";
+            if (rel is null)
+            {
+                violations.Add($"{path}: value is required");
+                continue;
+            }
+
+            if (rel.Resource is null)
+                violations.Add($"{path}.resource: value is required");
+            if (rel.Subject is null)
+                violations.Add($"{path}.subject: value is required");
+            else if (rel.Subject.Object is null)
+                violations.Add($"{path}.subject.object: value is required");
+        }
+
+        for (var i = 0; i < request.OptionalPreconditions.Count; i++)
+        {
+            if (request.OptionalPreconditions[i].Filter is null)
+                violations.Add($"optional_preconditions[{i}].filter: value is required");
+        }
+
+        if (violations.Count == 0)
+            return;
+
+        var detail = violations.Count == 1
+            ? "validation error: " + violations[0]
+            : "validation errors:" + string.Concat(violations.Select(v => "\n - " + v));
+        throw new RpcException(new Status(StatusCode.InvalidArgument, detail));
     }
 
     private static string RelationshipKeyWithoutCaveatOrExpiration(V1::Relationship rel)
