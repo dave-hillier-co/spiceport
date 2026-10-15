@@ -442,4 +442,36 @@ public class LookupSubjectsEngineTests
         Assert.Equal("alice", excluded.SubjectId);
         Assert.Null(excluded.Caveat);
     }
+
+    // SpiceDB's unionWildcardWithWildcard (basesubjectset.go) merges the two wildcards' caveats with
+    // shortcircuitedOr: an unconditional wildcard makes the union wildcard unconditional.
+    private const string ShortCircuitWildcardUnionSchema = """
+        caveat somecaveat(x int) {
+          x > 1
+        }
+
+        definition user {}
+
+        definition doc {
+          relation a: user:*
+          relation b: user:* with somecaveat
+          permission view = a + b
+        }
+        """;
+
+    [Fact]
+    public async Task Union_of_unconditional_and_caveated_wildcards_is_unconditional()
+    {
+        var (store, rev) = await Seed(
+            Tuple("doc", "1", "a", Onr("user", CoreConstants.PublicWildcard)),
+            Caveated("doc", "1", "b", Onr("user", CoreConstants.PublicWildcard), "somecaveat"));
+        var engine = BuildEngine(ShortCircuitWildcardUnionSchema);
+        var reader = store.SnapshotReader(rev);
+
+        var found = await Collect(engine.LookupSubjects(reader, Onr("doc", "1", "view"), "user"));
+
+        var wildcard = Assert.Single(found);
+        Assert.True(wildcard.IsWildcard);
+        Assert.Null(wildcard.Caveat);
+    }
 }
