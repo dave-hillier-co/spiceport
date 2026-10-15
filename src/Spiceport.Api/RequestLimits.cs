@@ -122,12 +122,38 @@ internal static class RequestLimits
                 violations.Add($"{path}.subject.object: value is required");
         }
 
-        for (var i = 0; i < request.OptionalPreconditions.Count; i++)
+        AddMissingPreconditionFilters(request.OptionalPreconditions, violations);
+        ThrowIfViolations(violations);
+    }
+
+    /// <summary>
+    /// Validates the shape of a <c>DeleteRelationships</c> request: its <c>relationship_filter</c> and every
+    /// precondition's <c>filter</c> are <c>(buf.validate.field).required</c>. SpiceDB's protovalidate
+    /// interceptor rejects a missing one with <see cref="StatusCode.InvalidArgument"/> before the handler runs;
+    /// without this guard the wire mapping dereferences the unset (<c>null</c>) message instead.
+    /// </summary>
+    internal static void ValidateDeleteRelationships(V1::DeleteRelationshipsRequest request)
+    {
+        var violations = new List<string>();
+        if (request.RelationshipFilter is null)
+            violations.Add("relationship_filter: value is required");
+        AddMissingPreconditionFilters(request.OptionalPreconditions, violations);
+        ThrowIfViolations(violations);
+    }
+
+    private static void AddMissingPreconditionFilters(
+        IReadOnlyList<V1::Precondition> preconditions, List<string> violations)
+    {
+        for (var i = 0; i < preconditions.Count; i++)
         {
-            if (request.OptionalPreconditions[i].Filter is null)
+            if (preconditions[i].Filter is null)
                 violations.Add($"optional_preconditions[{i}].filter: value is required");
         }
+    }
 
+    /// <summary>Throws <see cref="StatusCode.InvalidArgument"/> in protovalidate's <c>ValidationError</c> format.</summary>
+    private static void ThrowIfViolations(List<string> violations)
+    {
         if (violations.Count == 0)
             return;
 

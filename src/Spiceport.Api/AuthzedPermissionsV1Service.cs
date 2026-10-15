@@ -226,6 +226,9 @@ public sealed class AuthzedPermissionsV1Service(
     public override async Task<V1::DeleteRelationshipsResponse> DeleteRelationships(
         V1::DeleteRelationshipsRequest request, ServerCallContext context)
     {
+        // Reject a missing required filter as InvalidArgument before the wire mapping dereferences it.
+        RequestLimits.ValidateDeleteRelationships(request);
+
         try
         {
             var reply = await Relationships.DeleteRelationships(new DeleteRelationshipsArgs(

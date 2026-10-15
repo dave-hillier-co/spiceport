@@ -846,6 +846,36 @@ public class AuthzedPermissionsV1ServiceTests
     }
 
     [Fact]
+    public async Task DeleteRelationships_without_relationship_filter_is_invalid_argument()
+    {
+        // DeleteRelationshipsRequest.relationship_filter is (buf.validate.field).required: SpiceDB rejects
+        // its absence with InvalidArgument before the handler runs.
+        await using var cluster = await MeshTestCluster.CreateAsync(Schema);
+
+        var ex = await Assert.ThrowsAsync<RpcException>(() =>
+            Service(cluster).DeleteRelationships(new V1::DeleteRelationshipsRequest(), FakeServerCallContext.Default));
+        Assert.Equal(StatusCode.InvalidArgument, ex.StatusCode);
+        Assert.Contains("relationship_filter: value is required", ex.Status.Detail);
+    }
+
+    [Fact]
+    public async Task DeleteRelationships_precondition_without_filter_is_invalid_argument()
+    {
+        await using var cluster = await MeshTestCluster.CreateAsync(Schema);
+
+        var req = new V1::DeleteRelationshipsRequest
+        {
+            RelationshipFilter = new V1::RelationshipFilter { ResourceType = "document", OptionalResourceId = "readme" },
+        };
+        req.OptionalPreconditions.Add(new V1::Precondition { Operation = V1::Precondition.Types.Operation.MustMatch });
+
+        var ex = await Assert.ThrowsAsync<RpcException>(() =>
+            Service(cluster).DeleteRelationships(req, FakeServerCallContext.Default));
+        Assert.Equal(StatusCode.InvalidArgument, ex.StatusCode);
+        Assert.Contains("optional_preconditions[0].filter: value is required", ex.Status.Detail);
+    }
+
+    [Fact]
     public async Task LookupResources_streams_accessible_resources()
     {
         await using var cluster = await MeshTestCluster.CreateAsync(Schema);
