@@ -15,10 +15,7 @@ namespace Spiceport.Grains;
 /// (tag <c>C</c> plus the last resource id) when the Leopard accelerator did: that stream is the
 /// covered candidates in ordinal id order, so resumption skips ids at or before the last one. LookupSubjects has no engine cursor — its results are deterministically ordered
 /// by subject id, so a cursor is simply the last id already returned and resumption skips ids at or
-/// before it. All encode to a standard-alphabet base64 string (<c>+</c>, <c>/</c> and <c>=</c> padding,
-/// as SpiceDB's cursors are), so a token must be escaped before it is placed in a URL; the alphabet is
-/// part of the token format and changing it would invalidate outstanding cursors. An empty/whitespace
-/// token means "from the start".
+/// before it. Both encode to a URL-safe base64 string; an empty/whitespace token means "from the start".
 /// </remarks>
 internal static class ReverseOpsCursorCodec
 {
