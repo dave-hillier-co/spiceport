@@ -88,12 +88,17 @@ public sealed class LogWatchHub : IDatastoreWatcher, IAsyncDisposable
     }
 
     /// <summary>
-    /// Applies <paramref name="schemaBytes"/> to the live schema provider, monotonically: a
-    /// <paramref name="storedHash"/> already applied (by an earlier push or heartbeat) is a no-op, so a
-    /// racing push and heartbeat repair can never double-apply or thrash. A poison schema cannot reach
-    /// here in practice (it would have failed <c>WriteSchema</c>'s own validation before ever committing),
-    /// but <see cref="ISchemaProvider.Update"/> can still throw — caught and logged so a bad push can
-    /// never kill the heartbeat loop or this observer callback.
+    /// Applies <paramref name="schemaBytes"/> to the live schema provider, deduplicated by
+    /// <paramref name="storedHash"/>: a hash already applied successfully (by an earlier push or heartbeat)
+    /// is a no-op, so a racing push and heartbeat repair do not re-apply a schema the silo already serves.
+    /// The hash is recorded only AFTER the apply succeeds. <see cref="ISchemaProvider.Update"/> can still
+    /// throw (a poison schema cannot reach here in practice — it would have failed <c>WriteSchema</c>'s own
+    /// validation before ever committing — but a transient provider failure can); the failure is caught and
+    /// logged so a bad push can never kill the heartbeat loop or this observer callback, and the hash is left
+    /// unrecorded so the next push or heartbeat (<see cref="NeedsApply"/>) retries it. Recording it first
+    /// would pin the silo on its stale schema until a DIFFERENT schema was written. The apply runs outside the
+    /// lock; two concurrent applies of different hashes can at worst leave the older one recorded, which the
+    /// next heartbeat's hash comparison repairs.
     /// </summary>
     private void ApplySchema(byte[] schemaBytes, string storedHash)
     {
@@ -101,20 +106,23 @@ public sealed class LogWatchHub : IDatastoreWatcher, IAsyncDisposable
         {
             if (storedHash == _lastAppliedSchemaHash)
                 return;
+        }
+
+        if (_applySchema is not null)
+        {
+            try
+            {
+                _applySchema(Encoding.UTF8.GetString(schemaBytes));
+            }
+            catch (Exception ex)
+            {
+                _logger?.LogWarning(ex, "Schema apply failed (stored hash {StoredHash}); will retry on the next push or heartbeat", storedHash);
+                return;
+            }
+        }
+
+        lock (_lock)
             _lastAppliedSchemaHash = storedHash;
-        }
-
-        if (_applySchema is null)
-            return;
-
-        try
-        {
-            _applySchema(Encoding.UTF8.GetString(schemaBytes));
-        }
-        catch (Exception ex)
-        {
-            _logger?.LogWarning(ex, "Discarding schema apply (stored hash {StoredHash}): update failed", storedHash);
-        }
     }
 
     /// <summary>Registers the observer reference and starts the heartbeat loop on first use (idempotent).</summary>
