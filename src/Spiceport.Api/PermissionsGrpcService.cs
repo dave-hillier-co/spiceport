@@ -245,6 +245,18 @@ public sealed class PermissionsGrpcService(
         };
     }
 
+    /// <summary>
+    /// Maps a write-time schema violation onto SpiceDB's status: an unknown definition or relation
+    /// (NamespaceNotFound / RelationNotFound) is <c>FailedPrecondition</c>; a write to a permission or a
+    /// disallowed subject type (CannotWriteToPermission / InvalidSubjectType) is <c>InvalidArgument</c>.
+    /// </summary>
+    private static RpcException ToRpc(RelationshipValidationException ex) =>
+        new(new Status(
+            ex.Kind == RelationshipValidationErrorKind.NotFound
+                ? StatusCode.FailedPrecondition
+                : StatusCode.InvalidArgument,
+            ex.Message));
+
     public override async Task<WriteRelationshipsResponse> WriteRelationships(
         WriteRelationshipsRequest request, ServerCallContext context)
     {
@@ -254,6 +266,10 @@ public sealed class PermissionsGrpcService(
         {
             var reply = await Relationships.WriteRelationships(new WriteRelationshipsArgs(updates, preconditions));
             return new WriteRelationshipsResponse { WrittenAt = new ZedToken { Token = reply.WrittenAtToken } };
+        }
+        catch (RelationshipValidationException ex)
+        {
+            throw ToRpc(ex);
         }
         catch (PreconditionFailedException ex)
         {

@@ -291,6 +291,215 @@ public class AuthzedPermissionsV1ServiceTests
         Assert.Equal(StatusCode.AlreadyExists, ex.StatusCode);
     }
 
+    /// <summary>
+    /// The schema from issue #56: <c>document#viewer</c> admits only <c>user</c>, so a
+    /// <c>group#member</c> subject is outside its allowed direct relations; plus a permission and a
+    /// caveat-only relation to exercise the other write-time rejections.
+    /// </summary>
+    private const string WriteValidationSchema = """
+        definition user {}
+
+        caveat only_on_tuesday(day string) {
+            day == "tuesday"
+        }
+
+        definition group {
+            relation member: user
+        }
+
+        definition document {
+            relation viewer: user
+            relation tuesday_viewer: user with only_on_tuesday
+            permission view = viewer
+        }
+        """;
+
+    private static V1::WriteRelationshipsRequest WriteOne(
+        V1::RelationshipUpdate.Types.Operation op,
+        string resourceType, string resourceId, string relation,
+        string subjectType, string subjectId, string? subjectRelation = null, string? caveat = null)
+    {
+        var rel = new V1::Relationship
+        {
+            Resource = new V1::ObjectReference { ObjectType = resourceType, ObjectId = resourceId },
+            Relation = relation,
+            Subject = new V1::SubjectReference
+            {
+                Object = new V1::ObjectReference { ObjectType = subjectType, ObjectId = subjectId },
+                OptionalRelation = subjectRelation ?? string.Empty,
+            },
+        };
+        if (caveat is not null)
+            rel.OptionalCaveat = new V1::ContextualizedCaveat { CaveatName = caveat };
+
+        var req = new V1::WriteRelationshipsRequest();
+        req.Updates.Add(new V1::RelationshipUpdate { Operation = op, Relationship = rel });
+        return req;
+    }
+
+    private static async Task<int> CountStoredAsync(MeshTestCluster cluster, string resourceType)
+    {
+        var writer = new CollectingStreamWriter<V1::ReadRelationshipsResponse>();
+        await Service(cluster).ReadRelationships(new V1::ReadRelationshipsRequest
+        {
+            Consistency = new V1::Consistency { FullyConsistent = true },
+            RelationshipFilter = new V1::RelationshipFilter { ResourceType = resourceType },
+        }, writer, FakeServerCallContext.Default);
+        return writer.Collected.Count;
+    }
+
+    [Fact]
+    public async Task WriteRelationships_subject_type_not_allowed_on_relation_is_invalid_argument()
+    {
+        // Issue #56: SpiceDB validates every update against the schema inside the write transaction
+        // (relationships.ValidateRelationshipUpdates) and rejects a subject type outside the relation's
+        // allowed direct relations with INVALID_ARGUMENT (InvalidSubjectTypeError). Nothing persists.
+        await using var cluster = await MeshTestCluster.CreateAsync(WriteValidationSchema);
+
+        var ex = await Assert.ThrowsAsync<RpcException>(() => Service(cluster).WriteRelationships(
+            WriteOne(V1::RelationshipUpdate.Types.Operation.Create,
+                "document", "doc", "viewer", "group", "eng", "member"),
+            FakeServerCallContext.Default));
+
+        Assert.Equal(StatusCode.InvalidArgument, ex.StatusCode);
+        Assert.Contains("subjects of type `group#member` are not allowed on relation `document#viewer`", ex.Status.Detail);
+        Assert.Equal(0, await CountStoredAsync(cluster, "document"));
+    }
+
+    [Fact]
+    public async Task WriteRelationships_unknown_definition_is_failed_precondition()
+    {
+        // An unknown object definition is SpiceDB's NamespaceNotFound, which the v1 services rewrite to
+        // FAILED_PRECONDITION (the same mapping SchemaValidation applies for Check).
+        await using var cluster = await MeshTestCluster.CreateAsync(WriteValidationSchema);
+
+        var ex = await Assert.ThrowsAsync<RpcException>(() => Service(cluster).WriteRelationships(
+            WriteOne(V1::RelationshipUpdate.Types.Operation.Touch,
+                "nonesuch", "doc", "viewer", "user", "alice"),
+            FakeServerCallContext.Default));
+
+        Assert.Equal(StatusCode.FailedPrecondition, ex.StatusCode);
+        Assert.Contains("object definition `nonesuch` not found", ex.Status.Detail);
+    }
+
+    [Fact]
+    public async Task WriteRelationships_unknown_relation_is_failed_precondition()
+    {
+        await using var cluster = await MeshTestCluster.CreateAsync(WriteValidationSchema);
+
+        var ex = await Assert.ThrowsAsync<RpcException>(() => Service(cluster).WriteRelationships(
+            WriteOne(V1::RelationshipUpdate.Types.Operation.Touch,
+                "document", "doc", "nonesuch", "user", "alice"),
+            FakeServerCallContext.Default));
+
+        Assert.Equal(StatusCode.FailedPrecondition, ex.StatusCode);
+        Assert.Contains("relation/permission `nonesuch` not found under definition `document`", ex.Status.Detail);
+    }
+
+    [Fact]
+    public async Task WriteRelationships_to_a_permission_is_invalid_argument()
+    {
+        // SpiceDB CannotWriteToPermissionError -> INVALID_ARGUMENT.
+        await using var cluster = await MeshTestCluster.CreateAsync(WriteValidationSchema);
+
+        var ex = await Assert.ThrowsAsync<RpcException>(() => Service(cluster).WriteRelationships(
+            WriteOne(V1::RelationshipUpdate.Types.Operation.Touch,
+                "document", "doc", "view", "user", "alice"),
+            FakeServerCallContext.Default));
+
+        Assert.Equal(StatusCode.InvalidArgument, ex.StatusCode);
+        Assert.Contains("cannot write a relationship to permission `view` under definition `document`", ex.Status.Detail);
+    }
+
+    [Fact]
+    public async Task WriteRelationships_caveat_not_allowed_on_relation_is_invalid_argument()
+    {
+        // `document#viewer` admits only an uncaveated `user`; a caveated subject is not an allowed type.
+        await using var cluster = await MeshTestCluster.CreateAsync(WriteValidationSchema);
+
+        var ex = await Assert.ThrowsAsync<RpcException>(() => Service(cluster).WriteRelationships(
+            WriteOne(V1::RelationshipUpdate.Types.Operation.Touch,
+                "document", "doc", "viewer", "user", "alice", caveat: "only_on_tuesday"),
+            FakeServerCallContext.Default));
+
+        Assert.Equal(StatusCode.InvalidArgument, ex.StatusCode);
+        Assert.Contains("subjects of type `user with only_on_tuesday` are not allowed on relation `document#viewer`", ex.Status.Detail);
+    }
+
+    [Fact]
+    public async Task WriteRelationships_uncaveated_subject_on_caveat_only_relation_names_the_required_caveat()
+    {
+        await using var cluster = await MeshTestCluster.CreateAsync(WriteValidationSchema);
+
+        var ex = await Assert.ThrowsAsync<RpcException>(() => Service(cluster).WriteRelationships(
+            WriteOne(V1::RelationshipUpdate.Types.Operation.Touch,
+                "document", "doc", "tuesday_viewer", "user", "alice"),
+            FakeServerCallContext.Default));
+
+        Assert.Equal(StatusCode.InvalidArgument, ex.StatusCode);
+        Assert.Contains(
+            "subjects of type `user` are not allowed on relation `document#tuesday_viewer` without one of the following caveats: only_on_tuesday",
+            ex.Status.Detail);
+    }
+
+    [Fact]
+    public async Task WriteRelationships_delete_ignores_an_unspecified_caveat()
+    {
+        // The DELETE rule (ValidateRelationshipForDeletion) ignores the caveat when none is given, so an
+        // uncaveated DELETE of a caveat-only relation is valid; a disallowed subject type still is not.
+        await using var cluster = await MeshTestCluster.CreateAsync(WriteValidationSchema);
+
+        await Service(cluster).WriteRelationships(
+            WriteOne(V1::RelationshipUpdate.Types.Operation.Delete,
+                "document", "doc", "tuesday_viewer", "user", "alice"),
+            FakeServerCallContext.Default);
+
+        var ex = await Assert.ThrowsAsync<RpcException>(() => Service(cluster).WriteRelationships(
+            WriteOne(V1::RelationshipUpdate.Types.Operation.Delete,
+                "document", "doc", "viewer", "group", "eng", "member"),
+            FakeServerCallContext.Default));
+        Assert.Equal(StatusCode.InvalidArgument, ex.StatusCode);
+    }
+
+    [Fact]
+    public async Task WriteRelationships_schema_valid_write_succeeds()
+    {
+        await using var cluster = await MeshTestCluster.CreateAsync(WriteValidationSchema);
+
+        await Service(cluster).WriteRelationships(
+            WriteOne(V1::RelationshipUpdate.Types.Operation.Create,
+                "group", "eng", "member", "user", "alice"),
+            FakeServerCallContext.Default);
+
+        Assert.Equal(1, await CountStoredAsync(cluster, "group"));
+    }
+
+    [Fact]
+    public async Task ImportBulkRelationships_disallowed_subject_is_invalid_argument_and_imports_nothing()
+    {
+        await using var cluster = await MeshTestCluster.CreateAsync(WriteValidationSchema);
+
+        var bad = new V1::ImportBulkRelationshipsRequest();
+        bad.Relationships.Add(new V1::Relationship
+        {
+            Resource = new V1::ObjectReference { ObjectType = "document", ObjectId = "doc" },
+            Relation = "viewer",
+            Subject = new V1::SubjectReference
+            {
+                Object = new V1::ObjectReference { ObjectType = "group", ObjectId = "eng" },
+                OptionalRelation = "member",
+            },
+        });
+        var reader = new FakeAsyncStreamReader<V1::ImportBulkRelationshipsRequest>(
+            ImportBatch(("doc1", "alice")), bad);
+
+        var ex = await Assert.ThrowsAsync<RpcException>(() =>
+            Service(cluster).ImportBulkRelationships(reader, FakeServerCallContext.Default));
+
+        Assert.Equal(StatusCode.InvalidArgument, ex.StatusCode);
+        Assert.Equal(0, await CountStoredAsync(cluster, "document"));
+    }
+
     [Fact]
     public async Task WriteRelationships_duplicate_relationship_is_invalid_argument()
     {
@@ -743,7 +952,17 @@ public class AuthzedPermissionsV1ServiceTests
     [Fact]
     public async Task WriteRelationships_then_ReadRelationships_round_trips_expiration()
     {
-        await using var cluster = await MeshTestCluster.CreateAsync(Schema);
+        // An expiring relationship must target a relation whose allowed type carries the expiration
+        // trait: the write is validated against the schema like any other.
+        await using var cluster = await MeshTestCluster.CreateAsync("""
+            use expiration
+
+            definition user {}
+
+            definition document {
+                relation viewer: user with expiration
+            }
+            """);
 
         var expiresAt = new DateTimeOffset(2099, 1, 1, 0, 0, 0, TimeSpan.Zero);
         var req = new V1::WriteRelationshipsRequest();

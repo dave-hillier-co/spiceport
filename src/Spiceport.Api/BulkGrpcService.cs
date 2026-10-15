@@ -28,6 +28,18 @@ public sealed class BulkGrpcService(IGrainFactory grains, Grains.RelationshipRea
 {
     private IRelationshipsGrain Relationships => grains.GetGrain<IRelationshipsGrain>(IRelationshipsGrain.Key);
 
+    /// <summary>
+    /// Maps a write-time schema violation onto SpiceDB's status: an unknown definition or relation
+    /// (NamespaceNotFound / RelationNotFound) is <c>FailedPrecondition</c>; a write to a permission or a
+    /// disallowed subject type (CannotWriteToPermission / InvalidSubjectType) is <c>InvalidArgument</c>.
+    /// </summary>
+    private static RpcException ToRpc(RelationshipValidationException ex) =>
+        new(new Status(
+            ex.Kind == RelationshipValidationErrorKind.NotFound
+                ? StatusCode.FailedPrecondition
+                : StatusCode.InvalidArgument,
+            ex.Message));
+
     public override async Task<ImportBulkRelationshipsResponse> ImportBulkRelationships(
         IAsyncStreamReader<ImportBulkRelationshipsRequest> requestStream,
         ServerCallContext context)
@@ -58,6 +70,10 @@ public sealed class BulkGrpcService(IGrainFactory grains, Grains.RelationshipRea
                 NumLoaded = reply.NumLoaded,
                 LoadedAt = new ZedToken { Token = reply.LoadedAtToken },
             };
+        }
+        catch (RelationshipValidationException ex)
+        {
+            throw ToRpc(ex);
         }
         catch (WriteConflictException ex)
         {

@@ -55,6 +55,18 @@ public sealed class AuthzedPermissionsV1Service(
             },
             ex.Message));
 
+    /// <summary>
+    /// Maps a write-time schema violation onto SpiceDB's status: an unknown definition or relation
+    /// (NamespaceNotFound / RelationNotFound) is <c>FailedPrecondition</c>; a write to a permission or a
+    /// disallowed subject type (CannotWriteToPermission / InvalidSubjectType) is <c>InvalidArgument</c>.
+    /// </summary>
+    private static RpcException ToRpc(RelationshipValidationException ex) =>
+        new(new Status(
+            ex.Kind == RelationshipValidationErrorKind.NotFound
+                ? StatusCode.FailedPrecondition
+                : StatusCode.InvalidArgument,
+            ex.Message));
+
     public override async Task<V1::CheckPermissionResponse> CheckPermission(
         V1::CheckPermissionRequest request, ServerCallContext context)
     {
@@ -158,6 +170,10 @@ public sealed class AuthzedPermissionsV1Service(
         {
             var reply = await Relationships.WriteRelationships(new WriteRelationshipsArgs(updates, preconditions));
             return new V1::WriteRelationshipsResponse { WrittenAt = new V1::ZedToken { Token = reply.WrittenAtToken } };
+        }
+        catch (RelationshipValidationException ex)
+        {
+            throw ToRpc(ex);
         }
         catch (PreconditionFailedException ex)
         {
@@ -641,6 +657,10 @@ public sealed class AuthzedPermissionsV1Service(
 
             // v1 ImportBulkRelationshipsResponse carries only num_loaded (no token).
             return new V1::ImportBulkRelationshipsResponse { NumLoaded = reply.NumLoaded };
+        }
+        catch (RelationshipValidationException ex)
+        {
+            throw ToRpc(ex);
         }
         catch (WriteConflictException ex)
         {

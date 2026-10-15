@@ -59,6 +59,82 @@ public sealed class RelationshipsGrain(
         return await Sequencer.Commit(request).ConfigureAwait(ContinueOnCapturedContext);
     }
 
+    /// <summary>
+    /// Compiles the schema stored at <paramref name="revision"/> — the schema whose hash the
+    /// <c>ExpectedSchemaHash</c> gate compares — read through the <see cref="ISchemaSource"/> seam.
+    /// Pre-first-schema (nothing stored yet) falls back to the host-seeded live snapshot; the gate then
+    /// expects the empty hash, which is what a null stored hash matches.
+    /// </summary>
+    private async Task<Spiceport.Schema.CompiledSchema> CompileStoredSchemaAt(IRevision revision)
+    {
+        var storedBytes = await schemaSource.ReadSchemaAt(revision, CancellationToken.None)
+            .ConfigureAwait(ContinueOnCapturedContext);
+        if (storedBytes is null)
+            return schemaProvider.Current.Schema;
+
+        // This compile is of the STORED schema, never a caller's input: those bytes were validated when
+        // written, so a compile failure here is server-side corruption. It must surface as
+        // InvalidOperationException (gRPC Internal) — blaming the caller for a corrupt stored schema
+        // would be wrong.
+        try
+        {
+            return Spiceport.Schema.SchemaCompiler.CompileSchema(Encoding.UTF8.GetString(storedBytes));
+        }
+        catch (Spiceport.Schema.SchemaCompileException ex)
+        {
+            throw new InvalidOperationException(
+                $"stored schema failed to compile; the persisted schema at the pinned revision is corrupt: {ex.Message}",
+                ex);
+        }
+    }
+
+    /// <summary>
+    /// The last stored schema this activation compiled for write validation, keyed by its stored hash, so a
+    /// run of relationship writes under one schema reads and compiles it once. Pre-first-schema (null
+    /// hash) is never cached: it resolves to the live snapshot, which the host may still swap.
+    /// </summary>
+    private (string Hash, Spiceport.Schema.CompiledSchema Schema)? _validationSchema;
+
+    private async Task<Spiceport.Schema.CompiledSchema> ValidationSchemaAt(RevisionWithSchemaHash head)
+    {
+        if (head.SchemaHash is { } hash && _validationSchema is { } cached && cached.Hash == hash)
+            return cached.Schema;
+
+        var compiled = await CompileStoredSchemaAt(head.Revision).ConfigureAwait(ContinueOnCapturedContext);
+        if (head.SchemaHash is { } storedHash)
+            _validationSchema = (storedHash, compiled);
+        return compiled;
+    }
+
+    /// <summary>
+    /// Validates relationship mutations against the schema effective at head and commits them guarded by
+    /// that schema's hash (SpiceDB validates updates inside the write transaction,
+    /// <c>relationships.ValidateRelationshipUpdates</c>). The validation runs grain-side against a pinned
+    /// head; the commit carries <c>ExpectedSchemaHash</c>, so the sequencer re-proves atomically that no
+    /// schema write landed in between. A <see cref="CommitFailureKind.SchemaHashMoved"/> rejection
+    /// re-validates against the new schema and retries, bounded by <see cref="MaxCommitAttempts"/>.
+    /// Every other outcome returns to the caller for its own mapping.
+    /// </summary>
+    private async Task<CommitReply> CommitSchemaValidated(
+        Action<Spiceport.Schema.CompiledSchema> validate, CommitRequest request)
+    {
+        for (var attempt = 0; ; attempt++)
+        {
+            var head = await datastore.HeadRevision(CancellationToken.None).ConfigureAwait(ContinueOnCapturedContext);
+            var schema = await ValidationSchemaAt(head).ConfigureAwait(ContinueOnCapturedContext);
+            validate(schema);
+
+            var reply = await CommitDeclarative(request with { ExpectedSchemaHash = head.SchemaHash ?? string.Empty })
+                .ConfigureAwait(ContinueOnCapturedContext);
+            if (reply.Failure is not { Kind: CommitFailureKind.SchemaHashMoved })
+                return reply;
+
+            if (attempt + 1 >= MaxCommitAttempts)
+                throw new WriteConflictException(
+                    WriteConflictKind.Serialization, new SerializationException().Message);
+        }
+    }
+
     /// <inheritdoc />
     public async Task<WriteSchemaReply> WriteSchema(WriteSchemaArgs args)
     {
@@ -110,36 +186,8 @@ public sealed class RelationshipsGrain(
             var head = await datastore.HeadRevision(CancellationToken.None).ConfigureAwait(ContinueOnCapturedContext);
 
             // The CURRENT schema for the diff must be the one the pinned hash represents, so the gate and
-            // the validation can never disagree: compile the stored bytes at the pinned revision (they
-            // always compile — they were validated when written), read through the ISchemaSource seam.
-            // Pre-first-schema (nothing stored yet) falls back to the host-seeded live snapshot, matching
-            // the historical behavior; the gate then expects the empty hash (which is what a null stored
-            // hash matches).
-            var storedBytes = await schemaSource.ReadSchemaAt(head.Revision, CancellationToken.None)
-                .ConfigureAwait(ContinueOnCapturedContext);
-            Spiceport.Schema.CompiledSchema current;
-            if (storedBytes is null)
-            {
-                current = schemaProvider.Current.Schema;
-            }
-            else
-            {
-                // This compile is of the STORED schema (the diff base), never the caller's input: those
-                // bytes were validated when written, so a compile failure here is server-side corruption.
-                // It must surface as InvalidOperationException (gRPC Internal) — the ArgumentException
-                // mapping to InvalidArgument at the top of this method is reserved for the caller's NEW
-                // schema, and blaming the caller for a corrupt stored schema would be wrong.
-                try
-                {
-                    current = Spiceport.Schema.SchemaCompiler.CompileSchema(Encoding.UTF8.GetString(storedBytes));
-                }
-                catch (Spiceport.Schema.SchemaCompileException ex)
-                {
-                    throw new InvalidOperationException(
-                        $"stored schema failed to compile; the persisted schema at the pinned revision is corrupt: {ex.Message}",
-                        ex);
-                }
-            }
+            // the validation can never disagree.
+            var current = await CompileStoredSchemaAt(head.Revision).ConfigureAwait(ContinueOnCapturedContext);
 
             var checks = SchemaChangeValidator.ComputeChecks(current, nextCompiled);
             await SchemaChangeValidator.EvaluateAsync(checks, scanner, head.Revision, CancellationToken.None)
@@ -213,15 +261,18 @@ public sealed class RelationshipsGrain(
 
         // One declarative commit: the sequencer evaluates the preconditions against the same snapshot
         // the updates commit at (the semantics the inline transaction had) and applies the updates with
-        // Create preserved, so a duplicate create is rejected there and nothing commits.
-        var reply = await CommitDeclarative(new CommitRequest(
-            ToCommitPreconditions(args.Preconditions),
-            args.Updates,
-            DeleteByFilter: null,
-            SchemaBytes: null,
-            ExpectedSchemaHash: null,
-            CounterChanges: Array.Empty<CounterDeltaWire>(),
-            ExpectedHead: null)).ConfigureAwait(ContinueOnCapturedContext);
+        // Create preserved, so a duplicate create is rejected there and nothing commits. Every update is
+        // first validated against the schema at head, the commit guarded by that schema's hash.
+        var reply = await CommitSchemaValidated(
+            schema => RelationshipSchemaValidator.ValidateUpdates(schema, args.Updates),
+            new CommitRequest(
+                ToCommitPreconditions(args.Preconditions),
+                args.Updates,
+                DeleteByFilter: null,
+                SchemaBytes: null,
+                ExpectedSchemaHash: null,
+                CounterChanges: Array.Empty<CounterDeltaWire>(),
+                ExpectedHead: null)).ConfigureAwait(ContinueOnCapturedContext);
 
         if (reply.Failure is { } failure)
             throw RelationshipWriteFailure(failure);
@@ -269,14 +320,18 @@ public sealed class RelationshipsGrain(
             .Select(r => new RelationshipUpdateWire(RelationshipUpdateOpWire.Create, r))
             .ToList();
 
-        var reply = await CommitDeclarative(new CommitRequest(
-            Array.Empty<CommitPreconditionWire>(),
-            updates,
-            DeleteByFilter: null,
-            SchemaBytes: null,
-            ExpectedSchemaHash: null,
-            CounterChanges: Array.Empty<CounterDeltaWire>(),
-            ExpectedHead: null)).ConfigureAwait(ContinueOnCapturedContext);
+        // Every row is validated against the schema at head (SpiceDB ValidateRelationshipsForCreateOrTouch),
+        // the commit guarded by that schema's hash; one invalid row rejects the whole import.
+        var reply = await CommitSchemaValidated(
+            schema => RelationshipSchemaValidator.ValidateForCreateOrTouch(schema, args.Relationships),
+            new CommitRequest(
+                Array.Empty<CommitPreconditionWire>(),
+                updates,
+                DeleteByFilter: null,
+                SchemaBytes: null,
+                ExpectedSchemaHash: null,
+                CounterChanges: Array.Empty<CounterDeltaWire>(),
+                ExpectedHead: null)).ConfigureAwait(ContinueOnCapturedContext);
 
         // A duplicate row surfaces as CreateAlreadyExists and maps through the shared mapper to the
         // same typed WriteConflictException (-> gRPC AlreadyExists) the WriteRelationships path throws,
@@ -398,7 +453,8 @@ public sealed class RelationshipsGrain(
     /// <see cref="CreateRelationshipExistsException"/> derives from the conflicting relationship (the
     /// reply Detail). HeadMoved never reaches this mapper — <see cref="CommitDeclarative"/> retries it —
     /// and no other kind can occur on a declarative relationship commit (there is no
-    /// ExpectedHead/ExpectedSchemaHash and no counter delta), so anything else is surfaced loudly.
+    /// ExpectedHead and no counter delta, and SchemaHashMoved is retried by
+    /// <see cref="CommitSchemaValidated"/>), so anything else is surfaced loudly.
     /// </summary>
     private static Exception RelationshipWriteFailure(CommitFailureWire failure) => failure.Kind switch
     {

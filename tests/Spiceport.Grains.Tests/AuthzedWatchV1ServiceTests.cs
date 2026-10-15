@@ -110,7 +110,16 @@ public class AuthzedWatchV1ServiceTests
     [Fact]
     public async Task Watch_includes_relationship_expiration()
     {
-        await using var cluster = await MeshTestCluster.CreateAsync(Schema);
+        // An expiring relationship must target a relation whose allowed type carries the expiration
+        // trait: the write is validated against the schema like any other.
+        await using var cluster = await MeshTestCluster.CreateAsync("""
+            use expiration
+
+            definition user {}
+            definition document {
+                relation viewer: user with expiration
+            }
+            """);
         var service = Service(cluster);
 
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));

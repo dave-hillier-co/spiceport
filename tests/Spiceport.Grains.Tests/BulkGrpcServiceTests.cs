@@ -76,6 +76,52 @@ public class BulkGrpcServiceTests
     }
 
     [Fact]
+    public async Task Import_of_a_relation_the_schema_does_not_define_is_failed_precondition_and_imports_nothing()
+    {
+        // Issue #56: every imported row is validated against the schema (SpiceDB
+        // ValidateRelationshipsForCreateOrTouch). An unknown relation is RelationNotFound ->
+        // FAILED_PRECONDITION; the whole import is rejected, so the clean row before it is not applied.
+        await using var cluster = await MeshTestCluster.CreateAsync(Schema);
+        var service = Service(cluster);
+
+        var req = new ImportBulkRelationshipsRequest();
+        req.Relationships.Add(Viewer("doc1", "alice"));
+        var bad = Viewer("doc2", "bob");
+        bad.ResourceRelation = "owner";
+        req.Relationships.Add(bad);
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        var ex = await Assert.ThrowsAsync<RpcException>(() => service.ImportBulkRelationships(
+            new FakeStreamReader<ImportBulkRelationshipsRequest>([req]), new FakeServerCallContext(cts.Token)));
+
+        Assert.Equal(StatusCode.FailedPrecondition, ex.StatusCode);
+        Assert.Contains("relation/permission `owner` not found under definition `document`", ex.Status.Detail);
+
+        var writer = new CollectingStreamWriter<ExportBulkRelationshipsResponse>();
+        await service.ExportBulkRelationships(
+            new ExportBulkRelationshipsRequest(), writer, new FakeServerCallContext(cts.Token));
+        Assert.Empty(writer.Collected.SelectMany(r => r.Relationships));
+    }
+
+    [Fact]
+    public async Task Import_of_a_disallowed_subject_type_is_invalid_argument()
+    {
+        await using var cluster = await MeshTestCluster.CreateAsync(Schema);
+        var service = Service(cluster);
+
+        var req = new ImportBulkRelationshipsRequest();
+        var bad = Viewer("doc1", "alice");
+        bad.Subject.Object.ObjectType = "document";
+        req.Relationships.Add(bad);
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        var ex = await Assert.ThrowsAsync<RpcException>(() => service.ImportBulkRelationships(
+            new FakeStreamReader<ImportBulkRelationshipsRequest>([req]), new FakeServerCallContext(cts.Token)));
+
+        Assert.Equal(StatusCode.InvalidArgument, ex.StatusCode);
+    }
+
+    [Fact]
     public async Task Export_round_trips_the_imported_set()
     {
         await using var cluster = await MeshTestCluster.CreateAsync(Schema);
