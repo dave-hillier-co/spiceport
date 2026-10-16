@@ -17,7 +17,8 @@ namespace Spiceport.Grains.Tests;
 /// Drives the server-streaming <c>authzed.api.v1</c> <see cref="AuthzedWatchV1Service"/> IN-PROCESS (no
 /// Kestrel). Verifies: tailing from head sees a subsequent write with its changes_through token; resuming
 /// from a pre-write token replays the write exactly once; cancellation terminates the stream cleanly; the
-/// optional_object_types filter excludes updates of other resource types.
+/// optional_object_types filter excludes updates of other resource types; optional_relationship_filters
+/// emit only updates matching any filter, and cannot be combined with optional_object_types.
 /// </summary>
 [Collection(MeshClusterCollection.Name)]
 public class AuthzedWatchV1ServiceTests
@@ -110,7 +111,16 @@ public class AuthzedWatchV1ServiceTests
     [Fact]
     public async Task Watch_includes_relationship_expiration()
     {
-        await using var cluster = await MeshTestCluster.CreateAsync(Schema);
+        // An expiring relationship must target a relation whose allowed type carries the expiration
+        // trait: the write is validated against the schema like any other.
+        await using var cluster = await MeshTestCluster.CreateAsync("""
+            use expiration
+
+            definition user {}
+            definition document {
+                relation viewer: user with expiration
+            }
+            """);
         var service = Service(cluster);
 
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
@@ -180,6 +190,281 @@ public class AuthzedWatchV1ServiceTests
 
         Assert.All(writer.Collected,
             r => Assert.All(r.Updates, u => Assert.Equal("document", u.Relationship.Resource.ObjectType)));
+    }
+
+    [Fact]
+    public async Task Watch_with_relationship_filter_emits_only_matching_updates()
+    {
+        await using var cluster = await MeshTestCluster.CreateAsync(Schema);
+        var service = Service(cluster);
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        var writer = new CollectingStreamWriter<V1::WatchResponse>();
+        var ctx = new FakeServerCallContext(cts.Token);
+
+        var request = new V1::WatchRequest();
+        request.OptionalRelationshipFilters.Add(new V1::RelationshipFilter
+        {
+            ResourceType = "document",
+            OptionalRelation = "viewer",
+            OptionalSubjectFilter = new V1::SubjectFilter { SubjectType = "user", OptionalSubjectId = "alice" },
+        });
+        var watchTask = service.Watch(request, writer, ctx);
+
+        // Same resource type and relation, but a different subject: filtered out server-side.
+        await WriteViewer(cluster, "document", "doc1", "bob");
+        await WriteViewer(cluster, "document", "doc2", "alice");
+
+        var response = await writer.WaitForNext(TimeSpan.FromSeconds(10), watchTask);
+        cts.Cancel();
+        await watchTask;
+
+        var update = Assert.Single(response.Updates);
+        Assert.Equal("doc2", update.Relationship.Resource.ObjectId);
+        Assert.Equal("alice", update.Relationship.Subject.Object.ObjectId);
+        Assert.All(writer.Collected,
+            r => Assert.All(r.Updates, u => Assert.Equal("alice", u.Relationship.Subject.Object.ObjectId)));
+    }
+
+    [Fact]
+    public async Task Watch_with_multiple_relationship_filters_emits_updates_matching_any()
+    {
+        await using var cluster = await MeshTestCluster.CreateAsync(Schema);
+        var service = Service(cluster);
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        var writer = new CollectingStreamWriter<V1::WatchResponse>();
+        var ctx = new FakeServerCallContext(cts.Token);
+
+        var request = new V1::WatchRequest();
+        request.OptionalRelationshipFilters.Add(new V1::RelationshipFilter
+        {
+            ResourceType = "document",
+            OptionalResourceId = "doc1",
+        });
+        request.OptionalRelationshipFilters.Add(new V1::RelationshipFilter
+        {
+            ResourceType = "folder",
+            OptionalResourceIdPrefix = "f",
+        });
+        var watchTask = service.Watch(request, writer, ctx);
+
+        // doc2 matches neither filter; f1 matches the second; doc1 matches the first.
+        await WriteViewer(cluster, "document", "doc2", "alice");
+        await WriteViewer(cluster, "folder", "f1", "alice");
+        await WriteViewer(cluster, "document", "doc1", "alice");
+
+        var first = await writer.WaitForNext(TimeSpan.FromSeconds(10), watchTask);
+        var second = await writer.WaitForNext(TimeSpan.FromSeconds(10), watchTask);
+        cts.Cancel();
+        await watchTask;
+
+        Assert.Equal("f1", Assert.Single(first.Updates).Relationship.Resource.ObjectId);
+        Assert.Equal("doc1", Assert.Single(second.Updates).Relationship.Resource.ObjectId);
+        Assert.All(writer.Collected,
+            r => Assert.All(r.Updates, u => Assert.NotEqual("doc2", u.Relationship.Resource.ObjectId)));
+    }
+
+    [Fact]
+    public async Task Watch_with_both_object_types_and_relationship_filters_is_invalid_argument()
+    {
+        await using var cluster = await MeshTestCluster.CreateAsync(Schema);
+        var service = Service(cluster);
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        var writer = new CollectingStreamWriter<V1::WatchResponse>();
+        var ctx = new FakeServerCallContext(cts.Token);
+
+        var request = new V1::WatchRequest();
+        request.OptionalObjectTypes.Add("document");
+        request.OptionalRelationshipFilters.Add(new V1::RelationshipFilter { ResourceType = "document" });
+
+        var ex = await Assert.ThrowsAsync<RpcException>(() => service.Watch(request, writer, ctx));
+
+        Assert.Equal(StatusCode.InvalidArgument, ex.StatusCode);
+        Assert.Equal("cannot specify both object types and relationship filters", ex.Status.Detail);
+        Assert.Empty(writer.Collected);
+    }
+
+    private const string GroupSchema = """
+        definition user {}
+        definition group {
+            relation member: user
+        }
+        definition document {
+            relation viewer: user | group | group#member
+            permission view = viewer
+        }
+        """;
+
+    private static Task WriteGroupViewer(MeshTestCluster cluster, string id, string group, string subjectRelation)
+    {
+        var update = new WireUpdate(
+            WireOp.Touch,
+            new WireRelationship("document", id, "viewer", "group", group, subjectRelation, null, null, null));
+        return cluster.Relationships.WriteRelationships(new WireWriteArgs(new List<WireUpdate> { update }));
+    }
+
+    [Fact]
+    public async Task Watch_with_empty_subject_relation_emits_only_ellipsis_subjects()
+    {
+        await using var cluster = await MeshTestCluster.CreateAsync(GroupSchema);
+        var service = Service(cluster);
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        var writer = new CollectingStreamWriter<V1::WatchResponse>();
+        var ctx = new FakeServerCallContext(cts.Token);
+
+        // A present-but-empty optional_relation selects only ellipsis subjects, as upstream's
+        // RelationshipsFilterFromPublicFilter does (WithEllipsisRelation).
+        var request = new V1::WatchRequest();
+        request.OptionalRelationshipFilters.Add(new V1::RelationshipFilter
+        {
+            OptionalSubjectFilter = new V1::SubjectFilter
+            {
+                SubjectType = "group",
+                OptionalRelation = new V1::SubjectFilter.Types.RelationFilter { Relation = string.Empty },
+            },
+        });
+        var watchTask = service.Watch(request, writer, ctx);
+
+        await WriteGroupViewer(cluster, "doc1", "eng", "member");
+        await WriteGroupViewer(cluster, "doc2", "eng", "...");
+
+        var response = await writer.WaitForNext(TimeSpan.FromSeconds(10), watchTask);
+        cts.Cancel();
+        await watchTask;
+
+        var update = Assert.Single(response.Updates);
+        Assert.Equal("doc2", update.Relationship.Resource.ObjectId);
+        Assert.Equal(string.Empty, update.Relationship.Subject.OptionalRelation);
+        Assert.All(writer.Collected,
+            r => Assert.All(r.Updates, u => Assert.NotEqual("doc1", u.Relationship.Resource.ObjectId)));
+    }
+
+    [Fact]
+    public async Task Watch_with_named_subject_relation_emits_only_that_relation()
+    {
+        await using var cluster = await MeshTestCluster.CreateAsync(GroupSchema);
+        var service = Service(cluster);
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        var writer = new CollectingStreamWriter<V1::WatchResponse>();
+        var ctx = new FakeServerCallContext(cts.Token);
+
+        var request = new V1::WatchRequest();
+        request.OptionalRelationshipFilters.Add(new V1::RelationshipFilter
+        {
+            OptionalSubjectFilter = new V1::SubjectFilter
+            {
+                SubjectType = "group",
+                OptionalRelation = new V1::SubjectFilter.Types.RelationFilter { Relation = "member" },
+            },
+        });
+        var watchTask = service.Watch(request, writer, ctx);
+
+        await WriteGroupViewer(cluster, "doc1", "eng", "...");
+        await WriteGroupViewer(cluster, "doc2", "eng", "member");
+
+        var response = await writer.WaitForNext(TimeSpan.FromSeconds(10), watchTask);
+        cts.Cancel();
+        await watchTask;
+
+        var update = Assert.Single(response.Updates);
+        Assert.Equal("doc2", update.Relationship.Resource.ObjectId);
+        Assert.Equal("member", update.Relationship.Subject.OptionalRelation);
+    }
+
+    [Fact]
+    public async Task Watch_with_absent_subject_relation_emits_any_subject_relation()
+    {
+        await using var cluster = await MeshTestCluster.CreateAsync(GroupSchema);
+        var service = Service(cluster);
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        var writer = new CollectingStreamWriter<V1::WatchResponse>();
+        var ctx = new FakeServerCallContext(cts.Token);
+
+        var request = new V1::WatchRequest();
+        request.OptionalRelationshipFilters.Add(new V1::RelationshipFilter
+        {
+            OptionalSubjectFilter = new V1::SubjectFilter { SubjectType = "group" },
+        });
+        var watchTask = service.Watch(request, writer, ctx);
+
+        await WriteGroupViewer(cluster, "doc1", "eng", "member");
+        await WriteGroupViewer(cluster, "doc2", "eng", "...");
+
+        var first = await writer.WaitForNext(TimeSpan.FromSeconds(10), watchTask);
+        var second = await writer.WaitForNext(TimeSpan.FromSeconds(10), watchTask);
+        cts.Cancel();
+        await watchTask;
+
+        Assert.Equal("doc1", Assert.Single(first.Updates).Relationship.Resource.ObjectId);
+        Assert.Equal("doc2", Assert.Single(second.Updates).Relationship.Resource.ObjectId);
+    }
+
+    public static TheoryData<V1::RelationshipFilter, StatusCode, string> InvalidFilters() => new()
+    {
+        {
+            new V1::RelationshipFilter(),
+            StatusCode.InvalidArgument,
+            "the relationship filter provided is not valid: at least one field must be set"
+        },
+        {
+            new V1::RelationshipFilter { ResourceType = "document", OptionalResourceId = "d", OptionalResourceIdPrefix = "d" },
+            StatusCode.InvalidArgument,
+            "the relationship filter provided is not valid: resource_id and resource_id_prefix cannot be set at the same time"
+        },
+        {
+            new V1::RelationshipFilter { ResourceType = "nope" },
+            StatusCode.FailedPrecondition,
+            "object definition `nope` not found"
+        },
+        {
+            new V1::RelationshipFilter { ResourceType = "document", OptionalRelation = "nope" },
+            StatusCode.FailedPrecondition,
+            "relation/permission `nope` not found under definition `document`"
+        },
+        {
+            new V1::RelationshipFilter { OptionalSubjectFilter = new V1::SubjectFilter { SubjectType = "nope" } },
+            StatusCode.FailedPrecondition,
+            "object definition `nope` not found"
+        },
+        {
+            new V1::RelationshipFilter
+            {
+                OptionalSubjectFilter = new V1::SubjectFilter
+                {
+                    SubjectType = "group",
+                    OptionalRelation = new V1::SubjectFilter.Types.RelationFilter { Relation = "nope" },
+                },
+            },
+            StatusCode.FailedPrecondition,
+            "relation/permission `nope` not found under definition `group`"
+        },
+    };
+
+    [Theory]
+    [MemberData(nameof(InvalidFilters))]
+    public async Task Watch_with_invalid_relationship_filter_is_rejected(
+        V1::RelationshipFilter filter, StatusCode expectedCode, string expectedDetail)
+    {
+        await using var cluster = await MeshTestCluster.CreateAsync(GroupSchema);
+        var service = Service(cluster);
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        var writer = new CollectingStreamWriter<V1::WatchResponse>();
+        var ctx = new FakeServerCallContext(cts.Token);
+
+        var request = new V1::WatchRequest();
+        request.OptionalRelationshipFilters.Add(filter);
+
+        var ex = await Assert.ThrowsAsync<RpcException>(() => service.Watch(request, writer, ctx));
+
+        Assert.Equal(expectedCode, ex.StatusCode);
+        Assert.Equal(expectedDetail, ex.Status.Detail);
+        Assert.Empty(writer.Collected);
     }
 
     [Fact]

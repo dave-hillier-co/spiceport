@@ -172,8 +172,9 @@ Being plain in-process C# rather than grain code, the streaming ops take the cal
 `CancellationToken` directly with no Orleans grain-method plumbing to bridge — simpler than the retired
 Guid-per-stream grain scheme, with identical per-item cancellation behavior. The Leopard membership index
 still accelerates an unlimited, cursorless `LookupResources` (its fast path yields a complete candidate set
-confirmed by Check, dispatched via `IMembershipWalkGrain` across the mesh); a *limited* walk runs the
-cursor-bearing live traversal so every item carries a resume cursor.
+confirmed by Check, dispatched via `IMembershipWalkGrain` across the mesh, streamed in ordinal id order so
+each item carries a candidate-resume cursor); a *limited* walk runs the live traversal, whose items carry
+engine cursors.
 
 A prior iteration of this design routed these ops through Guid-keyed grains under default placement,
 because native Orleans `IAsyncEnumerable` grain streaming is not safe on a `[StatelessWorker]` grain (the

@@ -21,6 +21,9 @@ public class AuthzedExperimentalV1ServiceTests
             relation viewer: user
             permission view = viewer
         }
+        definition folder {
+            relation viewer: user
+        }
         """;
 
     private static AuthzedExperimentalV1Service Service(MeshTestCluster cluster) =>
@@ -99,7 +102,7 @@ public class AuthzedExperimentalV1ServiceTests
             new List<RelationshipUpdateWire>
             {
                 new(RelationshipUpdateOpWire.Touch,
-                    new RelationshipWire("user", "alice", "...", "user", "carol", "...", null, null, null)),
+                    new RelationshipWire("folder", "docs", "viewer", "user", "carol", "...", null, null, null)),
             }));
         var third = await service.ExperimentalCountRelationships(
             new V1::ExperimentalCountRelationshipsRequest { Name = "doc_viewers" }, FakeServerCallContext.Default);

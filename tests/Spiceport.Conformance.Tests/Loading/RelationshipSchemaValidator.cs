@@ -6,8 +6,9 @@ namespace Spiceport.Conformance.Tests;
 /// <summary>
 /// Mirrors SpiceDB's write-time <c>relationships.ValidateRelationshipsForCreateOrTouch</c>: a written
 /// relationship's (subject type, subrelation, caveat) must match one of the relation's allowed types.
-/// Spiceport's production write path does NOT perform this check (a known gap vs SpiceDB), so the
-/// loader-robustness suite applies it explicitly before writing.
+/// The loader-robustness suite applies it explicitly to fixture relationships before writing them
+/// through the datastore directly; the production write path runs the server's own
+/// <c>Spiceport.Grains.RelationshipSchemaValidator</c> inside <c>RelationshipsGrain</c>.
 /// </summary>
 public static class RelationshipSchemaValidator
 {

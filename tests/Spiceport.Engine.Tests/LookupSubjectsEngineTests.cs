@@ -367,4 +367,111 @@ public class LookupSubjectsEngineTests
             Assert.Equal(verdict == Membership.Member, foundIds.Contains(id));
         }
     }
+
+    // SpiceDB's subject-set union (basesubjectset.go unionConcreteWithConcrete) merges a subject's
+    // caveats with shortcircuitedOr: an unconditional branch makes the union unconditional.
+    private const string ShortCircuitUnionSchema = """
+        caveat somecaveat(x int) {
+          x > 1
+        }
+
+        definition user {}
+
+        definition doc {
+          relation viewer: user
+          relation cond_viewer: user with somecaveat
+          permission view = viewer + cond_viewer
+        }
+        """;
+
+    [Fact]
+    public async Task Union_of_unconditional_and_caveated_same_subject_is_unconditional()
+    {
+        var (store, rev) = await Seed(
+            Tuple("doc", "1", "viewer", Onr("user", "alice")),
+            Caveated("doc", "1", "cond_viewer", Onr("user", "alice"), "somecaveat"));
+        var engine = BuildEngine(ShortCircuitUnionSchema);
+        var reader = store.SnapshotReader(rev);
+
+        var found = await Collect(engine.LookupSubjects(reader, Onr("doc", "1", "view"), "user"));
+
+        var alice = Assert.Single(found);
+        Assert.Equal("alice", alice.SubjectId);
+        Assert.Null(alice.Caveat);
+    }
+
+    // SpiceDB's intersectWildcardWithWildcard unions the exclusion sets through BaseSubjectSet.Add,
+    // which merges a doubly-excluded subject with shortcircuitedOr: an unconditional exclusion on
+    // either side excludes unconditionally.
+    private const string ShortCircuitExclusionSchema = """
+        caveat somecaveat(x int) {
+          x > 1
+        }
+
+        definition user {}
+
+        definition doc {
+          relation a: user:*
+          relation b: user:*
+          relation banned: user
+          relation cbanned: user with somecaveat
+          permission p1 = a - cbanned
+          permission p2 = b - banned
+          permission view = p1 & p2
+        }
+        """;
+
+    [Fact]
+    public async Task Intersection_of_wildcards_with_conditional_and_unconditional_exclusion_excludes_unconditionally()
+    {
+        var (store, rev) = await Seed(
+            Tuple("doc", "1", "a", Onr("user", CoreConstants.PublicWildcard)),
+            Tuple("doc", "1", "b", Onr("user", CoreConstants.PublicWildcard)),
+            Tuple("doc", "1", "banned", Onr("user", "alice")),
+            Caveated("doc", "1", "cbanned", Onr("user", "alice"), "somecaveat"));
+        var engine = BuildEngine(ShortCircuitExclusionSchema);
+        var reader = store.SnapshotReader(rev);
+
+        var found = await Collect(engine.LookupSubjects(reader, Onr("doc", "1", "view"), "user"));
+
+        var wildcard = Assert.Single(found);
+        Assert.True(wildcard.IsWildcard);
+        Assert.Null(wildcard.Caveat);
+        Assert.NotNull(wildcard.ExcludedSubjects);
+        var excluded = Assert.Single(wildcard.ExcludedSubjects);
+        Assert.Equal("alice", excluded.SubjectId);
+        Assert.Null(excluded.Caveat);
+    }
+
+    // SpiceDB's unionWildcardWithWildcard (basesubjectset.go) merges the two wildcards' caveats with
+    // shortcircuitedOr: an unconditional wildcard makes the union wildcard unconditional.
+    private const string ShortCircuitWildcardUnionSchema = """
+        caveat somecaveat(x int) {
+          x > 1
+        }
+
+        definition user {}
+
+        definition doc {
+          relation a: user:*
+          relation b: user:* with somecaveat
+          permission view = a + b
+        }
+        """;
+
+    [Fact]
+    public async Task Union_of_unconditional_and_caveated_wildcards_is_unconditional()
+    {
+        var (store, rev) = await Seed(
+            Tuple("doc", "1", "a", Onr("user", CoreConstants.PublicWildcard)),
+            Caveated("doc", "1", "b", Onr("user", CoreConstants.PublicWildcard), "somecaveat"));
+        var engine = BuildEngine(ShortCircuitWildcardUnionSchema);
+        var reader = store.SnapshotReader(rev);
+
+        var found = await Collect(engine.LookupSubjects(reader, Onr("doc", "1", "view"), "user"));
+
+        var wildcard = Assert.Single(found);
+        Assert.True(wildcard.IsWildcard);
+        Assert.Null(wildcard.Caveat);
+    }
 }
