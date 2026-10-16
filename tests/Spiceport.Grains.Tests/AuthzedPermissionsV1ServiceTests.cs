@@ -1344,6 +1344,44 @@ public class AuthzedPermissionsV1ServiceTests
     }
 
     [Fact]
+    public async Task WriteRelationships_reports_a_missing_submessage_before_oversized_metadata()
+    {
+        // SpiceDB's protoc-gen-validate interceptor runs before the handler, whose first statement is
+        // validateTransactionMetadata, so a request malformed both ways gets the shape error.
+        await using var cluster = await MeshTestCluster.CreateAsync(Schema);
+
+        var request = new V1::WriteRelationshipsRequest
+        {
+            Updates = { new V1::RelationshipUpdate { Operation = V1::RelationshipUpdate.Types.Operation.Touch } },
+            OptionalTransactionMetadata = MetadataOfBytes(65_000),
+        };
+        var ex = await Assert.ThrowsAsync<RpcException>(() =>
+            Service(cluster).WriteRelationships(request, FakeServerCallContext.Default));
+
+        Assert.Equal(StatusCode.InvalidArgument, ex.StatusCode);
+        Assert.Equal(
+            "invalid WriteRelationshipsRequest.Updates[0]: embedded message failed validation | caused by: " +
+            "invalid RelationshipUpdate.Relationship: value is required",
+            ex.Status.Detail);
+    }
+
+    [Fact]
+    public async Task WriteRelationships_reports_oversized_metadata_before_too_many_updates()
+    {
+        // Within the handler SpiceDB checks the metadata size ahead of the update count.
+        await using var cluster = await MeshTestCluster.CreateAsync(Schema);
+
+        var request = new V1::WriteRelationshipsRequest { OptionalTransactionMetadata = MetadataOfBytes(65_000) };
+        for (var i = 0; i <= 1000; i++)
+            request.Updates.Add(WriteReq(V1::RelationshipUpdate.Types.Operation.Touch, $"doc{i}", "alice").Updates[0]);
+        var ex = await Assert.ThrowsAsync<RpcException>(() =>
+            Service(cluster).WriteRelationships(request, FakeServerCallContext.Default));
+
+        Assert.Equal(StatusCode.InvalidArgument, ex.StatusCode);
+        Assert.Matches("^metadata size of [0-9]+ is greater than maximum allowed of 65000$", ex.Status.Detail);
+    }
+
+    [Fact]
     public async Task DeleteRelationships_transaction_metadata_over_65000_bytes_is_invalid_argument()
     {
         await using var cluster = await MeshTestCluster.CreateAsync(Schema);

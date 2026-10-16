@@ -31,7 +31,9 @@ internal static class RequestLimits
 
     /// <summary>
     /// Validates the shape of a <c>WriteRelationships</c> request, throwing an
-    /// <see cref="RpcException"/> with <see cref="StatusCode.InvalidArgument"/> for: more than
+    /// <see cref="RpcException"/> with <see cref="StatusCode.InvalidArgument"/> for, in SpiceDB's order: a
+    /// missing required submessage, transaction metadata over
+    /// <see cref="RequestCeilings.MaxTransactionMetadataSize"/> bytes, more than
     /// <see cref="MaxUpdatesPerWrite"/> updates (ERROR_REASON_TOO_MANY_UPDATES_IN_REQUEST), more than
     /// <see cref="MaxPreconditionsCount"/> preconditions, a relationship appearing in more than one update
     /// (NewDuplicateRelationshipErr), or a per-relationship caveat context larger than
@@ -39,7 +41,13 @@ internal static class RequestLimits
     /// </summary>
     internal static void ValidateWriteRelationships(V1::WriteRelationshipsRequest request)
     {
+        // SpiceDB validates the request message (protoc-gen-validate) in an interceptor before its handler
+        // runs, so a missing required submessage is reported ahead of everything the handler checks.
         ValidateRequiredWriteFields(request);
+
+        // The handler's first check is the transaction metadata size, ahead of the update and precondition
+        // limits.
+        RequestCeilings.ValidateTransactionMetadata(request.OptionalTransactionMetadata);
 
         if (request.Updates.Count > MaxUpdatesPerWrite)
             throw new RpcException(new Status(
