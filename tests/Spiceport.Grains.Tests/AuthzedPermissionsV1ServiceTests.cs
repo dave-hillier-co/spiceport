@@ -442,6 +442,55 @@ public class AuthzedPermissionsV1ServiceTests
             ex.Status.Detail);
     }
 
+    private const string WildcardCaveatSchema = """
+        definition user {}
+
+        caveat c1(a int) { a == 1 }
+
+        caveat c2(a int) { a == 1 }
+
+        definition doc {
+            relation wildcard_only: user:* with c2
+            relation mixed: user with c1 | user:* with c2
+        }
+        """;
+
+    [Fact]
+    public async Task WriteRelationships_uncaveated_concrete_subject_does_not_name_a_wildcard_types_caveat()
+    {
+        // SpiceDB's NewInvalidSubjectTypeError compares allowedType.GetRelation(), which is "" for a
+        // wildcard allowed type, so `user:* with c2` never matches the concrete subject `user:tom`
+        // and the error falls through to the fuzzy suggestion.
+        await using var cluster = await MeshTestCluster.CreateAsync(WildcardCaveatSchema);
+
+        var ex = await Assert.ThrowsAsync<RpcException>(() => Service(cluster).WriteRelationships(
+            WriteOne(V1::RelationshipUpdate.Types.Operation.Touch,
+                "doc", "1", "wildcard_only", "user", "tom"),
+            FakeServerCallContext.Default));
+
+        Assert.Equal(StatusCode.InvalidArgument, ex.StatusCode);
+        Assert.Contains(
+            "subjects of type `user` are not allowed on relation `doc#wildcard_only`; did you mean `user:* with c2`?",
+            ex.Status.Detail);
+    }
+
+    [Fact]
+    public async Task WriteRelationships_required_caveat_hint_lists_only_the_concrete_types_caveats()
+    {
+        await using var cluster = await MeshTestCluster.CreateAsync(WildcardCaveatSchema);
+
+        var ex = await Assert.ThrowsAsync<RpcException>(() => Service(cluster).WriteRelationships(
+            WriteOne(V1::RelationshipUpdate.Types.Operation.Touch,
+                "doc", "1", "mixed", "user", "tom"),
+            FakeServerCallContext.Default));
+
+        Assert.Equal(StatusCode.InvalidArgument, ex.StatusCode);
+        Assert.Contains(
+            "subjects of type `user` are not allowed on relation `doc#mixed` without one of the following caveats: c1",
+            ex.Status.Detail);
+        Assert.DoesNotContain("c1,c2", ex.Status.Detail);
+    }
+
     [Fact]
     public async Task WriteRelationships_delete_ignores_an_unspecified_caveat()
     {
