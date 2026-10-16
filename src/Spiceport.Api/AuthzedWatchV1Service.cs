@@ -12,8 +12,9 @@ namespace Spiceport.Api;
 /// silo-singleton <see cref="IDatastore.Watch"/> directly (a long-lived stream is a poor fit for a
 /// request/response grain). Each emitted <see cref="V1::WatchResponse"/> carries its own ZedToken
 /// (<c>changes_through</c>) so a client can resume exactly once after a disconnect. v1 deltas vs the
-/// internal Watch: filter emitted updates by <c>optional_object_types</c>; no <c>schema_updated</c> field
-/// (this snapshot watches relationships only).
+/// internal Watch: filter emitted updates by <c>optional_object_types</c> or, mutually exclusively, by
+/// <c>optional_relationship_filters</c> (an update is emitted when it matches any filter); no
+/// <c>schema_updated</c> field (this snapshot watches relationships only).
 /// </summary>
 public sealed class AuthzedWatchV1Service(IDatastore datastore, ISchemaProvider schemaProvider)
     : V1::WatchService.WatchServiceBase
@@ -26,6 +27,16 @@ public sealed class AuthzedWatchV1Service(IDatastore datastore, ISchemaProvider 
         ArgumentNullException.ThrowIfNull(request);
 
         var cancellationToken = context.CancellationToken;
+
+        // Upstream rejects object types combined with relationship filters whenever relationship
+        // updates are being watched, before the start cursor is resolved.
+        if (IncludesRelationshipUpdates(request) &&
+            request.OptionalObjectTypes.Count > 0 && request.OptionalRelationshipFilters.Count > 0)
+        {
+            throw new RpcException(new Status(
+                StatusCode.InvalidArgument,
+                "cannot specify both object types and relationship filters"));
+        }
 
         // Empty => no filter; otherwise emit only updates whose resource object type is in the set.
         var objectTypeFilter = request.OptionalObjectTypes.Count == 0
@@ -51,6 +62,22 @@ public sealed class AuthzedWatchV1Service(IDatastore datastore, ISchemaProvider 
         {
             var head = await datastore.HeadRevision(cancellationToken);
             afterRevision = head.Revision;
+        }
+
+        // Empty => no filter; otherwise emit only updates matching at least one filter. Built after
+        // the cursor is resolved, as upstream does, so a bad cursor is reported ahead of a bad filter.
+        // Each filter is validated against the schema first (upstream: validateRelationshipsFilter).
+        IReadOnlyList<WatchRelationshipFilter>? relationshipFilters = null;
+        if (request.OptionalRelationshipFilters.Count > 0)
+        {
+            var schema = schemaProvider.Current;
+            relationshipFilters = request.OptionalRelationshipFilters
+                .Select(filter =>
+                {
+                    ValidateRelationshipFilter(schema, filter);
+                    return ToWatchFilter(filter);
+                })
+                .ToList();
         }
 
         var datastoreId = await datastore.GetUniqueId(cancellationToken);
@@ -90,12 +117,12 @@ public sealed class AuthzedWatchV1Service(IDatastore datastore, ISchemaProvider 
                     break;
 
                 var change = enumerator.Current;
-                var response = ToResponse(change, datastoreId, objectTypeFilter);
+                var response = ToResponse(change, datastoreId, objectTypeFilter, relationshipFilters);
 
                 // Checkpoints always flow through (they carry revision-progress liveness for filtered
                 // consumers). Otherwise skip a content response whose every update was filtered out.
                 if (!change.IsCheckpoint && response.Updates.Count == 0 &&
-                    !change.SchemaChanged && objectTypeFilter is not null)
+                    !change.SchemaChanged && (objectTypeFilter is not null || relationshipFilters is not null))
                 {
                     continue;
                 }
@@ -110,7 +137,10 @@ public sealed class AuthzedWatchV1Service(IDatastore datastore, ISchemaProvider 
     }
 
     private V1::WatchResponse ToResponse(
-        RevisionChange change, string datastoreId, HashSet<string>? objectTypeFilter)
+        RevisionChange change,
+        string datastoreId,
+        HashSet<string>? objectTypeFilter,
+        IReadOnlyList<WatchRelationshipFilter>? relationshipFilters)
     {
         var token = ZedTokens.FromRevision(change.Revision, schemaProvider.Current.SchemaHash, datastoreId);
         var response = new V1::WatchResponse
@@ -132,11 +162,126 @@ public sealed class AuthzedWatchV1Service(IDatastore datastore, ISchemaProvider 
                 continue;
             }
 
+            if (relationshipFilters is not null &&
+                !relationshipFilters.Any(filter => filter.Matches(update.Relationship)))
+            {
+                continue;
+            }
+
             response.Updates.Add(ToProto(update));
         }
 
         return response;
     }
+
+    /// <summary>
+    /// True when the request watches relationship updates: an empty selector, or one naming
+    /// <c>WATCH_KIND_UNSPECIFIED</c> or <c>WATCH_KIND_INCLUDE_RELATIONSHIP_UPDATES</c>.
+    /// </summary>
+    private static bool IncludesRelationshipUpdates(V1::WatchRequest request) =>
+        request.OptionalUpdateKinds.Count == 0 ||
+        request.OptionalUpdateKinds.Any(kind =>
+            kind is V1::WatchKind.Unspecified or V1::WatchKind.IncludeRelationshipUpdates);
+
+    /// <summary>
+    /// A converted v1 relationship filter. The core <see cref="SubjectRelationFilter"/> cannot say
+    /// "ellipsis only" (its ellipsis-only shape is the same value as <see cref="SubjectRelationFilter.Any"/>),
+    /// so a subject filter whose <c>optional_relation</c> is present but empty is carried as
+    /// <paramref name="SubjectEllipsisOnly"/> and enforced here.
+    /// </summary>
+    private sealed record WatchRelationshipFilter(RelationshipsFilter Filter, bool SubjectEllipsisOnly)
+    {
+        public bool Matches(Relationship relationship) =>
+            Filter.Matches(relationship) &&
+            (!SubjectEllipsisOnly || relationship.Subject.Relation == CoreConstants.Ellipsis);
+    }
+
+    /// <summary>
+    /// Validates a v1 <see cref="V1::RelationshipFilter"/> as upstream's
+    /// <c>validateRelationshipsFilter</c> does, in its order: the resource type and relation, then the
+    /// subject type and relation, must exist in the schema (FailedPrecondition otherwise); resource id
+    /// and resource id prefix are mutually exclusive; and at least one field must be set
+    /// (InvalidArgument for either).
+    /// </summary>
+    private static void ValidateRelationshipFilter(SchemaSnapshot schema, V1::RelationshipFilter f)
+    {
+        CheckFilterComponent(schema, f.ResourceType, f.OptionalRelation);
+
+        if (f.OptionalSubjectFilter is { } sub)
+            CheckFilterComponent(schema, sub.SubjectType, sub.OptionalRelation?.Relation ?? string.Empty);
+
+        if (!string.IsNullOrEmpty(f.OptionalResourceId) && !string.IsNullOrEmpty(f.OptionalResourceIdPrefix))
+            throw InvalidFilter("resource_id and resource_id_prefix cannot be set at the same time");
+
+        if (string.IsNullOrEmpty(f.ResourceType) && string.IsNullOrEmpty(f.OptionalResourceId) &&
+            string.IsNullOrEmpty(f.OptionalResourceIdPrefix) && string.IsNullOrEmpty(f.OptionalRelation) &&
+            f.OptionalSubjectFilter is null)
+        {
+            throw InvalidFilter("at least one field must be set");
+        }
+    }
+
+    /// <summary>
+    /// Upstream's <c>checkFilterComponent</c>: an empty type places no constraint; otherwise the type must
+    /// exist, and the relation must too, with an empty relation standing for the ellipsis.
+    /// </summary>
+    private static void CheckFilterComponent(SchemaSnapshot schema, string objectType, string optionalRelation)
+    {
+        if (string.IsNullOrEmpty(objectType))
+            return;
+
+        var allowEllipsis = optionalRelation.Length == 0;
+        SchemaValidation.CheckNamespaceAndRelations(
+            schema,
+            new SchemaValidation.TypeAndRelation(
+                objectType, allowEllipsis ? CoreConstants.Ellipsis : optionalRelation, allowEllipsis));
+    }
+
+    private static RpcException InvalidFilter(string reason) =>
+        new(new Status(StatusCode.InvalidArgument, $"the relationship filter provided is not valid: {reason}"));
+
+    /// <summary>
+    /// Maps a validated v1 <see cref="V1::RelationshipFilter"/> as upstream's
+    /// <c>RelationshipsFilterFromPublicFilter</c> does: an empty field places no constraint; a subject
+    /// filter's present-but-empty <c>optional_relation</c> selects only the ellipsis relation, a non-empty
+    /// one selects exactly that relation, and an absent one selects any relation.
+    /// </summary>
+    private static WatchRelationshipFilter ToWatchFilter(V1::RelationshipFilter f)
+    {
+        IReadOnlyList<SubjectsSelector>? selectors = null;
+        var subjectEllipsisOnly = false;
+        if (f.OptionalSubjectFilter is { } sub)
+        {
+            SubjectRelationFilter? relationFilter = null;
+            if (sub.OptionalRelation is { } relation)
+            {
+                if (relation.Relation.Length == 0)
+                    subjectEllipsisOnly = true;
+                else
+                    relationFilter = new SubjectRelationFilter(NonEllipsisRelation: relation.Relation);
+            }
+
+            selectors =
+            [
+                new SubjectsSelector(
+                    NullIfEmpty(sub.SubjectType),
+                    string.IsNullOrEmpty(sub.OptionalSubjectId) ? null : [sub.OptionalSubjectId],
+                    relationFilter),
+            ];
+        }
+
+        var filter = new RelationshipsFilter
+        {
+            OptionalResourceType = NullIfEmpty(f.ResourceType),
+            OptionalResourceIds = string.IsNullOrEmpty(f.OptionalResourceId) ? null : [f.OptionalResourceId],
+            OptionalResourceIdPrefix = NullIfEmpty(f.OptionalResourceIdPrefix),
+            OptionalResourceRelation = NullIfEmpty(f.OptionalRelation),
+            OptionalSubjectsSelectors = selectors,
+        };
+        return new WatchRelationshipFilter(filter, subjectEllipsisOnly);
+    }
+
+    private static string? NullIfEmpty(string value) => string.IsNullOrEmpty(value) ? null : value;
 
     /// <summary>
     /// Maps the request's <c>optional_update_kinds</c> to the datastore's <see cref="WatchContent"/>.
