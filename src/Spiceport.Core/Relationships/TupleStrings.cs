@@ -198,16 +198,19 @@ public static partial class TupleStrings
     }
 
     [GeneratedRegex(
-        @"^(?<dateTime>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(\.(?<fraction>\d+))?(?<zone>Z|[+\-]\d{2}:\d{2})$",
+        @"^(?<date>\d{4}-\d{2}-\d{2})T(?<hour>\d{1,2})(?<minuteSecond>:\d{2}:\d{2})(\.(?<fraction>\d+))?(?<zone>Z|[+\-]\d{2}:\d{2})$",
         RegexOptions.CultureInvariant)]
     private static partial Regex Rfc3339Regex();
 
     /// <summary>
-    /// Parses an RFC3339 timestamp strictly, as upstream SpiceDB does with Go's
-    /// <c>time.Parse(time.RFC3339, ...)</c>: a full date, a full time, an optional fraction of at
-    /// least one digit, and a mandatory <c>Z</c> or numeric offset of at most 23:59 (Go's bound,
-    /// wider than the +/-14:00 a <see cref="DateTimeOffset"/> offset allows, so the offset is
-    /// applied arithmetically). Fractions beyond the seven digits a tick can hold are truncated.
+    /// Parses an RFC3339 timestamp as upstream SpiceDB does with Go 1.25's
+    /// <c>time.Parse(time.RFC3339Nano, ...)</c>. Go tries a strict RFC3339 fast path and, when it
+    /// fails, falls back to its general layout parser, so the accepted set is the union of the
+    /// two: a full date, an hour of one or two digits (the layout's <c>15</c> element), two-digit
+    /// minutes and seconds, an optional fraction of at least one digit, and a mandatory <c>Z</c>
+    /// or two-digit numeric offset of at most 24:60 (the fallback parser's bound, wider than the
+    /// +/-14:00 a <see cref="DateTimeOffset"/> offset allows, so the offset is applied
+    /// arithmetically). Fractions beyond the seven digits a tick can hold are truncated.
     /// The result is normalised to UTC. Go also accepts year 0000 and instants whose UTC form
     /// falls outside 0001..9999; a <see cref="DateTimeOffset"/> cannot represent those, so they
     /// are rejected.
@@ -224,7 +227,8 @@ public static partial class TupleStrings
         var fraction = match.Groups["fraction"].Value;
         fraction = fraction.Length > 7 ? fraction[..7] : fraction.PadRight(7, '0');
         if (!DateTime.TryParseExact(
-                $"{match.Groups["dateTime"].Value}.{fraction}", "yyyy-MM-dd'T'HH:mm:ss.fffffff",
+                $"{match.Groups["date"].Value}T{match.Groups["hour"].Value.PadLeft(2, '0')}{match.Groups["minuteSecond"].Value}.{fraction}",
+                "yyyy-MM-dd'T'HH:mm:ss.fffffff",
                 CultureInvariant, DateTimeStyles.None, out var local))
         {
             return false;
@@ -236,7 +240,7 @@ public static partial class TupleStrings
         {
             var hours = int.Parse(zone.AsSpan(1, 2), CultureInvariant);
             var minutes = int.Parse(zone.AsSpan(4, 2), CultureInvariant);
-            if (hours > 23 || minutes > 59)
+            if (hours > 24 || minutes > 60)
             {
                 return false;
             }

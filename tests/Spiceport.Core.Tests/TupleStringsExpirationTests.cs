@@ -1,9 +1,9 @@
 namespace Spiceport.Core.Tests;
 
 /// <summary>
-/// The tuple-string expiration suffix accepts RFC3339 only, as upstream SpiceDB's parser does
-/// (<c>time.Parse(time.RFC3339, ...)</c>), so a tuple string means the same relationship
-/// whenever it is parsed.
+/// The tuple-string expiration suffix accepts what upstream SpiceDB's parser does
+/// (<c>time.Parse(time.RFC3339Nano, ...)</c> under Go 1.25.7, including its fallback to the
+/// general layout parser), so a tuple string means the same relationship whenever it is parsed.
 /// </summary>
 public class TupleStringsExpirationTests
 {
@@ -16,6 +16,13 @@ public class TupleStringsExpirationTests
     [InlineData("2025-01-02")]
     [InlineData("2025-01-02T03:04:05")]
     [InlineData("2025-01-02T03:04Z")]
+    // Go's layout parser reads the hour as one or two digits, but minutes, seconds and the
+    // offset fields are fixed-width.
+    [InlineData("2025-01-02T3:4:5Z")]
+    [InlineData("2025-01-02T03:04:5Z")]
+    [InlineData("2025-01-02T003:04:05Z")]
+    [InlineData("2025-01-02T03:04:05-1:00")]
+    [InlineData("2025-01-02T03:04:05.Z")]
     public void Non_rfc3339_expiration_is_rejected(string expiration)
     {
         var tuple = $"{Prefix}[expiration:{expiration}]";
@@ -51,7 +58,7 @@ public class TupleStringsExpirationTests
     [InlineData("2025-01-02T03:04:05-23:59", "2025-01-03T03:03:05Z")]
     public void Offset_beyond_fourteen_hours_is_accepted_as_go_does(string expiration, string expectedUtc)
     {
-        // Go's RFC3339 parser bounds the offset at 23:59, wider than .NET's +/-14:00.
+        // Go's offset bound is wider than .NET's +/-14:00.
         var rel = TupleStrings.ParseRelationship($"{Prefix}[expiration:{expiration}]");
 
         Assert.Equal(DateTimeOffset.Parse(expectedUtc, System.Globalization.CultureInfo.InvariantCulture),
@@ -60,11 +67,31 @@ public class TupleStringsExpirationTests
     }
 
     [Theory]
-    [InlineData("2025-01-02T03:04:05-24:00")]
-    [InlineData("2025-01-02T03:04:05-01:60")]
+    [InlineData("2025-01-02T3:04:05Z", "2025-01-02T03:04:05Z")]
+    [InlineData("2025-01-02T3:04:05.5Z", "2025-01-02T03:04:05.5Z")]
+    [InlineData("2025-01-02T03:04:05-24:00", "2025-01-03T03:04:05Z")]
+    [InlineData("2025-01-02T03:04:05-01:60", "2025-01-02T05:04:05Z")]
+    [InlineData("2025-01-02T03:04:05-24:60", "2025-01-03T04:04:05Z")]
+    public void Go_fallback_parser_forms_are_accepted(string expiration, string expectedUtc)
+    {
+        // When Go's strict RFC3339 fast path fails, time.Parse falls back to the general layout
+        // parser, which reads the hour with one or two digits and bounds a numeric offset at
+        // 24:60 rather than 23:59.
+        var rel = TupleStrings.ParseRelationship($"{Prefix}[expiration:{expiration}]");
+
+        Assert.Equal(DateTimeOffset.Parse(expectedUtc, System.Globalization.CultureInfo.InvariantCulture),
+            rel.OptionalExpiration);
+        Assert.Equal(TimeSpan.Zero, rel.OptionalExpiration!.Value.Offset);
+    }
+
+    [Theory]
+    [InlineData("2025-01-02T03:04:05-25:00")]
+    [InlineData("2025-01-02T03:04:05-24:61")]
+    [InlineData("2025-01-02T03:04:05-00:99")]
     [InlineData("2025-13-02T03:04:05Z")]
     [InlineData("2025-02-29T03:04:05Z")]
     [InlineData("2025-01-02T24:04:05Z")]
+    [InlineData("2025-02-30T3:04:05Z")]
     // Valid to Go, but not representable as a DateTimeOffset: year 0, and a UTC instant past 9999.
     [InlineData("0000-01-01T00:00:00Z")]
     [InlineData("9999-12-31T23:30:00-01:00")]
