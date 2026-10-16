@@ -265,7 +265,10 @@ public static class FaultHarness
             {
                 // Migration completes once the activation is idle, so wait to see it land.
                 await Call(Sequencer.GetHead());
-                await Call(cluster.MigrateAsync(Sequencer, victim.SiloAddress));
+                // Migrating onto the silo that already hosts the activation never deactivates it, so
+                // MigrateAsync would wait forever; placement is not seeded, so this happens by chance.
+                if (await Call(management.GetActivationAddress(Sequencer).AsTask()) != victim.SiloAddress)
+                    await Call(cluster.MigrateAsync(Sequencer, victim.SiloAddress));
                 var migrateBy = DateTime.UtcNow + CallTimeout;
                 while (await Call(management.GetActivationAddress(Sequencer).AsTask()) != victim.SiloAddress)
                 {
