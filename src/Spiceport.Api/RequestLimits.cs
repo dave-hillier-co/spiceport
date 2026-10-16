@@ -39,6 +39,8 @@ internal static class RequestLimits
     /// </summary>
     internal static void ValidateWriteRelationships(V1::WriteRelationshipsRequest request)
     {
+        ValidateRequiredWriteFields(request);
+
         if (request.Updates.Count > MaxUpdatesPerWrite)
             throw new RpcException(new Status(
                 StatusCode.InvalidArgument,
@@ -89,6 +91,76 @@ internal static class RequestLimits
         }
 
         return context;
+    }
+
+    /// <summary>
+    /// Rejects a <c>WriteRelationships</c> request missing a submessage the <c>authzed.api.v1</c> protos mark
+    /// <c>(buf.validate.field).required</c>: an update's relationship, a relationship's resource or subject, a
+    /// subject's object, or a precondition's filter. An unset message field is <c>null</c> here, so without
+    /// this guard the request fails with a <see cref="NullReferenceException"/> (an Internal/Unknown status).
+    /// SpiceDB's protovalidate interceptor rejects the same request with <see cref="StatusCode.InvalidArgument"/>
+    /// before the handler runs; the detail text follows protovalidate's <c>ValidationError</c> format.
+    /// </summary>
+    private static void ValidateRequiredWriteFields(V1::WriteRelationshipsRequest request)
+    {
+        var violations = new List<string>();
+        for (var i = 0; i < request.Updates.Count; i++)
+        {
+            var rel = request.Updates[i].Relationship;
+            var path = $"updates[{i}].relationship";
+            if (rel is null)
+            {
+                violations.Add($"{path}: value is required");
+                continue;
+            }
+
+            if (rel.Resource is null)
+                violations.Add($"{path}.resource: value is required");
+            if (rel.Subject is null)
+                violations.Add($"{path}.subject: value is required");
+            else if (rel.Subject.Object is null)
+                violations.Add($"{path}.subject.object: value is required");
+        }
+
+        AddMissingPreconditionFilters(request.OptionalPreconditions, violations);
+        ThrowIfViolations(violations);
+    }
+
+    /// <summary>
+    /// Validates the shape of a <c>DeleteRelationships</c> request: its <c>relationship_filter</c> and every
+    /// precondition's <c>filter</c> are <c>(buf.validate.field).required</c>. SpiceDB's protovalidate
+    /// interceptor rejects a missing one with <see cref="StatusCode.InvalidArgument"/> before the handler runs;
+    /// without this guard the wire mapping dereferences the unset (<c>null</c>) message instead.
+    /// </summary>
+    internal static void ValidateDeleteRelationships(V1::DeleteRelationshipsRequest request)
+    {
+        var violations = new List<string>();
+        if (request.RelationshipFilter is null)
+            violations.Add("relationship_filter: value is required");
+        AddMissingPreconditionFilters(request.OptionalPreconditions, violations);
+        ThrowIfViolations(violations);
+    }
+
+    private static void AddMissingPreconditionFilters(
+        IReadOnlyList<V1::Precondition> preconditions, List<string> violations)
+    {
+        for (var i = 0; i < preconditions.Count; i++)
+        {
+            if (preconditions[i].Filter is null)
+                violations.Add($"optional_preconditions[{i}].filter: value is required");
+        }
+    }
+
+    /// <summary>Throws <see cref="StatusCode.InvalidArgument"/> in protovalidate's <c>ValidationError</c> format.</summary>
+    private static void ThrowIfViolations(List<string> violations)
+    {
+        if (violations.Count == 0)
+            return;
+
+        var detail = violations.Count == 1
+            ? "validation error: " + violations[0]
+            : "validation errors:" + string.Concat(violations.Select(v => "\n - " + v));
+        throw new RpcException(new Status(StatusCode.InvalidArgument, detail));
     }
 
     private static string RelationshipKeyWithoutCaveatOrExpiration(V1::Relationship rel)
