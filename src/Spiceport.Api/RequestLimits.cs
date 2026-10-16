@@ -93,42 +93,52 @@ internal static class RequestLimits
         return context;
     }
 
+    /// <summary>protoc-gen-validate's separator between a failed field and the nested failure it wraps.</summary>
+    private const string Embedded = "embedded message failed validation | caused by: ";
+
     /// <summary>
     /// Rejects a <c>WriteRelationships</c> request missing a submessage the <c>authzed.api.v1</c> protos mark
-    /// <c>(buf.validate.field).required</c>: an update's relationship, a relationship's resource or subject, a
-    /// subject's object, or a precondition's filter. An unset message field is <c>null</c> here, so without
-    /// this guard the request fails with a <see cref="NullReferenceException"/> (an Internal/Unknown status).
-    /// SpiceDB's protovalidate interceptor rejects the same request with <see cref="StatusCode.InvalidArgument"/>
-    /// before the handler runs; the detail text follows protovalidate's <c>ValidationError</c> format.
+    /// <c>(validate.rules).message.required</c>: an update's relationship, a relationship's resource or
+    /// subject, a subject's object, or a precondition's filter. An unset message field is <c>null</c> here,
+    /// so without this guard the request fails with a <see cref="NullReferenceException"/> (an
+    /// Internal/Unknown status). SpiceDB's first interceptor, go-grpc-middleware's
+    /// <c>validator.UnaryServerInterceptor</c>, calls the protoc-gen-validate <c>ValidateAll</c> generated in
+    /// authzed-go and rejects the same request with <see cref="StatusCode.InvalidArgument"/> and
+    /// <c>err.Error()</c> as the detail, before the handler runs; the text follows that format.
     /// </summary>
     private static void ValidateRequiredWriteFields(V1::WriteRelationshipsRequest request)
     {
         var violations = new List<string>();
         for (var i = 0; i < request.Updates.Count; i++)
         {
+            var update = $"invalid WriteRelationshipsRequest.Updates[{i}]: {Embedded}";
             var rel = request.Updates[i].Relationship;
-            var path = $"updates[{i}].relationship";
             if (rel is null)
             {
-                violations.Add($"{path}: value is required");
+                violations.Add($"{update}invalid RelationshipUpdate.Relationship: value is required");
                 continue;
             }
 
+            // The Relationship's own ValidateAll multi-error is the cause of a single embedded wrapper.
+            var causes = new List<string>();
             if (rel.Resource is null)
-                violations.Add($"{path}.resource: value is required");
+                causes.Add("invalid Relationship.Resource: value is required");
             if (rel.Subject is null)
-                violations.Add($"{path}.subject: value is required");
+                causes.Add("invalid Relationship.Subject: value is required");
             else if (rel.Subject.Object is null)
-                violations.Add($"{path}.subject.object: value is required");
+                causes.Add($"invalid Relationship.Subject: {Embedded}invalid SubjectReference.Object: value is required");
+
+            if (causes.Count > 0)
+                violations.Add($"{update}invalid RelationshipUpdate.Relationship: {Embedded}{string.Join("; ", causes)}");
         }
 
-        AddMissingPreconditionFilters(request.OptionalPreconditions, violations);
+        AddMissingPreconditionFilters("WriteRelationshipsRequest", request.OptionalPreconditions, violations);
         ThrowIfViolations(violations);
     }
 
     /// <summary>
     /// Validates the shape of a <c>DeleteRelationships</c> request: its <c>relationship_filter</c> and every
-    /// precondition's <c>filter</c> are <c>(buf.validate.field).required</c>. SpiceDB's protovalidate
+    /// precondition's <c>filter</c> are <c>(validate.rules).message.required</c>. SpiceDB's protoc-gen-validate
     /// interceptor rejects a missing one with <see cref="StatusCode.InvalidArgument"/> before the handler runs;
     /// without this guard the wire mapping dereferences the unset (<c>null</c>) message instead.
     /// </summary>
@@ -136,31 +146,32 @@ internal static class RequestLimits
     {
         var violations = new List<string>();
         if (request.RelationshipFilter is null)
-            violations.Add("relationship_filter: value is required");
-        AddMissingPreconditionFilters(request.OptionalPreconditions, violations);
+            violations.Add("invalid DeleteRelationshipsRequest.RelationshipFilter: value is required");
+        AddMissingPreconditionFilters("DeleteRelationshipsRequest", request.OptionalPreconditions, violations);
         ThrowIfViolations(violations);
     }
 
     private static void AddMissingPreconditionFilters(
-        IReadOnlyList<V1::Precondition> preconditions, List<string> violations)
+        string requestName, IReadOnlyList<V1::Precondition> preconditions, List<string> violations)
     {
         for (var i = 0; i < preconditions.Count; i++)
         {
             if (preconditions[i].Filter is null)
-                violations.Add($"optional_preconditions[{i}].filter: value is required");
+                violations.Add(
+                    $"invalid {requestName}.OptionalPreconditions[{i}]: {Embedded}invalid Precondition.Filter: value is required");
         }
     }
 
-    /// <summary>Throws <see cref="StatusCode.InvalidArgument"/> in protovalidate's <c>ValidationError</c> format.</summary>
+    /// <summary>
+    /// Throws <see cref="StatusCode.InvalidArgument"/> with protoc-gen-validate's <c>MultiError</c> text: the
+    /// violations, in field order, joined with <c>"; "</c>.
+    /// </summary>
     private static void ThrowIfViolations(List<string> violations)
     {
         if (violations.Count == 0)
             return;
 
-        var detail = violations.Count == 1
-            ? "validation error: " + violations[0]
-            : "validation errors:" + string.Concat(violations.Select(v => "\n - " + v));
-        throw new RpcException(new Status(StatusCode.InvalidArgument, detail));
+        throw new RpcException(new Status(StatusCode.InvalidArgument, string.Join("; ", violations)));
     }
 
     private static string RelationshipKeyWithoutCaveatOrExpiration(V1::Relationship rel)

@@ -1405,7 +1405,7 @@ public class AuthzedPermissionsV1ServiceTests
     [Fact]
     public async Task WriteRelationships_update_without_relationship_is_invalid_argument()
     {
-        // An unset required submessage must reach the client as InvalidArgument (SpiceDB's protovalidate
+        // An unset required submessage must reach the client as InvalidArgument (SpiceDB's protoc-gen-validate
         // interceptor), never as the Internal/Unknown status a NullReferenceException in the wire mapping
         // would produce. Driven through the handler so the validation-before-mapping order is pinned.
         await using var cluster = await MeshTestCluster.CreateAsync(Schema);
@@ -1418,7 +1418,10 @@ public class AuthzedPermissionsV1ServiceTests
         var ex = await Assert.ThrowsAsync<RpcException>(() =>
             Service(cluster).WriteRelationships(req, FakeServerCallContext.Default));
         Assert.Equal(StatusCode.InvalidArgument, ex.StatusCode);
-        Assert.Contains("updates[0].relationship: value is required", ex.Status.Detail);
+        Assert.Equal(
+            "invalid WriteRelationshipsRequest.Updates[0]: embedded message failed validation | caused by: " +
+            "invalid RelationshipUpdate.Relationship: value is required",
+            ex.Status.Detail);
     }
 
     [Fact]
@@ -1432,20 +1435,23 @@ public class AuthzedPermissionsV1ServiceTests
         var ex = await Assert.ThrowsAsync<RpcException>(() =>
             Service(cluster).WriteRelationships(req, FakeServerCallContext.Default));
         Assert.Equal(StatusCode.InvalidArgument, ex.StatusCode);
-        Assert.Contains("optional_preconditions[0].filter: value is required", ex.Status.Detail);
+        Assert.Equal(
+            "invalid WriteRelationshipsRequest.OptionalPreconditions[0]: embedded message failed validation | caused by: " +
+            "invalid Precondition.Filter: value is required",
+            ex.Status.Detail);
     }
 
     [Fact]
     public async Task DeleteRelationships_without_relationship_filter_is_invalid_argument()
     {
-        // DeleteRelationshipsRequest.relationship_filter is (buf.validate.field).required: SpiceDB rejects
+        // DeleteRelationshipsRequest.relationship_filter is (validate.rules).message.required: SpiceDB rejects
         // its absence with InvalidArgument before the handler runs.
         await using var cluster = await MeshTestCluster.CreateAsync(Schema);
 
         var ex = await Assert.ThrowsAsync<RpcException>(() =>
             Service(cluster).DeleteRelationships(new V1::DeleteRelationshipsRequest(), FakeServerCallContext.Default));
         Assert.Equal(StatusCode.InvalidArgument, ex.StatusCode);
-        Assert.Contains("relationship_filter: value is required", ex.Status.Detail);
+        Assert.Equal("invalid DeleteRelationshipsRequest.RelationshipFilter: value is required", ex.Status.Detail);
     }
 
     [Fact]
@@ -1462,7 +1468,10 @@ public class AuthzedPermissionsV1ServiceTests
         var ex = await Assert.ThrowsAsync<RpcException>(() =>
             Service(cluster).DeleteRelationships(req, FakeServerCallContext.Default));
         Assert.Equal(StatusCode.InvalidArgument, ex.StatusCode);
-        Assert.Contains("optional_preconditions[0].filter: value is required", ex.Status.Detail);
+        Assert.Equal(
+            "invalid DeleteRelationshipsRequest.OptionalPreconditions[0]: embedded message failed validation | caused by: " +
+            "invalid Precondition.Filter: value is required",
+            ex.Status.Detail);
     }
 
     [Fact]
