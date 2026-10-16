@@ -1,4 +1,6 @@
 using System.Collections.Immutable;
+using System.Globalization;
+using System.Text;
 using Spiceport.Core;
 
 namespace Spiceport.Engine;
@@ -23,7 +25,11 @@ public readonly record struct VisitKey(
     string ResourceType, string ResourceId, string ResourceRelation,
     string SubjectType, string SubjectId, string SubjectRelation)
 {
-    /// <summary>The canonical field separator (U+001F); cannot appear in an ONR field, so the join is injective.</summary>
+    /// <summary>
+    /// The separator between a part's length prefix and its characters (U+001F). It is not what makes
+    /// the rendering injective -- nothing on the request path enforces the SpiceDB object-id grammar, so
+    /// an id may contain it -- the length prefix is.
+    /// </summary>
     private const char Separator = (char)0x1F;
 
     /// <summary>Builds a key from a (resource, subject) ONR pair.</summary>
@@ -32,24 +38,49 @@ public readonly record struct VisitKey(
             subject.ObjectType, subject.ObjectId, subject.Relation);
 
     /// <summary>
-    /// Renders this key as a single unit-separated (U+001F) string, suitable for carrying across a
-    /// wire boundary (e.g. <see cref="Grains.Abstractions.DispatchContext"/>'s ambient RequestContext).
+    /// Renders this key as a single string, suitable for carrying across a wire boundary (e.g.
+    /// <see cref="Grains.Abstractions.DispatchContext"/>'s ambient RequestContext). Each part is framed as
+    /// <c>{length}U+001F{part}</c> (length in invariant decimal UTF-16 code units) and the frames are
+    /// concatenated, so the rendering is injective for any six strings, whatever characters they contain.
     /// </summary>
-    public string ToCanonicalString() =>
-        string.Join(Separator, ResourceType, ResourceId, ResourceRelation, SubjectType, SubjectId, SubjectRelation);
+    public string ToCanonicalString()
+    {
+        var builder = new StringBuilder();
+        foreach (var part in (ReadOnlySpan<string>)[ResourceType, ResourceId, ResourceRelation, SubjectType, SubjectId, SubjectRelation])
+            builder.Append(part.Length.ToString(CultureInfo.InvariantCulture)).Append(Separator).Append(part);
+        return builder.ToString();
+    }
 
     /// <summary>
     /// Parses a canonical string produced by <see cref="ToCanonicalString"/>. Throws
-    /// <see cref="FormatException"/> on a malformed value (wrong part count) rather than silently
-    /// defaulting any field.
+    /// <see cref="FormatException"/> on a malformed value (a bad, zero-padded or overrunning length
+    /// prefix, a missing part, or trailing characters) rather than silently defaulting any field.
     /// </summary>
     public static VisitKey FromCanonicalString(string value)
     {
         ArgumentNullException.ThrowIfNull(value);
-        var parts = value.Split(Separator);
-        if (parts.Length != 6)
-            throw new FormatException(
-                $"Malformed VisitKey canonical string: expected 6 unit-separated parts, got {parts.Length}.");
+        var parts = new string[6];
+        var at = 0;
+        for (var i = 0; i < parts.Length; i++)
+        {
+            var mark = value.IndexOf(Separator, at);
+            if (mark < 0)
+                throw new FormatException(
+                    $"Malformed VisitKey canonical string: expected 6 length-prefixed parts, got {i}.");
+            var prefix = value.AsSpan(at, mark - at);
+            // ToCanonicalString never emits a leading zero, so rejecting one keeps parsing the exact
+            // inverse of rendering: each key has one canonical string and no other string parses to it.
+            if ((prefix.Length > 1 && prefix[0] == '0')
+                || !int.TryParse(prefix, NumberStyles.None, CultureInfo.InvariantCulture, out var length))
+                throw new FormatException($"Malformed VisitKey canonical string: bad length prefix for part {i}.");
+            var start = mark + 1;
+            if (length > value.Length - start)
+                throw new FormatException($"Malformed VisitKey canonical string: part {i} overruns the value.");
+            parts[i] = value.Substring(start, length);
+            at = start + length;
+        }
+        if (at != value.Length)
+            throw new FormatException("Malformed VisitKey canonical string: trailing characters after 6 parts.");
         return new VisitKey(parts[0], parts[1], parts[2], parts[3], parts[4], parts[5]);
     }
 }
