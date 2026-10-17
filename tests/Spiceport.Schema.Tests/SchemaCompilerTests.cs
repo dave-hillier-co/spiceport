@@ -176,7 +176,7 @@ public class SchemaCompilerTests
     {
         const string schema = """
             caveat ip_allowlist(user_ip ipaddress, allowed_ips list<string>) {
-              user_ip in allowed_ips
+              allowed_ips.exists(cidr, user_ip.in_cidr(cidr))
             }
 
             definition resource {
@@ -192,7 +192,8 @@ public class SchemaCompilerTests
         Assert.Equal("ip_allowlist", caveat.Name);
 
         // The raw CEL expression is captured verbatim (UTF-8), not evaluated.
-        Assert.Equal("user_ip in allowed_ips", Encoding.UTF8.GetString(caveat.SerializedExpression));
+        Assert.Equal(
+            "allowed_ips.exists(cidr, user_ip.in_cidr(cidr))", Encoding.UTF8.GetString(caveat.SerializedExpression));
 
         Assert.Equal(2, caveat.ParameterTypes.Count);
         Assert.Equal("ipaddress", caveat.ParameterTypes["user_ip"].TypeName);
@@ -354,5 +355,69 @@ public class SchemaCompilerTests
     {
         const string schema = "use bogus\ndefinition user {}";
         Assert.Throws<SchemaCompileException>(() => SchemaCompiler.Compile(schema));
+    }
+
+    [Fact]
+    public void RejectsACaveatWhoseExpressionDoesNotTypeCheck()
+    {
+        // SpiceDB's checker rejects a non-boolean operand of `||` at WriteSchema. The CEL part of the
+        // message is upstream's verbatim, positioned in the schema as upstream positions it.
+        var ex = Assert.Throws<SchemaCompileException>(() =>
+            SchemaCompiler.CompileSchema("caveat c(x int, y int) { x == 1 || y }"));
+        Assert.Equal(
+            "schema error at line 1, column 26: invalid expression for caveat `c`: "
+            + "ERROR: c:1:36: expected type 'bool' but found 'int'\n | x == 1 || y\n | ...........^",
+            ex.Message);
+    }
+
+    [Fact]
+    public void RejectsACaveatWithANonBooleanExpression()
+    {
+        var ex = Assert.Throws<SchemaCompileException>(() =>
+            SchemaCompiler.CompileSchema("caveat c(x int) {\n  x == 1 ? 'a' : 'b'\n}"));
+        Assert.Equal(
+            "schema error at line 2, column 3: invalid expression for caveat `c`: "
+            + "caveat expression must result in a boolean value: found `string`",
+            ex.Message);
+    }
+
+    [Theory]
+    // SpiceDB slices the body from its first token to its last; a newline after an identifier, `)`, `}`
+    // or `*` is a token (a synthetic semicolon), so the CEL source then has a second, empty line and the
+    // relocated error quotes that empty line.
+    [InlineData("caveat c(x int) {\n  x.y == 1\n}",
+        "schema error at line 2, column 3: invalid expression for caveat `c`: "
+        + "ERROR: c:2:4: type 'int' does not support field selection\n | \n | ^")]
+    [InlineData("caveat c(x int) {\n  x.y == \"a\"\n}",
+        "schema error at line 2, column 3: invalid expression for caveat `c`: "
+        + "ERROR: c:2:4: type 'int' does not support field selection")]
+    [InlineData("caveat c(x int) { /* lead */ x.y == 1 /* trail */ }",
+        "schema error at line 1, column 30: invalid expression for caveat `c`: "
+        + "ERROR: c:1:31: type 'int' does not support field selection\n | x.y == 1\n | ........^")]
+    [InlineData("caveat c(x int) {\n  x.y\n  == 1\n}",
+        "schema error at line 2, column 3: invalid expression for caveat `c`: "
+        + "ERROR: c:2:4: type 'int' does not support field selection\n |   == 1\n | ...^")]
+    public void PositionsCaveatErrorsAsSpiceDbDoes(string schema, string expected) =>
+        Assert.Equal(expected, Assert.Throws<SchemaCompileException>(() => SchemaCompiler.CompileSchema(schema)).Message);
+
+    [Theory]
+    [InlineData("caveat c(x foo) { x }",
+        "schema error at line 1, column 10: invalid type for caveat parameter `x` on caveat `c`: unknown type `foo`")]
+    [InlineData("caveat c(x int, y list) { x == 1 }",
+        "schema error at line 1, column 17: invalid type for caveat parameter `y` on caveat `c`: type `list` requires 1 generic types; found 0")]
+    [InlineData("caveat c(x int, x int) { x == 1 }",
+        "schema error at line 1, column 17: duplicate parameter `x` defined on caveat `c`")]
+    public void RejectsInvalidCaveatParameters(string schema, string expected) =>
+        Assert.Equal(expected, Assert.Throws<SchemaCompileException>(() => SchemaCompiler.CompileSchema(schema)).Message);
+
+    [Fact]
+    public void CompilesAStoredSchemaWithoutRecompilingItsCaveats()
+    {
+        // A stored schema was compiled when it was written; reloading it must not fail because the
+        // caveat checks have since grown stricter.
+        var compiled = SchemaCompiler.CompileStoredSchema("caveat c(x int, y int) { x == 1 || y }");
+
+        var caveat = Assert.Single(compiled.Caveats);
+        Assert.Equal("x == 1 || y", Encoding.UTF8.GetString(caveat.SerializedExpression));
     }
 }

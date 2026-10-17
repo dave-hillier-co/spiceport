@@ -1,6 +1,7 @@
 using System.Collections.Immutable;
 using System.Text;
 using Spiceport.Core;
+using Spiceport.Engine;
 
 namespace Spiceport.Schema;
 
@@ -23,8 +24,8 @@ public sealed record CompiledSchema(
 /// wildcards), and permissions (union <c>+</c>, intersection <c>&amp;</c>, exclusion
 /// <c>-</c>, arrows <c>-&gt;</c> / <c>.any()</c> / <c>.all()</c>, and <c>nil</c>).
 /// Caveat blocks and <c>with</c> / <c>expiration</c> traits are parsed; caveat names
-/// and expiration requirements are attached to allowed relations, but caveat bodies
-/// are not modelled (their CEL is ignored).
+/// and expiration requirements are attached to allowed relations. <see cref="Compile"/> ignores caveat
+/// bodies; <see cref="CompileSchema"/> compiles them (see there).
 /// </remarks>
 public static class SchemaCompiler
 {
@@ -49,13 +50,25 @@ public static class SchemaCompiler
     /// both namespace definitions and caveat definitions, each in source order.
     /// </summary>
     /// <remarks>
-    /// Caveat bodies are captured verbatim as CEL text and stored UTF-8 encoded in
-    /// <see cref="CaveatDefinition.SerializedExpression"/>; they are not type-checked
-    /// or evaluated here. Parameter types are modelled, including generic
-    /// <c>list&lt;T&gt;</c> / <c>map&lt;K,V&gt;</c> forms.
+    /// Caveats are compiled as SpiceDB's schema compiler compiles them
+    /// (<c>pkg/schemadsl/compiler/translator.go</c> <c>translateCaveatDefinition</c>): every parameter type
+    /// must be a known caveat type, and the CEL body must parse, type-check against the parameters and
+    /// produce a boolean (<see cref="CaveatCompiler"/>). A failure is a <see cref="SchemaCompileException"/>
+    /// carrying upstream's message. The body is still stored verbatim (UTF-8) in
+    /// <see cref="CaveatDefinition.SerializedExpression"/>; the compiled form is not kept.
     /// </remarks>
     /// <exception cref="SchemaCompileException">If the schema cannot be parsed or compiled.</exception>
-    public static CompiledSchema CompileSchema(string schemaText)
+    public static CompiledSchema CompileSchema(string schemaText) => Compile(schemaText, compileCaveats: true);
+
+    /// <summary>
+    /// Compiles schema DSL text that was already compiled when it was written (a stored schema), without
+    /// compiling its caveat bodies again. A stored schema must keep loading even if this compiler's caveat
+    /// checks grow stricter than the ones it was written under.
+    /// </summary>
+    /// <exception cref="SchemaCompileException">If the schema cannot be parsed or compiled.</exception>
+    public static CompiledSchema CompileStoredSchema(string schemaText) => Compile(schemaText, compileCaveats: false);
+
+    private static CompiledSchema Compile(string schemaText, bool compileCaveats)
     {
         if (schemaText is null)
         {
@@ -65,19 +78,66 @@ public static class SchemaCompiler
         SchemaFileNode file = Parser.Parse(schemaText);
         return new CompiledSchema(
             [.. file.Definitions.Select(CompileDefinition)],
-            [.. file.Caveats.Select(CompileCaveat)]);
+            [.. file.Caveats.Select(c => CompileCaveat(c, compileCaveats))]);
     }
 
-    private static CaveatDefinition CompileCaveat(CaveatNode caveat)
+    private static CaveatDefinition CompileCaveat(CaveatNode caveat, bool compileCaveat)
     {
-        var parameterTypes = caveat.Parameters.ToImmutableDictionary(
-            p => p.Name,
-            p => CompileCaveatType(p.Type));
+        var parameterTypes = ImmutableDictionary.CreateBuilder<string, CaveatTypeReference>();
+        foreach (var parameter in caveat.Parameters)
+        {
+            if (parameterTypes.ContainsKey(parameter.Name))
+            {
+                throw new SchemaCompileException(
+                    $"duplicate parameter `{parameter.Name}` defined on caveat `{caveat.Name}`",
+                    parameter.Line,
+                    parameter.Column);
+            }
+
+            var type = CompileCaveatType(parameter.Type);
+            if (compileCaveat)
+            {
+                try
+                {
+                    CaveatParameterTypes.Validate(type);
+                }
+                catch (CaveatCompileException ex)
+                {
+                    throw new SchemaCompileException(
+                        $"invalid type for caveat parameter `{parameter.Name}` on caveat `{caveat.Name}`: {ex.Message}",
+                        parameter.Line,
+                        parameter.Column);
+                }
+            }
+
+            parameterTypes.Add(parameter.Name, type);
+        }
+
+        // A parameterless caveat is left to SchemaTypeValidator, which rejects it by name.
+        if (compileCaveat && parameterTypes.Count > 0)
+            CompileCaveatExpression(caveat, parameterTypes);
 
         // The CEL expression is stored verbatim (UTF-8) rather than evaluated here.
         byte[] serialized = Encoding.UTF8.GetBytes(caveat.Expression);
 
-        return new CaveatDefinition(caveat.Name, serialized, parameterTypes);
+        return new CaveatDefinition(caveat.Name, serialized, parameterTypes.ToImmutable());
+    }
+
+    private static void CompileCaveatExpression(
+        CaveatNode caveat, IReadOnlyDictionary<string, CaveatTypeReference> parameterTypes)
+    {
+        try
+        {
+            CaveatCompiler.Compile(
+                caveat.Name, caveat.CelSource, parameterTypes, caveat.CelStartLine, caveat.CelStartColumn);
+        }
+        catch (CaveatCompileException ex)
+        {
+            throw new SchemaCompileException(
+                $"invalid expression for caveat `{caveat.Name}`: {ex.Message}",
+                caveat.CelStartLine + 1,
+                caveat.CelStartColumn + 1);
+        }
     }
 
     private static CaveatTypeReference CompileCaveatType(CaveatTypeRefNode type)

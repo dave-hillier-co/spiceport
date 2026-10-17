@@ -151,7 +151,7 @@ public sealed class SchemaResolver
     private static SchemaSnapshot Compile(string schemaHash, byte[] schemaBytes)
     {
         var text = Encoding.UTF8.GetString(schemaBytes);
-        var compiled = SchemaCompiler.CompileSchema(text);
+        var compiled = SchemaCompiler.CompileStoredSchema(text);
         // The persisted hash is authoritative (computed and validated at write time); reuse it verbatim so a
         // resolved snapshot's hash matches the grain key that selected it, rather than recomputing.
         return new SchemaSnapshot(compiled, schemaHash, text, Version: 0);

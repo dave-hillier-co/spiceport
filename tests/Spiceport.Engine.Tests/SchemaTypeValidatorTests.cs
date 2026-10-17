@@ -7,7 +7,7 @@ namespace Spiceport.Engine.Tests;
 /// (<c>pkg/schema/typesystem_validation.go</c>) and <c>ValidateCaveatDefinition</c>
 /// (<c>internal/namespace/caveats.go</c>): undefined references, permission-on-left-of-arrow, wildcard
 /// in arrow, missing allowed types, undefined caveat, duplicate/reused names, and the
-/// caveat-definition rules (≥1 parameter, parseable CEL, every declared parameter referenced).
+/// caveat-definition rules (≥1 parameter, every declared parameter referenced).
 /// </summary>
 public class SchemaTypeValidatorTests
 {
@@ -292,13 +292,15 @@ public class SchemaTypeValidatorTests
     }
 
     [Fact]
-    public void Caveat_WithUnparseableCel_IsRejected()
+    public void Caveat_WithUnparseableCel_IsRejectedByTheCompilerBeforeValidation()
     {
-        var ex = ValidateThrows("""
+        // The CEL body is compiled (parsed and type-checked) by SchemaCompiler.CompileSchema, as SpiceDB's
+        // schema compiler does, so it never reaches the validator.
+        var ex = Assert.Throws<SchemaCompileException>(() => Validate("""
             definition user {}
             caveat c(x int) { x > > 0 }
-            """);
-        Assert.Contains("c", ex.Message);
+            """));
+        Assert.Contains("invalid expression for caveat `c`: ERROR: c:", ex.Message);
     }
 
     [Fact]

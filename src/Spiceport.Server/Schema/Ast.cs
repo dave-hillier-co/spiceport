@@ -28,13 +28,30 @@ internal sealed record TypeRefNode(
 internal sealed record PermissionNode(string Name, ExprNode Expression);
 
 /// <summary>A <c>caveat</c> block: a name, typed parameters (in source order), and the raw CEL body text.</summary>
+/// <param name="Name">The caveat name.</param>
+/// <param name="Parameters">The parameters, in source order.</param>
+/// <param name="Expression">The body between the braces, trimmed: the text the schema stores.</param>
+/// <param name="Line">The 1-based line of the <c>caveat</c> keyword.</param>
+/// <param name="Column">The 1-based column of the <c>caveat</c> keyword.</param>
+/// <param name="CelSource">
+/// The body exactly as SpiceDB's schema parser slices it for CEL: from its first token to the end of its last
+/// token, where a newline that SpiceDB's lexer turns into a synthetic semicolon counts as a token. Caveat
+/// compile errors are positioned and quoted against this text, as upstream's are.
+/// </param>
+/// <param name="CelStartLine">The 0-based line of <paramref name="CelSource"/>'s start in the schema.</param>
+/// <param name="CelStartColumn">The 0-based column, in code points, of <paramref name="CelSource"/>'s start.</param>
 internal sealed record CaveatNode(
     string Name,
     ImmutableList<CaveatParameterNode> Parameters,
-    string Expression);
+    string Expression,
+    int Line,
+    int Column,
+    string CelSource,
+    int CelStartLine,
+    int CelStartColumn);
 
-/// <summary>One <c>name type</c> parameter inside a caveat parameter list.</summary>
-internal sealed record CaveatParameterNode(string Name, CaveatTypeRefNode Type);
+/// <summary>One <c>name type</c> parameter inside a caveat parameter list, with its name's 1-based position.</summary>
+internal sealed record CaveatParameterNode(string Name, CaveatTypeRefNode Type, int Line, int Column);
 
 /// <summary>A caveat parameter type reference, possibly with generic child types (e.g. <c>list&lt;int&gt;</c>).</summary>
 internal sealed record CaveatTypeRefNode(string Name, ImmutableList<CaveatTypeRefNode> ChildTypes);

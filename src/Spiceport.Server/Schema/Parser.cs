@@ -338,7 +338,7 @@ internal sealed class Parser
 
     private CaveatNode ParseCaveat()
     {
-        Advance(); // 'caveat'
+        Token keyword = Advance(); // 'caveat'
         string name = ParseTypePath();
 
         // Parameter list: ( name type, name type, ... )
@@ -365,14 +365,25 @@ internal sealed class Parser
         int bodyEnd = close.Offset;
         string expression = _source[bodyStart..bodyEnd].Trim();
 
-        return new CaveatNode(name, parameters.ToImmutable(), expression);
+        var (celStart, celEnd) = CaveatExpressionExtent.Find(_source, bodyStart, bodyEnd);
+        var (celLine, celColumn) = CaveatExpressionExtent.LineAndColumn(_source, celStart);
+
+        return new CaveatNode(
+            name,
+            parameters.ToImmutable(),
+            expression,
+            keyword.Line,
+            keyword.Column,
+            _source[celStart..celEnd],
+            celLine,
+            celColumn);
     }
 
     private CaveatParameterNode ParseCaveatParameter()
     {
-        string paramName = Expect(TokenType.Identifier, "caveat parameter name").Text;
+        Token paramName = Expect(TokenType.Identifier, "caveat parameter name");
         CaveatTypeRefNode type = ParseCaveatTypeRef();
-        return new CaveatParameterNode(paramName, type);
+        return new CaveatParameterNode(paramName.Text, type, paramName.Line, paramName.Column);
     }
 
     private CaveatTypeRefNode ParseCaveatTypeRef()

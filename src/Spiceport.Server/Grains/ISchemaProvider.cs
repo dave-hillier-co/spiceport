@@ -118,7 +118,7 @@ public sealed class MutableSchemaProvider : ISchemaProvider, ISchemaHashSource
 
     private static SchemaSnapshot Compile(string schemaText, long version)
     {
-        var compiled = SchemaCompiler.CompileSchema(schemaText);
+        var compiled = SchemaCompiler.CompileStoredSchema(schemaText);
         var hash = SchemaHash.Compute(compiled.Namespaces, compiled.Caveats);
         return new SchemaSnapshot(compiled, hash, schemaText, version);
     }
