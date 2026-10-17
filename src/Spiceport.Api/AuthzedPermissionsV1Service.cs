@@ -70,6 +70,8 @@ public sealed class AuthzedPermissionsV1Service(
     public override async Task<V1::CheckPermissionResponse> CheckPermission(
         V1::CheckPermissionRequest request, ServerCallContext context)
     {
+        RequestValidation.Validate(request);
+
         var subjectRelation = string.IsNullOrEmpty(request.Subject.OptionalRelation)
             ? CoreConstants.Ellipsis
             : request.Subject.OptionalRelation;
@@ -160,9 +162,10 @@ public sealed class AuthzedPermissionsV1Service(
     public override async Task<V1::WriteRelationshipsResponse> WriteRelationships(
         V1::WriteRelationshipsRequest request, ServerCallContext context)
     {
-        // Reject malformed/over-limit/duplicate/oversized-context requests up front (SpiceDB validates the
-        // request shape before applying it: required submessages in its interceptor, then the transaction
-        // metadata first in the handler). All of these are InvalidArgument, not FailedPrecondition.
+        RequestValidation.Validate(request);
+
+        // Reject over-limit/duplicate/oversized-context requests up front (SpiceDB's handler checks the
+        // transaction metadata first, then the counts). All of these are InvalidArgument.
         RequestLimits.ValidateWriteRelationships(request);
 
         var updates = request.Updates.Select(ToWire).ToList();
@@ -206,6 +209,8 @@ public sealed class AuthzedPermissionsV1Service(
         IServerStreamWriter<V1::ReadRelationshipsResponse> responseStream,
         ServerCallContext context)
     {
+        RequestValidation.Validate(request);
+
         RequestCeilings.ValidateLimit(request.OptionalLimit, RequestCeilings.MaxReadRelationshipsLimit);
 
         var filter = ToWire(request.RelationshipFilter);
@@ -256,8 +261,7 @@ public sealed class AuthzedPermissionsV1Service(
     public override async Task<V1::DeleteRelationshipsResponse> DeleteRelationships(
         V1::DeleteRelationshipsRequest request, ServerCallContext context)
     {
-        // Reject a missing required filter as InvalidArgument before the wire mapping dereferences it.
-        RequestLimits.ValidateDeleteRelationships(request);
+        RequestValidation.Validate(request);
 
         RequestCeilings.ValidateTransactionMetadata(request.OptionalTransactionMetadata);
         RequestCeilings.ValidateLimit(request.OptionalLimit, RequestCeilings.MaxDeleteRelationshipsLimit);
@@ -304,6 +308,8 @@ public sealed class AuthzedPermissionsV1Service(
     public override async Task<V1::ExpandPermissionTreeResponse> ExpandPermissionTree(
         V1::ExpandPermissionTreeRequest request, ServerCallContext context)
     {
+        RequestValidation.Validate(request);
+
         // Validate the resource definition+permission up front (SpiceDB: CheckNamespaceAndRelation).
         SchemaValidation.CheckNamespaceAndRelations(
             schema.Current,
@@ -347,6 +353,8 @@ public sealed class AuthzedPermissionsV1Service(
         IServerStreamWriter<V1::LookupResourcesResponse> responseStream,
         ServerCallContext context)
     {
+        RequestValidation.Validate(request);
+
         var subjectRelation = string.IsNullOrEmpty(request.Subject.OptionalRelation)
             ? CoreConstants.Ellipsis
             : request.Subject.OptionalRelation;
@@ -441,6 +449,8 @@ public sealed class AuthzedPermissionsV1Service(
         IServerStreamWriter<V1::LookupSubjectsResponse> responseStream,
         ServerCallContext context)
     {
+        RequestValidation.Validate(request);
+
         var subjectRelation = string.IsNullOrEmpty(request.OptionalSubjectRelation)
             ? CoreConstants.Ellipsis
             : request.OptionalSubjectRelation;
@@ -540,6 +550,8 @@ public sealed class AuthzedPermissionsV1Service(
     public override async Task<V1::CheckBulkPermissionsResponse> CheckBulkPermissions(
         V1::CheckBulkPermissionsRequest request, ServerCallContext context)
     {
+        RequestValidation.Validate(request);
+
         var snapshot = schema.Current;
 
         // Validate each pair against the schema UP FRONT and PER PAIR. An unknown resource definition,
@@ -679,6 +691,8 @@ public sealed class AuthzedPermissionsV1Service(
         var relationships = new List<RelationshipWire>();
         while (await requestStream.MoveNext(context.CancellationToken))
         {
+            // SpiceDB's stream interceptors validate each message as the handler receives it.
+            RequestValidation.Validate(requestStream.Current);
             foreach (var relationship in requestStream.Current.Relationships)
                 relationships.Add(ToWire(relationship));
         }
@@ -714,6 +728,8 @@ public sealed class AuthzedPermissionsV1Service(
         IServerStreamWriter<V1::ExportBulkRelationshipsResponse> responseStream,
         ServerCallContext context)
     {
+        RequestValidation.Validate(request);
+
         ArgumentNullException.ThrowIfNull(request);
         ArgumentNullException.ThrowIfNull(responseStream);
 

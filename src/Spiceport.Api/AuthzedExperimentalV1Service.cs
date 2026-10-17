@@ -28,8 +28,7 @@ public sealed class AuthzedExperimentalV1Service(IGrainFactory grains, ISchemaPr
     public override async Task<V1::ExperimentalRegisterRelationshipCounterResponse> ExperimentalRegisterRelationshipCounter(
         V1::ExperimentalRegisterRelationshipCounterRequest request, ServerCallContext context)
     {
-        if (request.RelationshipFilter is null)
-            throw new RpcException(new Status(StatusCode.InvalidArgument, "relationship_filter is required"));
+        RequestValidation.Validate(request);
 
         try
         {
@@ -53,6 +52,8 @@ public sealed class AuthzedExperimentalV1Service(IGrainFactory grains, ISchemaPr
     public override async Task<V1::ExperimentalUnregisterRelationshipCounterResponse> ExperimentalUnregisterRelationshipCounter(
         V1::ExperimentalUnregisterRelationshipCounterRequest request, ServerCallContext context)
     {
+        RequestValidation.Validate(request);
+
         try
         {
             await Relationships.UnregisterRelationshipCounter(new UnregisterCounterArgs(request.Name));
@@ -73,6 +74,8 @@ public sealed class AuthzedExperimentalV1Service(IGrainFactory grains, ISchemaPr
     public override async Task<V1::ExperimentalCountRelationshipsResponse> ExperimentalCountRelationships(
         V1::ExperimentalCountRelationshipsRequest request, ServerCallContext context)
     {
+        RequestValidation.Validate(request);
+
         CountRelationshipsReply reply;
         try
         {

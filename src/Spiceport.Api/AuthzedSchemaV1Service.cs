@@ -25,6 +25,8 @@ public sealed class AuthzedSchemaV1Service(IGrainFactory grains, ISchemaProvider
     public override async Task<V1::ReadSchemaResponse> ReadSchema(
         V1::ReadSchemaRequest request, ServerCallContext context)
     {
+        RequestValidation.Validate(request);
+
         var reply = await Relationships.ReadSchema();
         if (string.IsNullOrWhiteSpace(reply.SchemaText))
         {
@@ -44,6 +46,8 @@ public sealed class AuthzedSchemaV1Service(IGrainFactory grains, ISchemaProvider
     public override async Task<V1::WriteSchemaResponse> WriteSchema(
         V1::WriteSchemaRequest request, ServerCallContext context)
     {
+        RequestValidation.Validate(request);
+
         try
         {
             var reply = await Relationships.WriteSchema(new WriteSchemaArgs(request.Schema));
@@ -68,6 +72,8 @@ public sealed class AuthzedSchemaV1Service(IGrainFactory grains, ISchemaProvider
     public override Task<V1::ReflectSchemaResponse> ReflectSchema(
         V1::ReflectSchemaRequest request, ServerCallContext context)
     {
+        RequestValidation.Validate(request);
+
         var snapshot = schema.Current;
         var filters = SchemaFilters.FromRequest(request.OptionalFilters);
 
@@ -108,6 +114,8 @@ public sealed class AuthzedSchemaV1Service(IGrainFactory grains, ISchemaProvider
     public override Task<V1::DiffSchemaResponse> DiffSchema(
         V1::DiffSchemaRequest request, ServerCallContext context)
     {
+        RequestValidation.Validate(request);
+
         Spiceport.Schema.CompiledSchema comparison;
         try
         {
@@ -134,6 +142,8 @@ public sealed class AuthzedSchemaV1Service(IGrainFactory grains, ISchemaProvider
     public override Task<V1::ComputablePermissionsResponse> ComputablePermissions(
         V1::ComputablePermissionsRequest request, ServerCallContext context)
     {
+        RequestValidation.Validate(request);
+
         var snapshot = schema.Current;
         var namespaces = snapshot.Namespaces.ToImmutableDictionary(n => n.Name);
 
@@ -162,6 +172,8 @@ public sealed class AuthzedSchemaV1Service(IGrainFactory grains, ISchemaProvider
     public override Task<V1::DependentRelationsResponse> DependentRelations(
         V1::DependentRelationsRequest request, ServerCallContext context)
     {
+        RequestValidation.Validate(request);
+
         var namespaces = schema.Current.Namespaces.ToImmutableDictionary(n => n.Name);
 
         IReadOnlyList<RelationReference> dependents;
