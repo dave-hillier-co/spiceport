@@ -442,6 +442,55 @@ public class AuthzedPermissionsV1ServiceTests
             ex.Status.Detail);
     }
 
+    private const string WildcardCaveatSchema = """
+        definition user {}
+
+        caveat c1(a int) { a == 1 }
+
+        caveat c2(a int) { a == 1 }
+
+        definition doc {
+            relation wildcard_only: user:* with c2
+            relation mixed: user with c1 | user:* with c2
+        }
+        """;
+
+    [Fact]
+    public async Task WriteRelationships_uncaveated_concrete_subject_does_not_name_a_wildcard_types_caveat()
+    {
+        // SpiceDB's NewInvalidSubjectTypeError compares allowedType.GetRelation(), which is "" for a
+        // wildcard allowed type, so `user:* with c2` never matches the concrete subject `user:tom`
+        // and the error falls through to the fuzzy suggestion.
+        await using var cluster = await MeshTestCluster.CreateAsync(WildcardCaveatSchema);
+
+        var ex = await Assert.ThrowsAsync<RpcException>(() => Service(cluster).WriteRelationships(
+            WriteOne(V1::RelationshipUpdate.Types.Operation.Touch,
+                "doc", "1", "wildcard_only", "user", "tom"),
+            FakeServerCallContext.Default));
+
+        Assert.Equal(StatusCode.InvalidArgument, ex.StatusCode);
+        Assert.Contains(
+            "subjects of type `user` are not allowed on relation `doc#wildcard_only`; did you mean `user:* with c2`?",
+            ex.Status.Detail);
+    }
+
+    [Fact]
+    public async Task WriteRelationships_required_caveat_hint_lists_only_the_concrete_types_caveats()
+    {
+        await using var cluster = await MeshTestCluster.CreateAsync(WildcardCaveatSchema);
+
+        var ex = await Assert.ThrowsAsync<RpcException>(() => Service(cluster).WriteRelationships(
+            WriteOne(V1::RelationshipUpdate.Types.Operation.Touch,
+                "doc", "1", "mixed", "user", "tom"),
+            FakeServerCallContext.Default));
+
+        Assert.Equal(StatusCode.InvalidArgument, ex.StatusCode);
+        Assert.Contains(
+            "subjects of type `user` are not allowed on relation `doc#mixed` without one of the following caveats: c1",
+            ex.Status.Detail);
+        Assert.DoesNotContain("c1,c2", ex.Status.Detail);
+    }
+
     [Fact]
     public async Task WriteRelationships_delete_ignores_an_unspecified_caveat()
     {
@@ -1295,6 +1344,44 @@ public class AuthzedPermissionsV1ServiceTests
     }
 
     [Fact]
+    public async Task WriteRelationships_reports_a_missing_submessage_before_oversized_metadata()
+    {
+        // SpiceDB's protoc-gen-validate interceptor runs before the handler, whose first statement is
+        // validateTransactionMetadata, so a request malformed both ways gets the shape error.
+        await using var cluster = await MeshTestCluster.CreateAsync(Schema);
+
+        var request = new V1::WriteRelationshipsRequest
+        {
+            Updates = { new V1::RelationshipUpdate { Operation = V1::RelationshipUpdate.Types.Operation.Touch } },
+            OptionalTransactionMetadata = MetadataOfBytes(65_000),
+        };
+        var ex = await Assert.ThrowsAsync<RpcException>(() =>
+            Service(cluster).WriteRelationships(request, FakeServerCallContext.Default));
+
+        Assert.Equal(StatusCode.InvalidArgument, ex.StatusCode);
+        Assert.Equal(
+            "invalid WriteRelationshipsRequest.Updates[0]: embedded message failed validation | caused by: " +
+            "invalid RelationshipUpdate.Relationship: value is required",
+            ex.Status.Detail);
+    }
+
+    [Fact]
+    public async Task WriteRelationships_reports_oversized_metadata_before_too_many_updates()
+    {
+        // Within the handler SpiceDB checks the metadata size ahead of the update count.
+        await using var cluster = await MeshTestCluster.CreateAsync(Schema);
+
+        var request = new V1::WriteRelationshipsRequest { OptionalTransactionMetadata = MetadataOfBytes(65_000) };
+        for (var i = 0; i <= 1000; i++)
+            request.Updates.Add(WriteReq(V1::RelationshipUpdate.Types.Operation.Touch, $"doc{i}", "alice").Updates[0]);
+        var ex = await Assert.ThrowsAsync<RpcException>(() =>
+            Service(cluster).WriteRelationships(request, FakeServerCallContext.Default));
+
+        Assert.Equal(StatusCode.InvalidArgument, ex.StatusCode);
+        Assert.Matches("^metadata size of [0-9]+ is greater than maximum allowed of 65000$", ex.Status.Detail);
+    }
+
+    [Fact]
     public async Task DeleteRelationships_transaction_metadata_over_65000_bytes_is_invalid_argument()
     {
         await using var cluster = await MeshTestCluster.CreateAsync(Schema);
@@ -1356,7 +1443,7 @@ public class AuthzedPermissionsV1ServiceTests
     [Fact]
     public async Task WriteRelationships_update_without_relationship_is_invalid_argument()
     {
-        // An unset required submessage must reach the client as InvalidArgument (SpiceDB's protovalidate
+        // An unset required submessage must reach the client as InvalidArgument (SpiceDB's protoc-gen-validate
         // interceptor), never as the Internal/Unknown status a NullReferenceException in the wire mapping
         // would produce. Driven through the handler so the validation-before-mapping order is pinned.
         await using var cluster = await MeshTestCluster.CreateAsync(Schema);
@@ -1369,7 +1456,10 @@ public class AuthzedPermissionsV1ServiceTests
         var ex = await Assert.ThrowsAsync<RpcException>(() =>
             Service(cluster).WriteRelationships(req, FakeServerCallContext.Default));
         Assert.Equal(StatusCode.InvalidArgument, ex.StatusCode);
-        Assert.Contains("updates[0].relationship: value is required", ex.Status.Detail);
+        Assert.Equal(
+            "invalid WriteRelationshipsRequest.Updates[0]: embedded message failed validation | caused by: " +
+            "invalid RelationshipUpdate.Relationship: value is required",
+            ex.Status.Detail);
     }
 
     [Fact]
@@ -1383,20 +1473,23 @@ public class AuthzedPermissionsV1ServiceTests
         var ex = await Assert.ThrowsAsync<RpcException>(() =>
             Service(cluster).WriteRelationships(req, FakeServerCallContext.Default));
         Assert.Equal(StatusCode.InvalidArgument, ex.StatusCode);
-        Assert.Contains("optional_preconditions[0].filter: value is required", ex.Status.Detail);
+        Assert.Equal(
+            "invalid WriteRelationshipsRequest.OptionalPreconditions[0]: embedded message failed validation | caused by: " +
+            "invalid Precondition.Filter: value is required",
+            ex.Status.Detail);
     }
 
     [Fact]
     public async Task DeleteRelationships_without_relationship_filter_is_invalid_argument()
     {
-        // DeleteRelationshipsRequest.relationship_filter is (buf.validate.field).required: SpiceDB rejects
+        // DeleteRelationshipsRequest.relationship_filter is (validate.rules).message.required: SpiceDB rejects
         // its absence with InvalidArgument before the handler runs.
         await using var cluster = await MeshTestCluster.CreateAsync(Schema);
 
         var ex = await Assert.ThrowsAsync<RpcException>(() =>
             Service(cluster).DeleteRelationships(new V1::DeleteRelationshipsRequest(), FakeServerCallContext.Default));
         Assert.Equal(StatusCode.InvalidArgument, ex.StatusCode);
-        Assert.Contains("relationship_filter: value is required", ex.Status.Detail);
+        Assert.Equal("invalid DeleteRelationshipsRequest.RelationshipFilter: value is required", ex.Status.Detail);
     }
 
     [Fact]
@@ -1413,7 +1506,10 @@ public class AuthzedPermissionsV1ServiceTests
         var ex = await Assert.ThrowsAsync<RpcException>(() =>
             Service(cluster).DeleteRelationships(req, FakeServerCallContext.Default));
         Assert.Equal(StatusCode.InvalidArgument, ex.StatusCode);
-        Assert.Contains("optional_preconditions[0].filter: value is required", ex.Status.Detail);
+        Assert.Equal(
+            "invalid DeleteRelationshipsRequest.OptionalPreconditions[0]: embedded message failed validation | caused by: " +
+            "invalid Precondition.Filter: value is required",
+            ex.Status.Detail);
     }
 
     [Fact]

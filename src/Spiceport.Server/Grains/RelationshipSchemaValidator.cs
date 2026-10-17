@@ -144,6 +144,9 @@ internal static class RelationshipSchemaValidator
             var requiredCaveats = allowed
                 .Where(a => a.RequiredCaveat is { CaveatName.Length: > 0 }
                     && a.ObjectType == rel.Subject.ObjectType
+                    // SpiceDB compares allowedType.GetRelation(), which is "" for a wildcard
+                    // allowed type, so a wildcard type never matches a subject's relation.
+                    && !a.IsPublicWildcard
                     && (a.RelationName ?? CoreConstants.Ellipsis) == rel.Subject.Relation
                     && rel.Subject.ObjectId != CoreConstants.PublicWildcard
                     && a.RequiresExpiration == (rel.OptionalExpiration is not null))

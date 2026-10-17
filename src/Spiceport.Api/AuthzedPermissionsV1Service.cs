@@ -160,10 +160,9 @@ public sealed class AuthzedPermissionsV1Service(
     public override async Task<V1::WriteRelationshipsResponse> WriteRelationships(
         V1::WriteRelationshipsRequest request, ServerCallContext context)
     {
-        // Reject over-limit/duplicate/oversized-context requests up front (SpiceDB validates the request
-        // shape before applying it, the transaction metadata first). All of these are InvalidArgument, not
-        // FailedPrecondition.
-        RequestCeilings.ValidateTransactionMetadata(request.OptionalTransactionMetadata);
+        // Reject malformed/over-limit/duplicate/oversized-context requests up front (SpiceDB validates the
+        // request shape before applying it: required submessages in its interceptor, then the transaction
+        // metadata first in the handler). All of these are InvalidArgument, not FailedPrecondition.
         RequestLimits.ValidateWriteRelationships(request);
 
         var updates = request.Updates.Select(ToWire).ToList();
