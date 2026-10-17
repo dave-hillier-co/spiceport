@@ -34,7 +34,8 @@ public sealed class ReferenceDatastore : IDatastore
     // which revisions carry changes after a cursor. Pruned in lockstep with the GC window on each commit:
     // a revision older than (head - gcWindow) can no longer be a valid Watch cursor (IsRevisionValid
     // rejects it), so retaining it only grows the list unbounded and slows the per-poll re-scan.
-    private ImmutableList<long> _committedRevisions = ImmutableList<long>.Empty;
+    // Each entry carries the metadata its transaction was given (null for none), returned on its change.
+    private ImmutableList<CommittedRevision> _committedRevisions = ImmutableList<CommittedRevision>.Empty;
 
     // A signal completed whenever a new revision commits, so live Watch tailers wake without polling.
     // Swapped under _writeLock on every commit; waiters capture the current instance before re-checking.
@@ -107,6 +108,7 @@ public sealed class ReferenceDatastore : IDatastore
 
     public async Task<IRevision> ReadWriteTx(
         Func<IReadWriteTransaction, Task> transaction,
+        byte[]? transactionMetadata = null,
         CancellationToken cancellationToken = default)
     {
         DatastoreState baseState;
@@ -125,7 +127,10 @@ public sealed class ReferenceDatastore : IDatastore
             if (!ReferenceEquals(_current, baseState))
                 throw new SerializationException();
             _current = tx.Commit();
-            _committedRevisions = PruneExpiredRevisions(_committedRevisions.Add(newRevision), newRevision);
+            // SpiceDB stores no metadata for an empty one (common.Changes.AddRevisionMetadata).
+            var metadata = transactionMetadata is { Length: > 0 } ? transactionMetadata : null;
+            _committedRevisions = PruneExpiredRevisions(
+                _committedRevisions.Add(new CommittedRevision(newRevision, metadata)), newRevision);
             // Wake any live Watch tailers, then arm a fresh signal for the next commit.
             var signal = _commitSignal;
             _commitSignal = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -166,27 +171,27 @@ public sealed class ReferenceDatastore : IDatastore
             // one lock makes the "check then wait" race-free: any commit after this point either is in
             // our list, or will complete the signal we captured.
             DatastoreState state;
-            List<long> pending;
+            List<CommittedRevision> pending;
             TaskCompletionSource signal;
             lock (_writeLock)
             {
                 state = _current;
                 signal = _commitSignal;
-                pending = new List<long>();
-                foreach (var rev in _committedRevisions)
+                pending = new List<CommittedRevision>();
+                foreach (var committed in _committedRevisions)
                 {
-                    if (rev > cursor)
-                        pending.Add(rev);
+                    if (committed.Revision > cursor)
+                        pending.Add(committed);
                 }
             }
 
             // pending is already in ascending order (revisions are appended monotonically).
-            foreach (var rev in pending)
+            foreach (var committed in pending)
             {
-                var change = BuildChange(state, rev, options);
+                var change = BuildChange(state, committed, options);
                 if (change is not null)
                     yield return change;
-                cursor = rev;
+                cursor = committed.Revision;
             }
 
             // When checkpoints are requested, emit one after the batch so a consumer watching only a
@@ -210,8 +215,9 @@ public sealed class ReferenceDatastore : IDatastore
         }
     }
 
-    private static RevisionChange? BuildChange(DatastoreState state, long revision, WatchOptions options)
+    private static RevisionChange? BuildChange(DatastoreState state, CommittedRevision committed, WatchOptions options)
     {
+        var revision = committed.Revision;
         var rev = new TimestampRevision(revision);
         var includeRels = (options.Content & WatchContent.Relationships) != 0;
         var includeSchema = (options.Content & WatchContent.Schema) != 0;
@@ -222,11 +228,15 @@ public sealed class ReferenceDatastore : IDatastore
         var schemaChanged = includeSchema && state.SchemaChangedAt(revision);
 
         // Suppress empty checkpoints: only emit a revision that actually carries requested content.
+        // Metadata alone is not content: SpiceDB's Watch sends nothing for a revision carrying only metadata.
         if (relChanges.Count == 0 && !schemaChanged)
             return null;
 
-        return new RevisionChange(rev, relChanges, schemaChanged);
+        return new RevisionChange(rev, relChanges, schemaChanged, TransactionMetadata: committed.TransactionMetadata);
     }
+
+    /// <summary>A committed revision in the changefeed, with the metadata its transaction was given.</summary>
+    private sealed record CommittedRevision(long Revision, byte[]? TransactionMetadata);
 
     public Task<string> GetUniqueId(CancellationToken cancellationToken = default) => Task.FromResult(_uniqueId);
 
@@ -249,11 +259,11 @@ public sealed class ReferenceDatastore : IDatastore
     // floor (head - gcWindow) can never again be a valid Watch cursor, so it carries no information for
     // any future tailer and is safe to discard. The list stays in ascending order, so the survivors are
     // a contiguous suffix. Caller holds _writeLock.
-    private ImmutableList<long> PruneExpiredRevisions(ImmutableList<long> revisions, long head)
+    private ImmutableList<CommittedRevision> PruneExpiredRevisions(ImmutableList<CommittedRevision> revisions, long head)
     {
         var floor = head - _gcWindowNanos;
         var firstKept = 0;
-        while (firstKept < revisions.Count && revisions[firstKept] < floor)
+        while (firstKept < revisions.Count && revisions[firstKept].Revision < floor)
             firstKept++;
         return firstKept == 0 ? revisions : revisions.RemoveRange(0, firstKept);
     }

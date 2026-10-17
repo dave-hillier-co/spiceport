@@ -68,6 +68,14 @@ public sealed record DeleteByFilterWire(
 /// if the grain's head differs (the lambda compatibility path, whose preconditions were evaluated
 /// caller-side against this head). When null the grain serializes the commit unconditionally.
 /// </param>
+/// <param name="TransactionMetadata">
+/// The transaction metadata (SpiceDB <c>optional_transaction_metadata</c>, stored with the transaction by
+/// <c>options.WithMetadata</c>) as the serialized <c>google.protobuf.Struct</c> the API layer received —
+/// opaque bytes below it. An accepted commit journals it on the <see cref="LogEvent"/> of the revision it
+/// mints, on either path, so Watch returns it with that revision's changes; a rejected one journals
+/// nothing. Null or empty journals none (SpiceDB stores nothing for an empty metadata). Every request in a
+/// group-commit batch mints its own revision and event, so each keeps its own metadata.
+/// </param>
 [GenerateSerializer, Immutable]
 public sealed record CommitRequest(
     [property: Id(0)] IReadOnlyList<CommitPreconditionWire> Preconditions,
@@ -76,7 +84,8 @@ public sealed record CommitRequest(
     [property: Id(3)] byte[]? SchemaBytes,
     [property: Id(4)] string? ExpectedSchemaHash,
     [property: Id(5)] IReadOnlyList<CounterDeltaWire> CounterChanges,
-    [property: Id(6)] long? ExpectedHead);
+    [property: Id(6)] long? ExpectedHead,
+    [property: Id(7)] byte[]? TransactionMetadata = null);
 
 /// <summary>
 /// How a <see cref="CommitRequest"/> was rejected. Failures cross the grain boundary as STRUCTURED

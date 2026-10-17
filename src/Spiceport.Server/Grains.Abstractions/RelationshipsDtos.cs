@@ -70,11 +70,15 @@ public sealed record PreconditionWire(
     [property: Id(0)] PreconditionOpWire Operation,
     [property: Id(1)] RelationshipsFilterWire Filter);
 
-/// <summary>Arguments for <see cref="IRelationshipsGrain.WriteRelationships"/>.</summary>
+/// <summary>
+/// Arguments for <see cref="IRelationshipsGrain.WriteRelationships"/>. <see cref="TransactionMetadata"/> is
+/// the request's serialized <c>optional_transaction_metadata</c> (see <see cref="CommitRequest.TransactionMetadata"/>).
+/// </summary>
 [GenerateSerializer]
 public sealed record WriteRelationshipsArgs(
     [property: Id(0)] IReadOnlyList<RelationshipUpdateWire> Updates,
-    [property: Id(1)] IReadOnlyList<PreconditionWire>? Preconditions = null);
+    [property: Id(1)] IReadOnlyList<PreconditionWire>? Preconditions = null,
+    [property: Id(2)] byte[]? TransactionMetadata = null);
 
 /// <summary>Reply for <see cref="IRelationshipsGrain.WriteRelationships"/>.</summary>
 [GenerateSerializer]
@@ -95,13 +99,17 @@ public sealed record RelationshipsFilterWire(
     [property: Id(5)] IReadOnlyList<string>? SubjectIds,
     [property: Id(6)] string? SubjectRelation);
 
-/// <summary>Arguments for <see cref="IRelationshipsGrain.DeleteRelationships"/>.</summary>
+/// <summary>
+/// Arguments for <see cref="IRelationshipsGrain.DeleteRelationships"/>. <see cref="TransactionMetadata"/> is
+/// the request's serialized <c>optional_transaction_metadata</c> (see <see cref="CommitRequest.TransactionMetadata"/>).
+/// </summary>
 [GenerateSerializer]
 public sealed record DeleteRelationshipsArgs(
     [property: Id(0)] RelationshipsFilterWire Filter,
     [property: Id(1)] ulong? OptionalLimit,
     [property: Id(2)] IReadOnlyList<PreconditionWire>? Preconditions = null,
-    [property: Id(3)] bool RejectOverLimit = false);
+    [property: Id(3)] bool RejectOverLimit = false,
+    [property: Id(4)] byte[]? TransactionMetadata = null);
 
 /// <summary>Reply for <see cref="IRelationshipsGrain.DeleteRelationships"/>.</summary>
 [GenerateSerializer]
