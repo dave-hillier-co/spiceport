@@ -462,7 +462,8 @@ public sealed class RelationshipsGrain(
         CommitFailureKind.PreconditionFailed => PreconditionFailure(failure.Detail),
         CommitFailureKind.CreateAlreadyExists => new WriteConflictException(
             WriteConflictKind.CreateExisting,
-            new CreateRelationshipExistsException(failure.Detail ?? string.Empty).Message),
+            new CreateRelationshipExistsException(failure.Detail ?? string.Empty).Message,
+            failure.Detail),
         CommitFailureKind.DeleteLimitExceeded => new DeleteLimitExceededException(
             ulong.Parse(failure.Detail ?? "0", System.Globalization.CultureInfo.InvariantCulture)),
         _ => new InvalidOperationException(

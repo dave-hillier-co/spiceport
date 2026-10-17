@@ -48,15 +48,26 @@ internal static class RequestLimits
         RequestCeilings.ValidateTransactionMetadata(request.OptionalTransactionMetadata);
 
         if (request.Updates.Count > MaxUpdatesPerWrite)
-            throw new RpcException(new Status(
+            throw RpcErrors.WithReason(
                 StatusCode.InvalidArgument,
                 $"too many updates ({request.Updates.Count}) for WriteRelationships call (maximum: {MaxUpdatesPerWrite}); " +
-                "consider using ImportBulkRelationships API instead"));
+                "consider using ImportBulkRelationships API instead",
+                V1::ErrorReason.TooManyUpdatesInRequest,
+                [
+                    new("update_count", Invariant(request.Updates.Count)),
+                    new("maximum_updates_allowed", Invariant(MaxUpdatesPerWrite)),
+                ]);
 
         if (request.OptionalPreconditions.Count > MaxPreconditionsCount)
-            throw new RpcException(new Status(
+            throw RpcErrors.WithReason(
                 StatusCode.InvalidArgument,
-                $"precondition count of {request.OptionalPreconditions.Count} is greater than maximum allowed of {MaxPreconditionsCount}"));
+                $"precondition count of {request.OptionalPreconditions.Count} is greater than maximum allowed of {MaxPreconditionsCount}",
+                V1::ErrorReason.TooManyPreconditionsInRequest,
+                [
+                    new("precondition_count", Invariant(request.OptionalPreconditions.Count)),
+                    // SpiceDB's ExceedsMaximumPreconditionsError reuses the updates key for its maximum.
+                    new("maximum_updates_allowed", Invariant(MaxPreconditionsCount)),
+                ]);
 
         // A relationship can be specified in an update only once per overall request. The key ignores the
         // caveat and expiration (SpiceDB: V1StringRelationshipWithoutCaveatOrExpiration), so a CREATE and a
@@ -64,19 +75,31 @@ internal static class RequestLimits
         var seen = new HashSet<string>(StringComparer.Ordinal);
         foreach (var update in request.Updates)
         {
-            var key = RelationshipKeyWithoutCaveatOrExpiration(update.Relationship);
+            var key = GoRelationshipStrings.WithoutCaveatOrExpiration(update.Relationship);
             if (!seen.Add(key))
-                throw new RpcException(new Status(
+                throw RpcErrors.WithReason(
                     StatusCode.InvalidArgument,
                     $"found more than one update with relationship `{key}` in this request; " +
-                    "a relationship can only be specified in an update once per overall WriteRelationships request"));
+                    "a relationship can only be specified in an update once per overall WriteRelationships request",
+                    V1::ErrorReason.UpdatesOnSameRelationship,
+                    [
+                        new("definition_name", update.Relationship.Resource.ObjectType),
+                        new("relationship", GoRelationshipStrings.Full(update.Relationship)),
+                    ]);
 
             // proto.Size of the caveat: a relationship with no caveat is size 0 and is always allowed.
             var contextSize = update.Relationship.OptionalCaveat?.CalculateSize() ?? 0;
             if (contextSize > MaxRelationshipContextSize)
-                throw new RpcException(new Status(
+                throw RpcErrors.WithReason(
                     StatusCode.InvalidArgument,
-                    $"provided relationship `{key}` exceeded maximum allowed caveat size of {MaxRelationshipContextSize}"));
+                    $"provided relationship `{key}` exceeded maximum allowed caveat size of {MaxRelationshipContextSize}",
+                    V1::ErrorReason.MaxRelationshipContextSize,
+                    [
+                        new("relationship", key),
+                        new("max_allowed_size", Invariant(MaxRelationshipContextSize)),
+                        // SpiceDB reports proto.Size of the whole relationship here, not of its caveat.
+                        new("context_size", Invariant(update.Relationship.CalculateSize())),
+                    ]);
         }
     }
 
@@ -99,12 +122,5 @@ internal static class RequestLimits
         return context;
     }
 
-    private static string RelationshipKeyWithoutCaveatOrExpiration(V1::Relationship rel)
-    {
-        var subjectRelation = string.IsNullOrEmpty(rel.Subject.OptionalRelation)
-            ? string.Empty
-            : "#" + rel.Subject.OptionalRelation;
-        return $"{rel.Resource.ObjectType}:{rel.Resource.ObjectId}#{rel.Relation}@" +
-               $"{rel.Subject.Object.ObjectType}:{rel.Subject.Object.ObjectId}{subjectRelation}";
-    }
+    private static string Invariant(int value) => value.ToString(System.Globalization.CultureInfo.InvariantCulture);
 }

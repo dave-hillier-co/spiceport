@@ -1,6 +1,7 @@
 using Grpc.Core;
 using Spiceport.Core;
 using Spiceport.Grains;
+using V1 = Authzed.Api.V1;
 
 namespace Spiceport.Api;
 
@@ -87,23 +88,34 @@ internal static class SchemaValidation
     /// </summary>
     internal static RpcException? WildcardSubjectError(string subjectObjectId) =>
         subjectObjectId == CoreConstants.PublicWildcard
-            ? new RpcException(new Status(
-                StatusCode.InvalidArgument, "invalid argument: cannot perform check on wildcard subject"))
+            ? RpcErrors.WithReason(
+                StatusCode.InvalidArgument,
+                "invalid argument: cannot perform check on wildcard subject",
+                V1::ErrorReason.WildcardNotAllowed,
+                [new("field", "subject.object_id")])
             : null;
 
     /// <summary>
     /// Converts an <see cref="RpcException"/> into a <c>google.rpc.Status</c> proto for embedding in a
     /// per-pair bulk-check result, mirroring SpiceDB's <c>status.FromError(...).Proto()</c>: the numeric
-    /// <c>code</c> is the gRPC status code (whose values coincide with <c>google.rpc.Code</c>) and the
-    /// <c>message</c> is the status detail.
+    /// <c>code</c> is the gRPC status code (whose values coincide with <c>google.rpc.Code</c>), the
+    /// <c>message</c> is the status detail, and the details (the <c>ErrorInfo</c>) come along.
     /// </summary>
-    internal static Google.Rpc.Status ToRpcStatus(RpcException ex) =>
-        new() { Code = (int)ex.StatusCode, Message = ex.Status.Detail };
+    internal static Google.Rpc.Status ToRpcStatus(RpcException ex) => RpcErrors.ToRpcStatus(ex);
 
-    private static RpcException NamespaceNotFound(string definition) =>
-        new(new Status(StatusCode.FailedPrecondition, $"object definition `{definition}` not found"));
+    /// <summary>SpiceDB's <c>NamespaceNotFoundError</c>, which <c>rewriteError</c> reasons UNKNOWN_DEFINITION.</summary>
+    internal static RpcException NamespaceNotFound(string definition) =>
+        RpcErrors.WithReason(
+            StatusCode.FailedPrecondition,
+            $"object definition `{definition}` not found",
+            V1::ErrorReason.UnknownDefinition,
+            [new("definition_name", definition)]);
 
-    private static RpcException RelationNotFound(string definition, string relation) =>
-        new(new Status(StatusCode.FailedPrecondition,
-            $"relation/permission `{relation}` not found under definition `{definition}`"));
+    /// <summary>SpiceDB's <c>RelationNotFoundError</c>, which <c>rewriteError</c> reasons UNKNOWN_RELATION_OR_PERMISSION.</summary>
+    internal static RpcException RelationNotFound(string definition, string relation) =>
+        RpcErrors.WithReason(
+            StatusCode.FailedPrecondition,
+            $"relation/permission `{relation}` not found under definition `{definition}`",
+            V1::ErrorReason.UnknownRelationOrPermission,
+            [new("definition_name", definition), new("relation_or_permission_name", relation)]);
 }

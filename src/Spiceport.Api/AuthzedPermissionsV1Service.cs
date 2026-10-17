@@ -60,12 +60,137 @@ public sealed class AuthzedPermissionsV1Service(
     /// (NamespaceNotFound / RelationNotFound) is <c>FailedPrecondition</c>; a write to a permission or a
     /// disallowed subject type (CannotWriteToPermission / InvalidSubjectType) is <c>InvalidArgument</c>.
     /// </summary>
-    private static RpcException ToRpc(RelationshipValidationException ex) =>
-        new(new Status(
-            ex.Kind == RelationshipValidationErrorKind.NotFound
-                ? StatusCode.FailedPrecondition
-                : StatusCode.InvalidArgument,
-            ex.Message));
+    /// <remarks>
+    /// Each carries the <c>ErrorInfo</c> its SpiceDB error type does: UNKNOWN_DEFINITION /
+    /// UNKNOWN_RELATION_OR_PERMISSION (through <c>rewriteError</c>), CANNOT_UPDATE_PERMISSION, or
+    /// INVALID_SUBJECT_TYPE with the subject type and, when it lacked a required caveat, the allowed caveats.
+    /// </remarks>
+    private static RpcException ToRpc(RelationshipValidationException ex)
+    {
+        switch (ex.Violation)
+        {
+            case RelationshipViolation.DefinitionNotFound:
+                return RpcErrors.WithReason(
+                    StatusCode.FailedPrecondition, ex.Message, V1::ErrorReason.UnknownDefinition,
+                    [new("definition_name", ex.DefinitionName)]);
+            case RelationshipViolation.RelationNotFound:
+                return RpcErrors.WithReason(
+                    StatusCode.FailedPrecondition, ex.Message, V1::ErrorReason.UnknownRelationOrPermission,
+                    [new("definition_name", ex.DefinitionName), new("relation_or_permission_name", ex.RelationName ?? string.Empty)]);
+            case RelationshipViolation.WriteToPermission:
+                return RpcErrors.WithReason(
+                    StatusCode.InvalidArgument, ex.Message, V1::ErrorReason.CannotUpdatePermission,
+                    [new("definition_name", ex.DefinitionName), new("permission_name", ex.RelationName ?? string.Empty)]);
+            case RelationshipViolation.InvalidSubjectType:
+                var metadata = new List<KeyValuePair<string, string>>
+                {
+                    new("definition_name", ex.DefinitionName),
+                    new("relation_name", ex.RelationName ?? string.Empty),
+                    new("subject_type", ex.SubjectType ?? string.Empty),
+                };
+                if (ex.AllowedCaveats is not null)
+                    metadata.Add(new("allowed_caveats", ex.AllowedCaveats));
+                return RpcErrors.WithReason(StatusCode.InvalidArgument, ex.Message, V1::ErrorReason.InvalidSubjectType, metadata);
+            default:
+                throw new ArgumentOutOfRangeException(nameof(ex), ex.Violation, "unknown relationship violation");
+        }
+    }
+
+    /// <summary>
+    /// Maps a failed precondition onto SpiceDB's <c>PreconditionFailedError</c>: <c>FailedPrecondition</c> with
+    /// WRITE_OR_DELETE_PRECONDITION_FAILURE and metadata describing the failing precondition's filter (each
+    /// field only when set; the subject fields when the filter has a subject filter).
+    /// </summary>
+    private static RpcException ToRpc(PreconditionFailedException ex, IReadOnlyList<V1::Precondition> preconditions)
+    {
+        if (ex.PreconditionIndex < 0 || ex.PreconditionIndex >= preconditions.Count)
+            return new RpcException(new Status(StatusCode.FailedPrecondition, ex.Message));
+
+        var precondition = preconditions[ex.PreconditionIndex];
+        var filter = precondition.Filter;
+        var metadata = new List<KeyValuePair<string, string>>
+        {
+            new("precondition_operation", EnumName(precondition.Operation)),
+        };
+        AddIfSet(metadata, "precondition_resource_type", filter.ResourceType);
+        AddIfSet(metadata, "precondition_resource_id", filter.OptionalResourceId);
+        AddIfSet(metadata, "precondition_resource_id_prefix", filter.OptionalResourceIdPrefix);
+        AddIfSet(metadata, "precondition_relation", filter.OptionalRelation);
+        if (filter.OptionalSubjectFilter is { } subjectFilter)
+        {
+            metadata.Add(new("precondition_subject_type", subjectFilter.SubjectType));
+            AddIfSet(metadata, "precondition_subject_id", subjectFilter.OptionalSubjectId);
+            if (subjectFilter.OptionalRelation is { } relationFilter)
+                metadata.Add(new("precondition_subject_relation", relationFilter.Relation));
+        }
+
+        return RpcErrors.WithReason(
+            StatusCode.FailedPrecondition, ex.Message, V1::ErrorReason.WriteOrDeletePreconditionFailure, metadata);
+    }
+
+    /// <summary>
+    /// Maps a write conflict onto SpiceDB's status: a CREATE of an existing relationship is
+    /// <c>CreateRelationshipExistsError</c> (AlreadyExists, ATTEMPT_TO_RECREATE_RELATIONSHIP, naming the
+    /// relationship and its parts); a serialization failure is <c>SerializationError</c> (Aborted,
+    /// SERIALIZATION_FAILURE).
+    /// </summary>
+    private static RpcException ToRpc(WriteConflictException ex)
+    {
+        if (ex.Kind != WriteConflictKind.CreateExisting)
+            return RpcErrors.WithReason(ToStatusCode(ex.Kind), ex.Message, V1::ErrorReason.SerializationFailure);
+
+        var metadata = new List<KeyValuePair<string, string>>();
+        if (ex.Relationship is { } text && TupleStrings.TryParseRelationship(text, out var rel))
+        {
+            var subjectRelation = rel.Subject.Relation == CoreConstants.Ellipsis ? string.Empty : rel.Subject.Relation;
+            metadata.Add(new("relationship", text));
+            metadata.Add(new("resource_type", rel.Resource.ObjectType));
+            metadata.Add(new("resource_object_id", rel.Resource.ObjectId));
+            metadata.Add(new("resource_relation", rel.Resource.Relation));
+            metadata.Add(new("subject_type", rel.Subject.ObjectType));
+            metadata.Add(new("subject_object_id", rel.Subject.ObjectId));
+            metadata.Add(new("subject_relation", subjectRelation));
+        }
+
+        return RpcErrors.WithReason(
+            StatusCode.AlreadyExists, ex.Message, V1::ErrorReason.AttemptToRecreateRelationship, metadata);
+    }
+
+    /// <summary>
+    /// Maps a transactional delete over its limit onto SpiceDB's <c>CouldNotTransactionallyDeleteError</c>:
+    /// InvalidArgument, TOO_MANY_RELATIONSHIPS_FOR_TRANSACTIONAL_DELETE, with the limit and the request's filter.
+    /// </summary>
+    private static RpcException ToRpc(DeleteLimitExceededException ex, V1::RelationshipFilter filter)
+    {
+        var metadata = new List<KeyValuePair<string, string>>
+        {
+            new("limit", ex.Limit.ToString(System.Globalization.CultureInfo.InvariantCulture)),
+            new("filter_resource_type", filter.ResourceType),
+        };
+        AddIfSet(metadata, "filter_resource_id", filter.OptionalResourceId);
+        AddIfSet(metadata, "filter_relation", filter.OptionalRelation);
+        if (filter.OptionalSubjectFilter is { } subjectFilter)
+        {
+            metadata.Add(new("filter_subject_type", subjectFilter.SubjectType));
+            AddIfSet(metadata, "filter_subject_id", subjectFilter.OptionalSubjectId);
+            if (subjectFilter.OptionalRelation is { } relationFilter)
+                metadata.Add(new("filter_subject_relation", relationFilter.Relation));
+        }
+
+        return RpcErrors.WithReason(
+            StatusCode.InvalidArgument, ex.Message, V1::ErrorReason.TooManyRelationshipsForTransactionalDelete, metadata);
+    }
+
+    private static void AddIfSet(List<KeyValuePair<string, string>> metadata, string key, string value)
+    {
+        if (!string.IsNullOrEmpty(value))
+            metadata.Add(new(key, value));
+    }
+
+    /// <summary>The proto name of a <c>Precondition.Operation</c> (<c>OPERATION_MUST_MATCH</c>), as Go's <c>_name</c> map.</summary>
+    private static string EnumName(V1::Precondition.Types.Operation operation) =>
+        V1::Precondition.Descriptor.EnumTypes[0].FindValueByNumber((int)operation)?.Name
+            ?? ((int)operation).ToString(System.Globalization.CultureInfo.InvariantCulture);
 
     public override async Task<V1::CheckPermissionResponse> CheckPermission(
         V1::CheckPermissionRequest request, ServerCallContext context)
@@ -122,8 +247,8 @@ public sealed class AuthzedPermissionsV1Service(
         {
             // The check exhausted its recursion budget (deep schema/data or a cycle). SpiceDB surfaces
             // this as FailedPrecondition, NOT a NoPermission verdict, so the client can tell "the server
-            // gave up" apart from "not authorized".
-            throw new RpcException(new Status(StatusCode.FailedPrecondition, ex.Message));
+            // gave up" apart from "not authorized". It carries dispatch.MaxDepthExceededError's ErrorInfo.
+            throw RpcErrors.WithReason(StatusCode.FailedPrecondition, ex.Message, V1::ErrorReason.MaximumDepthExceeded);
         }
         catch (CaveatEvaluationException ex)
         {
@@ -181,14 +306,14 @@ public sealed class AuthzedPermissionsV1Service(
         }
         catch (PreconditionFailedException ex)
         {
-            throw new RpcException(new Status(StatusCode.FailedPrecondition, ex.Message));
+            throw ToRpc(ex, request.OptionalPreconditions);
         }
         catch (WriteConflictException ex)
         {
             // CreateExisting -> AlreadyExists (SpiceDB CreateRelationshipExistsError): a permanent
             // duplicate-create the client must NOT retry as transient. Serialization -> Aborted (SpiceDB
             // SerializationError): a genuine write-write conflict the client retries as a whole tx.
-            throw new RpcException(new Status(ToStatusCode(ex.Kind), ex.Message));
+            throw ToRpc(ex);
         }
         catch (SequencerOverloadedException ex)
         {
@@ -292,11 +417,11 @@ public sealed class AuthzedPermissionsV1Service(
         }
         catch (PreconditionFailedException ex)
         {
-            throw new RpcException(new Status(StatusCode.FailedPrecondition, ex.Message));
+            throw ToRpc(ex, request.OptionalPreconditions);
         }
         catch (DeleteLimitExceededException ex)
         {
-            throw new RpcException(new Status(StatusCode.InvalidArgument, ex.Message));
+            throw ToRpc(ex, request.RelationshipFilter);
         }
         catch (SequencerOverloadedException ex)
         {
@@ -714,7 +839,7 @@ public sealed class AuthzedPermissionsV1Service(
         }
         catch (WriteConflictException ex)
         {
-            throw new RpcException(new Status(ToStatusCode(ex.Kind), ex.Message));
+            throw ToRpc(ex);
         }
         catch (SequencerOverloadedException ex)
         {

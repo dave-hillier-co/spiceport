@@ -1,6 +1,7 @@
 using Google.Protobuf;
 using Google.Protobuf.WellKnownTypes;
 using Grpc.Core;
+using V1 = Authzed.Api.V1;
 
 namespace Spiceport.Api;
 
@@ -8,7 +9,7 @@ namespace Spiceport.Api;
 /// Per-RPC ceilings on the <c>authzed.api.v1</c> surface, mirroring SpiceDB's
 /// <c>PermissionsServerConfig</c> defaults (<c>internal/services/v1/relationships.go</c>) and the checks
 /// its handlers run before doing any work. Every violation is <see cref="StatusCode.InvalidArgument"/>
-/// with SpiceDB's message.
+/// with SpiceDB's message and the <c>ErrorInfo</c> its error type attaches.
 /// </summary>
 internal static class RequestCeilings
 {
@@ -38,9 +39,14 @@ internal static class RequestCeilings
     {
         if (providedLimit > 0 && providedLimit > maxLimit)
         {
-            throw new RpcException(new Status(
+            throw RpcErrors.WithReason(
                 StatusCode.InvalidArgument,
-                $"provided limit {providedLimit} is greater than maximum allowed of {maxLimit}"));
+                $"provided limit {providedLimit} is greater than maximum allowed of {maxLimit}",
+                V1::ErrorReason.ExceedsMaximumAllowableLimit,
+                [
+                    new("limit_provided", Invariant(providedLimit)),
+                    new("maximum_limit_allowed", Invariant(maxLimit)),
+                ]);
         }
     }
 
@@ -57,9 +63,17 @@ internal static class RequestCeilings
         var size = System.Text.Encoding.UTF8.GetByteCount(JsonFormatter.Default.Format(metadata));
         if (size > MaxTransactionMetadataSize)
         {
-            throw new RpcException(new Status(
+            throw RpcErrors.WithReason(
                 StatusCode.InvalidArgument,
-                $"metadata size of {size} is greater than maximum allowed of {MaxTransactionMetadataSize}"));
+                $"metadata size of {size} is greater than maximum allowed of {MaxTransactionMetadataSize}",
+                V1::ErrorReason.TransactionMetadataTooLarge,
+                [
+                    new("metadata_byte_size", Invariant(size)),
+                    new("maximum_allowed_metadata_byte_size", Invariant(MaxTransactionMetadataSize)),
+                ]);
         }
     }
+
+    private static string Invariant<T>(T value) where T : IFormattable =>
+        value.ToString(null, System.Globalization.CultureInfo.InvariantCulture);
 }

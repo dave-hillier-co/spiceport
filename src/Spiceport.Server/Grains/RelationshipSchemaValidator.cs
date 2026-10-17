@@ -81,8 +81,10 @@ internal static class RelationshipSchemaValidator
         if (relation.IsPermission)
         {
             throw new RelationshipValidationException(
-                RelationshipValidationErrorKind.Invalid,
-                $"cannot write a relationship to permission `{rel.Resource.Relation}` under definition `{rel.Resource.ObjectType}`");
+                RelationshipViolation.WriteToPermission,
+                $"cannot write a relationship to permission `{rel.Resource.Relation}` under definition `{rel.Resource.ObjectType}`",
+                rel.Resource.ObjectType,
+                rel.Resource.Relation);
         }
 
         var caveatName = rel.OptionalCaveat?.CaveatName;
@@ -123,11 +125,11 @@ internal static class RelationshipSchemaValidator
     private static AllowedCaveat? Caveat(string? name) => name is null ? null : new AllowedCaveat(name);
 
     private static RelationshipValidationException NamespaceNotFound(string name) =>
-        new(RelationshipValidationErrorKind.NotFound, $"object definition `{name}` not found");
+        new(RelationshipViolation.DefinitionNotFound, $"object definition `{name}` not found", name);
 
     private static RelationshipValidationException RelationNotFound(string ns, string relation) =>
-        new(RelationshipValidationErrorKind.NotFound,
-            $"relation/permission `{relation}` not found under definition `{ns}`");
+        new(RelationshipViolation.RelationNotFound,
+            $"relation/permission `{relation}` not found under definition `{ns}`", ns, relation);
 
     /// <summary>
     /// SpiceDB's <c>NewInvalidSubjectTypeError</c> wording: an uncaveated subject whose type is allowed only
@@ -155,9 +157,14 @@ internal static class RelationshipSchemaValidator
                 .ToList();
             if (requiredCaveats.Count > 0)
             {
+                var caveats = string.Join(",", requiredCaveats);
                 return new RelationshipValidationException(
-                    RelationshipValidationErrorKind.Invalid,
-                    $"subjects of type `{writtenSource}` are not allowed on relation `{target}` without one of the following caveats: {string.Join(",", requiredCaveats)}");
+                    RelationshipViolation.InvalidSubjectType,
+                    $"subjects of type `{writtenSource}` are not allowed on relation `{target}` without one of the following caveats: {caveats}",
+                    rel.Resource.ObjectType,
+                    rel.Resource.Relation,
+                    writtenSource,
+                    caveats);
             }
         }
 
@@ -173,7 +180,8 @@ internal static class RelationshipSchemaValidator
         var message = suggestion is null
             ? $"subjects of type `{writtenSource}` are not allowed on relation `{target}`"
             : $"subjects of type `{writtenSource}` are not allowed on relation `{target}`; did you mean `{suggestion}`?";
-        return new RelationshipValidationException(RelationshipValidationErrorKind.Invalid, message);
+        return new RelationshipValidationException(
+            RelationshipViolation.InvalidSubjectType, message, rel.Resource.ObjectType, rel.Resource.Relation, writtenSource);
     }
 
     /// <summary>The fuzzy-match test SpiceDB's suggestion uses: every rune of source appears in target, in order.</summary>

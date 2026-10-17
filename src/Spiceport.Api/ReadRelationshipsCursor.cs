@@ -64,20 +64,28 @@ internal static class ReadRelationshipsCursor
         }
         catch (Exception ex) when (ex is FormatException or ArgumentException)
         {
-            throw new RpcException(new Status(StatusCode.InvalidArgument, $"error decoding cursor: {ex.Message}"));
+            throw InvalidCursor($"error decoding cursor: {ex.Message}");
         }
 
         var parts = raw.Split(Separator, 3);
         if (parts.Length != 3 || parts[0] != FormatTag || parts[1] != requestHash)
-            throw new RpcException(new Status(StatusCode.InvalidArgument, HashMismatchMessage));
+            throw InvalidCursor(HashMismatchMessage);
 
         if (!TupleStrings.TryParseRelationship(parts[2], out _))
         {
-            throw new RpcException(new Status(
+            // SpiceDB's v1 NewInvalidCursorErr never sets the error's reason field, so the metadata it
+            // reports carries an empty "reason".
+            throw RpcErrors.WithReason(
                 StatusCode.FailedPrecondition,
-                "the cursor provided is not valid: could not parse resume relationship"));
+                "the cursor provided is not valid: could not parse resume relationship",
+                V1::ErrorReason.InvalidCursor,
+                [new("reason", string.Empty)]);
         }
 
         return parts[2];
     }
+
+    /// <summary>SpiceDB's <c>pkg/cursor</c> <c>InvalidCursorError</c>: INVALID_CURSOR with no metadata.</summary>
+    private static RpcException InvalidCursor(string message) =>
+        RpcErrors.WithReason(StatusCode.InvalidArgument, message, V1::ErrorReason.InvalidCursor);
 }

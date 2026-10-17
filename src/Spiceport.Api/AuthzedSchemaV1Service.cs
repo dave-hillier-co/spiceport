@@ -159,7 +159,7 @@ public sealed class AuthzedSchemaV1Service(IGrainFactory grains, ISchemaProvider
         }
         catch (SchemaIntrospectionException ex)
         {
-            throw ToRpc(ex);
+            throw ToRpc(ex, request.DefinitionName, request.RelationName);
         }
 
         var response = new V1::ComputablePermissionsResponse();
@@ -184,7 +184,7 @@ public sealed class AuthzedSchemaV1Service(IGrainFactory grains, ISchemaProvider
         }
         catch (SchemaIntrospectionException ex)
         {
-            throw ToRpc(ex);
+            throw ToRpc(ex, request.DefinitionName, request.PermissionName);
         }
 
         var response = new V1::DependentRelationsResponse();
@@ -209,14 +209,22 @@ public sealed class AuthzedSchemaV1Service(IGrainFactory grains, ISchemaProvider
         };
     }
 
-    private static RpcException ToRpc(SchemaIntrospectionException ex) => ex.Kind switch
+    /// <summary>
+    /// Maps an introspection failure onto its status. An unknown relation carries the <c>ErrorInfo</c>
+    /// <c>rewriteError</c> gives <c>schema.RelationNotFoundError</c> (UNKNOWN_RELATION_OR_PERMISSION), and a
+    /// relation where a permission was required that of <c>NotAPermissionError</c> (the same reason, keyed
+    /// <c>relationName</c>).
+    /// </summary>
+    private static RpcException ToRpc(SchemaIntrospectionException ex, string definitionName, string relationName) => ex.Kind switch
     {
         SchemaIntrospectionErrorKind.DefinitionNotFound =>
             new RpcException(new Status(StatusCode.NotFound, ex.Message)),
-        SchemaIntrospectionErrorKind.RelationNotFound =>
-            new RpcException(new Status(StatusCode.FailedPrecondition, ex.Message)),
-        SchemaIntrospectionErrorKind.NotAPermission =>
-            new RpcException(new Status(StatusCode.InvalidArgument, ex.Message)),
+        SchemaIntrospectionErrorKind.RelationNotFound => RpcErrors.WithReason(
+            StatusCode.FailedPrecondition, ex.Message, V1::ErrorReason.UnknownRelationOrPermission,
+            [new("definition_name", definitionName), new("relation_or_permission_name", relationName)]),
+        SchemaIntrospectionErrorKind.NotAPermission => RpcErrors.WithReason(
+            StatusCode.InvalidArgument, ex.Message, V1::ErrorReason.UnknownRelationOrPermission,
+            [new("relationName", relationName)]),
         _ => new RpcException(new Status(StatusCode.Internal, ex.Message)),
     };
 

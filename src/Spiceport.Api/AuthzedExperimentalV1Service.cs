@@ -29,6 +29,7 @@ public sealed class AuthzedExperimentalV1Service(IGrainFactory grains, ISchemaPr
         V1::ExperimentalRegisterRelationshipCounterRequest request, ServerCallContext context)
     {
         RequestValidation.Validate(request);
+        RequireName(request.Name);
 
         try
         {
@@ -37,7 +38,7 @@ public sealed class AuthzedExperimentalV1Service(IGrainFactory grains, ISchemaPr
         }
         catch (CounterOperationException ex)
         {
-            throw ToRpc(ex);
+            throw ToRpc(ex, request.Name, request.RelationshipFilter);
         }
         catch (SequencerOverloadedException ex)
         {
@@ -53,6 +54,7 @@ public sealed class AuthzedExperimentalV1Service(IGrainFactory grains, ISchemaPr
         V1::ExperimentalUnregisterRelationshipCounterRequest request, ServerCallContext context)
     {
         RequestValidation.Validate(request);
+        RequireName(request.Name);
 
         try
         {
@@ -60,7 +62,7 @@ public sealed class AuthzedExperimentalV1Service(IGrainFactory grains, ISchemaPr
         }
         catch (CounterOperationException ex)
         {
-            throw ToRpc(ex);
+            throw ToRpc(ex, request.Name, filter: null);
         }
         catch (SequencerOverloadedException ex)
         {
@@ -75,6 +77,7 @@ public sealed class AuthzedExperimentalV1Service(IGrainFactory grains, ISchemaPr
         V1::ExperimentalCountRelationshipsRequest request, ServerCallContext context)
     {
         RequestValidation.Validate(request);
+        RequireName(request.Name);
 
         CountRelationshipsReply reply;
         try
@@ -83,7 +86,7 @@ public sealed class AuthzedExperimentalV1Service(IGrainFactory grains, ISchemaPr
         }
         catch (CounterOperationException ex)
         {
-            throw ToRpc(ex);
+            throw ToRpc(ex, request.Name, filter: null);
         }
 
         // On-demand: the value is always available, so always emit the read_counter_value arm.
@@ -129,7 +132,41 @@ public sealed class AuthzedExperimentalV1Service(IGrainFactory grains, ISchemaPr
 
     private static string? NullIfEmpty(string? value) => string.IsNullOrEmpty(value) ? null : value;
 
-    private static RpcException ToRpc(CounterOperationException ex) =>
-        // Both counter failures map to FailedPrecondition, matching the SpiceDB reference.
-        new(new Status(StatusCode.FailedPrecondition, ex.Message));
+    /// <summary>
+    /// Both counter failures map to FailedPrecondition, matching the SpiceDB reference, with the
+    /// <c>ErrorInfo</c> <c>rewriteError</c> gives <c>CounterAlreadyRegisteredError</c> (the counter name and
+    /// the NEW filter, every field present) and <c>CounterNotRegisteredError</c> (the counter name).
+    /// </summary>
+    private static RpcException ToRpc(CounterOperationException ex, string name, V1::RelationshipFilter? filter)
+    {
+        if (ex.Kind != CounterErrorKind.AlreadyRegistered || filter is null)
+            return RpcErrors.WithReason(
+                StatusCode.FailedPrecondition, ex.Message, V1::ErrorReason.CounterNotRegistered, [new("counter_name", name)]);
+
+        var subjectFilter = filter.OptionalSubjectFilter;
+        return RpcErrors.WithReason(
+            StatusCode.FailedPrecondition,
+            ex.Message,
+            V1::ErrorReason.CounterAlreadyRegistered,
+            [
+                new("counter_name", name),
+                new("new_filter_resource_type", filter.ResourceType),
+                new("new_filter_resource_id", filter.OptionalResourceId),
+                new("new_filter_resource_id_prefix", filter.OptionalResourceIdPrefix),
+                new("new_filter_relation", filter.OptionalRelation),
+                new("new_filter_subject_type", subjectFilter?.SubjectType ?? string.Empty),
+                new("new_filter_subject_id", subjectFilter?.OptionalSubjectId ?? string.Empty),
+                new("new_filter_subject_relation", subjectFilter?.OptionalRelation?.Relation ?? string.Empty),
+            ]);
+    }
+
+    /// <summary>
+    /// SpiceDB's counter handlers reject an empty name themselves (the name pattern admits the empty string):
+    /// InvalidArgument, "name must be provided", reason UNSPECIFIED.
+    /// </summary>
+    private static void RequireName(string name)
+    {
+        if (string.IsNullOrEmpty(name))
+            throw RpcErrors.WithReason(StatusCode.InvalidArgument, "name must be provided", V1::ErrorReason.Unspecified);
+    }
 }

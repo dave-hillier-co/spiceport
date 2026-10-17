@@ -33,6 +33,18 @@ public sealed class WriteConflictException : Exception
     [Id(0)]
     public WriteConflictKind Kind { get; }
 
+    /// <summary>
+    /// For <see cref="WriteConflictKind.CreateExisting"/>, the relationship the CREATE collided on, as its
+    /// tuple string without caveat or expiration; otherwise <c>null</c>.
+    /// </summary>
+    [Id(1)]
+    public string? Relationship { get; }
+
     /// <summary>Creates the exception for the given conflict kind and message.</summary>
-    public WriteConflictException(WriteConflictKind kind, string message) : base(message) => Kind = kind;
+    public WriteConflictException(WriteConflictKind kind, string message, string? relationship = null)
+        : base(message)
+    {
+        Kind = kind;
+        Relationship = relationship;
+    }
 }
