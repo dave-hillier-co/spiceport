@@ -44,6 +44,11 @@ builder.Services.AddSingleton<IDatastore>(sp =>
 
 builder.Services.AddGrpc();
 
+// The ExperimentalService's deprecated aliases and Exp* schema tooling are translated onto the v1 services, so
+// those are resolvable from DI (per call, matching how the gRPC framework activates them itself).
+builder.Services.AddTransient<AuthzedPermissionsV1Service>();
+builder.Services.AddTransient<AuthzedSchemaV1Service>();
+
 var app = builder.Build();
 
 app.MapGrpcService<PermissionsGrpcService>();

@@ -540,6 +540,8 @@ public sealed class AuthzedPermissionsV1Service(
     public override async Task<V1::CheckBulkPermissionsResponse> CheckBulkPermissions(
         V1::CheckBulkPermissionsRequest request, ServerCallContext context)
     {
+        RequestCeilings.ValidateCheckCount(request.Items.Count);
+
         var snapshot = schema.Current;
 
         // Validate each pair against the schema UP FRONT and PER PAIR. An unknown resource definition,
@@ -709,15 +711,27 @@ public sealed class AuthzedPermissionsV1Service(
         }
     }
 
-    public override async Task ExportBulkRelationships(
+    public override Task ExportBulkRelationships(
         V1::ExportBulkRelationshipsRequest request,
         IServerStreamWriter<V1::ExportBulkRelationshipsResponse> responseStream,
-        ServerCallContext context)
+        ServerCallContext context) =>
+        ExportBulk(request, responseStream, context, RequestCeilings.MaxBulkExportRelationshipsLimit);
+
+    /// <summary>
+    /// The ExportBulkRelationships body, parameterised by its <c>optional_limit</c> ceiling: SpiceDB's
+    /// <c>ExportBulk</c>/<c>BulkExport</c> take the batch size from the calling server's configuration, which
+    /// differs between PermissionsService and the deprecated ExperimentalService alias.
+    /// </summary>
+    internal async Task ExportBulk(
+        V1::ExportBulkRelationshipsRequest request,
+        IServerStreamWriter<V1::ExportBulkRelationshipsResponse> responseStream,
+        ServerCallContext context,
+        uint maxLimit)
     {
         ArgumentNullException.ThrowIfNull(request);
         ArgumentNullException.ThrowIfNull(responseStream);
 
-        RequestCeilings.ValidateLimit(request.OptionalLimit, RequestCeilings.MaxBulkExportRelationshipsLimit);
+        RequestCeilings.ValidateLimit(request.OptionalLimit, maxLimit);
 
         var filter = request.OptionalRelationshipFilter is { } f ? ToWire(f) : EmptyFilter;
         var limit = (int)request.OptionalLimit;
