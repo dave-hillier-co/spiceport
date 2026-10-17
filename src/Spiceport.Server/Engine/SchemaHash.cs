@@ -19,7 +19,8 @@ namespace Spiceport.Engine;
 /// and the parameters ordered by name with their full (possibly generic) type references, so that a
 /// caveat body or parameter-type edit changes the hash. (The default record <c>ToString()</c> cannot be
 /// relied on here: it renders <c>byte[]</c>, dictionary and nested <see cref="ImmutableList{T}"/>
-/// properties as their type name rather than their contents.)
+/// properties as their type name rather than their contents.) Doc comments are deliberately left out:
+/// they are metadata that evaluation never reads, so a comment-only edit keeps the dispatch keyspace.
 /// </remarks>
 public static class SchemaHash
 {

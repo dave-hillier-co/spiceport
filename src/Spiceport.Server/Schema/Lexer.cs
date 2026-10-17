@@ -1,3 +1,5 @@
+using System.Collections.Immutable;
+
 namespace Spiceport.Schema;
 
 /// <summary>The kinds of tokens produced by the schema DSL <see cref="Lexer"/>.</summary>
@@ -37,14 +39,28 @@ internal enum TokenType
     Unknown,
 }
 
-/// <summary>A single lexeme: its kind, text, 1-based source position, and absolute character offset.</summary>
-internal readonly record struct Token(TokenType Type, string Text, int Line, int Column, int Offset);
+/// <summary>
+/// A single lexeme: its kind, text, 1-based source position, absolute character offset, and the comments
+/// lexed since the previous token that SpiceDB's parser would attach to it (null when there are none).
+/// </summary>
+internal readonly record struct Token(
+    TokenType Type, string Text, int Line, int Column, int Offset, ImmutableList<string>? Comments = null);
 
 /// <summary>
 /// Hand-written character-by-character lexer for the SpiceDB schema DSL.
 /// Whitespace and comments are skipped; newlines do not produce tokens (the
 /// parser is whitespace/terminator insensitive for the supported subset).
 /// </summary>
+/// <remarks>
+/// Comments are skipped as trivia but kept, verbatim with their markers, on the next token
+/// (<see cref="Token.Comments"/>) — SpiceDB's parser does the same in <c>consumeToken</c>
+/// (pkg/schemadsl/parser/parser_impl.go). SpiceDB's lexer turns a newline that follows an identifier,
+/// keyword, <c>}</c>, <c>)</c> or <c>*</c> into a synthetic semicolon token
+/// (pkg/schemadsl/lexer/lex_def.go <c>syntheticPredecessors</c>), and the comments before it attach to
+/// that semicolon rather than to the next statement; this lexer emits no semicolon there, so it drops
+/// the pending comments instead, with the same result: a trailing comment on a statement line is
+/// nobody's doc comment.
+/// </remarks>
 internal sealed class Lexer
 {
     private static readonly HashSet<string> Keywords =
@@ -67,6 +83,12 @@ internal sealed class Lexer
     private int _pos;
     private int _line = 1;
     private int _column = 1;
+
+    /// <summary>
+    /// True while the last token lexed is one after which SpiceDB emits a synthetic semicolon at the
+    /// next newline. Cleared by that newline (a second newline is an ordinary one).
+    /// </summary>
+    private bool _newlineEndsStatement;
 
     public Lexer(string input) => _input = input;
 
@@ -171,8 +193,15 @@ internal sealed class Lexer
 
     private Token Next()
     {
-        SkipTrivia();
+        var comments = SkipTrivia();
+        Token token = LexToken();
+        _newlineEndsStatement = token.Type is TokenType.Identifier or TokenType.Keyword
+            or TokenType.RightBrace or TokenType.RightParen or TokenType.Star;
+        return comments is null ? token : token with { Comments = [.. comments] };
+    }
 
+    private Token LexToken()
+    {
         if (AtEnd)
         {
             return new Token(TokenType.Eof, string.Empty, _line, _column, _pos);
@@ -243,24 +272,44 @@ internal sealed class Lexer
         return new Token(TokenType.Unknown, c.ToString(), line, col, off);
     }
 
-    private void SkipTrivia()
+    /// <summary>
+    /// Skips whitespace and comments, returning the comments (verbatim, markers included) that are
+    /// still pending for the next token, or null when there are none.
+    /// </summary>
+    private List<string>? SkipTrivia()
     {
+        List<string>? comments = null;
         while (!AtEnd)
         {
             char c = Current;
-            if (c is ' ' or '\t' or '\r' or '\n')
+            if (c is ' ' or '\t')
             {
                 Advance();
                 continue;
             }
 
+            if (c is '\r' or '\n')
+            {
+                if (_newlineEndsStatement)
+                {
+                    // SpiceDB lexes this newline as a synthetic semicolon, which takes the comments.
+                    comments?.Clear();
+                    _newlineEndsStatement = false;
+                }
+
+                Advance();
+                continue;
+            }
+
+            int start = _pos;
             if (c == '/' && Peek() == '/')
             {
-                while (!AtEnd && Current != '\n')
+                while (!AtEnd && Current is not ('\n' or '\r'))
                 {
                     Advance();
                 }
 
+                (comments ??= []).Add(_input[start.._pos]);
                 continue;
             }
 
@@ -279,11 +328,14 @@ internal sealed class Lexer
                     Advance();
                 }
 
+                (comments ??= []).Add(_input[start.._pos]);
                 continue;
             }
 
-            return;
+            break;
         }
+
+        return comments is { Count: > 0 } ? comments : null;
     }
 
     private Token LexIdentifierOrKeyword(int line, int col, int off)

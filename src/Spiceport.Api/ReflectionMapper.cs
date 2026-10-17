@@ -11,8 +11,8 @@ namespace Spiceport.Api;
 /// <c>typeAPIRepr</c>/<c>caveatAPIRepr</c>).
 /// </summary>
 /// <remarks>
-/// Honest gaps faithful to the compiled model: <c>comment</c> is always empty because the Core model
-/// carries no doc-comment metadata (the lexer/AST drops comments). Caveat <c>expression</c> is recovered
+/// <c>comment</c> is the declaration's doc comments joined by a newline, as SpiceDB renders
+/// <c>strings.Join(namespace.GetComments(metadata), "\n")</c>. Caveat <c>expression</c> is recovered
 /// from <see cref="CaveatDefinition.SerializedExpression"/>, which stores the verbatim CEL body text UTF-8.
 /// </remarks>
 public static class ReflectionMapper
@@ -20,7 +20,7 @@ public static class ReflectionMapper
     /// <summary>Builds the <c>ReflectionDefinition</c> for a namespace, splitting relations vs permissions.</summary>
     public static V1::ReflectionDefinition Definition(NamespaceDefinition def)
     {
-        var result = new V1::ReflectionDefinition { Name = def.Name, Comment = string.Empty };
+        var result = new V1::ReflectionDefinition { Name = def.Name, Comment = Comment(def.Comments) };
         foreach (var rel in def.Relations)
         {
             if (rel.IsPermission)
@@ -31,13 +31,16 @@ public static class ReflectionMapper
         return result;
     }
 
+    /// <summary>Renders a declaration's doc comments as the reflection <c>comment</c> string.</summary>
+    public static string Comment(IEnumerable<string> comments) => string.Join("\n", comments);
+
     /// <summary>Builds the <c>ReflectionRelation</c> for a base relation (with its subject types).</summary>
     public static V1::ReflectionRelation Relation(string parentDefinitionName, Relation relation)
     {
         var result = new V1::ReflectionRelation
         {
             Name = relation.Name,
-            Comment = string.Empty,
+            Comment = Comment(relation.Comments),
             ParentDefinitionName = parentDefinitionName,
         };
 
@@ -76,7 +79,7 @@ public static class ReflectionMapper
         new()
         {
             Name = permission.Name,
-            Comment = string.Empty,
+            Comment = Comment(permission.Comments),
             ParentDefinitionName = parentDefinitionName,
         };
 
@@ -86,7 +89,7 @@ public static class ReflectionMapper
         var result = new V1::ReflectionCaveat
         {
             Name = caveat.Name,
-            Comment = string.Empty,
+            Comment = Comment(caveat.Comments),
             // SerializedExpression holds the verbatim CEL body text (UTF-8), captured at compile time.
             Expression = Encoding.UTF8.GetString(caveat.SerializedExpression),
         };
