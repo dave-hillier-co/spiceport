@@ -129,6 +129,8 @@ public class RequestValidationTests
     // SpiceDB's consistency middleware (pkg/middleware/consistency) runs before the protoc-gen-validate
     // interceptor: a Consistency with no usable requirement falls to its default case, INTERNAL
     // "missing handling of consistency case in %v", where %v is the message's compact text form.
+    // These codes and messages are observed from a running SpiceDB v1.49.2 server called with an
+    // authzed-go v1.7.0 client (a grpc-js client sees the trailing-space message below as empty).
     [Fact]
     public void An_empty_consistency_is_an_internal_error_before_field_validation() =>
         AssertRejected(
@@ -286,6 +288,8 @@ public class RequestValidationTests
 
     // With a cursor present the middleware takes the revision from it, ahead of field validation. An empty
     // token decodes to a cursor with no version, which it reports as an unexpected (INTERNAL) error.
+    // Observed from a running SpiceDB v1.49.2 server on ReadRelationships, LookupResources, LookupSubjects
+    // and ExportBulkRelationships.
     [Fact]
     public void An_empty_cursor_is_an_internal_error_before_field_validation()
     {

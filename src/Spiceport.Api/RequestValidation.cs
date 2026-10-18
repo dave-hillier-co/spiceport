@@ -41,6 +41,14 @@ internal static class RequestValidation
     /// INTERNAL <c>missing handling of consistency case in %v</c>.
     /// </summary>
     /// <remarks>
+    /// <para>
+    /// Each code and message here is observed from a running SpiceDB v1.49.2 server (<c>spicedb serve</c> over
+    /// memdb, called with an authzed-go v1.7.0 client); none carries status details. The empty-consistency
+    /// message ends in a space (Go's <c>%v</c> of an empty message is empty): a Go client such as <c>zed</c>
+    /// receives it whole, while a Node (grpc-js) client receives an empty detail, because Node's HTTP/2 layer
+    /// drops a header value with leading or trailing whitespace (RFC 9113 section 8.2.1).
+    /// </para>
+    /// <para>
     /// Only what can be decided without the datastore is reproduced here: the default case, an empty
     /// ZedToken (which never decodes: INVALID_ARGUMENT <c>invalid revision requested</c>), and an empty
     /// cursor token (which decodes to a cursor with no version: INTERNAL <c>unexpected consistency
@@ -48,6 +56,7 @@ internal static class RequestValidation
     /// handler, after field validation, so an undecodable one on an otherwise malformed request reports the
     /// field violation where SpiceDB would report the token. Spiceport's cursors are its own format, so
     /// SpiceDB's cursor decoding cannot be reproduced at all.
+    /// </para>
     /// </remarks>
     private static void CheckConsistency(IMessage request)
     {
