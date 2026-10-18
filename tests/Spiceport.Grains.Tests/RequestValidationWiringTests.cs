@@ -40,10 +40,10 @@ public class RequestValidationWiringTests
 
     private static V1::RelationshipFilter BadFilter() => new() { ResourceType = BadType };
 
-    private static async Task AssertRejected(Func<Task> call, string detail)
+    private static async Task AssertRejected(Func<Task> call, string detail, StatusCode code = StatusCode.InvalidArgument)
     {
         var ex = await Assert.ThrowsAsync<RpcException>(call);
-        Assert.Equal(StatusCode.InvalidArgument, ex.StatusCode);
+        Assert.Equal(code, ex.StatusCode);
         Assert.Equal(detail, ex.Status.Detail);
     }
 
@@ -153,28 +153,28 @@ public class RequestValidationWiringTests
         () => Schema.ReflectSchema(
             new V1::ReflectSchemaRequest { Consistency = new V1::Consistency() },
             FakeServerCallContext.Default),
-        $"invalid ReflectSchemaRequest.Consistency: {Embedded}invalid Consistency.Requirement: value is required");
+        "missing handling of consistency case in ", StatusCode.Internal);
 
     [Fact]
     public Task DiffSchema() => AssertRejected(
         () => Schema.DiffSchema(
             new V1::DiffSchemaRequest { Consistency = new V1::Consistency() },
             FakeServerCallContext.Default),
-        $"invalid DiffSchemaRequest.Consistency: {Embedded}invalid Consistency.Requirement: value is required");
+        "missing handling of consistency case in ", StatusCode.Internal);
 
     [Fact]
     public Task ComputablePermissions() => AssertRejected(
         () => Schema.ComputablePermissions(
             new V1::ComputablePermissionsRequest { Consistency = new V1::Consistency() },
             FakeServerCallContext.Default),
-        $"invalid ComputablePermissionsRequest.Consistency: {Embedded}invalid Consistency.Requirement: value is required");
+        "missing handling of consistency case in ", StatusCode.Internal);
 
     [Fact]
     public Task DependentRelations() => AssertRejected(
         () => Schema.DependentRelations(
             new V1::DependentRelationsRequest { Consistency = new V1::Consistency() },
             FakeServerCallContext.Default),
-        $"invalid DependentRelationsRequest.Consistency: {Embedded}invalid Consistency.Requirement: value is required");
+        "missing handling of consistency case in ", StatusCode.Internal);
 
     [Fact]
     public Task RegisterRelationshipCounter() => AssertRejected(

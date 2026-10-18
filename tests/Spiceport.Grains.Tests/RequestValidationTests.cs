@@ -42,12 +42,22 @@ public class RequestValidationTests
     private static string Rel(string resource, string relation = "viewer", string subject = Alice, string extra = "") =>
         $$"""{"resource":{{resource}},"relation":"{{relation}}","subject":{{subject}}{{extra}}}""";
 
-    private static void AssertRejected(IMessage request, string detail)
+    private static void AssertRejected(IMessage request, string detail) =>
+        AssertRejected(request, StatusCode.InvalidArgument, detail);
+
+    private static void AssertRejected(IMessage request, StatusCode code, string detail)
     {
         var ex = Assert.Throws<RpcException>(() => RequestValidation.Validate(request));
-        Assert.Equal(StatusCode.InvalidArgument, ex.StatusCode);
+        Assert.Equal(code, ex.StatusCode);
         Assert.Equal(detail, ex.Status.Detail);
     }
+
+    /// <summary>
+    /// The protoc-gen-validate layer alone. SpiceDB's consistency middleware runs ahead of it and rejects
+    /// some of these requests first, so what the RPC returns is asserted separately.
+    /// </summary>
+    private static void AssertPgv(IMessage request, string detail) =>
+        Assert.Equal(detail, ProtoValidation.ValidateAll(request));
 
     [Fact]
     public void Valid_requests_pass()
@@ -116,31 +126,53 @@ public class RequestValidationTests
             "invalid CheckPermissionRequest.Resource: value is required; " +
             "invalid CheckPermissionRequest.Subject: value is required");
 
+    // SpiceDB's consistency middleware (pkg/middleware/consistency) runs before the protoc-gen-validate
+    // interceptor: a Consistency with no usable requirement falls to its default case, INTERNAL
+    // "missing handling of consistency case in %v", where %v is the message's compact text form.
     [Fact]
-    public void An_empty_consistency_needs_a_requirement() =>
+    public void An_empty_consistency_is_an_internal_error_before_field_validation() =>
         AssertRejected(
-            Parse<V1::CheckPermissionRequest>(Check(Doc("doc1"), consistency: "\"consistency\":{},")),
-            $"invalid CheckPermissionRequest.Consistency: {Embedded}invalid Consistency.Requirement: value is required");
+            Parse<V1::CheckPermissionRequest>(Check(Doc("Bad"), consistency: "\"consistency\":{},")),
+            StatusCode.Internal, "missing handling of consistency case in ");
 
     [Fact]
-    public void Minimize_latency_false_is_rejected() =>
+    public void Minimize_latency_false_is_an_unhandled_consistency_case() =>
         AssertRejected(
             Parse<V1::CheckPermissionRequest>(Check(Doc("doc1"), consistency: "\"consistency\":{\"minimizeLatency\":false},")),
-            $"invalid CheckPermissionRequest.Consistency: {Embedded}invalid Consistency.MinimizeLatency: value must equal true");
+            StatusCode.Internal, "missing handling of consistency case in minimize_latency:false");
 
     [Fact]
-    public void Fully_consistent_false_is_rejected() =>
+    public void Fully_consistent_false_is_an_unhandled_consistency_case() =>
         AssertRejected(
             Parse<V1::ExpandPermissionTreeRequest>(
                 """{"consistency":{"fullyConsistent":false},"resource":{"objectType":"document","objectId":"doc1"},"permission":"view"}"""),
-            $"invalid ExpandPermissionTreeRequest.Consistency: {Embedded}invalid Consistency.FullyConsistent: value must equal true");
+            StatusCode.Internal, "missing handling of consistency case in fully_consistent:false");
+
+    // The middleware decodes a ZedToken before field validation; an empty one never decodes.
+    [Fact]
+    public void An_empty_zed_token_is_an_invalid_revision() =>
+        AssertRejected(
+            Parse<V1::CheckPermissionRequest>(Check(Doc("doc 1"), consistency: "\"consistency\":{\"atLeastAsFresh\":{}},")),
+            "invalid revision requested");
 
     [Fact]
-    public void An_empty_zed_token_is_rejected() =>
-        AssertRejected(
+    public void The_consistency_rules_still_hold_at_the_protoc_gen_validate_layer()
+    {
+        AssertPgv(
+            Parse<V1::CheckPermissionRequest>(Check(Doc("doc1"), consistency: "\"consistency\":{},")),
+            $"invalid CheckPermissionRequest.Consistency: {Embedded}invalid Consistency.Requirement: value is required");
+        AssertPgv(
+            Parse<V1::CheckPermissionRequest>(Check(Doc("doc1"), consistency: "\"consistency\":{\"minimizeLatency\":false},")),
+            $"invalid CheckPermissionRequest.Consistency: {Embedded}invalid Consistency.MinimizeLatency: value must equal true");
+        AssertPgv(
+            Parse<V1::ExpandPermissionTreeRequest>(
+                """{"consistency":{"fullyConsistent":false},"resource":{"objectType":"document","objectId":"doc1"},"permission":"view"}"""),
+            $"invalid ExpandPermissionTreeRequest.Consistency: {Embedded}invalid Consistency.FullyConsistent: value must equal true");
+        AssertPgv(
             Parse<V1::CheckPermissionRequest>(Check(Doc("doc1"), consistency: "\"consistency\":{\"atLeastAsFresh\":{}},")),
             $"invalid CheckPermissionRequest.Consistency: {Embedded}invalid Consistency.AtLeastAsFresh: {Embedded}" +
             "invalid ZedToken.Token: value length must be at least 1 bytes");
+    }
 
     [Fact]
     public void A_check_on_a_wildcard_resource_is_rejected() =>
@@ -243,13 +275,27 @@ public class RequestValidationTests
     public void A_cursor_token_must_be_between_1_and_102400_bytes()
     {
         const string reason = "value length must be between 1 and 102400 bytes, inclusive";
-        AssertRejected(
+        AssertPgv(
             Parse<V1::ReadRelationshipsRequest>("""{"relationshipFilter":{"resourceType":"document"},"optionalCursor":{}}"""),
             $"invalid ReadRelationshipsRequest.OptionalCursor: {Embedded}invalid Cursor.Token: {reason}");
-        AssertRejected(
+        AssertPgv(
             Parse<V1::ReadRelationshipsRequest>(
                 $$$"""{"relationshipFilter":{"resourceType":"document"},"optionalCursor":{"token":"{{{new string('x', 102401)}}}"}}"""),
             $"invalid ReadRelationshipsRequest.OptionalCursor: {Embedded}invalid Cursor.Token: {reason}");
+    }
+
+    // With a cursor present the middleware takes the revision from it, ahead of field validation. An empty
+    // token decodes to a cursor with no version, which it reports as an unexpected (INTERNAL) error.
+    [Fact]
+    public void An_empty_cursor_is_an_internal_error_before_field_validation()
+    {
+        const string detail = "unexpected consistency middleware error: cursor pointer was nil";
+        AssertRejected(
+            Parse<V1::ReadRelationshipsRequest>("""{"relationshipFilter":{"resourceType":"Document"},"optionalCursor":{},"consistency":{}}"""),
+            StatusCode.Internal, detail);
+        AssertRejected(
+            Parse<V1::ExportBulkRelationshipsRequest>("""{"optionalRelationshipFilter":{"resourceType":"Document"},"optionalCursor":{}}"""),
+            StatusCode.Internal, detail);
     }
 
     [Fact]
@@ -297,7 +343,7 @@ public class RequestValidationTests
 
     [Fact]
     public void Export_bulk_checks_fields_in_declaration_order() =>
-        AssertRejected(
+        AssertPgv(
             Parse<V1::ExportBulkRelationshipsRequest>("""{"optionalRelationshipFilter":{"resourceType":"Document"},"optionalCursor":{}}"""),
             $"invalid ExportBulkRelationshipsRequest.OptionalCursor: {Embedded}" +
             "invalid Cursor.Token: value length must be between 1 and 102400 bytes, inclusive; " +
@@ -322,12 +368,13 @@ public class RequestValidationTests
     [Fact]
     public void Schema_requests_validate_their_consistency_and_size()
     {
+        // The schema service's requests pass through the same consistency middleware.
         AssertRejected(
             Parse<V1::ReflectSchemaRequest>("""{"consistency":{}}"""),
-            $"invalid ReflectSchemaRequest.Consistency: {Embedded}invalid Consistency.Requirement: value is required");
+            StatusCode.Internal, "missing handling of consistency case in ");
         AssertRejected(
             Parse<V1::DiffSchemaRequest>("""{"comparisonSchema":"x","consistency":{}}"""),
-            $"invalid DiffSchemaRequest.Consistency: {Embedded}invalid Consistency.Requirement: value is required");
+            StatusCode.Internal, "missing handling of consistency case in ");
         AssertRejected(
             new V1::WriteSchemaRequest { Schema = new string('x', 4_194_305) },
             "invalid WriteSchemaRequest.Schema: value length must be at most 4194304 bytes");
