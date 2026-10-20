@@ -4,8 +4,8 @@ using Cel;
 namespace Spiceport.Engine;
 
 /// <summary>
-/// Builds the shared CEL environment used for both compiling (parse-validating at schema write) and
-/// evaluating SpiceDB-style caveats. Registers the SpiceDB custom functions/types: <c>ipaddress(string)</c>
+/// Builds the CEL environment SpiceDB-style caveats are evaluated in (schema-write compilation is the
+/// static checker's, <see cref="CaveatCompiler"/>). Registers the SpiceDB custom functions/types: <c>ipaddress(string)</c>
 /// with <c>.in_cidr(string)</c>, and a map <c>.isSubtreeOf(map)</c> structural-subtree check.
 /// <c>timestamp</c>/<c>duration</c> are provided by the underlying CEL implementation.
 /// </summary>
