@@ -70,9 +70,15 @@ internal static class RequestCeilings
     {
         if (checkCount > MaxBulkCheckCount)
         {
-            throw new RpcException(new Status(
+            // SpiceDB's ExceedsMaximumChecksError: reason UNSPECIFIED with the counts as metadata.
+            throw RpcErrors.WithReason(
                 StatusCode.InvalidArgument,
-                $"check count of {checkCount} is greater than maximum allowed of {MaxBulkCheckCount}"));
+                $"check count of {checkCount} is greater than maximum allowed of {MaxBulkCheckCount}",
+                V1::ErrorReason.Unspecified,
+                [
+                    new("check_count", Invariant(checkCount)),
+                    new("maximum_checks_allowed", Invariant(MaxBulkCheckCount)),
+                ]);
         }
     }
 
