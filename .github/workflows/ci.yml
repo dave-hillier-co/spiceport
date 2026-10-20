@@ -16,8 +16,10 @@ concurrency:
 jobs:
   gate:
     runs-on: self-hosted
-    # A wedged test must fail the run, not hold the shared runner indefinitely.
-    timeout-minutes: 60
+    # A wedged test must fail the run, not hold the shared runner indefinitely; the per-step
+    # --blame-hang-timeout catches a hung test sooner. The cap leaves headroom over a full run,
+    # whose Grains suite alone takes most of an hour on the self-hosted runner.
+    timeout-minutes: 90
 
     steps:
       - uses: actions/checkout@v4
