@@ -198,6 +198,59 @@ public class RequestValidationWiringTests
             FakeServerCallContext.Default),
         $"invalid ExperimentalCountRelationshipsRequest.Name: {NameViolation}");
 
+    // The ExperimentalService aliases validate their OWN request type before sharing the v1 code path, so a
+    // violation names the experimental message, as SpiceDB's interceptors report it.
+    [Fact]
+    public Task BulkCheckPermission_names_its_own_request_type() => AssertRejected(
+        () => Experimental.BulkCheckPermission(
+            new V1::BulkCheckPermissionRequest
+            {
+                Items = { new V1::BulkCheckPermissionRequestItem { Resource = BadResource(), Permission = "view", Subject = Alice() } },
+            },
+            FakeServerCallContext.Default),
+        $"invalid BulkCheckPermissionRequest.Items[0]: {Embedded}invalid BulkCheckPermissionRequestItem.Resource: {Embedded}{TypeViolation}");
+
+    [Fact]
+    public Task BulkImportRelationships_validates_each_message_as_its_own_type() => AssertRejected(
+        () => Experimental.BulkImportRelationships(
+            new FakeStreamReader<V1::BulkImportRelationshipsRequest>(
+                new V1::BulkImportRelationshipsRequest
+                {
+                    Relationships = { new V1::Relationship { Resource = BadResource(), Relation = "viewer", Subject = Alice() } },
+                }),
+            FakeServerCallContext.Default),
+        $"invalid BulkImportRelationshipsRequest.Relationships[0]: {Embedded}invalid Relationship.Resource: {Embedded}{TypeViolation}");
+
+    [Fact]
+    public Task BulkExportRelationships_names_its_own_request_type() => AssertRejected(
+        () => Experimental.BulkExportRelationships(
+            new V1::BulkExportRelationshipsRequest { OptionalRelationshipFilter = BadFilter() },
+            new DiscardingStreamWriter<V1::BulkExportRelationshipsResponse>(),
+            FakeServerCallContext.Default),
+        $"invalid BulkExportRelationshipsRequest.OptionalRelationshipFilter: {Embedded}{OptionalTypeViolation}");
+
+    [Fact]
+    public async Task Experimental_schema_aliases_run_the_consistency_check_first()
+    {
+        const string unhandled = "missing handling of consistency case in ";
+        await AssertRejected(
+            () => Experimental.ExperimentalReflectSchema(
+                new V1::ExperimentalReflectSchemaRequest { Consistency = new V1::Consistency() }, FakeServerCallContext.Default),
+            unhandled, StatusCode.Internal);
+        await AssertRejected(
+            () => Experimental.ExperimentalDiffSchema(
+                new V1::ExperimentalDiffSchemaRequest { Consistency = new V1::Consistency() }, FakeServerCallContext.Default),
+            unhandled, StatusCode.Internal);
+        await AssertRejected(
+            () => Experimental.ExperimentalComputablePermissions(
+                new V1::ExperimentalComputablePermissionsRequest { Consistency = new V1::Consistency() }, FakeServerCallContext.Default),
+            unhandled, StatusCode.Internal);
+        await AssertRejected(
+            () => Experimental.ExperimentalDependentRelations(
+                new V1::ExperimentalDependentRelationsRequest { Consistency = new V1::Consistency() }, FakeServerCallContext.Default),
+            unhandled, StatusCode.Internal);
+    }
+
     private sealed class DiscardingStreamWriter<T> : IServerStreamWriter<T>
     {
         public WriteOptions? WriteOptions { get; set; }

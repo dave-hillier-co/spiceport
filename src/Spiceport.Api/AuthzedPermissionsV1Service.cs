@@ -682,10 +682,20 @@ public sealed class AuthzedPermissionsV1Service(
         }
     }
 
-    public override async Task<V1::CheckBulkPermissionsResponse> CheckBulkPermissions(
+    public override Task<V1::CheckBulkPermissionsResponse> CheckBulkPermissions(
         V1::CheckBulkPermissionsRequest request, ServerCallContext context)
     {
         RequestValidation.Validate(request);
+        return CheckBulkPermissionsCore(request, context);
+    }
+
+    /// <summary>
+    /// The CheckBulkPermissions body without the request validation: the ExperimentalService alias validates its own
+    /// request type (as SpiceDB's interceptors do) and then shares this code path, as upstream's handlers do.
+    /// </summary>
+    internal async Task<V1::CheckBulkPermissionsResponse> CheckBulkPermissionsCore(
+        V1::CheckBulkPermissionsRequest request, ServerCallContext context)
+    {
         RequestCeilings.ValidateCheckCount(request.Items.Count);
 
         var snapshot = schema.Current;
@@ -805,12 +815,32 @@ public sealed class AuthzedPermissionsV1Service(
         return resp;
     }
 
-    public override async Task<V1::ImportBulkRelationshipsResponse> ImportBulkRelationships(
+    public override Task<V1::ImportBulkRelationshipsResponse> ImportBulkRelationships(
         IAsyncStreamReader<V1::ImportBulkRelationshipsRequest> requestStream,
         ServerCallContext context)
     {
         ArgumentNullException.ThrowIfNull(requestStream);
 
+        // SpiceDB's stream interceptors validate each message as the handler receives it.
+        return ImportBulk(
+            new MappedAsyncStreamReader<V1::ImportBulkRelationshipsRequest, V1::ImportBulkRelationshipsRequest>(
+                requestStream,
+                message =>
+                {
+                    RequestValidation.Validate(message);
+                    return message;
+                }),
+            context);
+    }
+
+    /// <summary>
+    /// The ImportBulkRelationships body over an already-validated stream: the ExperimentalService alias
+    /// validates its own message type as it maps each one onto this.
+    /// </summary>
+    internal async Task<V1::ImportBulkRelationshipsResponse> ImportBulk(
+        IAsyncStreamReader<V1::ImportBulkRelationshipsRequest> requestStream,
+        ServerCallContext context)
+    {
         // Buffer the WHOLE client stream, then load it in ONE grain commit: real SpiceDB's
         // ImportBulkRelationships is atomic across the entire stream (observed v1.49.2 — a duplicate in
         // a later batch leaves NOTHING applied, including earlier batches), and one commit is the only
@@ -827,8 +857,6 @@ public sealed class AuthzedPermissionsV1Service(
         var relationships = new List<RelationshipWire>();
         while (await requestStream.MoveNext(context.CancellationToken))
         {
-            // SpiceDB's stream interceptors validate each message as the handler receives it.
-            RequestValidation.Validate(requestStream.Current);
             foreach (var relationship in requestStream.Current.Relationships)
                 relationships.Add(ToWire(relationship));
         }
@@ -862,13 +890,17 @@ public sealed class AuthzedPermissionsV1Service(
     public override Task ExportBulkRelationships(
         V1::ExportBulkRelationshipsRequest request,
         IServerStreamWriter<V1::ExportBulkRelationshipsResponse> responseStream,
-        ServerCallContext context) =>
-        ExportBulk(request, responseStream, context, RequestCeilings.MaxBulkExportRelationshipsLimit);
+        ServerCallContext context)
+    {
+        RequestValidation.Validate(request);
+        return ExportBulk(request, responseStream, context, RequestCeilings.MaxBulkExportRelationshipsLimit);
+    }
 
     /// <summary>
     /// The ExportBulkRelationships body, parameterised by its <c>optional_limit</c> ceiling: SpiceDB's
     /// <c>ExportBulk</c>/<c>BulkExport</c> take the batch size from the calling server's configuration, which
-    /// differs between PermissionsService and the deprecated ExperimentalService alias.
+    /// differs between PermissionsService and the deprecated ExperimentalService alias. The caller has
+    /// validated its own request type.
     /// </summary>
     internal async Task ExportBulk(
         V1::ExportBulkRelationshipsRequest request,
@@ -876,8 +908,6 @@ public sealed class AuthzedPermissionsV1Service(
         ServerCallContext context,
         uint maxLimit)
     {
-        RequestValidation.Validate(request);
-
         ArgumentNullException.ThrowIfNull(request);
         ArgumentNullException.ThrowIfNull(responseStream);
 

@@ -73,6 +73,16 @@ public sealed class AuthzedSchemaV1Service(IGrainFactory grains, ISchemaProvider
         V1::ReflectSchemaRequest request, ServerCallContext context)
     {
         RequestValidation.Validate(request);
+        return ReflectSchemaCore(request, context);
+    }
+
+    /// <summary>
+    /// The ReflectSchema body without the request validation: the ExperimentalService alias validates its own
+    /// request type (as SpiceDB's interceptors do) and then shares this code path, as upstream's handlers do.
+    /// </summary>
+    internal Task<V1::ReflectSchemaResponse> ReflectSchemaCore(
+        V1::ReflectSchemaRequest request, ServerCallContext context)
+    {
 
         var snapshot = schema.Current;
         var filters = SchemaFilters.FromRequest(request.OptionalFilters);
@@ -115,6 +125,16 @@ public sealed class AuthzedSchemaV1Service(IGrainFactory grains, ISchemaProvider
         V1::DiffSchemaRequest request, ServerCallContext context)
     {
         RequestValidation.Validate(request);
+        return DiffSchemaCore(request, context);
+    }
+
+    /// <summary>
+    /// The DiffSchema body without the request validation: the ExperimentalService alias validates its own
+    /// request type (as SpiceDB's interceptors do) and then shares this code path, as upstream's handlers do.
+    /// </summary>
+    internal Task<V1::DiffSchemaResponse> DiffSchemaCore(
+        V1::DiffSchemaRequest request, ServerCallContext context)
+    {
 
         Spiceport.Schema.CompiledSchema comparison;
         try
@@ -143,6 +163,16 @@ public sealed class AuthzedSchemaV1Service(IGrainFactory grains, ISchemaProvider
         V1::ComputablePermissionsRequest request, ServerCallContext context)
     {
         RequestValidation.Validate(request);
+        return ComputablePermissionsCore(request, context);
+    }
+
+    /// <summary>
+    /// The ComputablePermissions body without the request validation: the ExperimentalService alias validates its own
+    /// request type (as SpiceDB's interceptors do) and then shares this code path, as upstream's handlers do.
+    /// </summary>
+    internal Task<V1::ComputablePermissionsResponse> ComputablePermissionsCore(
+        V1::ComputablePermissionsRequest request, ServerCallContext context)
+    {
 
         var snapshot = schema.Current;
         var namespaces = snapshot.Namespaces.ToImmutableDictionary(n => n.Name);
@@ -173,6 +203,16 @@ public sealed class AuthzedSchemaV1Service(IGrainFactory grains, ISchemaProvider
         V1::DependentRelationsRequest request, ServerCallContext context)
     {
         RequestValidation.Validate(request);
+        return DependentRelationsCore(request, context);
+    }
+
+    /// <summary>
+    /// The DependentRelations body without the request validation: the ExperimentalService alias validates its own
+    /// request type (as SpiceDB's interceptors do) and then shares this code path, as upstream's handlers do.
+    /// </summary>
+    internal Task<V1::DependentRelationsResponse> DependentRelationsCore(
+        V1::DependentRelationsRequest request, ServerCallContext context)
+    {
 
         var namespaces = schema.Current.Namespaces.ToImmutableDictionary(n => n.Name);
 
