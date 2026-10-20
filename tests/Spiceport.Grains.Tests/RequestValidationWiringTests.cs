@@ -29,7 +29,7 @@ public class RequestValidationWiringTests
 
     private static readonly AuthzedPermissionsV1Service Permissions = new(null!, null!, null!, null!, null!);
     private static readonly AuthzedSchemaV1Service Schema = new(null!, null!);
-    private static readonly AuthzedExperimentalV1Service Experimental = new(null!, null!);
+    private static readonly AuthzedExperimentalV1Service Experimental = new(null!, Permissions, Schema);
 
     private static V1::ObjectReference BadResource() => new() { ObjectType = BadType, ObjectId = "doc1" };
 

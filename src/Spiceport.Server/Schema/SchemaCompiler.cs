@@ -77,7 +77,10 @@ public static class SchemaCompiler
         // The CEL expression is stored verbatim (UTF-8) rather than evaluated here.
         byte[] serialized = Encoding.UTF8.GetBytes(caveat.Expression);
 
-        return new CaveatDefinition(caveat.Name, serialized, parameterTypes);
+        return new CaveatDefinition(caveat.Name, serialized, parameterTypes)
+        {
+            Comments = NormalizeComments(caveat.Comments),
+        };
     }
 
     private static CaveatTypeReference CompileCaveatType(CaveatTypeRefNode type)
@@ -103,13 +106,19 @@ public static class SchemaCompiler
             relations.Add(CompilePermission(perm));
         }
 
-        return new NamespaceDefinition(def.Name, relations.ToImmutable());
+        return new NamespaceDefinition(def.Name, relations.ToImmutable())
+        {
+            Comments = NormalizeComments(def.Comments),
+        };
     }
 
     private static Relation CompileRelation(RelationNode rel)
     {
         var allowed = rel.AllowedTypes.Select(CompileTypeRef).ToImmutableList();
-        return new Relation(rel.Name, TypeInformation: new TypeInformation(allowed));
+        return new Relation(rel.Name, TypeInformation: new TypeInformation(allowed))
+        {
+            Comments = NormalizeComments(rel.Comments),
+        };
     }
 
     private static AllowedRelation CompileTypeRef(TypeRefNode t)
@@ -135,8 +144,22 @@ public static class SchemaCompiler
             ? nested.Value.Operation
             : SetOperation.Union(child);
 
-        return Relation.Permission(perm.Name, new UsersetRewrite(operation));
+        return Relation.Permission(perm.Name, new UsersetRewrite(operation)) with
+        {
+            Comments = NormalizeComments(perm.Comments),
+        };
     }
+
+    /// <summary>
+    /// Port of SpiceDB's <c>addComments</c>/<c>normalizeComment</c> (pkg/schemadsl/compiler/translator.go):
+    /// each comment becomes one doc comment, kept verbatim with its markers but with every line
+    /// whitespace-trimmed. The comments are metadata; nothing semantic reads them.
+    /// </summary>
+    private static ImmutableList<string> NormalizeComments(ImmutableList<string> comments) =>
+        [.. comments.Select(NormalizeComment)];
+
+    private static string NormalizeComment(string value) =>
+        string.Join('\n', value.Split('\n').Select(line => line.Trim()));
 
     private static SetOperationChild CompileExpr(ExprNode expr) => expr switch
     {

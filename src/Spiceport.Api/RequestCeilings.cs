@@ -26,6 +26,18 @@ internal static class RequestCeilings
     internal const uint MaxBulkExportRelationshipsLimit = 10_000;
 
     /// <summary>
+    /// Maximum <c>optional_limit</c> for the deprecated ExperimentalService BulkExportRelationships (SpiceDB
+    /// <c>ExperimentalServerOptions.MaxExportBatchSize</c> default).
+    /// </summary>
+    internal const uint MaxExperimentalBulkExportRelationshipsLimit = 100_000;
+
+    /// <summary>
+    /// Maximum number of items in one CheckBulkPermissions (or the deprecated BulkCheckPermission) request
+    /// (SpiceDB <c>maxBulkCheckCount</c>).
+    /// </summary>
+    internal const int MaxBulkCheckCount = 10_000;
+
+    /// <summary>
     /// Maximum JSON-encoded bytes of a write's or delete's <c>optional_transaction_metadata</c> (SpiceDB
     /// <c>MaximumTransactionMetadataSize</c>).
     /// </summary>
@@ -47,6 +59,20 @@ internal static class RequestCeilings
                     new("limit_provided", Invariant(providedLimit)),
                     new("maximum_limit_allowed", Invariant(maxLimit)),
                 ]);
+        }
+    }
+
+    /// <summary>
+    /// Rejects a bulk check of more than <see cref="MaxBulkCheckCount"/> items (SpiceDB
+    /// <c>NewExceedsMaximumChecksErr</c>).
+    /// </summary>
+    internal static void ValidateCheckCount(int checkCount)
+    {
+        if (checkCount > MaxBulkCheckCount)
+        {
+            throw new RpcException(new Status(
+                StatusCode.InvalidArgument,
+                $"check count of {checkCount} is greater than maximum allowed of {MaxBulkCheckCount}"));
         }
     }
 

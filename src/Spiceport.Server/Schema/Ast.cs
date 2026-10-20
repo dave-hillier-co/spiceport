@@ -5,11 +5,15 @@ namespace Spiceport.Schema;
 /// <summary>Root of a parsed schema file: a list of top-level definitions.</summary>
 internal sealed record SchemaFileNode(ImmutableList<DefinitionNode> Definitions, ImmutableList<CaveatNode> Caveats);
 
-/// <summary>A <c>definition</c> block containing relations and permissions.</summary>
-internal sealed record DefinitionNode(string Name, ImmutableList<RelationNode> Relations, ImmutableList<PermissionNode> Permissions);
+/// <summary>A <c>definition</c> block containing relations and permissions, with its leading comments.</summary>
+internal sealed record DefinitionNode(
+    string Name,
+    ImmutableList<RelationNode> Relations,
+    ImmutableList<PermissionNode> Permissions,
+    ImmutableList<string> Comments);
 
-/// <summary>A <c>relation</c> declaration with its allowed subject types.</summary>
-internal sealed record RelationNode(string Name, ImmutableList<TypeRefNode> AllowedTypes);
+/// <summary>A <c>relation</c> declaration with its allowed subject types and leading comments.</summary>
+internal sealed record RelationNode(string Name, ImmutableList<TypeRefNode> AllowedTypes, ImmutableList<string> Comments);
 
 /// <summary>One allowed subject type within a relation's type expression.</summary>
 /// <param name="TypeName">Subject namespace, possibly path-qualified.</param>
@@ -24,14 +28,18 @@ internal sealed record TypeRefNode(
     string? CaveatName,
     bool RequiresExpiration);
 
-/// <summary>A <c>permission</c> declaration with its compute expression.</summary>
-internal sealed record PermissionNode(string Name, ExprNode Expression);
+/// <summary>A <c>permission</c> declaration with its compute expression and leading comments.</summary>
+internal sealed record PermissionNode(string Name, ExprNode Expression, ImmutableList<string> Comments);
 
-/// <summary>A <c>caveat</c> block: a name, typed parameters (in source order), and the raw CEL body text.</summary>
+/// <summary>
+/// A <c>caveat</c> block: a name, typed parameters (in source order), the raw CEL body text, and its
+/// leading comments.
+/// </summary>
 internal sealed record CaveatNode(
     string Name,
     ImmutableList<CaveatParameterNode> Parameters,
-    string Expression);
+    string Expression,
+    ImmutableList<string> Comments);
 
 /// <summary>One <c>name type</c> parameter inside a caveat parameter list.</summary>
 internal sealed record CaveatParameterNode(string Name, CaveatTypeRefNode Type);

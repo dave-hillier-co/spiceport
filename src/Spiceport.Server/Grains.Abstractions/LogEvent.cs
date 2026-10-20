@@ -30,13 +30,20 @@ public sealed record CounterDeltaWire(
 /// INSTEAD of replaying <see cref="RelationshipChanges"/>/<see cref="SchemaChange"/>/<see cref="CounterChanges"/>
 /// (which are always empty/null on a GC event), then advances the head to <see cref="Revision"/> as usual.
 /// </param>
+/// <param name="TransactionMetadata">
+/// The metadata the commit that minted this revision carried (<see cref="CommitRequest.TransactionMetadata"/>),
+/// or null for none and on a GC event. It is part of the log, not of the folded state: no fold reads it, and
+/// Watch returns it with this revision's changes. Added after the journal format was in use, so an event
+/// journaled before it deserializes with none.
+/// </param>
 [GenerateSerializer, Immutable]
 public sealed record LogEvent(
     [property: Id(0)] long Revision,
     [property: Id(1)] IReadOnlyList<RelationshipUpdateWire> RelationshipChanges,
     [property: Id(2)] SchemaVersionWire? SchemaChange,
     [property: Id(3)] IReadOnlyList<CounterDeltaWire> CounterChanges,
-    [property: Id(4)] long? GcFloor);
+    [property: Id(4)] long? GcFloor,
+    [property: Id(5)] byte[]? TransactionMetadata = null);
 
 /// <summary>A bounded page of the event log, plus the head revision observed at read time.</summary>
 [GenerateSerializer]

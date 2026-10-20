@@ -7,10 +7,6 @@ namespace Spiceport.Grains;
 /// A single structural difference between two compiled schemas. A closed discriminated union mirroring
 /// the cases of the <c>authzed.api.v1.ReflectionSchemaDiff</c> proto <c>oneof</c>.
 /// </summary>
-/// <remarks>
-/// Doc-comment-change variants are intentionally absent: the compiled Core model carries no comment
-/// metadata (the lexer/AST drops comments), so they can never be detected.
-/// </remarks>
 public abstract record SchemaDelta
 {
     private SchemaDelta() { }
@@ -21,11 +17,17 @@ public abstract record SchemaDelta
     /// <summary>A whole definition was removed in the comparison schema.</summary>
     public sealed record DefinitionRemoved(NamespaceDefinition Definition) : SchemaDelta;
 
+    /// <summary>A kept definition's doc comments changed; carries the comparison schema's definition.</summary>
+    public sealed record DefinitionDocCommentChanged(NamespaceDefinition Definition) : SchemaDelta;
+
     /// <summary>A base relation was added to a kept definition.</summary>
     public sealed record RelationAdded(string DefinitionName, Relation Relation) : SchemaDelta;
 
     /// <summary>A base relation was removed from a kept definition (or turned into a permission).</summary>
     public sealed record RelationRemoved(string DefinitionName, Relation Relation) : SchemaDelta;
+
+    /// <summary>A kept relation's doc comments changed; carries the comparison schema's relation.</summary>
+    public sealed record RelationDocCommentChanged(string DefinitionName, Relation Relation) : SchemaDelta;
 
     /// <summary>An allowed subject type was added to a kept relation.</summary>
     public sealed record RelationSubjectTypeAdded(
@@ -44,6 +46,9 @@ public abstract record SchemaDelta
     /// <summary>A permission's userset-rewrite expression changed.</summary>
     public sealed record PermissionExprChanged(string DefinitionName, Relation Permission) : SchemaDelta;
 
+    /// <summary>A kept permission's doc comments changed; carries the comparison schema's permission.</summary>
+    public sealed record PermissionDocCommentChanged(string DefinitionName, Relation Permission) : SchemaDelta;
+
     /// <summary>A whole caveat was added.</summary>
     public sealed record CaveatAdded(CaveatDefinition Caveat) : SchemaDelta;
 
@@ -52,6 +57,9 @@ public abstract record SchemaDelta
 
     /// <summary>A kept caveat's expression changed.</summary>
     public sealed record CaveatExprChanged(CaveatDefinition Caveat) : SchemaDelta;
+
+    /// <summary>A kept caveat's doc comments changed; carries the comparison schema's caveat.</summary>
+    public sealed record CaveatDocCommentChanged(CaveatDefinition Caveat) : SchemaDelta;
 
     /// <summary>A parameter was added to a kept caveat.</summary>
     public sealed record CaveatParameterAdded(
@@ -108,6 +116,10 @@ public static class SchemaDiff
                 continue;
             }
 
+            // Comments first, as SpiceDB's pkg/diff/namespace DiffNamespaces checks them first.
+            if (!existingDef.Comments.SequenceEqual(nextDef.Comments, StringComparer.Ordinal))
+                deltas.Add(new SchemaDelta.DefinitionDocCommentChanged(nextDef));
+
             DiffRelations(existingDef, nextDef, deltas);
         }
     }
@@ -160,9 +172,13 @@ public static class SchemaDiff
                 // here: the trees hold ImmutableList children, whose Equals is reference, not value, based.)
                 if (!RewriteEquals(existingRel.UsersetRewrite, nextRel.UsersetRewrite))
                     deltas.Add(new SchemaDelta.PermissionExprChanged(nextDef.Name, nextRel));
+                if (!existingRel.Comments.SequenceEqual(nextRel.Comments, StringComparer.Ordinal))
+                    deltas.Add(new SchemaDelta.PermissionDocCommentChanged(nextDef.Name, nextRel));
             }
             else
             {
+                if (!existingRel.Comments.SequenceEqual(nextRel.Comments, StringComparer.Ordinal))
+                    deltas.Add(new SchemaDelta.RelationDocCommentChanged(nextDef.Name, nextRel));
                 DiffAllowedTypes(existingDef.Name, existingRel, nextRel, deltas);
             }
         }
@@ -205,6 +221,9 @@ public static class SchemaDiff
                 deltas.Add(new SchemaDelta.CaveatRemoved(existingCaveat));
                 continue;
             }
+
+            if (!existingCaveat.Comments.SequenceEqual(nextCaveat.Comments, StringComparer.Ordinal))
+                deltas.Add(new SchemaDelta.CaveatDocCommentChanged(nextCaveat));
 
             if (!existingCaveat.SerializedExpression.AsSpan().SequenceEqual(nextCaveat.SerializedExpression))
                 deltas.Add(new SchemaDelta.CaveatExprChanged(nextCaveat));

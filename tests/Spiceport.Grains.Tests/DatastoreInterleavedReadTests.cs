@@ -444,6 +444,62 @@ public sealed class DatastoreInterleavedReadTests
     }
 
     /// <summary>
+    /// Group commit keeps each request's transaction metadata with its own revision: a batch of commits
+    /// carrying different metadata (one none, one rejected) appends one event per accepted commit, each
+    /// holding exactly the metadata its request carried, and the rejected request's metadata appears
+    /// nowhere.
+    /// </summary>
+    [Fact]
+    public async Task A_batch_keeps_each_commits_metadata_on_its_own_event()
+    {
+        await using var scope = new Scope(await NewClusterAsync());
+        var grain = Grain(scope.Cluster);
+        Assert.Null((await grain.Commit(UpdateCommit(RelationshipUpdateOpWire.Create, "taken", "zoe"))).Failure);
+        var oldHead = (await grain.GetHead()).Head;
+        var writesBefore = Gate.DatastoreWrites;
+
+        static byte[] Metadata(string text) => System.Text.Encoding.UTF8.GetBytes(text);
+
+        Gate.HeadWriteBlock = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        Gate.HeadWriteParked = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var first = grain.Commit(UpdateCommit(RelationshipUpdateOpWire.Touch, "first", "alice") with
+        {
+            TransactionMetadata = Metadata("first"),
+        });
+        Task<CommitReply>[] batched;
+        try
+        {
+            await Gate.HeadWriteParked.Task.WaitAsync(Timeout);
+            Gate.HeadWriteParked = null;
+            batched =
+            [
+                grain.Commit(UpdateCommit(RelationshipUpdateOpWire.Touch, "b0", "bob") with { TransactionMetadata = Metadata("b0") }),
+                grain.Commit(UpdateCommit(RelationshipUpdateOpWire.Touch, "b1", "bob")),
+                grain.Commit(UpdateCommit(RelationshipUpdateOpWire.Create, "taken", "zoe") with { TransactionMetadata = Metadata("rejected") }),
+                grain.Commit(UpdateCommit(RelationshipUpdateOpWire.Touch, "b3", "bob") with { TransactionMetadata = Metadata("b3") }),
+            ];
+            await Task.Delay(TimeSpan.FromMilliseconds(500));
+        }
+        finally
+        {
+            Gate.HeadWriteBlock.TrySetResult(true);
+            Gate.HeadWriteBlock = null;
+        }
+
+        var firstReply = await first.WaitAsync(Timeout);
+        var replies = await Task.WhenAll(batched).WaitAsync(Timeout);
+        Assert.Equal(writesBefore + 2, Gate.DatastoreWrites); // the four shared one write
+        Assert.Equal(CommitFailureKind.CreateAlreadyExists, replies[2].Failure!.Kind);
+
+        var byRevision = (await grain.ReadFrom(oldHead, -1)).Events.ToDictionary(e => e.Revision);
+        Assert.Equal(4, byRevision.Count);
+        Assert.Equal(Metadata("first"), byRevision[firstReply.Revision!.Value].TransactionMetadata);
+        Assert.Equal(Metadata("b0"), byRevision[replies[0].Revision!.Value].TransactionMetadata);
+        Assert.Null(byRevision[replies[1].Revision!.Value].TransactionMetadata);
+        Assert.Equal(Metadata("b3"), byRevision[replies[3].Revision!.Value].TransactionMetadata);
+    }
+
+    /// <summary>
     /// A commit evaluated later in a batch sees the commits before it in the same batch: two Creates of
     /// one relationship batched together still conflict, exactly one winning.
     /// </summary>

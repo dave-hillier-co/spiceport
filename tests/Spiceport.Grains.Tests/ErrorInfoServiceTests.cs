@@ -40,7 +40,7 @@ public class ErrorInfoServiceTests
             cluster.ReverseOps, cluster.RelationshipReads, cluster.Services.GetRequiredService<ISchemaProvider>());
 
     private static AuthzedExperimentalV1Service Experimental(MeshTestCluster cluster) =>
-        new(cluster.GrainFactory, cluster.SchemaProvider);
+        new(cluster.GrainFactory, Permissions(cluster), SchemaService(cluster));
 
     private static V1::Relationship Rel(
         string relation, string subjectType = "user", string subjectId = "alice", string subjectRelation = "",
@@ -351,7 +351,7 @@ public class ErrorInfoServiceTests
     [Fact]
     public async Task A_counter_without_a_name_is_rejected_before_the_datastore()
     {
-        var service = new AuthzedExperimentalV1Service(null!, null!);
+        var service = new AuthzedExperimentalV1Service(null!, null!, null!);
         AssertErrorInfo(
             await Assert.ThrowsAsync<RpcException>(() => service.ExperimentalRegisterRelationshipCounter(
                 new V1::ExperimentalRegisterRelationshipCounterRequest { RelationshipFilter = CounterFilter() },

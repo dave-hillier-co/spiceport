@@ -51,8 +51,16 @@ public sealed record CaveatDefinition(
     IReadOnlyDictionary<string, CaveatTypeReference> ParameterTypes)
 {
     /// <summary>
+    /// The doc comments that preceded the caveat, each verbatim with its <c>//</c> or <c>/* */</c>
+    /// markers and every line trimmed (SpiceDB's <c>DocComment</c> metadata). Metadata, not semantics:
+    /// it takes no part in equality.
+    /// </summary>
+    public ImmutableList<string> Comments { get; init; } = [];
+
+    /// <summary>
     /// Value equality, comparing <see cref="SerializedExpression"/> and <see cref="ParameterTypes"/> by
-    /// content rather than by array and dictionary reference.
+    /// content rather than by array and dictionary reference. <see cref="Comments"/> is metadata and is
+    /// not compared.
     /// </summary>
     public bool Equals(CaveatDefinition? other)
     {

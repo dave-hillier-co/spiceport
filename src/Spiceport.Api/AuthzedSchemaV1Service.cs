@@ -84,7 +84,7 @@ public sealed class AuthzedSchemaV1Service(IGrainFactory grains, ISchemaProvider
             if (!filters.MatchesDefinition(def.Name))
                 continue;
 
-            var reflected = new V1::ReflectionDefinition { Name = def.Name, Comment = string.Empty };
+            var reflected = new V1::ReflectionDefinition { Name = def.Name, Comment = ReflectionMapper.Comment(def.Comments) };
             foreach (var rel in def.Relations)
             {
                 if (rel.IsPermission)
@@ -234,10 +234,14 @@ public sealed class AuthzedSchemaV1Service(IGrainFactory grains, ISchemaProvider
             new() { DefinitionAdded = ReflectionMapper.Definition(def) },
         SchemaDelta.DefinitionRemoved(var def) =>
             new() { DefinitionRemoved = ReflectionMapper.Definition(def) },
+        SchemaDelta.DefinitionDocCommentChanged(var def) =>
+            new() { DefinitionDocCommentChanged = ReflectionMapper.Definition(def) },
         SchemaDelta.RelationAdded(var defName, var rel) =>
             new() { RelationAdded = ReflectionMapper.Relation(defName, rel) },
         SchemaDelta.RelationRemoved(var defName, var rel) =>
             new() { RelationRemoved = ReflectionMapper.Relation(defName, rel) },
+        SchemaDelta.RelationDocCommentChanged(var defName, var rel) =>
+            new() { RelationDocCommentChanged = ReflectionMapper.Relation(defName, rel) },
         SchemaDelta.RelationSubjectTypeAdded(var defName, var rel, var subj) =>
             new()
             {
@@ -262,12 +266,16 @@ public sealed class AuthzedSchemaV1Service(IGrainFactory grains, ISchemaProvider
             new() { PermissionRemoved = ReflectionMapper.Permission(defName, perm) },
         SchemaDelta.PermissionExprChanged(var defName, var perm) =>
             new() { PermissionExprChanged = ReflectionMapper.Permission(defName, perm) },
+        SchemaDelta.PermissionDocCommentChanged(var defName, var perm) =>
+            new() { PermissionDocCommentChanged = ReflectionMapper.Permission(defName, perm) },
         SchemaDelta.CaveatAdded(var caveat) =>
             new() { CaveatAdded = ReflectionMapper.Caveat(caveat) },
         SchemaDelta.CaveatRemoved(var caveat) =>
             new() { CaveatRemoved = ReflectionMapper.Caveat(caveat) },
         SchemaDelta.CaveatExprChanged(var caveat) =>
             new() { CaveatExprChanged = ReflectionMapper.Caveat(caveat) },
+        SchemaDelta.CaveatDocCommentChanged(var caveat) =>
+            new() { CaveatDocCommentChanged = ReflectionMapper.Caveat(caveat) },
         SchemaDelta.CaveatParameterAdded(var caveatName, var name, var type) =>
             new() { CaveatParameterAdded = ReflectionMapper.CaveatParameter(caveatName, name, type) },
         SchemaDelta.CaveatParameterRemoved(var caveatName, var name, var type) =>

@@ -24,6 +24,13 @@ public sealed record Relation(
     /// <summary>True if this is a permission (has a userset rewrite).</summary>
     public bool IsPermission => UsersetRewrite is not null;
 
+    /// <summary>
+    /// The doc comments that preceded the declaration, each verbatim with its <c>//</c> or <c>/* */</c>
+    /// markers and every line trimmed (SpiceDB's <c>DocComment</c> metadata). Metadata, not semantics:
+    /// the engine's structural schema hash does not read it.
+    /// </summary>
+    public ImmutableList<string> Comments { get; init; } = [];
+
     /// <summary>Creates a base relation with the given allowed subject types.</summary>
     public static Relation BaseRelation(string name, params AllowedRelation[] allowedTypes) =>
         new(name, TypeInformation: new TypeInformation([.. allowedTypes]));
@@ -46,4 +53,10 @@ public sealed record NamespaceDefinition(string Name, ImmutableList<Relation> Re
     /// <summary>Creates a namespace definition from a name and relations.</summary>
     public static NamespaceDefinition Create(string name, params Relation[] relations) =>
         new(name, [.. relations]);
+
+    /// <summary>
+    /// The doc comments that preceded the definition, each verbatim with its <c>//</c> or <c>/* */</c>
+    /// markers and every line trimmed (SpiceDB's <c>DocComment</c> metadata). Metadata, not semantics.
+    /// </summary>
+    public ImmutableList<string> Comments { get; init; } = [];
 }

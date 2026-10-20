@@ -1,3 +1,4 @@
+using Google.Protobuf;
 using Google.Protobuf.WellKnownTypes;
 using Grpc.Core;
 using Spiceport.Core;
@@ -284,6 +285,13 @@ public sealed class AuthzedPermissionsV1Service(
         return resp;
     }
 
+    /// <summary>
+    /// A request's <c>optional_transaction_metadata</c> as the opaque bytes the commit journals with its
+    /// revision (the serialized <c>google.protobuf.Struct</c>, which Watch parses back). Absent stays absent.
+    /// </summary>
+    private static byte[]? ToWire(Struct? metadata) =>
+        metadata?.ToByteArray();
+
     public override async Task<V1::WriteRelationshipsResponse> WriteRelationships(
         V1::WriteRelationshipsRequest request, ServerCallContext context)
     {
@@ -297,7 +305,8 @@ public sealed class AuthzedPermissionsV1Service(
         var preconditions = ToWire(request.OptionalPreconditions);
         try
         {
-            var reply = await Relationships.WriteRelationships(new WriteRelationshipsArgs(updates, preconditions));
+            var reply = await Relationships.WriteRelationships(new WriteRelationshipsArgs(
+                updates, preconditions, ToWire(request.OptionalTransactionMetadata)));
             return new V1::WriteRelationshipsResponse { WrittenAt = new V1::ZedToken { Token = reply.WrittenAtToken } };
         }
         catch (RelationshipValidationException ex)
@@ -404,7 +413,8 @@ public sealed class AuthzedPermissionsV1Service(
                 filter,
                 limit,
                 ToWire(request.OptionalPreconditions),
-                RejectOverLimit: limit is not null && !request.OptionalAllowPartialDeletions));
+                RejectOverLimit: limit is not null && !request.OptionalAllowPartialDeletions,
+                TransactionMetadata: ToWire(request.OptionalTransactionMetadata)));
 
             return new V1::DeleteRelationshipsResponse
             {
@@ -676,6 +686,7 @@ public sealed class AuthzedPermissionsV1Service(
         V1::CheckBulkPermissionsRequest request, ServerCallContext context)
     {
         RequestValidation.Validate(request);
+        RequestCeilings.ValidateCheckCount(request.Items.Count);
 
         var snapshot = schema.Current;
 
@@ -848,17 +859,29 @@ public sealed class AuthzedPermissionsV1Service(
         }
     }
 
-    public override async Task ExportBulkRelationships(
+    public override Task ExportBulkRelationships(
         V1::ExportBulkRelationshipsRequest request,
         IServerStreamWriter<V1::ExportBulkRelationshipsResponse> responseStream,
-        ServerCallContext context)
+        ServerCallContext context) =>
+        ExportBulk(request, responseStream, context, RequestCeilings.MaxBulkExportRelationshipsLimit);
+
+    /// <summary>
+    /// The ExportBulkRelationships body, parameterised by its <c>optional_limit</c> ceiling: SpiceDB's
+    /// <c>ExportBulk</c>/<c>BulkExport</c> take the batch size from the calling server's configuration, which
+    /// differs between PermissionsService and the deprecated ExperimentalService alias.
+    /// </summary>
+    internal async Task ExportBulk(
+        V1::ExportBulkRelationshipsRequest request,
+        IServerStreamWriter<V1::ExportBulkRelationshipsResponse> responseStream,
+        ServerCallContext context,
+        uint maxLimit)
     {
         RequestValidation.Validate(request);
 
         ArgumentNullException.ThrowIfNull(request);
         ArgumentNullException.ThrowIfNull(responseStream);
 
-        RequestCeilings.ValidateLimit(request.OptionalLimit, RequestCeilings.MaxBulkExportRelationshipsLimit);
+        RequestCeilings.ValidateLimit(request.OptionalLimit, maxLimit);
 
         var filter = request.OptionalRelationshipFilter is { } f ? ToWire(f) : EmptyFilter;
         var limit = (int)request.OptionalLimit;
