@@ -150,6 +150,17 @@ public sealed class AuthzedWatchV1Service(IDatastore datastore, ISchemaProvider 
             IsCheckpoint = change.IsCheckpoint,
         };
 
+        // SpiceDB (internal/services/v1/watch.go) puts the change's transaction metadata on every response it
+        // sends for the change: the whole list as full_revision_metadata, and optional_transaction_metadata
+        // when the list has exactly one entry. A revision here is one transaction, so the list is that
+        // transaction's metadata or empty; a checkpoint change, here as there, carries none.
+        if (change.TransactionMetadata is { } metadata)
+        {
+            var parsed = Google.Protobuf.WellKnownTypes.Struct.Parser.ParseFrom(metadata);
+            response.OptionalTransactionMetadata = parsed;
+            response.FullRevisionMetadata.Add(parsed);
+        }
+
         // A checkpoint carries no content, only the revision.
         if (change.IsCheckpoint)
             return response;

@@ -9,7 +9,8 @@ namespace Spiceport.Grains.Tests.FaultInjection;
 /// sequencer's semantics, in the sequencer's order: preconditions against the state before the commit
 /// (MustMatch needs a matching row, MustNotMatch none), then the updates, then the delete-by-filter.
 /// A rejection applies nothing. Covers what the harness generates: preconditions, relationship updates
-/// and delete-by-filter, not schema or counter changes.
+/// and delete-by-filter, not schema or counter changes. The request's transaction metadata is stored with
+/// the revision the reference commits, as the sequencer journals it with its event.
 /// </summary>
 internal static class ReferenceCommit
 {
@@ -43,7 +44,7 @@ internal static class ReferenceCommit
                     (deleted, reachedLimit) = await tx.DeleteRelationships(
                         WireConvert.ToCoreFilter(deleteByFilter.Filter), deleteByFilter.Limit);
                 }
-            });
+            }, request.TransactionMetadata);
             return (new CommitReply(0, null, deleted, reachedLimit), revision);
         }
         catch (Rejected rejected)

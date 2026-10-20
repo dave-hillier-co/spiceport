@@ -186,6 +186,7 @@ public sealed class GrainBackedDatastore : IDatastore
 
     public async Task<IRevision> ReadWriteTx(
         Func<IReadWriteTransaction, Task> transaction,
+        byte[]? transactionMetadata = null,
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(transaction);
@@ -229,7 +230,10 @@ public sealed class GrainBackedDatastore : IDatastore
             //    diff at this revision (reusing the single per-revision diff definition). The grain re-mints
             //    the revision and stamps it, so the request carries no final revision.
             var committed = tx.Commit();
-            var request = CommitFromState(committed, newRevision, expectedHead);
+            var request = CommitFromState(committed, newRevision, expectedHead) with
+            {
+                TransactionMetadata = transactionMetadata,
+            };
 
             // 5. Submit to the sequencer's Commit with the compatibility CAS (ExpectedHead): applies only if
             //    the grain head still equals expectedHead. No preconditions ride along — the lambda already
@@ -359,10 +363,13 @@ public sealed class GrainBackedDatastore : IDatastore
             : (IReadOnlyList<RelationshipUpdate>)Array.Empty<RelationshipUpdate>();
         var schemaChanged = includeSchema && ev.SchemaChange is not null;
 
+        // Metadata alone is not content: SpiceDB's Watch sends nothing for a revision carrying only metadata.
         if (relChanges.Count == 0 && !schemaChanged)
             return null;
 
-        return new RevisionChange(new TimestampRevision(ev.Revision), relChanges, schemaChanged);
+        return new RevisionChange(
+            new TimestampRevision(ev.Revision), relChanges, schemaChanged,
+            TransactionMetadata: ev.TransactionMetadata);
     }
 
     /// <summary>

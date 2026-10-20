@@ -107,7 +107,12 @@ keys by construction where a filter names them and through the shard index (plus
 tail's keys) where it does not; the soundness argument is inline at the assembly site. Every
 rejection returns as a typed `CommitReply` failure with nothing applied. `ReadWriteTx` survives
 only as the `ExpectedHead` compatibility path -- the caller-evaluated CAS shape -- over the same
-`Commit` contract.
+`Commit` contract. A request may carry transaction metadata (SpiceDB's
+`optional_transaction_metadata`, opaque bytes below the gRPC service); an accepted commit, on
+either path, journals it on the `LogEvent` of the revision it mints, so it is part of the log --
+replayed and retained exactly as the event is, never read by any fold -- and Watch returns it with
+that revision's changes. Each member of a group-commit batch mints its own revision and event, so
+each keeps its own metadata.
 
 **Persistence.** Everything persists through stock Orleans grain storage: the sequencer through
 the state-storage log-consistency provider (each commit writes the small state and the pending
@@ -132,7 +137,8 @@ cold keys activate only to be projected. Silo memory is O(hot working set), not 
 - **`DatastoreGrain.Commit` is the write wire contract.** The `ReadWriteTx` lambda shape
   (`Func<IReadWriteTransaction, Task>`) pretended the caller interactively read-and-wrote
   inside a transaction; in reality the client staged mutations and CAS-appended once.
-  `Commit(preconditions, updates, deleteByFilter, schema + ExpectedSchemaHash, counters)` as
+  `Commit(preconditions, updates, deleteByFilter, schema + ExpectedSchemaHash, counters,
+  transaction metadata)` as
   a plain declarative request is honest, executes on the sequencer's serialization point
   (no caller-evaluated CAS loop; only the bounded duplicate-activation `HeadMoved` retry
   remains client-side), and reports every rejection as a typed `CommitReply` failure with

@@ -49,6 +49,48 @@ public class ReferenceDatastoreTests
         Assert.Equal(rel, update.Relationship);
     }
 
+    /// <summary>
+    /// SpiceDB's <c>options.WithMetadata</c>: the transaction metadata is stored with the revision the
+    /// transaction commits and returned on that revision's change (memdb <c>AddRevisionMetadata</c>), never on
+    /// another revision's and never on a checkpoint; an empty metadata is not stored at all.
+    /// </summary>
+    [Fact]
+    public async Task Watch_carries_each_transactions_metadata_on_its_own_revision_only()
+    {
+        var ds = new ReferenceDatastore();
+        var head = await ds.HeadRevision();
+        byte[] metadata = [1, 2, 3];
+
+        var withMetadata = await ds.ReadWriteTx(
+            tx => tx.WriteRelationships([new RelationshipUpdate(Rel("document", "a", "viewer", "user", "x"), UpdateOperation.Touch)]),
+            metadata);
+        var without = await ds.ReadWriteTx(
+            tx => tx.WriteRelationships([new RelationshipUpdate(Rel("document", "b", "viewer", "user", "x"), UpdateOperation.Touch)]));
+        var empty = await ds.ReadWriteTx(
+            tx => tx.WriteRelationships([new RelationshipUpdate(Rel("document", "c", "viewer", "user", "x"), UpdateOperation.Touch)]),
+            []);
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        var changes = new List<RevisionChange>();
+        await foreach (var change in ds.Watch(
+            head.Revision, new WatchOptions(WatchContent.Relationships | WatchContent.Checkpoints), cts.Token))
+        {
+            changes.Add(change);
+            if (change.IsCheckpoint)
+                break;
+        }
+
+        Assert.Equal(4, changes.Count);
+        Assert.Equal(withMetadata, changes[0].Revision);
+        Assert.Equal(metadata, changes[0].TransactionMetadata);
+        Assert.Equal(without, changes[1].Revision);
+        Assert.Null(changes[1].TransactionMetadata);
+        Assert.Equal(empty, changes[2].Revision);
+        Assert.Null(changes[2].TransactionMetadata);
+        Assert.True(changes[3].IsCheckpoint);
+        Assert.Null(changes[3].TransactionMetadata);
+    }
+
     [Fact]
     public async Task Watch_from_old_cursor_replays_committed_write()
     {

@@ -273,7 +273,8 @@ public sealed class RelationshipsGrain(
                 SchemaBytes: null,
                 ExpectedSchemaHash: null,
                 CounterChanges: Array.Empty<CounterDeltaWire>(),
-                ExpectedHead: null)).ConfigureAwait(ContinueOnCapturedContext);
+                ExpectedHead: null,
+                TransactionMetadata: args.TransactionMetadata)).ConfigureAwait(ContinueOnCapturedContext);
 
         if (reply.Failure is { } failure)
             throw RelationshipWriteFailure(failure);
@@ -295,7 +296,8 @@ public sealed class RelationshipsGrain(
             SchemaBytes: null,
             ExpectedSchemaHash: null,
             CounterChanges: Array.Empty<CounterDeltaWire>(),
-            ExpectedHead: null)).ConfigureAwait(ContinueOnCapturedContext);
+            ExpectedHead: null,
+            TransactionMetadata: args.TransactionMetadata)).ConfigureAwait(ContinueOnCapturedContext);
 
         if (reply.Failure is { } failure)
             throw RelationshipWriteFailure(failure);

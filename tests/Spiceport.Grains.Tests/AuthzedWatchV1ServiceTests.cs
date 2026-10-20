@@ -554,6 +554,150 @@ public class AuthzedWatchV1ServiceTests
         Assert.False(string.IsNullOrEmpty(response.ChangesThrough.Token));
     }
 
+    private static AuthzedPermissionsV1Service Permissions(MeshTestCluster cluster) =>
+        new(cluster.Checker, cluster.GrainFactory, cluster.ReverseOps, cluster.RelationshipReads,
+            cluster.Services.GetRequiredService<ISchemaProvider>());
+
+    private static V1::Relationship ViewerProto(string type, string id, string user) => new()
+    {
+        Resource = new V1::ObjectReference { ObjectType = type, ObjectId = id },
+        Relation = "viewer",
+        Subject = new V1::SubjectReference { Object = new V1::ObjectReference { ObjectType = "user", ObjectId = user } },
+    };
+
+    private static V1::WriteRelationshipsRequest TouchViewer(string type, string id, string user) => new()
+    {
+        Updates =
+        {
+            new V1::RelationshipUpdate
+            {
+                Operation = V1::RelationshipUpdate.Types.Operation.Touch,
+                Relationship = ViewerProto(type, id, user),
+            },
+        },
+    };
+
+    private static Google.Protobuf.WellKnownTypes.Struct Metadata(string json) =>
+        Google.Protobuf.JsonParser.Default.Parse<Google.Protobuf.WellKnownTypes.Struct>(json);
+
+    /// <summary>
+    /// SpiceDB (internal/services/v1/watch.go): every response for a revision carries the transaction
+    /// metadata the write supplied as <c>optional_transaction_metadata</c> (set when the revision has
+    /// exactly one) and the revision's whole list as <c>full_revision_metadata</c>.
+    /// </summary>
+    [Fact]
+    public async Task Watch_returns_the_writes_transaction_metadata_on_its_response()
+    {
+        await using var cluster = await MeshTestCluster.CreateAsync(Schema);
+        var service = Service(cluster);
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        var writer = new CollectingStreamWriter<V1::WatchResponse>();
+        var ctx = new FakeServerCallContext(cts.Token);
+        var watchTask = service.Watch(new V1::WatchRequest(), writer, ctx);
+
+        var metadata = Metadata("""{"source":"importer","attempt":2,"tags":["a","b"],"nested":{"ok":true}}""");
+        var write = TouchViewer("document", "doc1", "alice");
+        write.OptionalTransactionMetadata = metadata;
+        await Permissions(cluster).WriteRelationships(write, ctx);
+
+        var response = await writer.WaitForNext(TimeSpan.FromSeconds(10), watchTask);
+        cts.Cancel();
+        await watchTask;
+
+        Assert.Single(response.Updates);
+        Assert.Equal(metadata, response.OptionalTransactionMetadata);
+        Assert.Equal(metadata, Assert.Single(response.FullRevisionMetadata));
+    }
+
+    [Fact]
+    public async Task Watch_returns_the_deletes_transaction_metadata_with_its_deletions()
+    {
+        await using var cluster = await MeshTestCluster.CreateAsync(Schema);
+        var service = Service(cluster);
+        var permissions = Permissions(cluster);
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        var ctx = new FakeServerCallContext(cts.Token);
+        var seed = TouchViewer("document", "doc1", "alice");
+        seed.Updates.Add(new V1::RelationshipUpdate
+        {
+            Operation = V1::RelationshipUpdate.Types.Operation.Touch,
+            Relationship = ViewerProto("document", "doc1", "bob"),
+        });
+        await permissions.WriteRelationships(seed, ctx);
+
+        var writer = new CollectingStreamWriter<V1::WatchResponse>();
+        var watchTask = service.Watch(new V1::WatchRequest(), writer, ctx);
+
+        var metadata = Metadata("""{"reason":"offboarding"}""");
+        await permissions.DeleteRelationships(new V1::DeleteRelationshipsRequest
+        {
+            RelationshipFilter = new V1::RelationshipFilter { ResourceType = "document", OptionalResourceId = "doc1" },
+            OptionalTransactionMetadata = metadata,
+        }, ctx);
+
+        var response = await writer.WaitForNext(TimeSpan.FromSeconds(10), watchTask);
+        cts.Cancel();
+        await watchTask;
+
+        Assert.Equal(2, response.Updates.Count);
+        Assert.All(response.Updates, u => Assert.Equal(V1::RelationshipUpdate.Types.Operation.Delete, u.Operation));
+        Assert.Equal(metadata, response.OptionalTransactionMetadata);
+        Assert.Equal(metadata, Assert.Single(response.FullRevisionMetadata));
+    }
+
+    /// <summary>
+    /// No metadata, and an empty struct (SpiceDB stores none for it), leave both fields unset; a
+    /// checkpoint never carries metadata, because SpiceDB's datastores emit checkpoints as their own
+    /// metadata-free changes.
+    /// </summary>
+    [Fact]
+    public async Task Watch_leaves_metadata_unset_without_metadata_for_an_empty_struct_and_on_checkpoints()
+    {
+        await using var cluster = await MeshTestCluster.CreateAsync(Schema);
+        var service = Service(cluster);
+        var permissions = Permissions(cluster);
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        var writer = new CollectingStreamWriter<V1::WatchResponse>();
+        var ctx = new FakeServerCallContext(cts.Token);
+        var request = new V1::WatchRequest();
+        request.OptionalUpdateKinds.Add(V1::WatchKind.IncludeRelationshipUpdates);
+        request.OptionalUpdateKinds.Add(V1::WatchKind.IncludeCheckpoints);
+        var watchTask = service.Watch(request, writer, ctx);
+
+        var tagged = TouchViewer("document", "doc1", "alice");
+        tagged.OptionalTransactionMetadata = Metadata("""{"k":"v"}""");
+        await permissions.WriteRelationships(tagged, ctx);
+        await permissions.WriteRelationships(TouchViewer("document", "doc2", "bob"), ctx);
+        var empty = TouchViewer("document", "doc3", "carol");
+        empty.OptionalTransactionMetadata = new Google.Protobuf.WellKnownTypes.Struct();
+        await permissions.WriteRelationships(empty, ctx);
+
+        var responses = new List<V1::WatchResponse>();
+        // Every change is followed by a checkpoint, so read through the checkpoint after the third.
+        while (responses.Count(r => !r.IsCheckpoint) < 3 || !responses[^1].IsCheckpoint)
+            responses.Add(await writer.WaitForNext(TimeSpan.FromSeconds(10), watchTask));
+        cts.Cancel();
+        await watchTask;
+
+        var content = responses.Where(r => !r.IsCheckpoint).ToList();
+        Assert.Equal(Metadata("""{"k":"v"}"""), content[0].OptionalTransactionMetadata);
+        Assert.Null(content[1].OptionalTransactionMetadata);
+        Assert.Empty(content[1].FullRevisionMetadata);
+        Assert.Null(content[2].OptionalTransactionMetadata);
+        Assert.Empty(content[2].FullRevisionMetadata);
+
+        var checkpoints = responses.Where(r => r.IsCheckpoint).ToList();
+        Assert.NotEmpty(checkpoints);
+        Assert.All(checkpoints, c =>
+        {
+            Assert.Null(c.OptionalTransactionMetadata);
+            Assert.Empty(c.FullRevisionMetadata);
+        });
+    }
+
     private sealed class CollectingStreamWriter<T> : IServerStreamWriter<T>
     {
         private readonly Channel<T> _channel = Channel.CreateUnbounded<T>();
