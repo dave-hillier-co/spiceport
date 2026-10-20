@@ -205,6 +205,29 @@ public class AuthzedPermissionsV1ServiceTests
     }
 
     [Fact]
+    public async Task CheckBulkPermissions_more_than_10000_items_is_invalid_argument()
+    {
+        // SpiceDB maxBulkCheckCount (internal/services/v1/bulkcheck.go): NewExceedsMaximumChecksErr.
+        await using var cluster = await MeshTestCluster.CreateAsync(Schema);
+
+        var req = new V1::CheckBulkPermissionsRequest();
+        for (var i = 0; i < 10_001; i++)
+        {
+            req.Items.Add(new V1::CheckBulkPermissionsRequestItem
+            {
+                Resource = new V1::ObjectReference { ObjectType = "document", ObjectId = "readme" },
+                Permission = "view",
+                Subject = UserSubject("alice"),
+            });
+        }
+
+        var ex = await Assert.ThrowsAsync<RpcException>(() =>
+            Service(cluster).CheckBulkPermissions(req, FakeServerCallContext.Default));
+        Assert.Equal(StatusCode.InvalidArgument, ex.StatusCode);
+        Assert.Equal("check count of 10001 is greater than maximum allowed of 10000", ex.Status.Detail);
+    }
+
+    [Fact]
     public async Task CheckBulkPermissions_unknown_definition_is_per_pair_error()
     {
         // An unknown resource definition is a client schema/typo bug for that one pair: SpiceDB surfaces it
