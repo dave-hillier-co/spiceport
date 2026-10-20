@@ -105,6 +105,8 @@ public static class FaultHarness
         private readonly ReferenceDatastore _reference = new();
         private readonly List<long> _revisions = [];
         private readonly Dictionary<long, IRevision> _referenceAt = [];
+        private readonly Dictionary<long, byte[]?> _metadataAt = [];
+        private int _commitsGenerated;
         private long _gcFloor;
 
         public List<string> Trace { get; } = [];
@@ -186,6 +188,7 @@ public static class FaultHarness
                 StorageFaults.FailSequencerWrites(0);
                 StorageFaults.FailShardWrites(0);
                 await SpotCheck();
+                await CheckLogMetadata();
             }
 
             // A shard-projection failure that certainly fires: one more commit leaves events pending, so
@@ -339,7 +342,10 @@ public static class FaultHarness
                 }
 
                 if (reply.Revision is { } revision)
+                {
                     Record(revision, referenceRevision!);
+                    _metadataAt[revision] = commit.Request.TransactionMetadata;
+                }
             }
 
             // Trace in generation order, so concurrent completion order never shows.
@@ -353,6 +359,62 @@ public static class FaultHarness
             await CheckResource(latest, Docs[_rng.Next(Docs.Length)]);
             await CheckSubject(latest, Users[_rng.Next(Users.Length)]);
             await CheckResource(_rng.Next(_revisions.Count), Docs[_rng.Next(Docs.Length)]);
+        }
+
+        /// <summary>
+        /// The log's retained tail must carry, on every commit's event, exactly the transaction metadata
+        /// that commit submitted — whatever faults, flushes and reactivations came before. The oldest
+        /// servable cursor (the projection boundary or the GC floor, whichever is higher) is found by
+        /// bisecting the committed revisions, since servability is monotone in the cursor.
+        /// </summary>
+        private async Task CheckLogMetadata()
+        {
+            async Task<LogSegment?> TryRead(long cursor)
+            {
+                try
+                {
+                    return await Call(Sequencer.ReadFrom(cursor, -1));
+                }
+                catch (RevisionNotFoundException)
+                {
+                    return null;
+                }
+            }
+
+            var last = await TryRead(_revisions[^1]);
+            if (last is null)
+                return; // projected or collected through the newest commit: nothing retained to check
+            var (lo, hi) = (0, _revisions.Count - 1);
+            var segment = last;
+            while (lo < hi)
+            {
+                var mid = (lo + hi) / 2;
+                if (await TryRead(_revisions[mid]) is { } read)
+                {
+                    (hi, segment) = (mid, read);
+                }
+                else
+                {
+                    lo = mid + 1;
+                }
+            }
+
+            foreach (var ev in segment.Events.Where(e => e.GcFloor is null))
+            {
+                if (!_metadataAt.TryGetValue(ev.Revision, out var expected))
+                    Diverge($"the log holds a commit event at {ev.Revision} that no commit was told it minted");
+                var matches = expected is null
+                    ? ev.TransactionMetadata is null
+                    : ev.TransactionMetadata is { } actual && actual.AsSpan().SequenceEqual(expected);
+                if (!matches)
+                {
+                    Diverge($"the log's event at {ev.Revision} carries transaction metadata " +
+                            $"[{Show(ev.TransactionMetadata)}], its commit submitted [{Show(expected)}]");
+                }
+            }
+
+            static string Show(byte[]? metadata) =>
+                metadata is null ? "none" : System.Text.Encoding.UTF8.GetString(metadata);
         }
 
         private Task CheckResource(int revisionIndex, string doc) =>
@@ -402,6 +464,17 @@ public static class FaultHarness
         }
 
         private HarnessCommit NextCommit(string doc)
+        {
+            // Every third commit carries no transaction metadata; the rest a label unique to the commit.
+            // Derived from a counter, not the seeded generator, so the workload and fault schedule a seed
+            // draws are unchanged by it.
+            var generated = _commitsGenerated++;
+            var metadata = generated % 3 == 0 ? null : System.Text.Encoding.UTF8.GetBytes($"commit-{generated}");
+            var commit = NextCommitShape(doc);
+            return commit with { Request = commit.Request with { TransactionMetadata = metadata } };
+        }
+
+        private HarnessCommit NextCommitShape(string doc)
         {
             var kind = _rng.NextDouble();
             if (kind < 0.2)

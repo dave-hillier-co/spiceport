@@ -81,9 +81,17 @@ public interface IDatastore
     Task<RevisionWithSchemaHash> OptimizedRevision(CancellationToken cancellationToken = default);
 
     /// <summary>Runs a read-write transaction; commits if the function completes without throwing.</summary>
+    /// <param name="transaction">The transaction body.</param>
+    /// <param name="transactionMetadata">
+    /// Metadata stored with the revision the transaction commits and returned by <see cref="Watch"/> on that
+    /// revision's change (SpiceDB <c>options.WithMetadata</c>). Opaque bytes to the datastore; null or empty
+    /// stores none, as SpiceDB stores nothing for an empty metadata.
+    /// </param>
+    /// <param name="cancellationToken">Cancels the transaction.</param>
     /// <returns>The committed revision.</returns>
     Task<IRevision> ReadWriteTx(
         Func<IReadWriteTransaction, Task> transaction,
+        byte[]? transactionMetadata = null,
         CancellationToken cancellationToken = default);
 
     /// <summary>Returns true if the revision is still available.</summary>

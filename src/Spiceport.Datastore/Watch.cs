@@ -44,8 +44,16 @@ public sealed record WatchOptions(WatchContent Content = WatchContent.Relationsh
 /// through <paramref name="Revision"/> so a consumer filtering to a subset of content still observes
 /// revision progress. Mirrors SpiceDB's <c>RevisionChanges.IsCheckpoint</c>.
 /// </param>
+/// <param name="TransactionMetadata">
+/// The metadata the transaction that committed at <paramref name="Revision"/> was given (see
+/// <see cref="IDatastore.ReadWriteTx"/>), or null when it was given none. Opaque to the datastore. SpiceDB's
+/// <c>RevisionChanges.Metadatas</c> is a list because some of its datastores merge concurrent transactions into
+/// one revision; every revision here is exactly one transaction, so it holds at most one. A checkpoint
+/// never carries it.
+/// </param>
 public sealed record RevisionChange(
     IRevision Revision,
     IReadOnlyList<RelationshipUpdate> RelationshipChanges,
     bool SchemaChanged = false,
-    bool IsCheckpoint = false);
+    bool IsCheckpoint = false,
+    byte[]? TransactionMetadata = null);

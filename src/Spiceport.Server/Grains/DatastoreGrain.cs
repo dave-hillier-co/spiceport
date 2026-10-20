@@ -775,6 +775,11 @@ public sealed class DatastoreGrain :
         if (request.ExpectedHead is not null && request.CounterChanges.Count > 0)
             ev = ev with { CounterChanges = request.CounterChanges };
 
+        // The request's transaction metadata belongs to the revision it mints, on either path; an empty
+        // one is stored as none (SpiceDB common.Changes.AddRevisionMetadata skips an empty metadata).
+        if (request.TransactionMetadata is { Length: > 0 } metadata)
+            ev = ev with { TransactionMetadata = metadata };
+
         return (new CommitReply(newRevision, null, deletedCount, reachedLimit), ev);
     }
 

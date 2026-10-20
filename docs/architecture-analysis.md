@@ -280,7 +280,10 @@ feed, and Leopard index below are all pure folds of that one log.
   maps each event to a `RevisionChange`, and parks on the shared signal. Observer delivery is
   best-effort, so a slow per-silo heartbeat doubles as registration refresh and missed-push backstop —
   one heartbeat per silo, not a poller per stream; checkpoints ride the revision the feed has
-  progressed through, so a consumer filtering to a content subset still observes liveness.
+  progressed through, so a consumer filtering to a content subset still observes liveness. A
+  write's or delete's transaction metadata is journaled on its revision's `LogEvent`, so Watch
+  returns it with that revision's changes (SpiceDB's `optional_transaction_metadata` /
+  `full_revision_metadata`) from the log alone.
 
 - **A Leopard-style membership accelerator** (on by default, opt-out) is a mesh of per-subject
   walk grains (`IMembershipWalkGrain`, keyed by subject key + exact revision + schema hash): each
