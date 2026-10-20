@@ -89,7 +89,7 @@ internal sealed class Parser
 
     private DefinitionNode ParseDefinition()
     {
-        Advance(); // 'definition'
+        var comments = LeadingComments(Advance()); // 'definition'
         string name = ParseTypePath();
         Expect(TokenType.LeftBrace, "'{'");
 
@@ -119,12 +119,12 @@ internal sealed class Parser
         }
 
         Expect(TokenType.RightBrace, "'}'");
-        return new DefinitionNode(name, relations.ToImmutable(), permissions.ToImmutable());
+        return new DefinitionNode(name, relations.ToImmutable(), permissions.ToImmutable(), comments);
     }
 
     private RelationNode ParseRelation()
     {
-        Advance(); // 'relation'
+        var comments = LeadingComments(Advance()); // 'relation'
         string name = Expect(TokenType.Identifier, "relation name").Text;
         Expect(TokenType.Colon, "':'");
 
@@ -137,7 +137,7 @@ internal sealed class Parser
         }
 
         ConsumeOptionalTerminator();
-        return new RelationNode(name, types.ToImmutable());
+        return new RelationNode(name, types.ToImmutable(), comments);
     }
 
     private TypeRefNode ParseTypeRef()
@@ -206,7 +206,7 @@ internal sealed class Parser
 
     private PermissionNode ParsePermission()
     {
-        Advance(); // 'permission'
+        var comments = LeadingComments(Advance()); // 'permission'
         string name = Expect(TokenType.Identifier, "permission name").Text;
 
         // Optional type annotation: permission p: user | org = ...  (parsed and ignored).
@@ -224,7 +224,7 @@ internal sealed class Parser
         Expect(TokenType.Equals, "'='");
         ExprNode expr = ParseExpression();
         ConsumeOptionalTerminator();
-        return new PermissionNode(name, expr);
+        return new PermissionNode(name, expr, comments);
     }
 
     // Expression precedence (lowest binds last): exclusion '-' < intersection '&' < union '+'.
@@ -338,7 +338,7 @@ internal sealed class Parser
 
     private CaveatNode ParseCaveat()
     {
-        Advance(); // 'caveat'
+        var comments = LeadingComments(Advance()); // 'caveat'
         string name = ParseTypePath();
 
         // Parameter list: ( name type, name type, ... )
@@ -365,7 +365,7 @@ internal sealed class Parser
         int bodyEnd = close.Offset;
         string expression = _source[bodyStart..bodyEnd].Trim();
 
-        return new CaveatNode(name, parameters.ToImmutable(), expression);
+        return new CaveatNode(name, parameters.ToImmutable(), expression, comments);
     }
 
     private CaveatParameterNode ParseCaveatParameter()
@@ -433,6 +433,13 @@ internal sealed class Parser
 
         return string.Join("/", segments);
     }
+
+    /// <summary>
+    /// The comments attached to the token that opens a declaration. SpiceDB's <c>startNode</c> hangs the
+    /// current token's comments on the node it starts (pkg/schemadsl/parser/parser_impl.go
+    /// <c>decorateStartRuneAndComments</c>).
+    /// </summary>
+    private static ImmutableList<string> LeadingComments(Token keyword) => keyword.Comments ?? [];
 
     private void ConsumeOptionalTerminator()
     {

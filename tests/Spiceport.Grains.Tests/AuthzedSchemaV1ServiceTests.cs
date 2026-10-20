@@ -395,6 +395,73 @@ public class AuthzedSchemaV1ServiceTests
         Assert.Empty(resp.Diffs);
     }
 
+    private const string CommentedReflectSchema = """
+        /** A user. */
+        definition user {}
+
+        // Caveat doc.
+        caveat ip_match(allowed string, user_ip string) {
+            user_ip == allowed
+        }
+
+        // Document doc,
+        // over two lines.
+        definition document {
+            // Viewer doc.
+            relation viewer: user
+            relation editor: user // trailing, dropped as in SpiceDB
+            /*
+             * View doc.
+             */
+            permission view = viewer + editor
+        }
+        """;
+
+    [Fact]
+    public async Task ReflectSchema_returns_doc_comments_joined_by_newline()
+    {
+        await using var cluster = await MeshTestCluster.CreateAsync(EmptySchema);
+        var service = Service(cluster);
+        await service.WriteSchema(
+            new V1::WriteSchemaRequest { Schema = CommentedReflectSchema }, FakeServerCallContext.Default);
+
+        var resp = await service.ReflectSchema(new V1::ReflectSchemaRequest(), FakeServerCallContext.Default);
+
+        Assert.Equal("/** A user. */", Assert.Single(resp.Definitions, d => d.Name == "user").Comment);
+        var doc = Assert.Single(resp.Definitions, d => d.Name == "document");
+        Assert.Equal("// Document doc,\n// over two lines.", doc.Comment);
+        Assert.Equal("// Viewer doc.", Assert.Single(doc.Relations, r => r.Name == "viewer").Comment);
+        Assert.Equal(string.Empty, Assert.Single(doc.Relations, r => r.Name == "editor").Comment);
+        Assert.Equal("/*\n* View doc.\n*/", Assert.Single(doc.Permissions).Comment);
+        Assert.Equal("// Caveat doc.", Assert.Single(resp.Caveats).Comment);
+    }
+
+    [Fact]
+    public async Task DiffSchema_reports_doc_comment_changes_with_the_comparison_comment()
+    {
+        await using var cluster = await MeshTestCluster.CreateAsync(EmptySchema);
+        var service = Service(cluster);
+        await service.WriteSchema(new V1::WriteSchemaRequest { Schema = ReflectSchema }, FakeServerCallContext.Default);
+
+        var resp = await service.DiffSchema(
+            new V1::DiffSchemaRequest { ComparisonSchema = CommentedReflectSchema }, FakeServerCallContext.Default);
+
+        Assert.Contains(resp.Diffs, d => d.DiffCase == V1::ReflectionSchemaDiff.DiffOneofCase.DefinitionDocCommentChanged
+            && d.DefinitionDocCommentChanged.Name == "user"
+            && d.DefinitionDocCommentChanged.Comment == "/** A user. */");
+        Assert.Contains(resp.Diffs, d => d.DiffCase == V1::ReflectionSchemaDiff.DiffOneofCase.DefinitionDocCommentChanged
+            && d.DefinitionDocCommentChanged.Name == "document");
+        Assert.Contains(resp.Diffs, d => d.DiffCase == V1::ReflectionSchemaDiff.DiffOneofCase.RelationDocCommentChanged
+            && d.RelationDocCommentChanged.Name == "viewer"
+            && d.RelationDocCommentChanged.Comment == "// Viewer doc.");
+        Assert.Contains(resp.Diffs, d => d.DiffCase == V1::ReflectionSchemaDiff.DiffOneofCase.PermissionDocCommentChanged
+            && d.PermissionDocCommentChanged.Name == "view");
+        Assert.Contains(resp.Diffs, d => d.DiffCase == V1::ReflectionSchemaDiff.DiffOneofCase.CaveatDocCommentChanged
+            && d.CaveatDocCommentChanged.Name == "ip_match"
+            && d.CaveatDocCommentChanged.Comment == "// Caveat doc.");
+        Assert.Equal(5, resp.Diffs.Count);
+    }
+
     [Fact]
     public async Task DiffSchema_invalid_comparison_is_invalid_argument()
     {

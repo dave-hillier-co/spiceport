@@ -80,4 +80,18 @@ public class SchemaHashTests
 
         Assert.Equal(a, b);
     }
+
+    [Fact]
+    public void Doc_comment_edit_does_not_change_hash()
+    {
+        // Comments are metadata, not semantics: a comment-only edit must not rotate the dispatch keyspace.
+        var plain = HashOf(SchemaWithCaveat("x int", "x > 1"));
+        var commentedText = "// caveat doc\n" + SchemaWithCaveat("x int", "x > 1")
+            .Replace("definition document {", "// document doc\ndefinition document {\n  // viewer doc")
+            .Replace("permission view", "/* view doc */ permission view");
+        var compiled = SchemaCompiler.CompileSchema(commentedText);
+        Assert.Equal(["// document doc"], compiled.Namespaces.Single(n => n.Name == "document").Comments);
+
+        Assert.Equal(plain, HashOf(commentedText));
+    }
 }
