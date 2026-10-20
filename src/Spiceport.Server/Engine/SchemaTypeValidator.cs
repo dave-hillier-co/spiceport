@@ -1,4 +1,3 @@
-using Cel;
 using Spiceport.Core;
 using Spiceport.Schema;
 
@@ -14,9 +13,9 @@ namespace Spiceport.Engine;
 /// <remarks>
 /// On the first violation a <see cref="SchemaTypeException"/> is thrown (the grain re-wraps it for the
 /// gRPC boundary, where it maps to <c>FailedPrecondition</c>). What is checked: duplicate/reused
-/// definition + caveat names; per-caveat (≥1 parameter, parseable CEL, every declared parameter
-/// referenced); per-relation arrow targets (relation exists, is not a permission, does not import a
-/// wildcard); per-permission computed-userset targets exist; per-base-relation allowed-type list is
+/// definition + caveat names; per-caveat (≥1 parameter, every declared parameter referenced — the CEL
+/// body itself is compiled and type-checked earlier, by <c>SchemaCompiler.CompileSchema</c>);
+/// per-relation arrow targets (relation exists, is not a permission, does not import a wildcard); per-permission computed-userset targets exist; per-base-relation allowed-type list is
 /// non-empty, every allowed type's namespace/subrelation exists, none is self-referential, none is
 /// duplicated, and every <c>with &lt;caveat&gt;</c> names a defined caveat.
 /// </remarks>
@@ -35,7 +34,7 @@ public static class SchemaTypeValidator
         //    throw a raw ArgumentException on a later write.
         ValidateUniqueNames(schema);
 
-        // 1) Validate every caveat definition (CEL parse, ≥1 param, all params referenced).
+        // 1) Validate every caveat definition (≥1 param, all params referenced).
         foreach (var caveat in schema.Caveats)
             ValidateCaveat(caveat);
 
@@ -68,22 +67,11 @@ public static class SchemaTypeValidator
     {
         var expression = System.Text.Encoding.UTF8.GetString(caveat.SerializedExpression);
 
-        // (a) Parse/compile the CEL against the declared environment. A syntactically invalid expression
-        //     is rejected here rather than deferred to a later Check at evaluation time.
-        try
-        {
-            CaveatCompiler.Parse(expression);
-        }
-        catch (Exception ex) when (ex is CelException or InvalidOperationException or ArgumentException)
-        {
-            throw new SchemaTypeException($"could not compile caveat `{caveat.Name}`: {ex.Message}");
-        }
-
-        // (b) A caveat must declare at least one parameter.
+        // (a) A caveat must declare at least one parameter.
         if (caveat.ParameterTypes.Count == 0)
             throw new SchemaTypeException($"caveat `{caveat.Name}` must have at least one parameter defined");
 
-        // (c) Every declared parameter must be referenced by the expression.
+        // (b) Every declared parameter must be referenced by the expression.
         foreach (var param in caveat.ParameterTypes.Keys)
         {
             if (!ReferencesIdentifier(expression, param))

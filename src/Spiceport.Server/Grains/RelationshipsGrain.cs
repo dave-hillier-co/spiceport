@@ -78,7 +78,7 @@ public sealed class RelationshipsGrain(
         // would be wrong.
         try
         {
-            return Spiceport.Schema.SchemaCompiler.CompileSchema(Encoding.UTF8.GetString(storedBytes));
+            return Spiceport.Schema.SchemaCompiler.CompileStoredSchema(Encoding.UTF8.GetString(storedBytes));
         }
         catch (Spiceport.Schema.SchemaCompileException ex)
         {
@@ -140,10 +140,11 @@ public sealed class RelationshipsGrain(
     {
         ArgumentNullException.ThrowIfNull(args);
 
-        // Compile the proposed schema FIRST, but do NOT swap yet. A compile failure is surfaced as a
-        // serializable ArgumentException (the underlying SchemaCompileException is not an Orleans-
-        // serializable type across the grain boundary) carrying the original message so the gRPC layer
-        // can map it to InvalidArgument.
+        // Compile the proposed schema FIRST, but do NOT swap yet. A compile failure (including a caveat
+        // body that does not parse or type-check) is surfaced as a serializable ArgumentException (the
+        // underlying SchemaCompileException is not an Orleans-serializable type across the grain boundary)
+        // carrying the original message so the gRPC layer can map it to InvalidArgument. No parameter name
+        // is attached: ArgumentException would append " (Parameter 'args')" to the message the client sees.
         Spiceport.Schema.CompiledSchema nextCompiled;
         try
         {
@@ -151,13 +152,13 @@ public sealed class RelationshipsGrain(
         }
         catch (Spiceport.Schema.SchemaCompileException ex)
         {
-            throw new ArgumentException(ex.Message, nameof(args));
+            throw new ArgumentException(ex.Message);
         }
 
         // Run SpiceDB's type-system + caveat-definition validation on the freshly compiled schema BEFORE
         // touching the datastore. A type error (undefined reference, permission-on-left-of-arrow, wildcard
-        // in arrow, self-reference, missing allowed types, undefined caveat, duplicate/reused name, or an
-        // unparseable/parameterless/unused-parameter caveat) is rejected at write time as a
+        // in arrow, self-reference, missing allowed types, undefined caveat, duplicate/reused name, or a
+        // parameterless/unused-parameter caveat) is rejected at write time as a
         // FailedPrecondition — re-wrapped in the serializable carrier below.
         try
         {

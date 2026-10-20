@@ -101,6 +101,55 @@ public class AuthzedSchemaV1ServiceTests
     }
 
     [Fact]
+    public async Task WriteSchema_with_ill_typed_caveat_is_invalid_argument()
+    {
+        await using var cluster = await MeshTestCluster.CreateAsync(EmptySchema);
+        var service = Service(cluster);
+
+        // SpiceDB's schema compiler type-checks caveat bodies (pkg/caveats/compile.go): a non-boolean
+        // operand of `||` is a compile error, surfaced by WriteSchema as INVALID_ARGUMENT.
+        var bad = """
+            definition user {}
+            definition document {
+                relation viewer: user with c
+            }
+            caveat c(x int, y int) { x == 1 || y }
+            """;
+
+        var ex = await Assert.ThrowsAsync<RpcException>(() => service.WriteSchema(
+            new V1::WriteSchemaRequest { Schema = bad }, FakeServerCallContext.Default));
+        Assert.Equal(StatusCode.InvalidArgument, ex.StatusCode);
+        Assert.Equal(
+            "schema error at line 5, column 26: invalid expression for caveat `c`: "
+            + "ERROR: c:5:36: expected type 'bool' but found 'int'",
+            ex.Status.Detail);
+
+        // Nothing was written.
+        var read = await Assert.ThrowsAsync<RpcException>(() =>
+            service.ReadSchema(new V1::ReadSchemaRequest(), FakeServerCallContext.Default));
+        Assert.Equal(StatusCode.NotFound, read.StatusCode);
+    }
+
+    [Fact]
+    public async Task WriteSchema_with_non_boolean_caveat_is_invalid_argument()
+    {
+        await using var cluster = await MeshTestCluster.CreateAsync(EmptySchema);
+        var service = Service(cluster);
+
+        var bad = """
+            definition user {}
+            caveat c(somemap map<any>) { somemap.foo }
+            """;
+
+        var ex = await Assert.ThrowsAsync<RpcException>(() => service.WriteSchema(
+            new V1::WriteSchemaRequest { Schema = bad }, FakeServerCallContext.Default));
+        Assert.Equal(StatusCode.InvalidArgument, ex.StatusCode);
+        Assert.EndsWith(
+            "invalid expression for caveat `c`: caveat expression must result in a boolean value: found `dyn`",
+            ex.Status.Detail);
+    }
+
+    [Fact]
     public async Task WriteSchema_removing_caveat_parameter_is_failed_precondition()
     {
         await using var cluster = await MeshTestCluster.CreateAsync(EmptySchema);
