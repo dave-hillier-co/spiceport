@@ -131,4 +131,27 @@ public class SchemaCompilerDocCommentTests
         Assert.Equal(plain, commented);
         Assert.Equal(plain.GetHashCode(), commented.GetHashCode());
     }
+
+    [Fact]
+    public void Caveat_comments_attach_when_a_stored_schema_is_compiled()
+    {
+        // The stored-schema entry point skips recompiling caveat bodies, not their comments.
+        var compiled = SchemaCompiler.CompileStoredSchema("// cav doc\ncaveat c(x int) {\n  x > 1 // in body\n}\n");
+
+        Assert.Equal(["// cav doc"], Assert.Single(compiled.Caveats).Comments);
+    }
+
+    [Fact]
+    public void Comments_around_a_caveat_body_do_not_shift_its_type_errors()
+    {
+        // The CEL source starts at the body's first token, after any leading comment, and a trailing
+        // comment before the synthetic-semicolon newline stays inside it, as in SpiceDB.
+        var ex = Assert.Throws<SchemaCompileException>(() => SchemaCompiler.CompileSchema(
+            "// cav doc\ncaveat c(x int) { // lead\n  x.y == 1 // trail\n}\n"));
+
+        Assert.Equal(
+            "schema error at line 3, column 3: invalid expression for caveat `c`: "
+            + "ERROR: c:3:4: type 'int' does not support field selection",
+            ex.Message);
+    }
 }
