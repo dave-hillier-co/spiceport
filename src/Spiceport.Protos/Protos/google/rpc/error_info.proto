@@ -1,0 +1,24 @@
+// The google.rpc.ErrorInfo message, copied from googleapis' google/rpc/error_details.proto (Apache
+// License 2.0). SpiceDB attaches it to a status's details (grpc-status-details-bin) to give an
+// error a machine-readable reason; only this message of that file is needed, and the authzed buf
+// export does not carry it.
+
+syntax = "proto3";
+
+package google.rpc;
+
+option csharp_namespace = "Google.Rpc";
+option go_package = "google.golang.org/genproto/googleapis/rpc/errdetails;errdetails";
+
+// Describes the cause of the error with structured details.
+message ErrorInfo {
+  // The reason of the error. This is a constant value that identifies the proximate cause of the
+  // error.
+  string reason = 1;
+
+  // The logical grouping to which the "reason" belongs.
+  string domain = 2;
+
+  // Additional structured details about this error.
+  map<string, string> metadata = 3;
+}

@@ -42,6 +42,10 @@ public sealed class AuthzedExperimentalV1Service(
     public override async Task<V1::BulkCheckPermissionResponse> BulkCheckPermission(
         V1::BulkCheckPermissionRequest request, ServerCallContext context)
     {
+        // SpiceDB's interceptors validate the experimental request type itself, then its handler shares
+        // the bulk checker with CheckBulkPermissions (not that RPC's interceptor chain).
+        RequestValidation.Validate(request);
+
         var converted = new V1::CheckBulkPermissionsRequest { Consistency = request.Consistency };
         foreach (var item in request.Items)
         {
@@ -54,7 +58,7 @@ public sealed class AuthzedExperimentalV1Service(
             });
         }
 
-        var result = await permissions.CheckBulkPermissions(converted, context);
+        var result = await permissions.CheckBulkPermissionsCore(converted, context);
 
         var response = new V1::BulkCheckPermissionResponse { CheckedAt = result.CheckedAt };
         foreach (var pair in result.Pairs)
@@ -95,10 +99,16 @@ public sealed class AuthzedExperimentalV1Service(
     public override async Task<V1::BulkImportRelationshipsResponse> BulkImportRelationships(
         IAsyncStreamReader<V1::BulkImportRelationshipsRequest> requestStream, ServerCallContext context)
     {
-        var reply = await permissions.ImportBulkRelationships(
+        // Each message is validated as its own (experimental) type as it is received, as SpiceDB's stream
+        // interceptors do.
+        var reply = await permissions.ImportBulk(
             new MappedAsyncStreamReader<V1::BulkImportRelationshipsRequest, V1::ImportBulkRelationshipsRequest>(
                 requestStream,
-                batch => new V1::ImportBulkRelationshipsRequest { Relationships = { batch.Relationships } }),
+                batch =>
+                {
+                    RequestValidation.Validate(batch);
+                    return new V1::ImportBulkRelationshipsRequest { Relationships = { batch.Relationships } };
+                }),
             context);
 
         return new V1::BulkImportRelationshipsResponse { NumLoaded = reply.NumLoaded };
@@ -109,6 +119,8 @@ public sealed class AuthzedExperimentalV1Service(
         IServerStreamWriter<V1::BulkExportRelationshipsResponse> responseStream,
         ServerCallContext context)
     {
+        RequestValidation.Validate(request);
+
         var converted = new V1::ExportBulkRelationshipsRequest
         {
             Consistency = request.Consistency,
@@ -133,23 +145,30 @@ public sealed class AuthzedExperimentalV1Service(
     public override async Task<V1::ExperimentalReflectSchemaResponse> ExperimentalReflectSchema(
         V1::ExperimentalReflectSchemaRequest request, ServerCallContext context)
     {
+        RequestValidation.Validate(request);
+
         var converted = new V1::ReflectSchemaRequest { Consistency = request.Consistency };
         foreach (var filter in request.OptionalFilters)
             converted.OptionalFilters.Add(ProtoReshape.As<V1::ReflectionSchemaFilter>(filter));
 
         return ProtoReshape.As<V1::ExperimentalReflectSchemaResponse>(
-            await schema.ReflectSchema(converted, context));
+            await schema.ReflectSchemaCore(converted, context));
     }
 
     public override async Task<V1::ExperimentalDiffSchemaResponse> ExperimentalDiffSchema(
-        V1::ExperimentalDiffSchemaRequest request, ServerCallContext context) =>
-        ProtoReshape.As<V1::ExperimentalDiffSchemaResponse>(await schema.DiffSchema(
+        V1::ExperimentalDiffSchemaRequest request, ServerCallContext context)
+    {
+        RequestValidation.Validate(request);
+        return ProtoReshape.As<V1::ExperimentalDiffSchemaResponse>(await schema.DiffSchemaCore(
             new V1::DiffSchemaRequest { Consistency = request.Consistency, ComparisonSchema = request.ComparisonSchema },
             context));
+    }
 
     public override async Task<V1::ExperimentalComputablePermissionsResponse> ExperimentalComputablePermissions(
-        V1::ExperimentalComputablePermissionsRequest request, ServerCallContext context) =>
-        ProtoReshape.As<V1::ExperimentalComputablePermissionsResponse>(await schema.ComputablePermissions(
+        V1::ExperimentalComputablePermissionsRequest request, ServerCallContext context)
+    {
+        RequestValidation.Validate(request);
+        return ProtoReshape.As<V1::ExperimentalComputablePermissionsResponse>(await schema.ComputablePermissionsCore(
             new V1::ComputablePermissionsRequest
             {
                 Consistency = request.Consistency,
@@ -158,10 +177,13 @@ public sealed class AuthzedExperimentalV1Service(
                 OptionalDefinitionNameFilter = request.OptionalDefinitionNameFilter,
             },
             context));
+    }
 
     public override async Task<V1::ExperimentalDependentRelationsResponse> ExperimentalDependentRelations(
-        V1::ExperimentalDependentRelationsRequest request, ServerCallContext context) =>
-        ProtoReshape.As<V1::ExperimentalDependentRelationsResponse>(await schema.DependentRelations(
+        V1::ExperimentalDependentRelationsRequest request, ServerCallContext context)
+    {
+        RequestValidation.Validate(request);
+        return ProtoReshape.As<V1::ExperimentalDependentRelationsResponse>(await schema.DependentRelationsCore(
             new V1::DependentRelationsRequest
             {
                 Consistency = request.Consistency,
@@ -169,12 +191,13 @@ public sealed class AuthzedExperimentalV1Service(
                 PermissionName = request.PermissionName,
             },
             context));
+    }
 
     public override async Task<V1::ExperimentalRegisterRelationshipCounterResponse> ExperimentalRegisterRelationshipCounter(
         V1::ExperimentalRegisterRelationshipCounterRequest request, ServerCallContext context)
     {
-        if (request.RelationshipFilter is null)
-            throw new RpcException(new Status(StatusCode.InvalidArgument, "relationship_filter is required"));
+        RequestValidation.Validate(request);
+        RequireName(request.Name);
 
         try
         {
@@ -183,7 +206,7 @@ public sealed class AuthzedExperimentalV1Service(
         }
         catch (CounterOperationException ex)
         {
-            throw ToRpc(ex);
+            throw ToRpc(ex, request.Name, request.RelationshipFilter);
         }
         catch (SequencerOverloadedException ex)
         {
@@ -198,13 +221,16 @@ public sealed class AuthzedExperimentalV1Service(
     public override async Task<V1::ExperimentalUnregisterRelationshipCounterResponse> ExperimentalUnregisterRelationshipCounter(
         V1::ExperimentalUnregisterRelationshipCounterRequest request, ServerCallContext context)
     {
+        RequestValidation.Validate(request);
+        RequireName(request.Name);
+
         try
         {
             await Relationships.UnregisterRelationshipCounter(new UnregisterCounterArgs(request.Name));
         }
         catch (CounterOperationException ex)
         {
-            throw ToRpc(ex);
+            throw ToRpc(ex, request.Name, filter: null);
         }
         catch (SequencerOverloadedException ex)
         {
@@ -218,6 +244,9 @@ public sealed class AuthzedExperimentalV1Service(
     public override async Task<V1::ExperimentalCountRelationshipsResponse> ExperimentalCountRelationships(
         V1::ExperimentalCountRelationshipsRequest request, ServerCallContext context)
     {
+        RequestValidation.Validate(request);
+        RequireName(request.Name);
+
         CountRelationshipsReply reply;
         try
         {
@@ -225,7 +254,7 @@ public sealed class AuthzedExperimentalV1Service(
         }
         catch (CounterOperationException ex)
         {
-            throw ToRpc(ex);
+            throw ToRpc(ex, request.Name, filter: null);
         }
 
         // On-demand: the value is always available, so always emit the read_counter_value arm.
@@ -271,7 +300,41 @@ public sealed class AuthzedExperimentalV1Service(
 
     private static string? NullIfEmpty(string? value) => string.IsNullOrEmpty(value) ? null : value;
 
-    private static RpcException ToRpc(CounterOperationException ex) =>
-        // Both counter failures map to FailedPrecondition, matching the SpiceDB reference.
-        new(new Status(StatusCode.FailedPrecondition, ex.Message));
+    /// <summary>
+    /// Both counter failures map to FailedPrecondition, matching the SpiceDB reference, with the
+    /// <c>ErrorInfo</c> <c>rewriteError</c> gives <c>CounterAlreadyRegisteredError</c> (the counter name and
+    /// the NEW filter, every field present) and <c>CounterNotRegisteredError</c> (the counter name).
+    /// </summary>
+    private static RpcException ToRpc(CounterOperationException ex, string name, V1::RelationshipFilter? filter)
+    {
+        if (ex.Kind != CounterErrorKind.AlreadyRegistered || filter is null)
+            return RpcErrors.WithReason(
+                StatusCode.FailedPrecondition, ex.Message, V1::ErrorReason.CounterNotRegistered, [new("counter_name", name)]);
+
+        var subjectFilter = filter.OptionalSubjectFilter;
+        return RpcErrors.WithReason(
+            StatusCode.FailedPrecondition,
+            ex.Message,
+            V1::ErrorReason.CounterAlreadyRegistered,
+            [
+                new("counter_name", name),
+                new("new_filter_resource_type", filter.ResourceType),
+                new("new_filter_resource_id", filter.OptionalResourceId),
+                new("new_filter_resource_id_prefix", filter.OptionalResourceIdPrefix),
+                new("new_filter_relation", filter.OptionalRelation),
+                new("new_filter_subject_type", subjectFilter?.SubjectType ?? string.Empty),
+                new("new_filter_subject_id", subjectFilter?.OptionalSubjectId ?? string.Empty),
+                new("new_filter_subject_relation", subjectFilter?.OptionalRelation?.Relation ?? string.Empty),
+            ]);
+    }
+
+    /// <summary>
+    /// SpiceDB's counter handlers reject an empty name themselves (the name pattern admits the empty string):
+    /// InvalidArgument, "name must be provided", reason UNSPECIFIED.
+    /// </summary>
+    private static void RequireName(string name)
+    {
+        if (string.IsNullOrEmpty(name))
+            throw RpcErrors.WithReason(StatusCode.InvalidArgument, "name must be provided", V1::ErrorReason.Unspecified);
+    }
 }

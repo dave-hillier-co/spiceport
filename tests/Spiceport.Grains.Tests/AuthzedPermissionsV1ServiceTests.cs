@@ -225,6 +225,10 @@ public class AuthzedPermissionsV1ServiceTests
             Service(cluster).CheckBulkPermissions(req, FakeServerCallContext.Default));
         Assert.Equal(StatusCode.InvalidArgument, ex.StatusCode);
         Assert.Equal("check count of 10001 is greater than maximum allowed of 10000", ex.Status.Detail);
+        // ExceedsMaximumChecksError attaches ErrorInfo with reason UNSPECIFIED and the counts.
+        ErrorInfoTests.AssertErrorInfo(
+            ex, StatusCode.InvalidArgument, "ERROR_REASON_UNSPECIFIED",
+            ("check_count", "10001"), ("maximum_checks_allowed", "10000"));
     }
 
     [Fact]

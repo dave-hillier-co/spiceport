@@ -25,6 +25,8 @@ public sealed class AuthzedSchemaV1Service(IGrainFactory grains, ISchemaProvider
     public override async Task<V1::ReadSchemaResponse> ReadSchema(
         V1::ReadSchemaRequest request, ServerCallContext context)
     {
+        RequestValidation.Validate(request);
+
         var reply = await Relationships.ReadSchema();
         if (string.IsNullOrWhiteSpace(reply.SchemaText))
         {
@@ -44,6 +46,8 @@ public sealed class AuthzedSchemaV1Service(IGrainFactory grains, ISchemaProvider
     public override async Task<V1::WriteSchemaResponse> WriteSchema(
         V1::WriteSchemaRequest request, ServerCallContext context)
     {
+        RequestValidation.Validate(request);
+
         try
         {
             var reply = await Relationships.WriteSchema(new WriteSchemaArgs(request.Schema));
@@ -68,6 +72,18 @@ public sealed class AuthzedSchemaV1Service(IGrainFactory grains, ISchemaProvider
     public override Task<V1::ReflectSchemaResponse> ReflectSchema(
         V1::ReflectSchemaRequest request, ServerCallContext context)
     {
+        RequestValidation.Validate(request);
+        return ReflectSchemaCore(request, context);
+    }
+
+    /// <summary>
+    /// The ReflectSchema body without the request validation: the ExperimentalService alias validates its own
+    /// request type (as SpiceDB's interceptors do) and then shares this code path, as upstream's handlers do.
+    /// </summary>
+    internal Task<V1::ReflectSchemaResponse> ReflectSchemaCore(
+        V1::ReflectSchemaRequest request, ServerCallContext context)
+    {
+
         var snapshot = schema.Current;
         var filters = SchemaFilters.FromRequest(request.OptionalFilters);
 
@@ -108,6 +124,18 @@ public sealed class AuthzedSchemaV1Service(IGrainFactory grains, ISchemaProvider
     public override Task<V1::DiffSchemaResponse> DiffSchema(
         V1::DiffSchemaRequest request, ServerCallContext context)
     {
+        RequestValidation.Validate(request);
+        return DiffSchemaCore(request, context);
+    }
+
+    /// <summary>
+    /// The DiffSchema body without the request validation: the ExperimentalService alias validates its own
+    /// request type (as SpiceDB's interceptors do) and then shares this code path, as upstream's handlers do.
+    /// </summary>
+    internal Task<V1::DiffSchemaResponse> DiffSchemaCore(
+        V1::DiffSchemaRequest request, ServerCallContext context)
+    {
+
         Spiceport.Schema.CompiledSchema comparison;
         try
         {
@@ -134,6 +162,18 @@ public sealed class AuthzedSchemaV1Service(IGrainFactory grains, ISchemaProvider
     public override Task<V1::ComputablePermissionsResponse> ComputablePermissions(
         V1::ComputablePermissionsRequest request, ServerCallContext context)
     {
+        RequestValidation.Validate(request);
+        return ComputablePermissionsCore(request, context);
+    }
+
+    /// <summary>
+    /// The ComputablePermissions body without the request validation: the ExperimentalService alias validates its own
+    /// request type (as SpiceDB's interceptors do) and then shares this code path, as upstream's handlers do.
+    /// </summary>
+    internal Task<V1::ComputablePermissionsResponse> ComputablePermissionsCore(
+        V1::ComputablePermissionsRequest request, ServerCallContext context)
+    {
+
         var snapshot = schema.Current;
         var namespaces = snapshot.Namespaces.ToImmutableDictionary(n => n.Name);
 
@@ -149,7 +189,7 @@ public sealed class AuthzedSchemaV1Service(IGrainFactory grains, ISchemaProvider
         }
         catch (SchemaIntrospectionException ex)
         {
-            throw ToRpc(ex);
+            throw ToRpc(ex, request.DefinitionName, request.RelationName);
         }
 
         var response = new V1::ComputablePermissionsResponse();
@@ -162,6 +202,18 @@ public sealed class AuthzedSchemaV1Service(IGrainFactory grains, ISchemaProvider
     public override Task<V1::DependentRelationsResponse> DependentRelations(
         V1::DependentRelationsRequest request, ServerCallContext context)
     {
+        RequestValidation.Validate(request);
+        return DependentRelationsCore(request, context);
+    }
+
+    /// <summary>
+    /// The DependentRelations body without the request validation: the ExperimentalService alias validates its own
+    /// request type (as SpiceDB's interceptors do) and then shares this code path, as upstream's handlers do.
+    /// </summary>
+    internal Task<V1::DependentRelationsResponse> DependentRelationsCore(
+        V1::DependentRelationsRequest request, ServerCallContext context)
+    {
+
         var namespaces = schema.Current.Namespaces.ToImmutableDictionary(n => n.Name);
 
         IReadOnlyList<RelationReference> dependents;
@@ -172,7 +224,7 @@ public sealed class AuthzedSchemaV1Service(IGrainFactory grains, ISchemaProvider
         }
         catch (SchemaIntrospectionException ex)
         {
-            throw ToRpc(ex);
+            throw ToRpc(ex, request.DefinitionName, request.PermissionName);
         }
 
         var response = new V1::DependentRelationsResponse();
@@ -197,14 +249,22 @@ public sealed class AuthzedSchemaV1Service(IGrainFactory grains, ISchemaProvider
         };
     }
 
-    private static RpcException ToRpc(SchemaIntrospectionException ex) => ex.Kind switch
+    /// <summary>
+    /// Maps an introspection failure onto its status. An unknown relation carries the <c>ErrorInfo</c>
+    /// <c>rewriteError</c> gives <c>schema.RelationNotFoundError</c> (UNKNOWN_RELATION_OR_PERMISSION), and a
+    /// relation where a permission was required that of <c>NotAPermissionError</c> (the same reason, keyed
+    /// <c>relationName</c>).
+    /// </summary>
+    private static RpcException ToRpc(SchemaIntrospectionException ex, string definitionName, string relationName) => ex.Kind switch
     {
         SchemaIntrospectionErrorKind.DefinitionNotFound =>
             new RpcException(new Status(StatusCode.NotFound, ex.Message)),
-        SchemaIntrospectionErrorKind.RelationNotFound =>
-            new RpcException(new Status(StatusCode.FailedPrecondition, ex.Message)),
-        SchemaIntrospectionErrorKind.NotAPermission =>
-            new RpcException(new Status(StatusCode.InvalidArgument, ex.Message)),
+        SchemaIntrospectionErrorKind.RelationNotFound => RpcErrors.WithReason(
+            StatusCode.FailedPrecondition, ex.Message, V1::ErrorReason.UnknownRelationOrPermission,
+            [new("definition_name", definitionName), new("relation_or_permission_name", relationName)]),
+        SchemaIntrospectionErrorKind.NotAPermission => RpcErrors.WithReason(
+            StatusCode.InvalidArgument, ex.Message, V1::ErrorReason.UnknownRelationOrPermission,
+            [new("relationName", relationName)]),
         _ => new RpcException(new Status(StatusCode.Internal, ex.Message)),
     };
 

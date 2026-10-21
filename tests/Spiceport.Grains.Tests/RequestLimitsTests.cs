@@ -5,7 +5,8 @@ using V1 = Authzed.Api.V1;
 namespace Spiceport.Grains.Tests;
 
 /// <summary>
-/// Pure request-shape tests for <see cref="RequestLimits"/> (no cluster). An unset proto3 message field
+/// Pure request-shape tests for missing required submessages, which <see cref="RequestValidation"/> rejects
+/// ahead of the <see cref="RequestLimits"/> handler checks (no cluster). An unset proto3 message field
 /// is <c>null</c> in C#; SpiceDB rejects a missing required submessage with INVALID_ARGUMENT through its
 /// protoc-gen-validate interceptor (go-grpc-middleware's validator over authzed-go's <c>ValidateAll</c>)
 /// before any handler runs, so the boundary must too, rather than letting a
@@ -40,14 +41,14 @@ public class RequestLimitsTests
 
     private static void AssertInvalidArgument(V1::WriteRelationshipsRequest request, string detail)
     {
-        var ex = Assert.Throws<RpcException>(() => RequestLimits.ValidateWriteRelationships(request));
+        var ex = Assert.Throws<RpcException>(() => RequestValidation.Validate(request));
         Assert.Equal(StatusCode.InvalidArgument, ex.StatusCode);
         Assert.Equal(detail, ex.Status.Detail);
     }
 
     private static void AssertInvalidArgument(V1::DeleteRelationshipsRequest request, string detail)
     {
-        var ex = Assert.Throws<RpcException>(() => RequestLimits.ValidateDeleteRelationships(request));
+        var ex = Assert.Throws<RpcException>(() => RequestValidation.Validate(request));
         Assert.Equal(StatusCode.InvalidArgument, ex.StatusCode);
         Assert.Equal(detail, ex.Status.Detail);
     }
@@ -164,6 +165,7 @@ public class RequestLimitsTests
             Operation = V1::Precondition.Types.Operation.MustMatch,
             Filter = new V1::RelationshipFilter { ResourceType = "document" },
         });
+        RequestValidation.Validate(request);
         RequestLimits.ValidateWriteRelationships(request);
     }
 }
