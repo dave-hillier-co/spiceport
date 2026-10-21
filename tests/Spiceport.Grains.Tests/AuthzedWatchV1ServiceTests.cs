@@ -698,6 +698,245 @@ public class AuthzedWatchV1ServiceTests
         });
     }
 
+    private const string ObjectTypePattern =
+        "\"^([a-z][a-z0-9_]{1,62}[a-z0-9]/)*[a-z][a-z0-9_]{1,62}[a-z0-9]$\"";
+
+    private static V1::WatchRequest Request(
+        string[]? objectTypes = null,
+        V1::RelationshipFilter[]? filters = null,
+        string? startCursor = null,
+        V1::WatchKind[]? kinds = null)
+    {
+        var request = new V1::WatchRequest();
+        request.OptionalObjectTypes.Add(objectTypes ?? []);
+        request.OptionalRelationshipFilters.Add(filters ?? []);
+        request.OptionalUpdateKinds.Add(kinds ?? []);
+        if (startCursor is not null)
+            request.OptionalStartCursor = new V1::ZedToken { Token = startCursor };
+        return request;
+    }
+
+    private static V1::RelationshipFilter Filter(string resourceType) => new() { ResourceType = resourceType };
+
+    /// <summary>
+    /// Malformed requests and the status SpiceDB v1.49.2 answers each with, observed from a running
+    /// <c>spicedb serve</c> over memdb: the protoc-gen-validate interceptor (<c>ValidateAll</c>) first, then
+    /// the handler's own checks in order (object types with relationship filters, the start cursor, each
+    /// filter against the schema).
+    /// </summary>
+    public static TheoryData<string, V1::WatchRequest, StatusCode, string> MalformedRequests() => new()
+    {
+        {
+            "object type breaks its pattern",
+            Request(objectTypes: ["Doc"]),
+            StatusCode.InvalidArgument,
+            $"invalid WatchRequest.OptionalObjectTypes[0]: value does not match regex pattern {ObjectTypePattern}"
+        },
+        {
+            "every bad object type is reported",
+            Request(objectTypes: ["Doc", "x"]),
+            StatusCode.InvalidArgument,
+            $"invalid WatchRequest.OptionalObjectTypes[0]: value does not match regex pattern {ObjectTypePattern}; " +
+            $"invalid WatchRequest.OptionalObjectTypes[1]: value does not match regex pattern {ObjectTypePattern}"
+        },
+        {
+            "object type too long",
+            Request(objectTypes: [new string('a', 129)]),
+            StatusCode.InvalidArgument,
+            "invalid WatchRequest.OptionalObjectTypes[0]: value length must be at most 128 bytes; " +
+            $"invalid WatchRequest.OptionalObjectTypes[0]: value does not match regex pattern {ObjectTypePattern}"
+        },
+        {
+            "filter resource type breaks its pattern",
+            Request(filters: [Filter("Doc")]),
+            StatusCode.InvalidArgument,
+            "invalid WatchRequest.OptionalRelationshipFilters[0]: embedded message failed validation | caused by: " +
+            "invalid RelationshipFilter.ResourceType: value does not match regex pattern " +
+            "\"^(([a-z][a-z0-9_]{1,61}[a-z0-9]/)*[a-z][a-z0-9_]{1,62}[a-z0-9])?$\""
+        },
+        {
+            "filter resource id is a wildcard",
+            Request(filters: [new V1::RelationshipFilter { ResourceType = "document", OptionalResourceId = "*" }]),
+            StatusCode.InvalidArgument,
+            "invalid WatchRequest.OptionalRelationshipFilters[0]: embedded message failed validation | caused by: " +
+            "invalid RelationshipFilter.OptionalResourceId: value does not match regex pattern " +
+            "\"^([a-zA-Z0-9/_|\\\\-=+]{1,})?$\""
+        },
+        {
+            "field validation precedes the object types and filters check",
+            Request(objectTypes: ["Doc"], filters: [Filter("document")]),
+            StatusCode.InvalidArgument,
+            $"invalid WatchRequest.OptionalObjectTypes[0]: value does not match regex pattern {ObjectTypePattern}"
+        },
+        {
+            "object types and filters precede schema validation of the filters",
+            Request(objectTypes: ["document"], filters: [Filter("nope")]),
+            StatusCode.InvalidArgument,
+            "cannot specify both object types and relationship filters"
+        },
+        {
+            "object types and filters together are allowed when relationships are not watched",
+            Request(objectTypes: ["document"], filters: [Filter("nope")], kinds: [V1::WatchKind.IncludeSchemaUpdates]),
+            StatusCode.FailedPrecondition,
+            "object definition `nope` not found"
+        },
+        {
+            "empty start cursor fails field validation",
+            Request(startCursor: ""),
+            StatusCode.InvalidArgument,
+            "invalid WatchRequest.OptionalStartCursor: embedded message failed validation | caused by: " +
+            "invalid ZedToken.Token: value length must be at least 1 bytes"
+        },
+        {
+            "field violations are all reported",
+            Request(objectTypes: ["Doc"], startCursor: ""),
+            StatusCode.InvalidArgument,
+            $"invalid WatchRequest.OptionalObjectTypes[0]: value does not match regex pattern {ObjectTypePattern}; " +
+            "invalid WatchRequest.OptionalStartCursor: embedded message failed validation | caused by: " +
+            "invalid ZedToken.Token: value length must be at least 1 bytes"
+        },
+        {
+            "start cursor that is not base64",
+            Request(startCursor: "garbage"),
+            StatusCode.InvalidArgument,
+            "failed to decode start revision: error decoding zedtoken: illegal base64 data at input byte 4"
+        },
+        {
+            // SpiceDB reports its protobuf unmarshal error here (proto: illegal wireType 6 for this input);
+            // Spiceport's own token format cannot, so it keeps the frame with its own cause.
+            "start cursor that is base64 but not a token",
+            Request(startCursor: "Zm9v"),
+            StatusCode.InvalidArgument,
+            "failed to decode start revision: error decoding zedtoken: malformed zedtoken"
+        },
+        {
+            "field validation precedes the start cursor",
+            Request(objectTypes: ["Doc"], startCursor: "garbage"),
+            StatusCode.InvalidArgument,
+            $"invalid WatchRequest.OptionalObjectTypes[0]: value does not match regex pattern {ObjectTypePattern}"
+        },
+        {
+            "object types and filters precede the start cursor",
+            Request(objectTypes: ["document"], filters: [Filter("document")], startCursor: "garbage"),
+            StatusCode.InvalidArgument,
+            "cannot specify both object types and relationship filters"
+        },
+        {
+            "the start cursor precedes schema validation of the filters",
+            Request(filters: [Filter("nope")], startCursor: "garbage"),
+            StatusCode.InvalidArgument,
+            "failed to decode start revision: error decoding zedtoken: illegal base64 data at input byte 4"
+        },
+        {
+            "a wildcard subject filter with a relation is not rejected by handwritten validation",
+            Request(filters:
+            [
+                new V1::RelationshipFilter
+                {
+                    ResourceType = "document",
+                    OptionalSubjectFilter = new V1::SubjectFilter
+                    {
+                        SubjectType = "user",
+                        OptionalSubjectId = "*",
+                        OptionalRelation = new V1::SubjectFilter.Types.RelationFilter { Relation = "viewer" },
+                    },
+                },
+            ]),
+            StatusCode.FailedPrecondition,
+            "relation/permission `viewer` not found under definition `user`"
+        },
+    };
+
+    [Theory]
+    [MemberData(nameof(MalformedRequests))]
+    public async Task Watch_rejects_a_malformed_request_as_SpiceDB_does(
+        string because, V1::WatchRequest request, StatusCode expectedCode, string expectedDetail)
+    {
+        _ = because;
+        await using var cluster = await MeshTestCluster.CreateAsync(Schema);
+        var service = Service(cluster);
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        var writer = new CollectingStreamWriter<V1::WatchResponse>();
+        var ctx = new FakeServerCallContext(cts.Token);
+
+        var ex = await Assert.ThrowsAsync<RpcException>(() => service.Watch(request, writer, ctx));
+
+        Assert.Equal(expectedCode, ex.StatusCode);
+        Assert.Equal(expectedDetail, ex.Status.Detail);
+        Assert.Empty(writer.Collected);
+    }
+
+    [Fact]
+    public async Task Watch_rejects_a_start_cursor_from_another_datastore()
+    {
+        await using var cluster = await MeshTestCluster.CreateAsync(Schema);
+        var service = Service(cluster);
+        var head = await cluster.Datastore.HeadRevision(CancellationToken.None);
+        var foreign = ZedTokens.FromRevision(head.Revision, head.SchemaHash, "another-datastore");
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        var ex = await Assert.ThrowsAsync<RpcException>(() => service.Watch(
+            Request(startCursor: foreign.Token), new CollectingStreamWriter<V1::WatchResponse>(),
+            new FakeServerCallContext(cts.Token)));
+
+        Assert.Equal(StatusCode.InvalidArgument, ex.StatusCode);
+        Assert.Equal("start revision was generated by a different datastore instance", ex.Status.Detail);
+    }
+
+    /// <summary>
+    /// SpiceDB's <c>InvalidFilterError</c> carries ERROR_REASON_INVALID_FILTER with the filter's prototext as
+    /// <c>filter</c>; the schema errors carry their definition (and relation) names.
+    /// </summary>
+    [Fact]
+    public async Task Watch_filter_errors_carry_SpiceDBs_error_info()
+    {
+        await using var cluster = await MeshTestCluster.CreateAsync(Schema);
+        var service = Service(cluster);
+
+        async Task<RpcException> Rejected(V1::RelationshipFilter filter)
+        {
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+            return await Assert.ThrowsAsync<RpcException>(() => service.Watch(
+                Request(filters: [filter]), new CollectingStreamWriter<V1::WatchResponse>(),
+                new FakeServerCallContext(cts.Token)));
+        }
+
+        ErrorInfoTests.AssertErrorInfo(
+            await Rejected(new V1::RelationshipFilter()),
+            StatusCode.InvalidArgument, "ERROR_REASON_INVALID_FILTER", ("filter", ""));
+        ErrorInfoTests.AssertErrorInfo(
+            await Rejected(new V1::RelationshipFilter
+            {
+                ResourceType = "document", OptionalResourceId = "a", OptionalResourceIdPrefix = "b",
+            }),
+            StatusCode.InvalidArgument, "ERROR_REASON_INVALID_FILTER",
+            ("filter", "resource_type:\"document\" optional_resource_id:\"a\" optional_resource_id_prefix:\"b\""));
+        ErrorInfoTests.AssertErrorInfo(
+            await Rejected(new V1::RelationshipFilter
+            {
+                ResourceType = "document",
+                OptionalResourceId = "a",
+                OptionalResourceIdPrefix = "b",
+                OptionalRelation = "viewer",
+                OptionalSubjectFilter = new V1::SubjectFilter
+                {
+                    SubjectType = "user",
+                    OptionalRelation = new V1::SubjectFilter.Types.RelationFilter(),
+                },
+            }),
+            StatusCode.InvalidArgument, "ERROR_REASON_INVALID_FILTER",
+            ("filter", "resource_type:\"document\" optional_resource_id:\"a\" optional_resource_id_prefix:\"b\" " +
+                "optional_relation:\"viewer\" optional_subject_filter:{subject_type:\"user\" optional_relation:{}}"));
+        ErrorInfoTests.AssertErrorInfo(
+            await Rejected(Filter("nope")),
+            StatusCode.FailedPrecondition, "ERROR_REASON_UNKNOWN_DEFINITION", ("definition_name", "nope"));
+        ErrorInfoTests.AssertErrorInfo(
+            await Rejected(new V1::RelationshipFilter { ResourceType = "document", OptionalRelation = "nope" }),
+            StatusCode.FailedPrecondition, "ERROR_REASON_UNKNOWN_RELATION_OR_PERMISSION",
+            ("definition_name", "document"), ("relation_or_permission_name", "nope"));
+    }
+
     private sealed class CollectingStreamWriter<T> : IServerStreamWriter<T>
     {
         private readonly Channel<T> _channel = Channel.CreateUnbounded<T>();
