@@ -15,14 +15,14 @@ concurrency:
 
 jobs:
   gate:
-    runs-on: self-hosted
+    runs-on: [self-hosted, macOS, ARM64]
     # A wedged test must fail the run, not hold the shared runner indefinitely; the per-step
     # --blame-hang-timeout catches a hung test sooner. The cap leaves headroom over a full run,
     # whose Grains suite alone takes most of an hour on the self-hosted runner.
     timeout-minutes: 90
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       # The runner service starts from a minimal PATH, so Homebrew's bin — where
       # docker lives — is added explicitly. Via GITHUB_PATH rather than a
@@ -33,7 +33,7 @@ jobs:
 
       # The SDK comes from the action rather than whatever the runner happens to
       # have installed, so CI builds with the framework the solution targets.
-      - uses: actions/setup-dotnet@v4
+      - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4
         with:
           dotnet-version: 10.0.x
 
